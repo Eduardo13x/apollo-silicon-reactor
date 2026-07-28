@@ -570,7 +570,8 @@ mod tests {
 
     #[test]
     fn universal_gold_actuator_models_drive_utility_imagination() {
-        let mut telemetry = TelemetryMedallion::new();
+        let mut telemetry =
+            TelemetryMedallion::new(crate::engine::installation_identity::InstallationId(1));
         let mut persisted =
             crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
         persisted.actuator_evidence_schema_version = 2;
@@ -633,7 +634,8 @@ mod tests {
     #[test]
     fn stale_or_uncertain_utility_models_abstain() {
         let now_unix = 2_000_000;
-        let mut telemetry = TelemetryMedallion::new();
+        let mut telemetry =
+            TelemetryMedallion::new(crate::engine::installation_identity::InstallationId(1));
         let mut persisted =
             crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
         persisted.actuator_evidence_schema_version = 2;
@@ -688,7 +690,8 @@ mod tests {
         use crate::engine::telemetry_medallion::HardwareRegime;
 
         let now_unix = 2_500_000;
-        let mut telemetry = TelemetryMedallion::new();
+        let mut telemetry =
+            TelemetryMedallion::new(crate::engine::installation_identity::InstallationId(1));
         let mut persisted =
             crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
         persisted.actuator_evidence_schema_version = 2;
@@ -731,7 +734,8 @@ mod tests {
     #[test]
     fn immature_workload_bucket_falls_back_to_mature_aggregate() {
         let now_unix = 3_000_000;
-        let mut telemetry = TelemetryMedallion::new();
+        let mut telemetry =
+            TelemetryMedallion::new(crate::engine::installation_identity::InstallationId(1));
         let mut persisted =
             crate::engine::telemetry_medallion::TelemetryMedallionPersisted::default();
         persisted.actuator_evidence_schema_version = 2;
@@ -777,7 +781,8 @@ mod tests {
     fn incremental_refresh_skips_unchanged_models_and_invalidates_on_gold() {
         let mut graph = crate::engine::causal_graph::CausalGraph::new();
         let tracker = crate::engine::outcome_tracker::OutcomeTracker::new();
-        let telemetry = TelemetryMedallion::new();
+        let telemetry =
+            TelemetryMedallion::new(crate::engine::installation_identity::InstallationId(1));
         let mut model = WorldModel::default();
 
         model.refresh_from_parts_for_workload(&graph, &tracker, 1.0, "build");

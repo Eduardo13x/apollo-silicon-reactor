@@ -1049,7 +1049,9 @@ mod tests {
         };
         use apollo_engine::engine::world_model::WorldModel;
 
-        let mut telemetry = TelemetryMedallion::new();
+        let mut telemetry = TelemetryMedallion::new(
+            apollo_engine::engine::installation_identity::InstallationId(1),
+        );
         let mut persisted = TelemetryMedallionPersisted::default();
         persisted.actuator_evidence_schema_version = 2;
         let now_unix = 1_000_000;
@@ -1094,7 +1096,9 @@ mod tests {
         };
         use apollo_engine::engine::world_model::WorldModel;
 
-        let mut telemetry = TelemetryMedallion::new();
+        let mut telemetry = TelemetryMedallion::new(
+            apollo_engine::engine::installation_identity::InstallationId(1),
+        );
         let mut persisted = TelemetryMedallionPersisted::default();
         persisted.actuator_evidence_schema_version = 2;
         let now_unix = 1_000_000;

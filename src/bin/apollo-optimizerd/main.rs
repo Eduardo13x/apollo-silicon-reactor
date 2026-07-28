@@ -78,13 +78,13 @@ use apollo_engine::engine::compressor_aware::{
 };
 use apollo_engine::engine::daemon_helpers::{
     audit_log, battery_pressure_boost, detect_prior_crash, frozen_state_path, governor_state_path,
-    holt_winters_path, hop_groups_path, journal_path, kill_switch_path, learned_state_path,
-    load_frozen_state, load_governor_state, load_wake_state, markov_path, merge_seed_into,
-    metrics_path, overflow_history_path, parse_profile, pid_start_time, predictive_agent_path,
-    remove_crash_sentinel, rl_threshold_path, signal_intelligence_path, skills_path, socket_path,
-    spawn_reaped_purge, telemetry_output_dir, temporal_histograms_path, timeline_path,
-    unfreeze_pids, unfreeze_pids_verified_outcome, wake_state_path, write_frozen_state,
-    write_governor_state,
+    holt_winters_path, hop_groups_path, installation_id_path, journal_path, kill_switch_path,
+    learned_state_path, load_frozen_state, load_governor_state, load_wake_state, markov_path,
+    merge_seed_into, metrics_path, overflow_history_path, parse_profile, pid_start_time,
+    predictive_agent_path, remove_crash_sentinel, rl_threshold_path, signal_intelligence_path,
+    skills_path, socket_path, spawn_reaped_purge, telemetry_output_dir, temporal_histograms_path,
+    timeline_path, unfreeze_pids, unfreeze_pids_verified_outcome, wake_state_path,
+    write_frozen_state, write_governor_state,
 };
 use apollo_engine::engine::execute_actions::execute_actions;
 use apollo_engine::engine::focus_markov::FocusMarkov;
@@ -907,8 +907,13 @@ fn main() -> anyhow::Result<()> {
                 mut companion_graph,
                 mut active_coalitions,
             } = daemon_init::DaemonSubsystems::new();
+            let installation_id = apollo_engine::engine::installation_identity::load_or_create(
+                Path::new(installation_id_path()),
+            )?;
             let mut telemetry_medallion =
-                apollo_engine::engine::telemetry_medallion::TelemetryMedallion::new();
+                apollo_engine::engine::telemetry_medallion::TelemetryMedallion::new(
+                    installation_id,
+                );
             {
                 let mut m_guard = state.metrics.lock_recover();
                 m_guard.metrics.recently_applied_restore_status =

@@ -16,10 +16,15 @@ use serde::{Deserialize, Serialize};
 
 use crate::collector::SystemSnapshot;
 use crate::engine::execute_actions::ExecuteOutcomes;
+use crate::engine::installation_identity::InstallationId;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::predictive_agent::Intervention;
 use crate::engine::signal_intelligence::SignalDigest;
+use crate::engine::telemetry_context_admission::{
+    classify, ContextAdmission, ContextAdmissionInput, ContextReasonCounters, ContextTier,
+};
 use crate::engine::types::{CapabilityReport, RootAction, RuntimeMetrics};
+use chrono::Utc;
 
 const MAX_PENDING_ACTIONS: usize = 192;
 const MAX_RECENT_EVIDENCE: usize = 64;
@@ -518,8 +523,14 @@ pub struct TelemetryMedallionPersisted {
     pub no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct TelemetryMedallion {
+    installation_id: InstallationId,
+    current_tier: ContextTier,
+    last_admitted_live: Option<TelemetryContextSummary>,
+    consecutive_gold: u32,
+    local_gold_total: u64,
+    reason_counters: ContextReasonCounters,
     bronze_total: u64,
     silver_total: u64,
     gold_total: u64,
@@ -547,14 +558,64 @@ pub struct TelemetryMedallion {
     no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
 }
 
+impl Default for TelemetryMedallion {
+    fn default() -> Self {
+        Self {
+            installation_id: InstallationId::UNKNOWN,
+            current_tier: ContextTier::Rejected,
+            last_admitted_live: None,
+            consecutive_gold: 0,
+            local_gold_total: 0,
+            reason_counters: ContextReasonCounters::default(),
+            bronze_total: 0,
+            silver_total: 0,
+            gold_total: 0,
+            rejected_total: 0,
+            invalid_total: 0,
+            quality_sum: 0.0,
+            last_cycle: 0,
+            latest: None,
+            pending_actions: VecDeque::new(),
+            family_stats: BTreeMap::new(),
+            action_models: BTreeMap::new(),
+            action_models_revision: 0,
+            recent_evidence: VecDeque::new(),
+            external_counters: ExternalActuatorCounters::default(),
+            next_action_id: 0,
+            actuator_issued_total: 0,
+            actuator_resolved_total: 0,
+            actuator_silver_total: 0,
+            actuator_gold_total: 0,
+            actuator_effective_total: 0,
+            actuator_rejected_total: 0,
+            actuator_expired_total: 0,
+            actuator_quality_sum: 0.0,
+            actuator_utility_sum: 0.0,
+            no_action_delta_ema: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct TrustedTelemetryView<'a> {
+    pub current: Option<&'a TelemetryContextSummary>,
+    pub installation_id: InstallationId,
+    pub action_models: &'a BTreeMap<String, ActionModelStats>,
+    pub action_models_revision: u64,
+    pub metrics: TelemetryMedallionMetrics,
+}
+
 impl TelemetryMedallion {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(installation_id: InstallationId) -> Self {
+        Self {
+            installation_id,
+            ..Self::default()
+        }
     }
 
     /// Admit one complete live snapshot. Bronze always advances for a cycle;
     /// Silver/Gold only advance when the normalized measurements are usable.
-    pub fn observe(&mut self, observation: TelemetryObservation<'_>) {
+    pub fn observe(&mut self, observation: TelemetryObservation<'_>) -> ContextAdmission {
         let summary = summarize(&observation);
         let TelemetryObservation {
             snapshot,
@@ -567,36 +628,28 @@ impl TelemetryMedallion {
             purge_recent,
             ..
         } = observation;
-        if cycle < self.last_cycle {
-            for pending in &mut self.pending_actions {
-                pending.issued_cycle = cycle;
-            }
-            self.latest = None;
-        }
         self.bronze_total = self.bronze_total.saturating_add(1);
-        self.last_cycle = cycle;
+        let admission = classify(ContextAdmissionInput::live(
+            &summary,
+            self.last_admitted_live.as_ref(),
+            Utc::now().timestamp(),
+            self.installation_id,
+        ));
+        self.record_admission(admission);
 
-        let valid = summary.workload.len() <= 64
-            && summary.memory_pressure.is_finite()
-            && (0.0..=1.0).contains(&summary.memory_pressure)
-            && summary.memory_pressure_raw.is_finite()
-            && (0.0..=1.0).contains(&summary.memory_pressure_raw)
-            && summary.compressor_pressure.is_finite()
-            && (0.0..=1.0).contains(&summary.compressor_pressure)
-            && summary.cpu_global_usage.is_finite()
-            && (0.0..=1.0).contains(&summary.cpu_global_usage)
-            && summary.cpu_mean_busy.is_finite()
-            && (0.0..=1.0).contains(&summary.cpu_mean_busy)
-            && summary.cpu_max_busy.is_finite()
-            && (0.0..=1.0).contains(&summary.cpu_max_busy)
-            && summary.thermal_score.is_finite()
-            && (0.0..=1.0).contains(&summary.thermal_score);
-
-        if !valid {
-            self.rejected_total = self.rejected_total.saturating_add(1);
-            self.invalid_total = self.invalid_total.saturating_add(1);
-            return;
+        if admission.tier != ContextTier::Gold {
+            self.current_tier = admission.tier;
+            self.consecutive_gold = 0;
+            if admission.tier == ContextTier::Silver {
+                self.last_admitted_live = Some(summary);
+            }
+            return admission;
         }
+
+        self.current_tier = ContextTier::Gold;
+        self.consecutive_gold = self.consecutive_gold.saturating_add(1);
+        self.local_gold_total = self.local_gold_total.saturating_add(1);
+        self.last_cycle = cycle;
 
         let applied_root_actions: Vec<&RootAction> = outcomes
             .audit_traces
@@ -621,7 +674,11 @@ impl TelemetryMedallion {
             .saturating_add(external_deltas.interaction_activations)
             .saturating_add(u64::from(applied_intervention.is_some()));
 
-        if issued_this_cycle == 0 && resolved_this_cycle == 0 && self.pending_actions.is_empty() {
+        if self.consecutive_gold >= 2
+            && issued_this_cycle == 0
+            && resolved_this_cycle == 0
+            && self.pending_actions.is_empty()
+        {
             if let Some(previous) = self.latest.as_ref() {
                 for objective in ALL_OBJECTIVES {
                     let delta =
@@ -721,14 +778,27 @@ impl TelemetryMedallion {
         }
         self.external_counters = ExternalActuatorCounters::from_runtime(runtime, intervention);
 
-        self.silver_total = self.silver_total.saturating_add(1);
-        self.quality_sum += context_quality(&summary);
-        // Context Gold means complete, coherent descriptive context. It is
-        // deliberately not interchangeable with action-medallion Gold.
-        if !summary.workload.is_empty() && cycle > 0 {
-            self.gold_total = self.gold_total.saturating_add(1);
+        self.latest = Some(summary.clone());
+        self.last_admitted_live = Some(summary);
+        admission
+    }
+
+    fn record_admission(&mut self, admission: ContextAdmission) {
+        self.reason_counters.record(admission.reasons);
+        self.quality_sum = (self.quality_sum + admission.quality).max(0.0);
+        match admission.tier {
+            ContextTier::Rejected => {
+                self.rejected_total = self.rejected_total.saturating_add(1);
+                self.invalid_total = self.invalid_total.saturating_add(1);
+            }
+            ContextTier::Silver => {
+                self.silver_total = self.silver_total.saturating_add(1);
+            }
+            ContextTier::Gold => {
+                self.silver_total = self.silver_total.saturating_add(1);
+                self.gold_total = self.gold_total.saturating_add(1);
+            }
         }
-        self.latest = Some(summary);
     }
 
     fn external_deltas(&mut self, runtime: &RuntimeMetrics) -> ExternalDeltas {
@@ -1095,6 +1165,18 @@ impl TelemetryMedallion {
 
     pub fn latest(&self) -> Option<&TelemetryContextSummary> {
         self.latest.as_ref()
+    }
+
+    pub fn trusted_view(&self) -> TrustedTelemetryView<'_> {
+        TrustedTelemetryView {
+            current: (self.current_tier == ContextTier::Gold)
+                .then_some(self.latest.as_ref())
+                .flatten(),
+            installation_id: self.installation_id,
+            action_models: &self.action_models,
+            action_models_revision: self.action_models_revision,
+            metrics: self.metrics(),
+        }
     }
 
     pub fn family_stats(&self) -> &BTreeMap<ActuatorFamily, ActuatorFamilyStats> {
@@ -1778,6 +1860,8 @@ mod tests {
     use crate::engine::lotka_volterra::StabilityRegime;
     use chrono::Utc;
 
+    const LOCAL_ID: InstallationId = InstallationId(0x1020_3040_5060_7080);
+
     fn snapshot() -> SystemSnapshot {
         SystemSnapshot {
             timestamp: Utc::now(),
@@ -1838,6 +1922,32 @@ mod tests {
         }
     }
 
+    fn healthy_runtime() -> RuntimeMetrics {
+        RuntimeMetrics {
+            collector_pressure_alive: true,
+            reactor_health: "healthy".to_string(),
+            pressure_dominant_factor: "memory".to_string(),
+            ..RuntimeMetrics::default()
+        }
+    }
+
+    fn m4_capabilities() -> CapabilityReport {
+        CapabilityReport {
+            can_taskpolicy: true,
+            can_sysctl: true,
+            can_memorystatus: true,
+            can_memory_pressure_send: false,
+            can_mdutil: true,
+            can_tmutil: true,
+            is_root: true,
+            p_core_count: Some(4),
+            e_core_count: Some(6),
+            unavailable: Vec::new(),
+            memorystatus_probe: Some("ok".to_string()),
+            task_for_pid_probe: Some("ok".to_string()),
+        }
+    }
+
     fn trace(action: RootAction, applied: bool) -> PolicyDecisionTrace {
         PolicyDecisionTrace {
             t: Utc::now(),
@@ -1857,14 +1967,15 @@ mod tests {
         cycle: u64,
         outcomes: &ExecuteOutcomes,
         runtime: &RuntimeMetrics,
-    ) {
+    ) -> ContextAdmission {
         let snapshot = snapshot();
         let signal = signal();
+        let capabilities = m4_capabilities();
         medallion.observe(TelemetryObservation {
             snapshot: &snapshot,
             hardware: None,
             runtime,
-            capabilities: None,
+            capabilities: Some(&capabilities),
             signal: &signal,
             workload: "idle",
             cycle,
@@ -1876,7 +1987,7 @@ mod tests {
             nars_beliefs_total: 1,
             natural_drift: 0.0,
             arousal_level: 0.5,
-        });
+        })
     }
 
     fn gold_evidence(
@@ -1910,16 +2021,17 @@ mod tests {
 
     #[test]
     fn every_live_cycle_advances_context_bronze_and_gold() {
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         let signal = signal();
         let outcomes = ExecuteOutcomes::default();
         let snapshot = snapshot();
-        let runtime = RuntimeMetrics::default();
+        let runtime = healthy_runtime();
+        let capabilities = m4_capabilities();
         medallion.observe(TelemetryObservation {
             snapshot: &snapshot,
             hardware: None,
             runtime: &runtime,
-            capabilities: None,
+            capabilities: Some(&capabilities),
             signal: &signal,
             workload: "idle",
             cycle: 1,
@@ -1943,7 +2055,7 @@ mod tests {
     fn kernel_capabilities_and_apple_silicon_topology_enter_context() {
         let snapshot = snapshot();
         let signal = signal();
-        let runtime = RuntimeMetrics::default();
+        let runtime = healthy_runtime();
         let outcomes = ExecuteOutcomes::default();
         let capabilities = CapabilityReport {
             can_taskpolicy: true,
@@ -1959,7 +2071,7 @@ mod tests {
             memorystatus_probe: Some("ok".to_string()),
             task_for_pid_probe: Some("ok".to_string()),
         };
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.observe(TelemetryObservation {
             snapshot: &snapshot,
             hardware: None,
@@ -1989,8 +2101,130 @@ mod tests {
     }
 
     #[test]
+    fn rejected_and_silver_context_have_zero_learning_side_effects() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        assert_eq!(
+            observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime,).tier,
+            ContextTier::Gold
+        );
+        let before_latest = medallion.latest.clone();
+        let before_pending = medallion.pending_actions.len();
+        let before_models = medallion.action_models.clone();
+        let before_baseline = medallion.no_action_delta_ema.clone();
+
+        let mut rejected_snapshot = snapshot();
+        rejected_snapshot.pressure.memory_pressure = f64::NAN;
+        let signal = signal();
+        let capabilities = m4_capabilities();
+        let outcomes = ExecuteOutcomes::default();
+        let rejected = medallion.observe(TelemetryObservation {
+            snapshot: &rejected_snapshot,
+            hardware: None,
+            runtime: &runtime,
+            capabilities: Some(&capabilities),
+            signal: &signal,
+            workload: "idle",
+            cycle: 2,
+            outcomes: &outcomes,
+            intervention: Intervention::Observe,
+            applied_intervention: None,
+            purge_recent: false,
+            nars_drift_score: 0.0,
+            nars_beliefs_total: 1,
+            natural_drift: 0.0,
+            arousal_level: 0.5,
+        });
+        assert_eq!(rejected.tier, ContextTier::Rejected);
+        assert_eq!(medallion.latest, before_latest);
+        assert_eq!(medallion.pending_actions.len(), before_pending);
+        assert_eq!(medallion.action_models, before_models);
+        assert_eq!(medallion.no_action_delta_ema, before_baseline);
+
+        let mut silver_runtime = healthy_runtime();
+        silver_runtime.collector_pressure_alive = false;
+        assert_eq!(
+            observe(
+                &mut medallion,
+                3,
+                &ExecuteOutcomes::default(),
+                &silver_runtime,
+            )
+            .tier,
+            ContextTier::Silver
+        );
+        assert_eq!(medallion.latest, before_latest);
+        assert_eq!(medallion.pending_actions.len(), before_pending);
+        assert_eq!(medallion.action_models, before_models);
+        assert_eq!(medallion.no_action_delta_ema, before_baseline);
+        assert!(medallion.trusted_view().current.is_none());
+    }
+
+    #[test]
+    fn baseline_requires_two_consecutive_gold_contexts() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        let mut silver_runtime = healthy_runtime();
+        silver_runtime.collector_pressure_alive = false;
+        observe(
+            &mut medallion,
+            2,
+            &ExecuteOutcomes::default(),
+            &silver_runtime,
+        );
+        observe(&mut medallion, 3, &ExecuteOutcomes::default(), &runtime);
+        assert!(medallion.no_action_delta_ema.is_empty());
+        observe(&mut medallion, 4, &ExecuteOutcomes::default(), &runtime);
+        assert!(!medallion.no_action_delta_ema.is_empty());
+    }
+
+    #[test]
+    fn action_evidence_requires_gold_at_both_endpoints() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes {
+            audit_traces: vec![trace(
+                RootAction::BoostProcess {
+                    pid: 300,
+                    name: "Editor".to_string(),
+                    reason: "fixture".to_string(),
+                    decision_reason: DecisionReason::InteractiveFocus,
+                    start_sec: 12_345,
+                    start_usec: 678,
+                },
+                true,
+            )],
+            ..ExecuteOutcomes::default()
+        };
+        let runtime = healthy_runtime();
+        assert_eq!(
+            observe(&mut medallion, 1, &outcomes, &runtime).tier,
+            ContextTier::Gold
+        );
+        assert_eq!(medallion.metrics().actuator_pending_total, 1);
+
+        let mut silver_runtime = healthy_runtime();
+        silver_runtime.collector_pressure_alive = false;
+        assert_eq!(
+            observe(
+                &mut medallion,
+                4,
+                &ExecuteOutcomes::default(),
+                &silver_runtime,
+            )
+            .tier,
+            ContextTier::Silver
+        );
+        assert!(medallion.action_models().is_empty());
+        assert_eq!(medallion.metrics().actuator_pending_total, 1);
+
+        observe(&mut medallion, 5, &ExecuteOutcomes::default(), &runtime);
+        assert_eq!(medallion.metrics().actuator_bronze_total, 1);
+    }
+
+    #[test]
     fn restore_clamps_corrupt_tier_ordering() {
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.restore(TelemetryMedallionPersisted {
             bronze_total: 2,
             silver_total: 8,
@@ -2091,8 +2325,8 @@ mod tests {
             ],
             ..ExecuteOutcomes::default()
         };
-        let mut medallion = TelemetryMedallion::new();
-        let runtime = RuntimeMetrics::default();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
         observe(&mut medallion, 1, &outcomes, &runtime);
         assert_eq!(medallion.metrics().actuator_issued_total, 1);
         assert_eq!(medallion.metrics().actuator_bronze_total, 0);
@@ -2108,11 +2342,11 @@ mod tests {
 
     #[test]
     fn markov_hit_is_resolved_as_effective_gold_evidence() {
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         let mut runtime = RuntimeMetrics {
             markov_prewarm_applied: 1,
             markov_prediction_app: "Terminal".to_string(),
-            ..RuntimeMetrics::default()
+            ..healthy_runtime()
         };
         observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
         assert_eq!(medallion.metrics().actuator_pending_total, 1);
@@ -2143,8 +2377,8 @@ mod tests {
             ],
             ..ExecuteOutcomes::default()
         };
-        let mut medallion = TelemetryMedallion::new();
-        let runtime = RuntimeMetrics::default();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
         observe(&mut medallion, 1, &outcomes, &runtime);
         for cycle in 2..=6 {
             observe(&mut medallion, cycle, &ExecuteOutcomes::default(), &runtime);
@@ -2175,7 +2409,7 @@ mod tests {
             r#"{"bronze_total":7,"silver_total":7,"gold_total":6,"last_cycle":40}"#,
         )
         .expect("backward-compatible state");
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.restore(state);
         let metrics = medallion.metrics();
         assert_eq!(metrics.bronze_total, 7);
@@ -2209,7 +2443,7 @@ mod tests {
                 ..ActionModelStats::default()
             },
         );
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.restore(legacy);
         let metrics = medallion.metrics();
         assert_eq!(metrics.bronze_total, 12);
@@ -2253,7 +2487,7 @@ mod tests {
             e_core_count: 6,
             ram_gib: 16,
         };
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.action_models.insert(
             "boost:Editor".to_string(),
             ActionModelStats {
@@ -2333,7 +2567,7 @@ mod tests {
             .action_models
             .insert("boost:*".to_string(), local_family);
 
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.restore(persisted);
         assert_eq!(medallion.metrics().actuator_ready_models, 0);
     }
@@ -2407,7 +2641,7 @@ mod tests {
             target_present_after: None,
         });
 
-        let mut medallion = TelemetryMedallion::new();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         medallion.restore(persisted);
         let rebuilt = medallion.action_models().get("boost:Editor").unwrap();
         assert_eq!(rebuilt.observations, 11);
@@ -2433,13 +2667,13 @@ mod tests {
             )],
             ..ExecuteOutcomes::default()
         };
-        let runtime = RuntimeMetrics::default();
-        let mut original = TelemetryMedallion::new();
+        let runtime = healthy_runtime();
+        let mut original = TelemetryMedallion::new(LOCAL_ID);
         observe(&mut original, 1, &outcomes, &runtime);
         let wire = serde_json::to_vec(&original.snapshot()).expect("serialize state");
         let persisted: TelemetryMedallionPersisted =
             serde_json::from_slice(&wire).expect("deserialize state");
-        let mut restored = TelemetryMedallion::new();
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
         restored.restore(persisted);
         for cycle in 2..=4 {
             observe(&mut restored, cycle, &ExecuteOutcomes::default(), &runtime);
