@@ -454,6 +454,13 @@ pub struct TelemetryMedallionMetrics {
     pub local_gold_total: u64,
     pub rejected_total: u64,
     pub invalid_total: u64,
+    pub non_finite_total: u64,
+    pub range_total: u64,
+    pub stale_total: u64,
+    pub temporal_total: u64,
+    pub foreign_total: u64,
+    pub coherence_total: u64,
+    pub current_tier: ContextTier,
     pub mean_quality: f64,
     pub gold_rate: f64,
     pub actuator_issued_total: u64,
@@ -789,17 +796,17 @@ impl TelemetryMedallion {
 
     fn record_admission(&mut self, admission: ContextAdmission) {
         self.reason_counters.record(admission.reasons);
-        self.quality_sum = (self.quality_sum + admission.quality).max(0.0);
         match admission.tier {
             ContextTier::Rejected => {
                 self.rejected_total = self.rejected_total.saturating_add(1);
                 self.invalid_total = self.invalid_total.saturating_add(1);
             }
             ContextTier::Silver => {
+                self.quality_sum = (self.quality_sum + admission.quality).max(0.0);
                 self.silver_total = self.silver_total.saturating_add(1);
             }
             ContextTier::Gold => {
-                self.silver_total = self.silver_total.saturating_add(1);
+                self.quality_sum = (self.quality_sum + admission.quality).max(0.0);
                 self.gold_total = self.gold_total.saturating_add(1);
             }
         }
@@ -1126,7 +1133,7 @@ impl TelemetryMedallion {
     }
 
     pub fn metrics(&self) -> TelemetryMedallionMetrics {
-        let bronze = self.bronze_total.max(1) as f64;
+        let admitted = self.silver_total.saturating_add(self.gold_total);
         TelemetryMedallionMetrics {
             bronze_total: self.bronze_total,
             silver_total: self.silver_total,
@@ -1134,11 +1141,22 @@ impl TelemetryMedallion {
             local_gold_total: self.local_gold_total,
             rejected_total: self.rejected_total,
             invalid_total: self.invalid_total,
-            mean_quality: (self.quality_sum / bronze).clamp(0.0, 1.0),
-            gold_rate: if self.silver_total == 0 {
+            non_finite_total: self.reason_counters.non_finite,
+            range_total: self.reason_counters.out_of_range,
+            stale_total: self.reason_counters.stale,
+            temporal_total: self.reason_counters.temporal,
+            foreign_total: self.reason_counters.foreign_hardware,
+            coherence_total: self.reason_counters.coherence,
+            current_tier: self.current_tier,
+            mean_quality: if admitted == 0 {
                 0.0
             } else {
-                (self.gold_total as f64 / self.silver_total as f64).clamp(0.0, 1.0)
+                (self.quality_sum / admitted as f64).clamp(0.0, 1.0)
+            },
+            gold_rate: if self.bronze_total == 0 {
+                0.0
+            } else {
+                (self.gold_total as f64 / self.bronze_total as f64).clamp(0.0, 1.0)
             },
             actuator_issued_total: self.actuator_issued_total,
             actuator_pending_total: self.pending_actions.len() as u64,
@@ -1248,12 +1266,20 @@ impl TelemetryMedallion {
             state.actuator_evidence_schema_version < ACTUATOR_EVIDENCE_SCHEMA_VERSION;
 
         self.bronze_total = state.bronze_total;
-        self.silver_total = state.silver_total.min(self.bronze_total);
-        self.gold_total = state.gold_total.min(self.silver_total);
-        self.rejected_total = state.rejected_total.min(self.bronze_total);
+        self.gold_total = state.gold_total.min(self.bronze_total);
+        self.rejected_total = state
+            .rejected_total
+            .min(self.bronze_total.saturating_sub(self.gold_total));
+        self.silver_total = state.silver_total.min(
+            self.bronze_total
+                .saturating_sub(self.gold_total)
+                .saturating_sub(self.rejected_total),
+        );
         self.invalid_total = state.invalid_total.min(self.rejected_total);
+        self.reason_counters = ContextReasonCounters::default();
+        let admitted = self.silver_total.saturating_add(self.gold_total);
         self.quality_sum = if state.quality_sum.is_finite() {
-            state.quality_sum.clamp(0.0, self.silver_total as f64)
+            state.quality_sum.clamp(0.0, admitted as f64)
         } else {
             0.0
         };
@@ -2043,7 +2069,7 @@ mod tests {
         });
         let metrics = medallion.metrics();
         assert_eq!(metrics.bronze_total, 1);
-        assert_eq!(metrics.silver_total, 1);
+        assert_eq!(metrics.silver_total, 0);
         assert_eq!(metrics.gold_total, 1);
         assert!(medallion.latest().is_some());
     }
@@ -2232,9 +2258,10 @@ mod tests {
             ..TelemetryMedallionPersisted::default()
         });
         let metrics = medallion.metrics();
-        assert_eq!(metrics.silver_total, 2);
+        assert_eq!(metrics.silver_total, 0);
         assert_eq!(metrics.gold_total, 2);
-        assert_eq!(metrics.invalid_total, 2);
+        assert_eq!(metrics.rejected_total, 0);
+        assert_eq!(metrics.invalid_total, 0);
         assert_eq!(metrics.mean_quality, 1.0);
     }
 

@@ -1447,6 +1447,26 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub world_model_context_gold_total: u64,
     #[serde(default)]
+    pub world_model_context_rejected_total: u64,
+    #[serde(default)]
+    pub world_model_context_non_finite_total: u64,
+    #[serde(default)]
+    pub world_model_context_range_total: u64,
+    #[serde(default)]
+    pub world_model_context_stale_total: u64,
+    #[serde(default)]
+    pub world_model_context_temporal_total: u64,
+    #[serde(default)]
+    pub world_model_context_foreign_total: u64,
+    #[serde(default)]
+    pub world_model_context_coherence_total: u64,
+    #[serde(default)]
+    pub world_model_context_local_gold_total: u64,
+    #[serde(default)]
+    pub world_model_context_current_tier: String,
+    #[serde(default)]
+    pub world_model_context_authority_phase: String,
+    #[serde(default)]
     pub world_model_context_quality: f64,
     /// Universal actuator-evidence lane. Bronze is a resolved applied action,
     /// Silver is structurally valid, and Gold is low-confounding evidence.

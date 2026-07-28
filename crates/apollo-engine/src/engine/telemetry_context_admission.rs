@@ -19,6 +19,16 @@ pub enum ContextTier {
     Gold,
 }
 
+impl ContextTier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Silver => "silver",
+            Self::Gold => "gold",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum ContextReason {

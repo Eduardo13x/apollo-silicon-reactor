@@ -394,9 +394,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if m.world_model_context_bronze_total > 0 {
         lines.push(format!(
-            "Ctx    G {}/{} q{:.0}%",
+            "Ctx    G{} S{} R{} q{:.0}%",
             format_number(m.world_model_context_gold_total),
-            format_number(m.world_model_context_bronze_total),
+            format_number(m.world_model_context_silver_total),
+            format_number(m.world_model_context_rejected_total),
             m.world_model_context_quality * 100.0
         ));
     }
@@ -428,10 +429,26 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 family.mean_utility * 100.0
             ));
         }
+    }
+    let authority_phase = match m.world_model_context_authority_phase.as_str() {
+        "calibrating" => "calibrating",
+        "trusted" => "trusted",
+        "suspended" => "suspended",
+        _ => "protected",
+    };
+    if m.world_model_actuator_known_models == 0 {
+        lines.push("WM-U   protected · no evidence".to_string());
+    } else {
         lines.push(format!(
-            "WM-U   ready {}/{} V{} P{}",
+            "WM-U   {} {}/{}",
+            authority_phase,
             format_number(m.world_model_actuator_ready_models),
-            format_number(m.world_model_actuator_known_models),
+            format_number(m.world_model_actuator_known_models)
+        ));
+    }
+    if m.world_model_utility_vetoes_total > 0 || m.world_model_utility_promotions_total > 0 {
+        lines.push(format!(
+            "WM-U+  V{} P{}",
             format_number(m.world_model_utility_vetoes_total),
             format_number(m.world_model_utility_promotions_total)
         ));
@@ -993,8 +1010,12 @@ mod tests {
         status.metrics.world_model_contextual_actions = 1;
         status.metrics.world_model_data_quality = 1.0;
         status.metrics.world_model_context_bronze_total = 500;
-        status.metrics.world_model_context_gold_total = 498;
-        status.metrics.world_model_context_quality = 0.996;
+        status.metrics.world_model_context_silver_total = 7;
+        status.metrics.world_model_context_gold_total = 490;
+        status.metrics.world_model_context_rejected_total = 3;
+        status.metrics.world_model_context_stale_total = 1;
+        status.metrics.world_model_context_quality = 0.98;
+        status.metrics.world_model_context_authority_phase = "calibrating".to_string();
         status.metrics.world_model_actuator_issued_total = 12;
         status.metrics.world_model_actuator_pending_total = 2;
         status.metrics.world_model_actuator_bronze_total = 10;
@@ -1022,11 +1043,25 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Causal 2/3 ready G127 q100% P3"));
-        assert!(think.iter().any(|line| line == "Ctx    G 498/500 q100%"));
+        assert!(think.iter().any(|line| line == "Ctx    G490 S7 R3 q98%"));
         assert!(think.iter().any(|line| line == "Act    G 8/10 P2 q94%"));
         assert!(think.iter().any(|line| line == "Act+   boost G5/6"));
         assert!(think.iter().any(|line| line == "       eff 4/6 u+3%"));
-        assert!(think.iter().any(|line| line == "WM-U   ready 2/7 V0 P3"));
+        assert!(think.iter().any(|line| line == "WM-U   calibrating 2/7"));
+        assert!(think.iter().any(|line| line == "WM-U+  V0 P3"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn think_quadrant_explains_protected_world_model_without_models() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_context_authority_phase = "protected".to_string();
+
+        let think = render_think_q(&status);
+
+        assert!(think
+            .iter()
+            .any(|line| line == "WM-U   protected · no evidence"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

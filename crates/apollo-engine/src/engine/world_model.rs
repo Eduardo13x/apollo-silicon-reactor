@@ -99,6 +99,17 @@ pub enum ModelAuthorityPhase {
     Suspended,
 }
 
+impl ModelAuthorityPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Protected => "protected",
+            Self::Calibrating => "calibrating",
+            Self::Trusted => "trusted",
+            Self::Suspended => "suspended",
+        }
+    }
+}
+
 /// Per-cycle snapshot of the learned action-conditioned predictions plus
 /// the do-nothing baseline. Built once per decision cycle from the live
 /// CausalGraph + OutcomeTracker (O(edges), no allocation per query).
