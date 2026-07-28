@@ -5,7 +5,7 @@
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-M1%2B-success.svg)
 ![AIS](https://img.shields.io/badge/AIS-S--tier-brightgreen.svg)
 
-**apollo-silicon-reactor** (antes `apollo-optimizer`) es un daemon autónomo de optimización de sistema diseñado para **macOS Apple Silicon, baseline M1 8 GB**. Rust puro, sin Python, sin shell scripting en el hot loop. No es un gestor de procesos genérico — es un agente adaptativo con 9 fases de aprendizaje cableadas que redistribuye CPU, RAM y headroom térmico según la intención real del usuario en lugar del scheduler "justo" por defecto de XNU.
+**apollo-silicon-reactor** (antes `apollo-optimizer`) es un daemon autónomo de optimización para **macOS Apple Silicon**. Detecta topología y memoria por capacidades; el baseline M1 8 GB se conserva como evidencia histórica, no como autoridad portable. Rust puro, sin Python, sin shell scripting en el hot loop. No es un gestor de procesos genérico — es un agente adaptativo con 9 fases de aprendizaje cableadas que redistribuye CPU, RAM y headroom térmico según la intención real del usuario en lugar del scheduler "justo" por defecto de XNU.
 
 El reactor aprende. Cada ciclo observa ~400-600 procesos vivos, puntúa acciones candidatas a través de un stack neuro-cognitivo (razonamiento NARS, grafo causal, scorer de políticas asimétrico, agente RL, modulador de presencia de usuario), commitea su rationale a un journal auditable, y revierte o refuerza sus propios parámetros aprendidos según el score AIS de calidad que sigue.
 
@@ -61,7 +61,9 @@ Los outcomes resueltos cruzan un medallón de confianza antes de modificar Bayes
 
 La curación no hace I/O y usa una ventana fija de fingerprints, por lo que su costo y memoria permanecen acotados. Solo Gold actualiza el canal causal privado que sirve de insumo al `WorldModel`; las observaciones crudas del grafo causal no pueden entrar a sus predicciones. El modelo prefiere evidencia Gold del workload activo cuando madura y usa el agregado como respaldo durante el arranque en frío. Si todavía no reúne 10 resultados Gold con calidad mínima de 90%, se abstiene y permite exploración en vez de bloquear acciones.
 
-`runtime_metrics.json` publica totales Bronze/Silver/Gold, rechazos, inválidos, duplicados, calidad media y tasa Gold, además de acciones conocidas/listas y evidencia Gold persistida del `WorldModel`. El dashboard muestra `Data G <gold>/<bronze> q<quality>%` y `World <ready>/<known> ready G<evidence> q<quality>%`. AIS incorpora esta evidencia solo después de observar datos reales: calidad alta mejora D3, mientras volumen contaminado la penaliza.
+El contexto sistémico tiene una frontera adicional: una identidad aleatoria privada liga la autoridad a una instalación, y un clasificador `O(F)` separa `Rejected`, `Silver` y `Gold`. Rejected solo incrementa contadores; Silver sirve para diagnóstico; únicamente Gold local, fresco y coherente puede actualizar baseline, endpoints, modelos o la vista confiable del `WorldModel`. Reinicios descartan continuidad pendiente y datos M1/legacy/foráneos quedan como auditoría sin masa efectiva.
+
+`runtime_metrics.json` publica totales de admisión, razones fijas, calidad, Gold local y la fase `protected`, `calibrating`, `trusted` o `suspended`, además de acciones conocidas/listas. El dashboard separa `Ctx G... S... R...` de `WM-U`; cuando no hay evidencia dice `protected · no evidence` en vez de `0/0`. El modelo solo promociona aceleradores reversibles ya permitidos cuando una cota de confianza del 95% es decisivamente positiva; ante incertidumbre conserva la política estable.
 
 ## Sistema Cognitivo
 

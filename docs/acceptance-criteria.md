@@ -2,9 +2,33 @@
 
 **Status:** spec / driving document for the brutal acceptance gates.
 **Scope:** the two-tier accept framework that decides KEEP vs REVERT for every change the autonomous loop makes.
-**Hardware basis:** Apple Silicon M1, 8 GiB RAM, pagesize 16384, swap total 2 GiB. All calibrated numbers below are one-box numbers — recalibrate on different hardware.
+**Historical hardware basis:** Apple Silicon M1, 8 GiB RAM, pagesize 16384, swap total 2 GiB. All calibrated numbers below are one-box historical numbers and must be recalibrated on different hardware. They never grant World Model authority on another installation.
 
 > Supervision doctrine applies. This document never declares anything "closed" on small-N evidence. Floors are calibrated from n=31 steady-state rows over ~15h on ONE box — preliminary, not closed (project bar: N≥500). Where a number is a bootstrap default that re-derives live, it says so.
+
+## Current M4 trust canary
+
+The deployment target used for the current trust boundary is capability-derived
+as 4 P-cores, 6 E-cores, and 16 GiB RAM. No chip-name branch is used. A guarded
+M4 deployment additionally requires:
+
+- injected non-finite, range, temporal, stale, and hardware-mismatch fixtures
+  cause zero changes to baselines, pending evidence, action models, or trusted
+  World Model context;
+- the live context tier reaches Gold with the collectors available on this Mac;
+- the private installation ID is nonzero, owner-only, and absent from runtime
+  metrics, dashboard output, and portable learned-state exports;
+- restored M1, legacy, or foreign-installation models remain audit-only until
+  matching fresh local Gold context and decisive local evidence exist;
+- daemon failures remain zero and cycles continue advancing;
+- post-deploy p95 does not regress by more than 25% against the pre-snapshot;
+- fluidity does not regress by more than 0.03 absolute after warmup;
+- pressure, thermal, process-protection, and existing action safety gates remain
+  active regardless of World Model phase.
+
+Dashboard interpretation is explicit: `Ctx` reports admission health, while
+`WM-U protected`, `calibrating`, `trusted`, or `suspended` reports utility-model
+authority. No action evidence is displayed as `0/0`.
 
 ---
 
