@@ -9,6 +9,10 @@ const MAX_CONTEXT_TEXT_BYTES: usize = 64;
 const MIN_TEMP_C: f64 = -20.0;
 const MAX_TEMP_C: f64 = 150.0;
 const MAX_COMPONENT_WATTS: f64 = 500.0;
+/// `PressureComponents::total_boost()` is an additive diagnostic, not a
+/// fraction. Its current physical maximum is 1.74; retain headroom for new
+/// factors while still rejecting corrupt magnitudes.
+const MAX_PRESSURE_TOTAL_BOOST: f64 = 4.0;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -261,13 +265,18 @@ fn validate_required_numbers(context: &TelemetryContextSummary, reasons: &mut Co
         context.signal_urgency,
         context.signal_entropy_anomaly,
         context.signal_transformer_anomaly,
-        context.pressure_total_boost,
         context.arousal_level,
         context.markov_prediction_confidence,
     ];
     for value in fractions {
         finite_range(value, 0.0, 1.0, reasons);
     }
+    finite_range(
+        context.pressure_total_boost,
+        0.0,
+        MAX_PRESSURE_TOTAL_BOOST,
+        reasons,
+    );
 
     let signed = [
         context.signal_pressure_velocity,
@@ -590,6 +599,25 @@ mod tests {
         context.e_cluster_util = Some(57.25);
         context.ane_util_pct = Some(100.0);
         assert_eq!(classify_live(&context).tier, ContextTier::Gold);
+    }
+
+    #[test]
+    fn accepts_raw_additive_pressure_boost_above_one() {
+        let mut context = clean_context();
+        // effective_pressure::PressureComponents intentionally preserves the
+        // uncapped sum for observability; all current factors max at 1.74.
+        context.pressure_total_boost = 1.74;
+
+        let admission = classify_live(&context);
+
+        assert_eq!(admission.tier, ContextTier::Gold);
+        assert!(
+            !admission.reasons.contains(ContextReason::OutOfRange),
+            "a valid additive boost must not be treated as a fraction"
+        );
+
+        context.pressure_total_boost = MAX_PRESSURE_TOTAL_BOOST + 0.01;
+        assert_rejected(context, ContextReason::OutOfRange);
     }
 
     #[test]
