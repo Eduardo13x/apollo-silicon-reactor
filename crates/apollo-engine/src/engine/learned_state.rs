@@ -1065,6 +1065,13 @@ impl LearnedState {
             ot.natural_drift_ema = ot.natural_drift_ema.clamp(-0.2, 0.2);
             // baseline_drop_ema is a probability-like value in [0, 1].
             ot.baseline_drop_ema = ot.baseline_drop_ema.clamp(0.0, 1.0);
+            if let Some(drift_detector) = &mut ot.drift_detector {
+                drift_detector.validate_imported_state();
+            }
+        }
+
+        if let Some(arousal_state) = &mut self.arousal_state {
+            arousal_state.validate_imported_state();
         }
 
         if let Some(sa) = &mut self.specialist_accuracy {

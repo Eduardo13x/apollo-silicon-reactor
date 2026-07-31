@@ -182,8 +182,9 @@ const COOLDOWN: Duration = Duration::from_secs(60);
 const TCP_SCALE_DOWN_DWELL: Duration = Duration::from_secs(300);
 
 /// Hardware-calibrated VM gates. The generic values remain the safe fallback;
-/// M4/16GB reacts earlier to a real swap ramp without treating normal cache
-/// pressure as a reason to churn compressor sysctls.
+/// a balanced 16GB Apple Silicon topology reacts earlier to a real swap ramp
+/// without treating normal cache pressure as a reason to churn compressor
+/// sysctls.
 #[derive(Debug, Clone, Copy)]
 struct VmTuningProfile {
     high_pressure: f64,
@@ -194,10 +195,17 @@ struct VmTuningProfile {
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-fn vm_tuning_profile_for(chip: Option<&str>, memory_bytes: Option<u64>) -> VmTuningProfile {
-    let is_m4 = chip.is_some_and(|name| name.contains("Apple M4"));
+fn vm_tuning_profile_for(
+    memory_bytes: Option<u64>,
+    p_core_count: Option<u32>,
+    e_core_count: Option<u32>,
+) -> VmTuningProfile {
     let ram_gib = memory_bytes.unwrap_or_default() / GIB;
-    if is_m4 && (12..=20).contains(&ram_gib) {
+    let has_balanced_topology = matches!(
+        (p_core_count, e_core_count),
+        (Some(p_cores), Some(e_cores)) if p_cores >= 4 && e_cores >= 6
+    );
+    if has_balanced_topology && (12..=20).contains(&ram_gib) {
         VmTuningProfile {
             high_pressure: 0.68,
             low_pressure: 0.32,
@@ -259,8 +267,9 @@ impl SysctlGovernor {
     /// always return an empty vec.
     pub fn new(is_root: bool) -> Self {
         let vm_profile = vm_tuning_profile_for(
-            sysctl_direct::read_str("machdep.cpu.brand_string").as_deref(),
             sysctl_direct::read_u64("hw.memsize"),
+            sysctl_direct::read_u32_val("hw.perflevel0.logicalcpu"),
+            sysctl_direct::read_u32_val("hw.perflevel1.logicalcpu"),
         );
         let (defaults, unavailable_keys) = if is_root {
             capture_defaults(is_root)
@@ -1476,17 +1485,41 @@ mod tests {
     }
 
     #[test]
-    fn m4_16gb_vm_profile_avoids_normal_pressure_churn() {
-        let profile = vm_tuning_profile_for(Some("Apple M4"), Some(16 * GIB));
+    fn balanced_16gb_vm_profile_avoids_normal_pressure_churn() {
+        let profile = vm_tuning_profile_for(Some(16 * GIB), Some(4), Some(6));
         assert_eq!(profile.high_pressure, 0.68);
         assert_eq!(profile.low_pressure, 0.32);
         assert_eq!(profile.high_cycles, 2);
         assert_eq!(profile.low_cycles, 8);
         assert!(0.35 > profile.low_pressure && 0.35 < profile.high_pressure);
 
-        let generic = vm_tuning_profile_for(Some("Apple M1"), Some(8 * GIB));
+        let generic = vm_tuning_profile_for(Some(8 * GIB), Some(4), Some(4));
         assert_eq!(generic.high_pressure, 0.75);
         assert_eq!(generic.low_pressure, 0.40);
+    }
+
+    #[test]
+    fn balanced_apple_silicon_profile_is_name_agnostic() {
+        let profile = vm_tuning_profile_for(Some(16 * GIB), Some(4), Some(6));
+        assert_eq!(
+            profile.high_pressure, 0.68,
+            "equivalent hardware must receive the same capability-based tuning"
+        );
+        assert_eq!(profile.low_pressure, 0.32);
+    }
+
+    #[test]
+    fn vm_profile_falls_back_when_topology_is_unknown_or_unbalanced() {
+        for profile in [
+            vm_tuning_profile_for(Some(16 * GIB), None, None),
+            vm_tuning_profile_for(Some(16 * GIB), Some(4), Some(4)),
+            vm_tuning_profile_for(Some(8 * GIB), Some(4), Some(6)),
+        ] {
+            assert_eq!(profile.high_pressure, 0.75);
+            assert_eq!(profile.low_pressure, 0.40);
+            assert_eq!(profile.high_cycles, 3);
+            assert_eq!(profile.low_cycles, 6);
+        }
     }
 
     #[test]

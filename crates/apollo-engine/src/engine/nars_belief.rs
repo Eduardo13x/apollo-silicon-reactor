@@ -50,6 +50,10 @@ const MIN_CONFIDENCE_FOR_DRIFT: f32 = 0.30;
 /// EMA alpha for aggregate drift score (slow-decaying: half-life ≈ 69 ticks).
 const DRIFT_SCORE_ALPHA: f64 = 0.01;
 
+/// Signals below this floor are operationally zero. Flushing the tail avoids
+/// persisting denormals indefinitely after a stable period.
+const SIGNAL_ZERO_FLOOR: f64 = 1.0e-12;
+
 /// Max equivalent observations for a maximum-arousal event.
 /// arousal=1.0 → evidence weight = confidence_from_count(MAX_SALIENT_OBS).
 /// This means a crisis event (swap=12GB, p_oom=1.0) counts as strongly as
@@ -448,6 +452,50 @@ impl DriftDetector {
         detector
     }
 
+    /// Normalize persisted state before it is exposed to runtime decisions.
+    /// Valid learned evidence is preserved; only invalid ranges, stale
+    /// denormal tails, and derived counters are repaired.
+    pub fn validate_imported_state(&mut self) {
+        self.drift_threshold = if self.drift_threshold.is_finite() {
+            self.drift_threshold.clamp(0.05, 0.40)
+        } else {
+            DRIFT_THRESHOLD
+        };
+        self.drift_score = operational_unit_signal(self.drift_score);
+        self.prev_drift_score = operational_unit_signal(self.prev_drift_score);
+        self.gradient_ema = operational_signed_signal(self.gradient_ema);
+        self.gradient_acceleration = operational_signed_signal(self.gradient_acceleration);
+        self.changepoint_posterior = operational_unit_signal(self.changepoint_posterior);
+        self.early_warning_score = operational_unit_signal(self.early_warning_score);
+        self.adaptive_threshold.noise_ema =
+            operational_unit_signal(self.adaptive_threshold.noise_ema);
+        self.adaptive_threshold.noise_variance_ema =
+            operational_unit_signal(self.adaptive_threshold.noise_variance_ema);
+
+        for entry in self
+            .beliefs
+            .values_mut()
+            .chain(self.contextual_beliefs.values_mut())
+        {
+            entry.tv = TruthValue::new(
+                finite_frequency(entry.tv.frequency),
+                finite_confidence(entry.tv.confidence),
+            );
+            entry.freq_before_last_revision = finite_frequency(entry.freq_before_last_revision);
+            entry.lti = finite_frequency(entry.lti);
+        }
+
+        self.enforce_capacity();
+        let effective_thr = self
+            .adaptive_threshold
+            .recommended_threshold(self.drift_threshold as f64) as f32;
+        self.drifted_count = self
+            .beliefs
+            .values()
+            .filter(|entry| entry.is_drifted(effective_thr))
+            .count();
+    }
+
     /// Record an observation with neutral salience (standard weight).
     /// `success` = did the action produce a good outcome?
     /// Returns the local frequency delta from revision.
@@ -479,9 +527,15 @@ impl DriftDetector {
 
         // Arousal amplifies the drift EMA signal too — a crisis-level regime
         // change is more alarming than a routine one.
-        let arousal_amp = 1.0 + salience.arousal as f64;
-        self.drift_score = DRIFT_SCORE_ALPHA * delta as f64 * arousal_amp
-            + (1.0 - DRIFT_SCORE_ALPHA) * self.drift_score;
+        let arousal = if salience.arousal.is_finite() {
+            salience.arousal.clamp(0.0, 1.0) as f64
+        } else {
+            0.0
+        };
+        let prior_score = finite_unit_signal(self.drift_score);
+        let next_score = DRIFT_SCORE_ALPHA * delta as f64 * (1.0 + arousal)
+            + (1.0 - DRIFT_SCORE_ALPHA) * prior_score;
+        self.drift_score = operational_unit_signal(next_score);
 
         // Phase 4.1 wiring (Sprint 9, 2026-05-16): feed |delta| into the
         // adaptive noise-floor tracker so `recommended_threshold` reflects
@@ -492,7 +546,11 @@ impl DriftDetector {
         // Phase 4.1 wiring — consume adaptive recommendation. When the
         // recommended threshold > base, bump the observability counter so
         // dashboards can see the noise floor moving.
-        let base_thr = self.drift_threshold as f64;
+        if !self.drift_threshold.is_finite() {
+            self.drift_threshold = DRIFT_THRESHOLD;
+        }
+        let base_thr = self.drift_threshold.clamp(0.05, 0.40) as f64;
+        self.drift_threshold = base_thr as f32;
         let effective_thr = self.adaptive_threshold.recommended_threshold(base_thr);
         if effective_thr > base_thr + f64::EPSILON {
             crate::engine::lse_counters::LSE_COUNTERS.add_adaptive_drift_threshold_raises(1);
@@ -786,21 +844,27 @@ impl DriftDetector {
     ///
     /// [Adams & MacKay 2007] "Bayesian Online Changepoint Detection" arXiv:0710.3742
     pub fn update_early_warning(&mut self) {
+        self.drift_score = operational_unit_signal(self.drift_score);
+        self.prev_drift_score = finite_unit_signal(self.prev_drift_score);
+        self.gradient_ema = finite_signed_signal(self.gradient_ema);
+        self.gradient_acceleration = finite_signed_signal(self.gradient_acceleration);
+
         // Gradient: d(drift_score)/dt
         let gradient = self.drift_score - self.prev_drift_score;
         let prev_gradient = self.gradient_ema;
-        self.gradient_ema = 0.3 * gradient + 0.7 * self.gradient_ema;
+        self.gradient_ema = operational_signed_signal(0.3 * gradient + 0.7 * self.gradient_ema);
         self.prev_drift_score = self.drift_score;
 
         // Acceleration: d²(drift_score)/dt²
         let accel = self.gradient_ema - prev_gradient;
-        self.gradient_acceleration = 0.3 * accel + 0.7 * self.gradient_acceleration;
+        self.gradient_acceleration =
+            operational_signed_signal(0.3 * accel + 0.7 * self.gradient_acceleration);
 
         // Simplified Bayesian run-length changepoint detection:
         // If gradient is consistently positive → run length increases → posterior grows.
         // If gradient reverses → run length resets → posterior drops.
         if self.gradient_ema > 0.001 {
-            self.run_length += 1;
+            self.run_length = self.run_length.saturating_add(1);
         } else {
             self.run_length = self.run_length.saturating_sub(2);
         }
@@ -808,11 +872,14 @@ impl DriftDetector {
         // Posterior: sigmoid-like growth with run length.
         // At run_length=5, posterior ≈ 0.50. At run_length=10, posterior ≈ 0.91.
         let rl = self.run_length as f64;
-        self.changepoint_posterior = 1.0 - 1.0 / (1.0 + (rl / 5.0).powi(2));
+        self.changepoint_posterior =
+            operational_unit_signal(1.0 - 1.0 / (1.0 + (rl / 5.0).powi(2)));
 
-        // Composite early warning
+        // Only a positive gradient means drift is worsening. A negative
+        // gradient is recovery and must not become an alarm through abs().
+        let worsening_gradient = self.gradient_ema.max(0.0);
         self.early_warning_score =
-            (0.6 * self.gradient_ema.abs() + 0.4 * self.changepoint_posterior).clamp(0.0, 1.0);
+            operational_unit_signal(0.6 * worsening_gradient + 0.4 * self.changepoint_posterior);
     }
 
     /// True if early warning detects drift is starting (before threshold breach).
@@ -867,30 +934,55 @@ pub struct ArousalState {
     /// Current EMA arousal level ∈ [0,1].
     pub level: f32,
     /// EMA decay factor. α=0.15 → half-life ≈ 4 samples (fast-reacting).
+    #[serde(default = "default_arousal_alpha")]
     alpha: f32,
     /// Count of observations fed into this EMA.
     pub samples: u64,
+}
+
+fn default_arousal_alpha() -> f32 {
+    0.15
 }
 
 impl Default for ArousalState {
     fn default() -> Self {
         Self {
             level: 0.0,
-            alpha: 0.15,
+            alpha: default_arousal_alpha(),
             samples: 0,
         }
     }
 }
 
 impl ArousalState {
+    /// Normalize restored M1/older-schema state before runtime consumers read it.
+    pub fn validate_imported_state(&mut self) {
+        self.level = if self.level.is_finite() {
+            self.level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.alpha = if self.alpha.is_finite() {
+            self.alpha.clamp(0.01, 1.0)
+        } else {
+            default_arousal_alpha()
+        };
+    }
+
     /// Update arousal EMA with a new salience observation.
     ///
     /// The EMA reacts quickly to spikes (α=0.15) but decays slowly when inputs
     /// are low — mimicking the lingering effect of stress hormones (cortisol
     /// half-life ≈ 60–90 min, modeled here as persistent EMA memory).
     pub fn update(&mut self, salience: Salience) {
-        self.level = self.alpha * salience.arousal + (1.0 - self.alpha) * self.level;
-        self.samples += 1;
+        self.validate_imported_state();
+        let observation = if salience.arousal.is_finite() {
+            salience.arousal.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        self.level = (self.alpha * observation + (1.0 - self.alpha) * self.level).clamp(0.0, 1.0);
+        self.samples = self.samples.saturating_add(1);
     }
 
     /// Drift recalibration threshold adjusted by Yerkes-Dodson inverted-U.
@@ -904,13 +996,27 @@ impl ArousalState {
     ///   arousal=0.5 → threshold × 1.00 (baseline)
     ///   arousal=1.0 → threshold × 0.75 (hair-trigger, aggressive)
     pub fn adjusted_drift_threshold(&self, base: f64) -> f64 {
-        let arousal = self.level as f64;
+        let arousal = if self.level.is_finite() {
+            self.level.clamp(0.0, 1.0) as f64
+        } else {
+            0.0
+        };
+        let base = if base.is_finite() {
+            base.max(0.0)
+        } else {
+            0.08
+        };
         base * (1.0 + 0.5 * (0.5 - arousal))
     }
 
     /// Yerkes-Dodson zone label for dashboard display.
     pub fn zone(&self) -> &'static str {
-        match self.level {
+        let level = if self.level.is_finite() {
+            self.level.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        match level {
             a if a < 0.25 => "Idle",
             a if a < 0.45 => "Calm",
             a if a < 0.65 => "Optimal",
@@ -924,12 +1030,13 @@ impl ArousalState {
     /// so the affective system reacts to leading ODE physics signals.
     /// [Schultz 1997 RPE] — prediction error is the primary arousal driver.
     pub fn inject_ode_surprise(&mut self, ode_rss_surprise: f64) {
-        if ode_rss_surprise > 0.0 {
+        self.validate_imported_state();
+        if ode_rss_surprise.is_finite() && ode_rss_surprise > 0.0 {
             let surprise_arousal = (ode_rss_surprise as f32).clamp(0.0, 1.0);
             let boost_alpha = (self.alpha * 2.0).min(0.30);
             self.level = boost_alpha * surprise_arousal + (1.0 - boost_alpha) * self.level;
             self.level = self.level.clamp(0.0, 1.0);
-            self.samples += 1;
+            self.samples = self.samples.saturating_add(1);
         }
     }
 }
@@ -1037,18 +1144,23 @@ impl AdaptiveDriftThreshold {
         // Sanitise: clamp to a sane range. NaN/Inf are dropped to 0 so
         // poisoned input from upstream never compounds inside our EMAs.
         let x = if abs_drift_delta.is_finite() {
-            abs_drift_delta.max(0.0)
+            abs_drift_delta.clamp(0.0, 1.0)
         } else {
             0.0
         };
+        self.noise_ema = finite_unit_signal(self.noise_ema);
+        self.noise_variance_ema = finite_unit_signal(self.noise_variance_ema);
         // First-order EMA: noise_ema := α·x + (1−α)·noise_ema
-        self.noise_ema = Self::ALPHA_MEAN * x + (1.0 - Self::ALPHA_MEAN) * self.noise_ema;
+        self.noise_ema = operational_unit_signal(
+            Self::ALPHA_MEAN * x + (1.0 - Self::ALPHA_MEAN) * self.noise_ema,
+        );
         // Second-order EMA against the (just updated) mean:
         //   var := α·(x − μ)² + (1−α)·var
         // [Welford 1962] adapted to exponential-decay form.
         let dev = x - self.noise_ema;
-        self.noise_variance_ema =
-            Self::ALPHA_VAR * dev * dev + (1.0 - Self::ALPHA_VAR) * self.noise_variance_ema;
+        self.noise_variance_ema = operational_unit_signal(
+            Self::ALPHA_VAR * dev * dev + (1.0 - Self::ALPHA_VAR) * self.noise_variance_ema,
+        );
         // Saturating sample counter — daemon uptime exceeds 2^63 ns
         // (~292 years) before this overflows, so saturate is symbolic.
         self.samples = self.samples.saturating_add(1);
@@ -1064,13 +1176,74 @@ impl AdaptiveDriftThreshold {
     /// deafens to below the operator-tuned base; the upper clamp prevents
     /// pathological variance from inducing complete drift blindness.
     pub fn recommended_threshold(&self, base_threshold: f64) -> f64 {
+        let base_threshold = if base_threshold.is_finite() {
+            base_threshold.max(0.0)
+        } else {
+            DRIFT_THRESHOLD as f64
+        };
         if self.samples < Self::MIN_SAMPLES {
             return base_threshold;
         }
-        let sigma = self.noise_variance_ema.max(0.0).sqrt();
+        let sigma = finite_unit_signal(self.noise_variance_ema).sqrt();
         let effective = base_threshold + Self::SIGMA_K * sigma;
         let upper = base_threshold * Self::MAX_RATIO;
         effective.clamp(base_threshold, upper)
+    }
+}
+
+#[inline]
+fn finite_unit_signal(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn operational_unit_signal(value: f64) -> f64 {
+    let value = finite_unit_signal(value);
+    if value < SIGNAL_ZERO_FLOOR {
+        0.0
+    } else {
+        value
+    }
+}
+
+#[inline]
+fn finite_signed_signal(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+#[inline]
+fn operational_signed_signal(value: f64) -> f64 {
+    let value = finite_signed_signal(value);
+    if value.abs() < SIGNAL_ZERO_FLOOR {
+        0.0
+    } else {
+        value
+    }
+}
+
+#[inline]
+fn finite_frequency(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.5
+    }
+}
+
+#[inline]
+fn finite_confidence(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 0.99)
+    } else {
+        0.0
     }
 }
 
@@ -1635,6 +1808,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn imported_non_finite_arousal_state_self_heals() {
+        let mut a = ArousalState {
+            level: f32::NAN,
+            alpha: f32::INFINITY,
+            samples: u64::MAX,
+        };
+
+        assert_eq!(a.zone(), "Idle");
+        a.update(Salience {
+            arousal: f32::NAN,
+            valence: 0.0,
+        });
+
+        assert!(a.level.is_finite());
+        assert!((0.0..=1.0).contains(&a.level));
+        assert_eq!(a.alpha, default_arousal_alpha());
+        assert!(a.adjusted_drift_threshold(f64::NAN).is_finite());
+        assert_eq!(a.samples, u64::MAX);
+    }
+
+    #[test]
+    fn arousal_serde_defaults_missing_alpha_from_older_state() {
+        let a: ArousalState =
+            serde_json::from_str(r#"{"level":0.4,"samples":12}"#).expect("older state");
+        assert_eq!(a.alpha, default_arousal_alpha());
+    }
+
     // ── Proactive Early Warning tests [Adams & MacKay 2007] ─────────────────
 
     #[test]
@@ -1672,6 +1873,63 @@ mod tests {
             "Stable → no warning: {}",
             d.early_warning()
         );
+    }
+
+    #[test]
+    fn early_warning_does_not_treat_recovery_as_drift() {
+        let mut d = DriftDetector::new();
+        d.prev_drift_score = 1.0;
+        d.drift_score = 0.0;
+
+        d.update_early_warning();
+
+        assert!(
+            !d.has_early_warning(),
+            "falling drift is recovery, not an early warning: {}",
+            d.early_warning()
+        );
+    }
+
+    #[test]
+    fn stable_drift_residue_flushes_to_exact_zero() {
+        let mut d = DriftDetector::new();
+        d.drift_score = 1.0e-13;
+
+        d.observe("stable_process", true);
+
+        assert_eq!(
+            d.score(),
+            0.0,
+            "operationally irrelevant drift residue must not persist"
+        );
+    }
+
+    #[test]
+    fn imported_non_finite_drift_state_recovers_on_observation() {
+        let mut d = DriftDetector::new();
+        d.drift_score = f64::NAN;
+        d.adaptive_threshold.noise_ema = f64::INFINITY;
+        d.adaptive_threshold.noise_variance_ema = f64::NAN;
+
+        d.observe("stable_process", true);
+
+        assert!(d.score().is_finite());
+        assert!(d.adaptive_threshold.noise_ema.is_finite());
+        assert!(d.adaptive_threshold.noise_variance_ema.is_finite());
+    }
+
+    #[test]
+    fn imported_drift_state_is_valid_before_first_observation() {
+        let mut d = DriftDetector::new();
+        d.drift_score = f64::from_bits(1);
+        d.prev_drift_score = 2.0;
+        d.drifted_count = usize::MAX;
+
+        d.validate_imported_state();
+
+        assert_eq!(d.score(), 0.0);
+        assert_eq!(d.prev_drift_score, 1.0);
+        assert!(d.drifted_count <= d.len());
     }
 
     #[test]
