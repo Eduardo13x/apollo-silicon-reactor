@@ -21,6 +21,20 @@ pub struct OverheadInput {
     pub reason_avg_ms: f64,
     pub memory_pressure: f64,
     pub fluidity_degraded: bool,
+    pub holt_winters_avg_ms: f64,
+    pub page_reclaim_avg_ms: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptionalSubsystem {
+    HoltWinters,
+    PageReclaim,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubsystemBudget {
+    pub cadence: u64,
+    pub deadline_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -29,30 +43,78 @@ pub struct OverheadBudget {
     pub full_refresh_cadence: u64,
     pub optional_reason_budget_ms: u64,
     pub allow_speculation: bool,
+    pub sensor_interval_secs: u64,
+    pub holt_winters: SubsystemBudget,
+    pub page_reclaim: SubsystemBudget,
 }
 
 impl OverheadBudget {
-    fn for_level(level: OverheadLevel) -> Self {
-        match level {
+    fn for_level(level: OverheadLevel, input: OverheadInput) -> Self {
+        let mut budget = match level {
             OverheadLevel::Nominal => Self {
                 level,
                 full_refresh_cadence: 30,
                 optional_reason_budget_ms: 150,
                 allow_speculation: true,
+                sensor_interval_secs: 3,
+                holt_winters: SubsystemBudget {
+                    cadence: 1,
+                    deadline_ms: 150,
+                },
+                page_reclaim: SubsystemBudget {
+                    cadence: 10,
+                    deadline_ms: 170,
+                },
             },
             OverheadLevel::Guarded => Self {
                 level,
                 full_refresh_cadence: 60,
                 optional_reason_budget_ms: 100,
                 allow_speculation: true,
+                sensor_interval_secs: 6,
+                holt_winters: SubsystemBudget {
+                    cadence: 2,
+                    deadline_ms: 100,
+                },
+                page_reclaim: SubsystemBudget {
+                    cadence: 20,
+                    deadline_ms: 115,
+                },
             },
             OverheadLevel::Constrained => Self {
                 level,
                 full_refresh_cadence: 120,
                 optional_reason_budget_ms: 60,
                 allow_speculation: false,
+                sensor_interval_secs: 9,
+                holt_winters: SubsystemBudget {
+                    cadence: 4,
+                    deadline_ms: 60,
+                },
+                page_reclaim: SubsystemBudget {
+                    cadence: 30,
+                    deadline_ms: 75,
+                },
             },
+        };
+        // A lane that exceeds its own expected cost pays a lower cadence even
+        // when the aggregate daemon remains healthy. This prevents one noisy
+        // optional subsystem from consuming every other lane's budget.
+        if input.holt_winters_avg_ms > 5.0 {
+            budget.holt_winters.cadence = budget.holt_winters.cadence.saturating_mul(2);
         }
+        if input.page_reclaim_avg_ms > 5.0 {
+            budget.page_reclaim.cadence = budget.page_reclaim.cadence.saturating_mul(2);
+        }
+        budget
+    }
+
+    pub fn admits(self, subsystem: OptionalSubsystem, cycle: u64, elapsed_ms: u128) -> bool {
+        let lane = match subsystem {
+            OptionalSubsystem::HoltWinters => self.holt_winters,
+            OptionalSubsystem::PageReclaim => self.page_reclaim,
+        };
+        cycle.is_multiple_of(lane.cadence.max(1)) && elapsed_ms <= lane.deadline_ms as u128
     }
 }
 
@@ -91,7 +153,7 @@ impl AdaptiveOverheadGovernor {
         } else {
             self.recovery_streak = 0;
         }
-        OverheadBudget::for_level(self.level)
+        OverheadBudget::for_level(self.level, input)
     }
 }
 
@@ -122,10 +184,12 @@ mod tests {
             reason_avg_ms: 12.0,
             memory_pressure: 0.39,
             fluidity_degraded: false,
+            ..OverheadInput::default()
         });
         assert_eq!(budget.level, OverheadLevel::Nominal);
         assert_eq!(budget.full_refresh_cadence, 30);
         assert!(budget.allow_speculation);
+        assert_eq!(budget.sensor_interval_secs, 3);
     }
 
     #[test]
@@ -147,5 +211,19 @@ mod tests {
             assert_eq!(governor.observe(healthy).level, OverheadLevel::Constrained);
         }
         assert_eq!(governor.observe(healthy).level, OverheadLevel::Guarded);
+    }
+
+    #[test]
+    fn expensive_optional_lane_pays_lower_cadence_independently() {
+        let mut governor = AdaptiveOverheadGovernor::default();
+        let budget = governor.observe(OverheadInput {
+            holt_winters_avg_ms: 8.0,
+            page_reclaim_avg_ms: 1.0,
+            ..OverheadInput::default()
+        });
+        assert_eq!(budget.holt_winters.cadence, 2);
+        assert_eq!(budget.page_reclaim.cadence, 10);
+        assert!(!budget.admits(OptionalSubsystem::HoltWinters, 1, 10));
+        assert!(budget.admits(OptionalSubsystem::PageReclaim, 10, 10));
     }
 }

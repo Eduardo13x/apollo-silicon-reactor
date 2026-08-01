@@ -118,6 +118,56 @@ pub struct UtilityAssessment {
     pub quality: f64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilityAbstentionReason {
+    NoCurrentGold,
+    UnknownAction,
+    ImmatureEvidence,
+    LowQuality,
+    StaleEvidence,
+    ForeignInstallation,
+    HardwareMismatch,
+    UncertainInterval,
+}
+
+impl UtilityAbstentionReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoCurrentGold => "no_current_gold",
+            Self::UnknownAction => "unknown_action",
+            Self::ImmatureEvidence => "immature_evidence",
+            Self::LowQuality => "low_quality",
+            Self::StaleEvidence => "stale_evidence",
+            Self::ForeignInstallation => "foreign_installation",
+            Self::HardwareMismatch => "hardware_mismatch",
+            Self::UncertainInterval => "uncertain_interval",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UtilityAbstention {
+    pub reason: UtilityAbstentionReason,
+    pub scope: Option<UtilityEvidenceScope>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UtilityAssessmentResult {
+    Assessed(UtilityAssessment),
+    Abstained(UtilityAbstention),
+}
+
+/// Non-authoritative family evidence for ranking a previously unseen target.
+/// Family priors can improve exploration order but can never veto an action.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UtilityPrior {
+    pub utility_ema: f64,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub effective_evidence: f64,
+    pub quality: f64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelAuthorityPhase {
@@ -381,13 +431,27 @@ impl WorldModel {
     }
 
     pub fn assess_utility(&self, action_key: &str, workload: &str) -> Option<UtilityAssessment> {
+        match self.assess_utility_diagnostic(action_key, workload) {
+            UtilityAssessmentResult::Assessed(assessment) => Some(assessment),
+            UtilityAssessmentResult::Abstained(_) => None,
+        }
+    }
+
+    pub fn assess_utility_diagnostic(
+        &self,
+        action_key: &str,
+        workload: &str,
+    ) -> UtilityAssessmentResult {
         let Some(now_unix) = self.latest_context.as_ref().map(|ctx| ctx.timestamp_unix) else {
-            return None;
+            return UtilityAssessmentResult::Abstained(UtilityAbstention {
+                reason: UtilityAbstentionReason::NoCurrentGold,
+                scope: None,
+            });
         };
         let workload_key = format!("{workload}|{action_key}");
         // Prefer same-workload evidence only when it is mature. An immature
         // contextual bucket must not hide a mature aggregate model.
-        let selected = [
+        let candidates = [
             (
                 UtilityEvidenceScope::Workload,
                 self.utility_predicted.get(&workload_key),
@@ -396,19 +460,39 @@ impl WorldModel {
                 UtilityEvidenceScope::Aggregate,
                 self.utility_predicted.get(action_key),
             ),
-        ]
-        .into_iter()
-        .filter_map(|(scope, stats)| stats.map(|stats| (scope, stats)))
-        .find(|(_, stats)| {
-            utility_model_ready(
+        ];
+        let mut last_abstention = None;
+        let mut selected = None;
+        for (scope, stats) in candidates {
+            let Some(stats) = stats else {
+                continue;
+            };
+            match utility_model_status(
                 stats,
                 now_unix,
                 self.latest_context.as_ref(),
                 self.current_installation_id,
-            )
-        });
+                true,
+            ) {
+                Ok(()) => {
+                    selected = Some((scope, stats));
+                    break;
+                }
+                Err(reason) => {
+                    last_abstention = Some(UtilityAbstention {
+                        reason,
+                        scope: Some(scope),
+                    });
+                }
+            }
+        }
         let Some((scope, stats)) = selected else {
-            return None;
+            return UtilityAssessmentResult::Abstained(last_abstention.unwrap_or(
+                UtilityAbstention {
+                    reason: UtilityAbstentionReason::UnknownAction,
+                    scope: None,
+                },
+            ));
         };
         let effective_evidence = stats.effective_evidence_at(now_unix);
         let standard_error =
@@ -426,12 +510,40 @@ impl WorldModel {
         } else {
             UtilityImagined::Unknown
         };
-        Some(UtilityAssessment {
+        UtilityAssessmentResult::Assessed(UtilityAssessment {
             verdict,
             scope,
             utility_ema: stats.utility_ema,
             lower_bound: lower,
             upper_bound: upper,
+            effective_evidence,
+            quality: stats.quality_ema,
+        })
+    }
+
+    /// Return a same-installation, same-hardware family prior for ranking.
+    /// Unlike [`Self::assess_utility`], this deliberately accepts a confidence
+    /// interval that crosses zero: its width becomes uncertainty, and callers
+    /// are forbidden from using the prior as veto authority.
+    pub fn assess_family_prior(&self, action_key: &str) -> Option<UtilityPrior> {
+        let now_unix = self.latest_context.as_ref()?.timestamp_unix;
+        let family = action_key.split_once(':')?.0;
+        let stats = self.utility_predicted.get(&format!("{family}:*"))?;
+        utility_model_status(
+            stats,
+            now_unix,
+            self.latest_context.as_ref(),
+            self.current_installation_id,
+            false,
+        )
+        .ok()?;
+        let effective_evidence = stats.effective_evidence_at(now_unix);
+        let standard_error =
+            (stats.utility_variance_ema.max(UTILITY_VARIANCE_FLOOR) / effective_evidence).sqrt();
+        Some(UtilityPrior {
+            utility_ema: stats.utility_ema,
+            lower_bound: stats.utility_ema - UTILITY_CONFIDENCE_Z * standard_error,
+            upper_bound: stats.utility_ema + UTILITY_CONFIDENCE_Z * standard_error,
             effective_evidence,
             quality: stats.quality_ema,
         })
@@ -458,6 +570,33 @@ impl WorldModel {
                         self.latest_context.as_ref(),
                         self.current_installation_id,
                     )
+            })
+            .count()
+    }
+
+    pub fn utility_known_families(&self) -> usize {
+        self.utility_predicted
+            .keys()
+            .filter(|key| key.ends_with(":*"))
+            .count()
+    }
+
+    pub fn utility_ready_families(&self) -> usize {
+        let Some(now_unix) = self.latest_context.as_ref().map(|ctx| ctx.timestamp_unix) else {
+            return 0;
+        };
+        self.utility_predicted
+            .iter()
+            .filter(|(key, stats)| {
+                key.ends_with(":*")
+                    && utility_model_status(
+                        stats,
+                        now_unix,
+                        self.latest_context.as_ref(),
+                        self.current_installation_id,
+                        false,
+                    )
+                    .is_ok()
             })
             .count()
     }
@@ -514,22 +653,49 @@ fn utility_model_ready(
     context: Option<&TelemetryContextSummary>,
     installation_id: InstallationId,
 ) -> bool {
-    let base_ready = stats.quality_ema >= MIN_UTILITY_DATA_QUALITY
-        && stats.last_observed_unix > 0
-        && now_unix >= stats.last_observed_unix
-        && now_unix - stats.last_observed_unix <= UTILITY_MAX_AGE_SECS
-        && stats.effective_evidence_at(now_unix) >= MIN_UTILITY_EVIDENCE
-        && context.is_some_and(|context| stats.hardware_regime.matches_context(context))
-        && installation_id.is_known()
-        && stats.installation_id == installation_id;
-    if !base_ready {
-        return false;
+    utility_model_status(stats, now_unix, context, installation_id, true).is_ok()
+}
+
+fn utility_model_status(
+    stats: &ActionModelStats,
+    now_unix: i64,
+    context: Option<&TelemetryContextSummary>,
+    installation_id: InstallationId,
+    require_decisive_interval: bool,
+) -> Result<(), UtilityAbstentionReason> {
+    let Some(context) = context else {
+        return Err(UtilityAbstentionReason::NoCurrentGold);
+    };
+    if stats.effective_evidence_at(now_unix) < MIN_UTILITY_EVIDENCE {
+        return Err(UtilityAbstentionReason::ImmatureEvidence);
+    }
+    if stats.quality_ema < MIN_UTILITY_DATA_QUALITY {
+        return Err(UtilityAbstentionReason::LowQuality);
+    }
+    if stats.last_observed_unix <= 0
+        || now_unix < stats.last_observed_unix
+        || now_unix - stats.last_observed_unix > UTILITY_MAX_AGE_SECS
+    {
+        return Err(UtilityAbstentionReason::StaleEvidence);
+    }
+    if !installation_id.is_known() || stats.installation_id != installation_id {
+        return Err(UtilityAbstentionReason::ForeignInstallation);
+    }
+    if !stats.hardware_regime.matches_context(context) {
+        return Err(UtilityAbstentionReason::HardwareMismatch);
+    }
+    if !require_decisive_interval {
+        return Ok(());
     }
     let evidence = stats.effective_evidence_at(now_unix);
     let standard_error = (stats.utility_variance_ema.max(UTILITY_VARIANCE_FLOOR) / evidence).sqrt();
     let lower = stats.utility_ema - UTILITY_CONFIDENCE_Z * standard_error;
     let upper = stats.utility_ema + UTILITY_CONFIDENCE_Z * standard_error;
-    lower > DOMINANCE_MARGIN || upper <= 0.0
+    if lower > DOMINANCE_MARGIN || upper <= 0.0 {
+        Ok(())
+    } else {
+        Err(UtilityAbstentionReason::UncertainInterval)
+    }
 }
 
 #[cfg(test)]
@@ -1033,6 +1199,65 @@ mod tests {
         model.refresh_from_parts_for_workload(&graph, &tracker, 1.0, "build");
         assert_eq!(model.known_actions(), 1);
         assert_eq!(model.cache_stats(), (2, 1, 1, 1));
+    }
+
+    #[test]
+    fn utility_abstention_explains_missing_and_immature_evidence() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &BTreeMap::new(), 1);
+        assert_eq!(
+            model.assess_utility_diagnostic("boost:Unknown", "build"),
+            UtilityAssessmentResult::Abstained(UtilityAbstention {
+                reason: UtilityAbstentionReason::UnknownAction,
+                scope: None,
+            })
+        );
+
+        let mut immature = mature_model(now, LOCAL_ID);
+        immature.evidence_mass = 2.0;
+        immature.effective_observations = 2;
+        let models = BTreeMap::from([("boost:Editor".to_string(), immature)]);
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id: LOCAL_ID,
+            action_models: &models,
+            action_models_revision: 2,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+        assert!(matches!(
+            model.assess_utility_diagnostic("boost:Editor", "build"),
+            UtilityAssessmentResult::Abstained(UtilityAbstention {
+                reason: UtilityAbstentionReason::ImmatureEvidence,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn family_prior_ranks_unseen_target_without_granting_veto_authority() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let models = BTreeMap::from([("boost:*".to_string(), mature_model(now, LOCAL_ID))]);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &models, 1);
+
+        let prior = model
+            .assess_family_prior("boost:Unseen")
+            .expect("mature local family prior");
+        assert!(prior.utility_ema > 0.0);
+        assert_eq!(
+            model.assess_utility_diagnostic("boost:Unseen", "build"),
+            UtilityAssessmentResult::Abstained(UtilityAbstention {
+                reason: UtilityAbstentionReason::UnknownAction,
+                scope: None,
+            }),
+            "family evidence must not become exact-action veto authority"
+        );
     }
 
     #[test]

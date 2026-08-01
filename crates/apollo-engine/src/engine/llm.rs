@@ -295,6 +295,84 @@ pub fn write_json_critical(path: &Path, value: &impl Serialize, mode: Option<u32
     write_json_fsync(path, value, mode, true);
 }
 
+/// Strict transactional JSON checkpoint for irreplaceable learned state.
+///
+/// Unlike the best-effort generic writer, this function never falls back to a
+/// truncate-in-place write. It retains one previous checkpoint, fsyncs both
+/// temporary files, atomically renames them, and fsyncs the parent directory.
+pub fn write_json_transactional(
+    path: &Path,
+    value: &impl Serialize,
+    mode: Option<u32>,
+) -> std::io::Result<()> {
+    static CHECKPOINT_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let _checkpoint_guard = CHECKPOINT_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    fn io_other(error: impl std::fmt::Display) -> std::io::Error {
+        std::io::Error::other(error.to_string())
+    }
+
+    HardPath::verify_no_symlink(path).map_err(io_other)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("checkpoint path has no parent"))?;
+    HardPath::secure_create_dir_all(parent).map_err(io_other)?;
+    let json = serde_json::to_vec_pretty(value).map_err(io_other)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| std::io::Error::other("checkpoint path has no UTF-8 file name"))?;
+    let tmp_path = parent.join(format!(".{file_name}.new"));
+    let previous_path = parent.join(format!("{file_name}.previous"));
+    let previous_tmp = parent.join(format!(".{file_name}.previous.new"));
+    for candidate in [&tmp_path, &previous_path, &previous_tmp] {
+        HardPath::verify_no_symlink(candidate).map_err(io_other)?;
+    }
+
+    #[cfg(unix)]
+    fn write_synced(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(mode)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+    #[cfg(not(unix))]
+    fn write_synced(path: &Path, bytes: &[u8], _mode: u32) -> std::io::Result<()> {
+        fs::write(path, bytes)
+    }
+
+    let mode = mode.unwrap_or(0o600);
+    if path.exists() {
+        if previous_tmp.exists() {
+            fs::remove_file(&previous_tmp)?;
+        }
+        // APFS hard links retain the prior inode with metadata-only I/O. Fall
+        // back to a synced copy on filesystems that reject hard links.
+        if fs::hard_link(path, &previous_tmp).is_err() {
+            let previous = fs::read(path)?;
+            write_synced(&previous_tmp, &previous, mode)?;
+        }
+        fs::rename(&previous_tmp, &previous_path)?;
+    }
+    if let Err(error) = write_synced(&tmp_path, &json, mode)
+        .and_then(|()| fs::rename(&tmp_path, path))
+        .and_then(|()| fs::File::open(parent)?.sync_all())
+    {
+        let _ = fs::remove_file(&tmp_path);
+        let _ = fs::remove_file(&previous_tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn write_secret(path: &Path, value: &str) -> anyhow::Result<()> {
     HardPath::verify_no_symlink(path)?;
 

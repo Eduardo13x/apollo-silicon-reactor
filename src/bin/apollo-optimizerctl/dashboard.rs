@@ -378,11 +378,16 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     if m.ais_score > 0.0 {
         lines.push(format!(
-            "AIS    {:.1} {} · L {:.0}%",
-            m.ais_score,
+            "AIS    C{:.1} {} O{:.0}%",
+            if m.ais_capability > 0.0 {
+                m.ais_capability
+            } else {
+                m.ais_score
+            },
             m.ais_grade,
-            m.ais_learning * 100.0
+            m.ais_optimization_opportunity * 100.0
         ));
+        lines.push(format!("       L {:.0}%", m.ais_learning * 100.0));
     }
     if m.learning_bronze_total > 0 {
         lines.push(format!(
@@ -451,6 +456,33 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             "WM-U+  V{} P{}",
             format_number(m.world_model_utility_vetoes_total),
             format_number(m.world_model_utility_promotions_total)
+        ));
+    }
+    if m.world_model_family_known_models > 0 {
+        lines.push(format!(
+            "WM-F   {}/{} prior {}",
+            format_number(m.world_model_family_ready_models),
+            format_number(m.world_model_family_known_models),
+            format_number(m.world_model_family_prior_uses_total)
+        ));
+    }
+    if m.world_model_abstentions_total > 0 {
+        lines.push(format!(
+            "WM-A   {} {}",
+            format_number(m.world_model_abstentions_total),
+            m.world_model_last_abstention_reason
+                .chars()
+                .take(18)
+                .collect::<String>()
+        ));
+    }
+    if m.action_planner_proposed_total > 0 {
+        lines.push(format!(
+            "Plan   {}/{} C{} R{}",
+            format_number(m.action_planner_admitted_total),
+            format_number(m.action_planner_proposed_total),
+            format_number(m.action_planner_conflict_drops_total),
+            format_number(m.action_planner_reorders_total)
         ));
     }
     lines.push(format!(
@@ -998,6 +1030,8 @@ mod tests {
     fn think_quadrant_surfaces_medallion_quality_and_ais_learning() {
         let mut status = dashboard_status();
         status.metrics.ais_score = 92.4;
+        status.metrics.ais_capability = 92.4;
+        status.metrics.ais_optimization_opportunity = 0.18;
         status.metrics.ais_grade = "S".to_string();
         status.metrics.ais_learning = 0.88;
         status.metrics.learning_bronze_total = 200;
@@ -1038,7 +1072,8 @@ mod tests {
 
         let think = render_think_q(&status);
 
-        assert!(think.iter().any(|line| line == "AIS    92.4 S · L 88%"));
+        assert!(think.iter().any(|line| line == "AIS    C92.4 S O18%"));
+        assert!(think.iter().any(|line| line == "       L 88%"));
         assert!(think.iter().any(|line| line == "Data   G 198/200 q99%"));
         assert!(think
             .iter()

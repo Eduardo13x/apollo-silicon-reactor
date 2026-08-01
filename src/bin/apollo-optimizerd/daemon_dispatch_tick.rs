@@ -12,11 +12,15 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
+use apollo_engine::engine::action_planner::{
+    plan_actions, IntentEvidence, PlanReport, PlanningContext,
+};
+use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest};
 use apollo_engine::engine::audit_types::PolicyDecisionTrace;
 use apollo_engine::engine::daemon_helpers::write_frozen_state;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::degradation::DegradationInputs;
-use apollo_engine::engine::execute_actions::{execute_actions, ExecuteOutcomes};
+use apollo_engine::engine::execute_actions::ExecuteOutcomes;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
@@ -180,21 +184,37 @@ pub fn record_applied_actions(
 
 use crate::{cognitive_tick, daemon_action_pipeline};
 
-fn utility_model_vetoes(
-    action: &RootAction,
-    world_model: &apollo_engine::engine::world_model::WorldModel,
+fn record_world_model_abstention(
+    metrics: &mut apollo_engine::engine::types::RuntimeMetrics,
+    reason: apollo_engine::engine::world_model::UtilityAbstentionReason,
+    action_key: &str,
     workload: &str,
-) -> Option<WorldModelInfluence> {
-    if !apollo_engine::engine::telemetry_medallion::utility_veto_eligible(action) {
-        return None;
-    }
-    let key = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)?;
-    let assessment = world_model.assess_utility(&key, workload)?;
-    matches!(
-        assessment.verdict,
-        apollo_engine::engine::world_model::UtilityImagined::DoNothingDominates { .. }
-    )
-    .then(|| WorldModelInfluence::from_assessment("veto", key, workload, assessment))
+) {
+    use apollo_engine::engine::world_model::UtilityAbstentionReason;
+
+    metrics.world_model_abstentions_total = metrics.world_model_abstentions_total.saturating_add(1);
+    metrics.world_model_last_abstention_reason = reason.as_str().to_string();
+    metrics.world_model_last_abstention_action = action_key.to_string();
+    metrics.world_model_last_abstention_workload = workload.to_string();
+    let counter = match reason {
+        UtilityAbstentionReason::NoCurrentGold => &mut metrics.world_model_abstention_no_gold_total,
+        UtilityAbstentionReason::UnknownAction => &mut metrics.world_model_abstention_unknown_total,
+        UtilityAbstentionReason::ImmatureEvidence => {
+            &mut metrics.world_model_abstention_immature_total
+        }
+        UtilityAbstentionReason::LowQuality => &mut metrics.world_model_abstention_quality_total,
+        UtilityAbstentionReason::StaleEvidence => &mut metrics.world_model_abstention_stale_total,
+        UtilityAbstentionReason::ForeignInstallation => {
+            &mut metrics.world_model_abstention_origin_total
+        }
+        UtilityAbstentionReason::HardwareMismatch => {
+            &mut metrics.world_model_abstention_hardware_total
+        }
+        UtilityAbstentionReason::UncertainInterval => {
+            &mut metrics.world_model_abstention_uncertain_total
+        }
+    };
+    *counter = counter.saturating_add(1);
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -240,11 +260,113 @@ impl WorldModelInfluence {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct WorldModelPriorityReport {
-    pub positive_total: u64,
-    pub reordered_total: u64,
-    pub last_influence: Option<WorldModelInfluence>,
+#[derive(Debug, Clone, PartialEq)]
+enum UtilityGateDecision {
+    Admit,
+    Veto(WorldModelInfluence),
+    Abstained {
+        reason: apollo_engine::engine::world_model::UtilityAbstentionReason,
+        action_key: String,
+    },
+}
+
+fn evaluate_utility_gate(
+    action: &RootAction,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+) -> UtilityGateDecision {
+    if !apollo_engine::engine::telemetry_medallion::utility_veto_eligible(action) {
+        return UtilityGateDecision::Admit;
+    }
+    let Some(key) = apollo_engine::engine::telemetry_medallion::actuator_action_key(action) else {
+        return UtilityGateDecision::Admit;
+    };
+    match world_model.assess_utility_diagnostic(&key, workload) {
+        apollo_engine::engine::world_model::UtilityAssessmentResult::Assessed(assessment)
+            if matches!(
+                assessment.verdict,
+                apollo_engine::engine::world_model::UtilityImagined::DoNothingDominates { .. }
+            ) =>
+        {
+            UtilityGateDecision::Veto(WorldModelInfluence::from_assessment(
+                "veto", key, workload, assessment,
+            ))
+        }
+        apollo_engine::engine::world_model::UtilityAssessmentResult::Abstained(abstention) => {
+            UtilityGateDecision::Abstained {
+                reason: abstention.reason,
+                action_key: key,
+            }
+        }
+        _ => UtilityGateDecision::Admit,
+    }
+}
+
+/// Build a single intent plan from specialist proposals and mature World
+/// Model evidence. The learned model contributes only utility and uncertainty;
+/// the planner remains unable to manufacture actions or bypass safety gates.
+pub fn plan_action_intents(
+    actions: Vec<RootAction>,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+    memory_pressure: f64,
+    app_launching: bool,
+    fluidity_degraded: bool,
+) -> (Vec<RootAction>, PlanReport) {
+    let mut context = PlanningContext {
+        memory_pressure,
+        app_launching,
+        fluidity_degraded,
+        ..PlanningContext::default()
+    };
+    let mut family_priors_used = 0_u64;
+    let mut exact_positive_evidence = 0_u64;
+    for action in &actions {
+        let Some(key) = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)
+        else {
+            continue;
+        };
+        let Some(assessment) = world_model.assess_utility(&key, workload) else {
+            if let Some(prior) = world_model.assess_family_prior(&key) {
+                context.utility_evidence.insert(
+                    key,
+                    IntentEvidence {
+                        // Shrink family evidence because the target itself is
+                        // unseen. It influences order only, never admission.
+                        expected_benefit: prior.lower_bound.max(0.0) * 0.50,
+                        uncertainty: (prior.upper_bound - prior.lower_bound)
+                            .abs()
+                            .clamp(0.0, 1.0),
+                    },
+                );
+                family_priors_used = family_priors_used.saturating_add(1);
+            }
+            continue;
+        };
+        let expected_benefit = match assessment.verdict {
+            apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => {
+                exact_positive_evidence = exact_positive_evidence.saturating_add(1);
+                margin
+            }
+            apollo_engine::engine::world_model::UtilityImagined::DoNothingDominates {
+                predicted_utility,
+            } => predicted_utility.min(0.0),
+            apollo_engine::engine::world_model::UtilityImagined::Unknown => 0.0,
+        };
+        context.utility_evidence.insert(
+            key,
+            IntentEvidence {
+                expected_benefit,
+                uncertainty: (assessment.upper_bound - assessment.lower_bound)
+                    .abs()
+                    .clamp(0.0, 1.0),
+            },
+        );
+    }
+    let (planned, mut report) = plan_actions(actions, &context);
+    report.evidence_ranked = exact_positive_evidence;
+    report.family_priors_used = family_priors_used;
+    (planned, report)
 }
 
 pub fn record_world_model_influence(
@@ -261,105 +383,6 @@ pub fn record_world_model_influence(
     metrics.world_model_last_influence_evidence = influence.evidence;
     metrics.world_model_last_influence_quality = influence.quality;
     metrics.world_model_last_influence_margin = influence.margin;
-}
-
-/// Move proven responsiveness actions ahead of exploratory accelerators before
-/// they enter the bounded action queue. This never creates or changes an
-/// action: it only reorders existing Boost and interactive thread-QoS hints
-/// when their own workload-conditioned utility model is mature and positive.
-///
-/// Pressure protection stays untouched because only accelerator slots are
-/// rewritten. That keeps freeze, throttle, recovery, and kernel guardrails in
-/// their original order while letting demonstrated low-latency wins dispatch
-/// first when the normal queue is busy.
-pub fn prioritize_world_model_accelerators(
-    mut actions: Vec<RootAction>,
-    world_model: &apollo_engine::engine::world_model::WorldModel,
-    workload: &str,
-) -> (Vec<RootAction>, WorldModelPriorityReport) {
-    let mut ranked: Vec<(
-        usize,
-        apollo_engine::engine::world_model::UtilityAssessment,
-        String,
-    )> = actions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, action)| {
-            if !is_responsiveness_accelerator(action) {
-                return None;
-            }
-            let key = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)?;
-            let assessment = world_model.assess_utility(&key, workload)?;
-            match assessment.verdict {
-                apollo_engine::engine::world_model::UtilityImagined::ActWins { .. } => {
-                    Some((index, assessment, key))
-                }
-                _ => None,
-            }
-        })
-        .collect();
-
-    if ranked.is_empty() {
-        return (actions, WorldModelPriorityReport::default());
-    }
-
-    // Keep the candidate set small and stable: only the existing accelerator
-    // positions are permuted, descending by the measured utility margin.
-    let accelerator_slots: Vec<usize> = actions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, action)| is_responsiveness_accelerator(action).then_some(index))
-        .collect();
-    ranked.sort_by(|left, right| {
-        let left_margin = match left.1.verdict {
-            apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => margin,
-            _ => 0.0,
-        };
-        let right_margin = match right.1.verdict {
-            apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => margin,
-            _ => 0.0,
-        };
-        right_margin
-            .total_cmp(&left_margin)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-
-    let mut ordered_accelerators: Vec<RootAction> = ranked
-        .iter()
-        .map(|(index, _, _)| actions[*index].clone())
-        .collect();
-    let proven_indexes: HashSet<usize> = ranked.iter().map(|(index, _, _)| *index).collect();
-    ordered_accelerators.extend(
-        accelerator_slots
-            .iter()
-            .filter(|index| !proven_indexes.contains(index))
-            .map(|index| actions[*index].clone()),
-    );
-    let reordered_total = ranked
-        .iter()
-        .zip(accelerator_slots.iter())
-        .filter(|((source, _, _), destination)| source != *destination)
-        .count() as u64;
-    for (slot, action) in accelerator_slots.into_iter().zip(ordered_accelerators) {
-        actions[slot] = action;
-    }
-
-    let influence_kind = if reordered_total > 0 {
-        "reorder"
-    } else {
-        "promote"
-    };
-    let last_influence = ranked.first().map(|(_, assessment, key)| {
-        WorldModelInfluence::from_assessment(influence_kind, key.clone(), workload, *assessment)
-    });
-    (
-        actions,
-        WorldModelPriorityReport {
-            positive_total: ranked.len() as u64,
-            reordered_total,
-            last_influence,
-        },
-    )
 }
 
 fn is_responsiveness_accelerator(action: &RootAction) -> bool {
@@ -474,17 +497,23 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     // immature model always abstains, so this cannot starve exploration.
     let mut utility_vetoes = 0_u64;
     let mut last_utility_veto = None;
+    let mut utility_abstentions = Vec::new();
     filtered_actions.retain(|action| {
-        if let Some(influence) = utility_model_vetoes(action, world_model, workload) {
-            utility_vetoes = utility_vetoes.saturating_add(1);
-            tracing::debug!(action_key = %influence.action_key, workload, "world model vetoed low-utility action");
-            last_utility_veto = Some(influence);
-            false
-        } else {
-            true
+        match evaluate_utility_gate(action, world_model, workload) {
+            UtilityGateDecision::Veto(influence) => {
+                utility_vetoes = utility_vetoes.saturating_add(1);
+                tracing::debug!(action_key = %influence.action_key, workload, "world model vetoed low-utility action");
+                last_utility_veto = Some(influence);
+                false
+            }
+            UtilityGateDecision::Abstained { reason, action_key } => {
+                utility_abstentions.push((reason, action_key));
+                true
+            }
+            UtilityGateDecision::Admit => true,
         }
     });
-    if utility_vetoes > 0 {
+    if utility_vetoes > 0 || !utility_abstentions.is_empty() {
         let mut metrics = state.metrics.lock_recover();
         metrics.metrics.world_model_utility_vetoes_total = metrics
             .metrics
@@ -492,6 +521,9 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             .saturating_add(utility_vetoes);
         if let Some(influence) = last_utility_veto.as_ref() {
             record_world_model_influence(&mut metrics.metrics, influence);
+        }
+        for (reason, action_key) in utility_abstentions {
+            record_world_model_abstention(&mut metrics.metrics, reason, &action_key, workload);
         }
     }
     // ── Per-PID dedup chokepoint ─────────────────────────────────────────────
@@ -640,7 +672,8 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     // would now hold the lock across the entire cycle.
     let qos_arc = state.mach_qos.clone();
 
-    let outcomes = if cb_is_open {
+    let broker = ActuationBroker::from_runtime(caps, dry_run);
+    let broker_execution = if cb_is_open {
         // Circuit Open: only dispatch unfreeze (always safe).
         tracing::warn!(
             op_mode = op_mode.as_str(),
@@ -650,49 +683,60 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             .into_iter()
             .filter(|a| matches!(a, RootAction::UnfreezeProcess { .. }))
             .collect();
-        execute_actions(
-            safe_actions,
+        broker.execute(ActuationRequest {
+            actions: safe_actions,
             caps,
             journal_path,
-            &mut frozen_set,
-            &learned_protected,
-            &learned_interactive,
-            Some(&qos_arc),
-            dry_run,
-            snapshot.pressure.memory_pressure,
-            snapshot.pressure.thrashing_score,
+            frozen: &mut frozen_set,
+            learned_protected: &learned_protected,
+            learned_interactive: &learned_interactive,
+            qos_mgr: Some(&qos_arc),
+            memory_pressure: snapshot.pressure.memory_pressure,
+            thrashing_score: snapshot.pressure.thrashing_score,
             coalition_guard,
             cpu_pegged_fraction,
-        )
+        })
     } else {
         // Circuit Closed or HalfOpen: run normally, then report outcome.
-        let out = execute_actions(
-            filtered_actions,
+        let out = broker.execute(ActuationRequest {
+            actions: filtered_actions,
             caps,
             journal_path,
-            &mut frozen_set,
-            &learned_protected,
-            &learned_interactive,
-            Some(&qos_arc),
-            dry_run,
-            snapshot.pressure.memory_pressure,
-            snapshot.pressure.thrashing_score,
+            frozen: &mut frozen_set,
+            learned_protected: &learned_protected,
+            learned_interactive: &learned_interactive,
+            qos_mgr: Some(&qos_arc),
+            memory_pressure: snapshot.pressure.memory_pressure,
+            thrashing_score: snapshot.pressure.thrashing_score,
             coalition_guard,
             cpu_pegged_fraction,
-        );
+        });
         // Report outcome to circuit breaker.
         {
             let mut pg = state.policy.lock_recover();
-            if out.failures == 0 {
+            if out.outcomes.failures == 0 {
                 pg.circuit_breaker.record_success();
             } else {
-                for _ in 0..out.failures {
+                for _ in 0..out.outcomes.failures {
                     pg.circuit_breaker.record_failure();
                 }
             }
         }
         out
     };
+    {
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.privilege_boundary_mode = broker_execution.mode.as_str().to_string();
+        metrics.metrics.privileged_action_requests_total = metrics
+            .metrics
+            .privileged_action_requests_total
+            .saturating_add(broker_execution.requests);
+        metrics.metrics.privileged_action_rejections_total = metrics
+            .metrics
+            .privileged_action_rejections_total
+            .saturating_add(broker_execution.rejected);
+    }
+    let outcomes = broker_execution.outcomes;
 
     // Update degradation controller with new failure count.
     if outcomes.failures > 0 {
@@ -1281,14 +1325,19 @@ mod tests {
             },
         });
 
+        assert!(matches!(
+            evaluate_utility_gate(&boost(100), &model, "idle"),
+            UtilityGateDecision::Veto(WorldModelInfluence { action_key, .. })
+                if action_key == "boost:p100"
+        ));
         assert_eq!(
-            utility_model_vetoes(&boost(100), &model, "idle")
-                .as_ref()
-                .map(|influence| influence.action_key.as_str()),
-            Some("boost:p100")
+            evaluate_utility_gate(&throttle(100), &model, "idle"),
+            UtilityGateDecision::Admit
         );
-        assert!(utility_model_vetoes(&throttle(100), &model, "idle").is_none());
-        assert!(utility_model_vetoes(&boost(200), &model, "idle").is_none());
+        assert!(matches!(
+            evaluate_utility_gate(&boost(200), &model, "idle"),
+            UtilityGateDecision::Abstained { .. }
+        ));
     }
 
     #[test]
@@ -1344,20 +1393,17 @@ mod tests {
             },
         });
 
-        let (actions, report) = prioritize_world_model_accelerators(
+        let (actions, report) = plan_action_intents(
             vec![boost(100), freeze(900), boost(200)],
             &model,
             "build",
+            0.30,
+            false,
+            false,
         );
 
-        assert_eq!(report.positive_total, 1);
-        assert_eq!(report.reordered_total, 1);
-        let influence = report.last_influence.expect("reorder must be explained");
-        assert_eq!(influence.kind, "reorder");
-        assert_eq!(influence.action_key, "boost:p200");
-        assert_eq!(influence.scope, "workload");
-        assert!(influence.evidence >= 10.0);
-        assert!(influence.lower_bound > 0.0);
+        assert_eq!(report.evidence_ranked, 1);
+        assert_eq!(report.reordered, 2);
         assert!(matches!(
             actions[0],
             RootAction::BoostProcess { pid: 200, .. }
@@ -1425,15 +1471,17 @@ mod tests {
             },
         });
 
-        let (actions, report) =
-            prioritize_world_model_accelerators(vec![boost(200), boost(100)], &model, "build");
+        let (actions, report) = plan_action_intents(
+            vec![boost(200), boost(100)],
+            &model,
+            "build",
+            0.30,
+            false,
+            false,
+        );
 
-        assert_eq!(report.positive_total, 1);
-        assert_eq!(report.reordered_total, 0);
-        let influence = report.last_influence.expect("promotion must be explained");
-        assert_eq!(influence.kind, "promote");
-        assert_eq!(influence.action_key, "boost:p200");
-        assert!(influence.lower_bound > 0.0);
+        assert_eq!(report.evidence_ranked, 1);
+        assert_eq!(report.reordered, 0);
         assert!(matches!(
             actions[0],
             RootAction::BoostProcess { pid: 200, .. }

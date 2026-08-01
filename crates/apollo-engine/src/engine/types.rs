@@ -506,6 +506,12 @@ pub struct RuntimeMetrics {
     pub paging_hints_applied: u64,
     pub sysctl_applied: u64,
     pub failures: u64,
+    #[serde(default)]
+    pub privilege_boundary_mode: String,
+    #[serde(default)]
+    pub privileged_action_requests_total: u64,
+    #[serde(default)]
+    pub privileged_action_rejections_total: u64,
     pub last_error: Option<String>,
     pub last_cycle_at: Option<DateTime<Utc>>,
     pub p95_cycle_ms: f64,
@@ -523,6 +529,20 @@ pub struct RuntimeMetrics {
     pub apollo_overhead_constrained_cycles: u64,
     #[serde(default)]
     pub apollo_overhead_optional_skips_total: u64,
+    #[serde(default)]
+    pub apollo_overhead_sensor_interval_secs: u64,
+    #[serde(default)]
+    pub apollo_overhead_holt_cadence: u64,
+    #[serde(default)]
+    pub apollo_overhead_page_reclaim_cadence: u64,
+    #[serde(default)]
+    pub apollo_overhead_holt_skips_total: u64,
+    #[serde(default)]
+    pub apollo_overhead_page_reclaim_skips_total: u64,
+    #[serde(default)]
+    pub metrics_disk_writes_total: u64,
+    #[serde(default)]
+    pub metrics_snapshot_clone_skips_total: u64,
     pub refresh_duration_ms: f64,
     pub memory_budget_duration_ms: f64,
     pub reactor_duration_ms: f64,
@@ -1414,6 +1434,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub ais_score: f64,
     #[serde(default)]
+    pub ais_capability: f64,
+    #[serde(default)]
+    pub ais_optimization_opportunity: f64,
+    #[serde(default)]
     pub ais_grade: String,
     #[serde(default)]
     pub ais_decision: f64,
@@ -1526,6 +1550,12 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub world_model_actuator_ready_models: u64,
     #[serde(default)]
+    pub world_model_family_known_models: u64,
+    #[serde(default)]
+    pub world_model_family_ready_models: u64,
+    #[serde(default)]
+    pub world_model_family_prior_uses_total: u64,
+    #[serde(default)]
     pub world_model_actuator_families: Vec<ActuatorEvidenceStatus>,
     #[serde(default)]
     pub world_model_utility_vetoes_total: u64,
@@ -1536,6 +1566,18 @@ pub struct RuntimeMetrics {
     /// Positive candidates that actually changed position in the queue.
     #[serde(default)]
     pub world_model_utility_reorders_total: u64,
+    /// Central intent planner telemetry. Proposed counts all candidates that
+    /// reached planning; admitted excludes contradictory same-target intents.
+    #[serde(default)]
+    pub action_planner_proposed_total: u64,
+    #[serde(default)]
+    pub action_planner_admitted_total: u64,
+    #[serde(default)]
+    pub action_planner_conflict_drops_total: u64,
+    #[serde(default)]
+    pub action_planner_reorders_total: u64,
+    #[serde(default)]
+    pub action_planner_last_resolution: String,
     #[serde(default)]
     pub world_model_last_influence_kind: String,
     #[serde(default)]
@@ -1556,6 +1598,30 @@ pub struct RuntimeMetrics {
     pub world_model_last_influence_quality: f64,
     #[serde(default)]
     pub world_model_last_influence_margin: f64,
+    #[serde(default)]
+    pub world_model_abstentions_total: u64,
+    #[serde(default)]
+    pub world_model_last_abstention_reason: String,
+    #[serde(default)]
+    pub world_model_last_abstention_action: String,
+    #[serde(default)]
+    pub world_model_last_abstention_workload: String,
+    #[serde(default)]
+    pub world_model_abstention_no_gold_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_unknown_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_immature_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_quality_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_stale_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_origin_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_hardware_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_uncertain_total: u64,
     #[serde(default)]
     pub world_model_counterfactual_eligible_total: u64,
     #[serde(default)]

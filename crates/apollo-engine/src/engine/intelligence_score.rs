@@ -188,6 +188,16 @@ pub struct AisInput {
     /// Leave at 0 in simulation tests to use skip-rate formula unconditionally.
     #[serde(default)]
     pub current_pressure: f64,
+    /// Live opportunity signals. They do not increase capability; they explain
+    /// how much correctable work the current machine is presenting.
+    #[serde(default)]
+    pub swap_delta_bps: f64,
+    #[serde(default)]
+    pub thrashing_score: f64,
+    #[serde(default)]
+    pub fluidity_degraded: bool,
+    #[serde(default)]
+    pub cpu_pegged_fraction: f64,
     /// Kalman Riccati steady-state RMSE floor (√P*) for the current operating noise.
     /// [Kalman 1960] P* = (-Q + √(Q²+4QR)) / 2: theoretical minimum posterior covariance.
     /// When set (> 0), used as the dynamic threshold in signal_quality().
@@ -243,6 +253,13 @@ fn detect_runtime_hardware_context() -> (u32, u32) {
 pub struct AisScore {
     /// Total AIS score [0, 100].
     pub total: f64,
+    /// Learned capability score. Equal to `total` for backward compatibility;
+    /// named explicitly so dashboards do not conflate it with current demand.
+    #[serde(default)]
+    pub capability: f64,
+    /// Current optimization demand [0, 1]. Low is healthy headroom, not failure.
+    #[serde(default)]
+    pub optimization_opportunity: f64,
     /// Per-dimension scores [0, 1].
     pub decision_precision: f64,
     pub signal_quality: f64,
@@ -507,6 +524,10 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let habituation_skips = rm_u("habituation_skips");
     let process_evals = rm_u("bps_evaluated");
     let current_pressure = rm_f("si_pressure_smooth");
+    let swap_delta_bps = rm_f("swap_delta_bps");
+    let thrashing_score = rm_f("thrashing_score");
+    let fluidity_degraded = rm["fluidity_degraded"].as_bool().unwrap_or(false);
+    let cpu_pegged_fraction = rm_f("cpu_pegged_fraction");
 
     // D5
     let kills_applied = rm_u("kills_applied") as u32;
@@ -604,6 +625,10 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         habituation_skips,
         process_evals,
         current_pressure,
+        swap_delta_bps,
+        thrashing_score,
+        fluidity_degraded,
+        cpu_pegged_fraction,
 
         kills_applied,
         survival_activations,
@@ -647,6 +672,7 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
     let d7 = wisdom(input);
     let evidence_coverage = ais_evidence_coverage(input);
     let operational_health = (0.60 * d5 + 0.40 * d4).clamp(0.0, 1.0);
+    let optimization_opportunity = optimization_opportunity(input);
 
     let total = (W_DECISION * d1
         + W_SIGNAL * d2
@@ -678,6 +704,8 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
 
     AisScore {
         total,
+        capability: total,
+        optimization_opportunity,
         decision_precision: d1,
         signal_quality: d2,
         learning_velocity: d3,
@@ -690,6 +718,28 @@ pub fn compute_ais(input: &AisInput) -> AisScore {
         pareto_balanced,
         grade,
     }
+}
+
+/// Current optimization demand, deliberately separate from learned quality.
+/// A calm machine should approach zero even when Apollo's capability is high.
+fn optimization_opportunity(input: &AisInput) -> f64 {
+    let pressure = ((input.current_pressure - 0.35) / 0.50).clamp(0.0, 1.0);
+    let swap_growth = (input.swap_delta_bps.max(0.0) / (256.0 * 1024.0 * 1024.0)).clamp(0.0, 1.0);
+    let thrashing = (input.thrashing_score / 5_000.0).clamp(0.0, 1.0);
+    let latency = if input.target_cycle_ms > 0.0 {
+        ((input.p95_cycle_ms / input.target_cycle_ms) - 0.75).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let fluidity = f64::from(input.fluidity_degraded);
+    let cpu = ((input.cpu_pegged_fraction - 0.60) / 0.40).clamp(0.0, 1.0);
+    (0.35 * pressure
+        + 0.20 * thrashing
+        + 0.15 * swap_growth
+        + 0.15 * latency
+        + 0.10 * fluidity
+        + 0.05 * cpu)
+        .clamp(0.0, 1.0)
 }
 
 // ── Dimension 1: Decision Precision ──────────────────────────────────────────
@@ -1670,6 +1720,10 @@ mod tests {
             habituation_skips,
             process_evals,
             current_pressure,
+            swap_delta_bps: 0.0,
+            thrashing_score: 0.0,
+            fluidity_degraded: false,
+            cpu_pegged_fraction: 0.0,
 
             // D5
             kills_applied,
@@ -1814,6 +1868,10 @@ mod tests {
             hardware_memory_gb: 8,
             rl_total_ticks: 0,     // simulation mode: use convergence_ticks
             current_pressure: 0.0, // simulation mode: use skip-rate formula
+            swap_delta_bps: 0.0,
+            thrashing_score: 0.0,
+            fluidity_degraded: false,
+            cpu_pegged_fraction: 0.0,
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,
@@ -2514,6 +2572,10 @@ mod tests {
             hardware_memory_gb: 8,
             rl_total_ticks: 0,
             current_pressure: 0.0,
+            swap_delta_bps: 0.0,
+            thrashing_score: 0.0,
+            fluidity_degraded: false,
+            cpu_pegged_fraction: 0.0,
             causal_mechanism_count: 0,
             experience_memory_count: 0,
             novel_patterns_count: 0,
@@ -2750,6 +2812,10 @@ mod tests {
             habituation_skips: 25,
             process_evals: 100,
             current_pressure: 0.25, // low pressure (skip-rate scoring applies)
+            swap_delta_bps: 0.0,
+            thrashing_score: 0.0,
+            fluidity_degraded: false,
+            cpu_pegged_fraction: 0.0,
 
             // D5: clean safety record
             kills_applied: 0,
@@ -2926,6 +2992,31 @@ mod tests {
     }
 
     #[test]
+    fn optimization_opportunity_is_demand_not_capability() {
+        let calm = AisInput {
+            current_pressure: 0.30,
+            p95_cycle_ms: 35.0,
+            target_cycle_ms: 100.0,
+            ..AisInput::default()
+        };
+        let stressed = AisInput {
+            current_pressure: 0.90,
+            swap_delta_bps: 256.0 * 1024.0 * 1024.0,
+            thrashing_score: 5_000.0,
+            fluidity_degraded: true,
+            cpu_pegged_fraction: 1.0,
+            ..calm.clone()
+        };
+        let calm_score = compute_ais(&calm);
+        let stressed_score = compute_ais(&stressed);
+
+        assert_eq!(calm_score.capability, calm_score.total);
+        assert_eq!(stressed_score.capability, stressed_score.total);
+        assert!(calm_score.optimization_opportunity < 0.05);
+        assert!(stressed_score.optimization_opportunity > 0.75);
+    }
+
+    #[test]
     fn phase_and_verified_outcomes_add_bounded_wisdom() {
         let base = AisInput {
             causal_mechanism_count: 2,
@@ -2999,6 +3090,10 @@ mod tests {
             habituation_skips: 0,
             process_evals: 100,
             current_pressure: 0.85, // high pressure — budget_score=1.0 (correct to run all)
+            swap_delta_bps: 64.0 * 1024.0 * 1024.0,
+            thrashing_score: 5_000.0,
+            fluidity_degraded: true,
+            cpu_pegged_fraction: 0.90,
 
             // D5: safety incidents
             kills_applied: 2,

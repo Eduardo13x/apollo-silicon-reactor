@@ -114,6 +114,7 @@ pub struct SmcReader {
     last_error: Arc<Mutex<Option<String>>>,
     /// Heartbeat: epoch millis of the last successful snapshot.
     heartbeat: Arc<AtomicU64>,
+    interval_ms: Arc<AtomicU64>,
 }
 
 impl SmcReader {
@@ -127,6 +128,7 @@ impl SmcReader {
         let error_count: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let heartbeat = Arc::new(AtomicU64::new(0));
+        let interval_ms = Arc::new(AtomicU64::new(interval.as_millis().max(250) as u64));
 
         let c = cache.clone();
         let lr = last_read_at.clone();
@@ -134,6 +136,7 @@ impl SmcReader {
         let ec = error_count.clone();
         let le = last_error.clone();
         let hb = heartbeat.clone();
+        let poll_interval = interval_ms.clone();
 
         if let Err(e) = thread::Builder::new()
             .name("smc-reader".into())
@@ -203,7 +206,9 @@ impl SmcReader {
                             *le.lock_recover() = Some(e);
                         }
                     }
-                    thread::sleep(interval);
+                    thread::sleep(Duration::from_millis(
+                        poll_interval.load(Ordering::Acquire).max(250),
+                    ));
                 }
             })
         {
@@ -217,7 +222,17 @@ impl SmcReader {
             error_count,
             last_error,
             heartbeat,
+            interval_ms,
         }
+    }
+
+    /// Adjust the next background sensor polling interval. The current IOKit
+    /// call is never interrupted; the new interval applies after it returns.
+    pub fn set_interval(&self, interval: Duration) {
+        self.interval_ms.store(
+            interval.as_millis().clamp(250, u64::MAX as u128) as u64,
+            Ordering::Release,
+        );
     }
 
     /// Get the latest cached hardware snapshot (<1 μs).

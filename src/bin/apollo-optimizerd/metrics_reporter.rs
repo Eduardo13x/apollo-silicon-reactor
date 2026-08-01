@@ -107,6 +107,8 @@ fn publish_world_model_metrics(
         context.controlled_holdout_mean_control_utility;
     metrics.world_model_actuator_known_models = world_model.utility_known_actions() as u64;
     metrics.world_model_actuator_ready_models = world_model.utility_ready_actions() as u64;
+    metrics.world_model_family_known_models = world_model.utility_known_families() as u64;
+    metrics.world_model_family_ready_models = world_model.utility_ready_families() as u64;
     metrics.world_model_actuator_families = telemetry_medallion
         .family_stats()
         .iter()
@@ -653,6 +655,8 @@ pub fn merge_cycle_metrics<'a>(
     // Populate AIS fields (computed before the lock was taken).
     if let Some(s) = ais_snapshot {
         metrics.metrics.ais_score = s.total;
+        metrics.metrics.ais_capability = s.capability;
+        metrics.metrics.ais_optimization_opportunity = s.optimization_opportunity;
         metrics.metrics.ais_grade = s.grade.to_string();
         metrics.metrics.ais_decision = s.decision_precision;
         metrics.metrics.ais_signal = s.signal_quality;
@@ -666,9 +670,20 @@ pub fn merge_cycle_metrics<'a>(
         metrics.metrics.ais_pareto_balanced = s.pareto_balanced;
     }
 
-    // Clone before releasing lock — write_metrics does file I/O
-    // and holding the lock during I/O blocks GetStatus requests.
-    let metrics_snapshot = metrics.metrics.clone();
+    let should_write = should_snapshot_metrics(cycle_count, in_sleep);
+    // Clone only when a write is due. Previously RuntimeMetrics (including
+    // vectors and deques) was cloned on 24 cycles out of 25 and discarded.
+    let metrics_snapshot = if should_write {
+        metrics.metrics.metrics_disk_writes_total =
+            metrics.metrics.metrics_disk_writes_total.saturating_add(1);
+        Some(metrics.metrics.clone())
+    } else {
+        metrics.metrics.metrics_snapshot_clone_skips_total = metrics
+            .metrics
+            .metrics_snapshot_clone_skips_total
+            .saturating_add(1);
+        None
+    };
     drop(metrics);
     // Rate-limit disk writes: atomic write (temp+rename) at 300ms/cycle was
     // writing 11KB × 2 = 22KB every 300ms = 73KB/s. Write every 25 cycles
@@ -676,9 +691,13 @@ pub fn merge_cycle_metrics<'a>(
     // Also skip writes while the system is sleeping — macOS accounts disk
     // writes against the daemon even during pre-sleep, burning the daily
     // budget while the machine is idle.
-    if !in_sleep && cycle_count.is_multiple_of(METRICS_DISK_WRITE_EVERY_N_CYCLES) {
+    if let Some(metrics_snapshot) = metrics_snapshot {
         write_metrics(metrics_path, &metrics_snapshot);
     }
+}
+
+fn should_snapshot_metrics(cycle_count: u64, in_sleep: bool) -> bool {
+    !in_sleep && cycle_count.is_multiple_of(METRICS_DISK_WRITE_EVERY_N_CYCLES)
 }
 
 #[cfg(test)]
@@ -687,6 +706,13 @@ mod tests {
     use apollo_engine::engine::adaptive_governor::GovernorDecision as GovDecision;
     use apollo_engine::engine::intelligence_score::{compute_ais, AisInput};
     use std::time::Duration;
+
+    #[test]
+    fn metrics_snapshot_is_cloned_only_on_write_cycles() {
+        assert!(!should_snapshot_metrics(24, false));
+        assert!(should_snapshot_metrics(25, false));
+        assert!(!should_snapshot_metrics(25, true));
+    }
 
     fn decision(pid: u32, dec: GovDecision, tier: ProcessTier) -> ProcessDecision {
         ProcessDecision {

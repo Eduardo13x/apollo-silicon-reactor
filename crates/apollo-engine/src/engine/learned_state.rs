@@ -651,12 +651,10 @@ pub fn try_migrate(schema_version: u32, mut state: LearnedState) -> LearnedState
                 v = 2;
             }
             // Up to date — nothing left to migrate.
-            _ if v >= CURRENT_SCHEMA_VERSION => {
-                state.version = CURRENT_SCHEMA_VERSION;
-                return state;
-            }
+            _ if v == CURRENT_SCHEMA_VERSION => return state,
             // Unknown future version loaded by an older binary. Keep as-is so
             // we do not destroy data the older binary cannot understand.
+            _ if v > CURRENT_SCHEMA_VERSION => return state,
             _ => return state,
         }
     }
@@ -1168,23 +1166,27 @@ impl LearnedState {
     /// [Gray & Reuter 1992] §10 — WAL/atomic-replace: the previous
     /// committed state must survive any single-point failure.
     pub fn persist(&self, path: &Path) {
-        // 2026-05-12: switched to crash-safe atomic write with fsync.
-        // Previous implementation `fs::write(tmp) + rename` survives torn
-        // writes but NOT power loss after rename — the renamed inode could
-        // hold partial data if the kernel buffer hadn't flushed.
-        // `write_json_critical` opens with O_WRONLY|O_CREAT|O_TRUNC, writes,
-        // fsyncs the tmp file (`sync_all` = `fsync(2)`, not `F_FULLFSYNC`; the
-        // parent directory is NOT separately fsync'd), then atomic-renames.
-        // Net guarantee: old-or-new committed state, never a torn file — a
-        // power-loss right after rename may revert to the prior persist but
-        // cannot corrupt. Adds ~1-3ms per persist (amortized: cadence ~30s in
-        // steady state). Worth the cost — learned_state is the most valuable
-        // file Apollo writes. Full platter durability (F_FULLFSYNC + parent-dir
-        // fsync) is deferred: worst case avoided is ~30s of EMA loss on a hard
-        // power-yank, never corruption.
+        if std::fs::read_to_string(path)
+            .ok()
+            .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+            .and_then(|value| value.get("version").and_then(serde_json::Value::as_u64))
+            .is_some_and(|version| version > CURRENT_SCHEMA_VERSION as u64)
+        {
+            tracing::error!(
+                path = %path.display(),
+                supported = CURRENT_SCHEMA_VERSION,
+                "refusing to overwrite newer learned-state schema"
+            );
+            return;
+        }
+        // The transactional writer serializes checkpoints, retains one previous
+        // generation, fsyncs the replacement, atomically renames it, and fsyncs
+        // the parent directory. It never falls back to truncate-in-place.
         // [Gray & Reuter 1992 §10 — durability requires fsync, not just
         // atomic rename].
-        crate::engine::llm::write_json_critical(path, self, Some(0o600));
+        if let Err(error) = crate::engine::llm::write_json_transactional(path, self, Some(0o600)) {
+            tracing::error!(path = %path.display(), %error, "learned-state checkpoint failed");
+        }
     }
 
     /// Patch only the `process_baselines` field of an existing persisted file.
@@ -1317,9 +1319,42 @@ impl LearnedState {
     /// Automatically runs [`try_migrate`] so callers always receive a struct
     /// at [`CURRENT_SCHEMA_VERSION`], regardless of how old the on-disk file is.
     pub fn load(path: &Path) -> Option<Self> {
-        let data = std::fs::read_to_string(path).ok()?;
-        let state: Self = serde_json::from_str(&data).ok()?;
-        Some(try_migrate(state.version, state))
+        fn parse_supported(data: &str) -> Result<LearnedState, bool> {
+            let value: serde_json::Value = serde_json::from_str(data).map_err(|_| false)?;
+            let version = value
+                .get("version")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if version > CURRENT_SCHEMA_VERSION as u64 {
+                return Err(true);
+            }
+            let state: LearnedState = serde_json::from_value(value).map_err(|_| false)?;
+            Ok(try_migrate(state.version, state))
+        }
+
+        if let Ok(data) = std::fs::read_to_string(path) {
+            match parse_supported(&data) {
+                Ok(state) => return Some(state),
+                // Never hide an incompatible future checkpoint behind an old
+                // fallback: the older binary must fail closed.
+                Err(true) => {
+                    tracing::error!(path = %path.display(), "learned-state schema is newer than this binary");
+                    return None;
+                }
+                Err(false) => {}
+            }
+        }
+
+        let file_name = path.file_name()?.to_str()?;
+        let previous = path.parent()?.join(format!("{file_name}.previous"));
+        let data = std::fs::read_to_string(&previous).ok()?;
+        match parse_supported(&data) {
+            Ok(state) => {
+                tracing::warn!(path = %path.display(), backup = %previous.display(), "restored learned state from previous checkpoint");
+                Some(state)
+            }
+            Err(_) => None,
+        }
     }
 }
 
@@ -2686,6 +2721,56 @@ mod tests {
                 .is_none(),
             "v1→v2 must clear kf_mv to None"
         );
+    }
+
+    #[test]
+    fn future_schema_is_preserved_by_migration_and_rejected_by_load() {
+        let future_version = CURRENT_SCHEMA_VERSION + 1;
+        let state: LearnedState = serde_json::from_value(serde_json::json!({
+            "version": future_version
+        }))
+        .expect("minimal learned state");
+        let migrated = try_migrate(future_version, state);
+        assert_eq!(migrated.version, future_version);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("learned_state.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({"version": future_version}).to_string(),
+        )
+        .expect("write future checkpoint");
+        assert!(LearnedState::load(&path).is_none());
+
+        let older: LearnedState = serde_json::from_value(serde_json::json!({
+            "version": CURRENT_SCHEMA_VERSION,
+            "persist_generations": 9
+        }))
+        .expect("older state");
+        older.persist(&path);
+        let retained: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("future checkpoint retained"),
+        )
+        .expect("valid retained checkpoint");
+        assert_eq!(retained["version"].as_u64(), Some(future_version as u64));
+    }
+
+    #[test]
+    fn malformed_primary_recovers_previous_transactional_checkpoint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("learned_state.json");
+        let mut state: LearnedState = serde_json::from_value(serde_json::json!({
+            "version": CURRENT_SCHEMA_VERSION,
+            "persist_generations": 1
+        }))
+        .expect("minimal learned state");
+        state.persist(&path);
+        state.persist_generations = 2;
+        state.persist(&path);
+        std::fs::write(&path, "{truncated").expect("corrupt primary");
+
+        let recovered = LearnedState::load(&path).expect("previous checkpoint fallback");
+        assert_eq!(recovered.persist_generations, 1);
     }
 
     #[test]

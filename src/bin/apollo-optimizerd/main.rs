@@ -68,6 +68,7 @@ extern "C" fn handle_sigterm(_sig: libc::c_int) {
 
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::action_accumulator::{ActionAccumulator, ActionPhase, EmitContext};
+use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest};
 use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
 use apollo_engine::engine::amx_detector;
 use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
@@ -87,7 +88,6 @@ use apollo_engine::engine::daemon_helpers::{
     timeline_path, unfreeze_pids, unfreeze_pids_verified_outcome, wake_state_path,
     write_frozen_state, write_governor_state,
 };
-use apollo_engine::engine::execute_actions::execute_actions;
 use apollo_engine::engine::focus_markov::FocusMarkov;
 use apollo_engine::engine::foreground::{ForegroundDetector, ForegroundState};
 use apollo_engine::engine::gpu_manager::GPUManager;
@@ -2017,6 +2017,8 @@ fn main() -> anyhow::Result<()> {
                         reason_avg_ms: metrics.metrics.stage_reason_avg_ms,
                         memory_pressure: metrics.metrics.memory_pressure,
                         fluidity_degraded: metrics.metrics.fluidity_degraded,
+                        holt_winters_avg_ms: metrics.metrics.stage_reason_holtwinters_avg_ms,
+                        page_reclaim_avg_ms: metrics.metrics.stage_reason_pagereclaim_avg_ms,
                     }
                 };
                 let overhead_budget = overhead_governor.observe(overhead_input);
@@ -2030,6 +2032,12 @@ fn main() -> anyhow::Result<()> {
                         overhead_budget.optional_reason_budget_ms;
                     metrics.metrics.apollo_overhead_speculation_allowed =
                         overhead_budget.allow_speculation;
+                    metrics.metrics.apollo_overhead_sensor_interval_secs =
+                        overhead_budget.sensor_interval_secs;
+                    metrics.metrics.apollo_overhead_holt_cadence =
+                        overhead_budget.holt_winters.cadence;
+                    metrics.metrics.apollo_overhead_page_reclaim_cadence =
+                        overhead_budget.page_reclaim.cadence;
                     metrics.metrics.apollo_overhead_constrained_cycles = metrics
                         .metrics
                         .apollo_overhead_constrained_cycles
@@ -2037,6 +2045,7 @@ fn main() -> anyhow::Result<()> {
                             overhead_budget.level == adaptive_overhead::OverheadLevel::Constrained,
                         ));
                 }
+                smc_reader.set_interval(Duration::from_secs(overhead_budget.sensor_interval_secs));
 
                 // Adaptive snapshot: use lightweight path (no disk/net refresh) every cycle
                 // except for a governor-selected full-refresh heartbeat.
@@ -3584,22 +3593,25 @@ fn main() -> anyhow::Result<()> {
                 // tighten overflow_thresholds proactively.
                 // Extracted to daemon_holt_winters_tick::run_holt_winters_tick (Wave 30).
                 //
-                // 2026-05-12: stage budget watchdog. Under stress (cycle already
-                // > 150ms in REASON), skip the non-critical forecasting +
-                // page-reclaim + chromium ticks for THIS cycle. They tolerate
-                // a skipped cycle (forecaster accumulates samples, page-reclaim
-                // is gated on 10-cycle cadence anyway, chromium has its own
-                // internal grace). The critical path (Sense → Signal → Decide →
-                // Execute → Learn → Persist) always runs. [Hellerstein 2004 §9
-                // — saturation requires graceful degradation, not unbounded
-                // cycle latency that itself becomes a stressor].
-                let stage_budget_exceeded = _t_reason_start.elapsed().as_millis()
-                    > overhead_budget.optional_reason_budget_ms as u128;
-                if stage_budget_exceeded {
+                // Optional forecasting and page-reclaim have independent
+                // cadence/deadline budgets. Expensive lanes slow themselves
+                // without suppressing unrelated sensing or observability. The
+                // critical Sense -> Signal -> Decide -> Execute -> Learn ->
+                // Persist path always runs. [Hellerstein 2004 §9].
+                let holt_allowed = overhead_budget.admits(
+                    adaptive_overhead::OptionalSubsystem::HoltWinters,
+                    cycle_count,
+                    _t_reason_start.elapsed().as_millis(),
+                );
+                if !holt_allowed {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.apollo_overhead_optional_skips_total = metrics
                         .metrics
                         .apollo_overhead_optional_skips_total
+                        .saturating_add(1);
+                    metrics.metrics.apollo_overhead_holt_skips_total = metrics
+                        .metrics
+                        .apollo_overhead_holt_skips_total
                         .saturating_add(1);
                     // Sprint 13 perf: demoted INFO→DEBUG. ~4 k events in
                     // 6 h — fired whenever a reason stage cycle exceeded
@@ -3608,11 +3620,11 @@ fn main() -> anyhow::Result<()> {
                     // JSON formatting cost.
                     tracing::debug!(
                         elapsed_ms = _t_reason_start.elapsed().as_millis() as u64,
-                        "cycle: skipping HoltWinters/PageReclaim/Chromium (budget exceeded)"
+                        "cycle: skipping HoltWinters (subsystem budget)"
                     );
                 }
                 let _t_hw_start = Instant::now();
-                if !stage_budget_exceeded {
+                if holt_allowed {
                     daemon_holt_winters_tick::run_holt_winters_tick(
                         snapshot.pressure.memory_pressure,
                         hour_of_day,
@@ -3682,7 +3694,12 @@ fn main() -> anyhow::Result<()> {
                 // Jiang & Zhang 2005 — proactive beats reactive by 20-40%.
                 // Runs every 10 cycles (~5s) to avoid vm_stat overhead every cycle.
                 let _t_pr_start = Instant::now();
-                if cycle_count.is_multiple_of(10) && !stage_budget_exceeded {
+                let page_reclaim_allowed = overhead_budget.admits(
+                    adaptive_overhead::OptionalSubsystem::PageReclaim,
+                    cycle_count,
+                    _t_reason_start.elapsed().as_millis(),
+                );
+                if page_reclaim_allowed {
                     // snapshot.pressure.memory_pressure already includes battery
                     // + thermal boosts via effective_pressure::compute(). Don't add again.
                     // 2026-05-12: post-wake aggressive purge — when the wake
@@ -3712,6 +3729,16 @@ fn main() -> anyhow::Result<()> {
                         apollo_engine::engine::lse_counters::LSE_COUNTERS
                             .increment_paging_hints_applied();
                     }
+                } else if cycle_count.is_multiple_of(10) {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.apollo_overhead_optional_skips_total = metrics
+                        .metrics
+                        .apollo_overhead_optional_skips_total
+                        .saturating_add(1);
+                    metrics.metrics.apollo_overhead_page_reclaim_skips_total = metrics
+                        .metrics
+                        .apollo_overhead_page_reclaim_skips_total
+                        .saturating_add(1);
                 }
                 lf_metrics.record_stage(
                     apollo_engine::engine::lse_counters::CycleStage::ReasonPageReclaim,
@@ -4864,24 +4891,21 @@ fn main() -> anyhow::Result<()> {
                     let revert_actions = sysctl_governor.revert_to_defaults();
                     if !revert_actions.is_empty() {
                         let mut frozen_dummy = std::collections::HashSet::new();
-                        let outcomes = execute_actions(
-                            revert_actions,
-                            &caps,
-                            &journal_path,
-                            &mut frozen_dummy,
-                            &[],
-                            &[],
-                            None,
-                            dry_run,
-                            // No freeze actions in a sysctl-revert batch — pressure
-                            // is irrelevant here; pass 0.0 so the assertion gate stays armed.
-                            0.0,
-                            0.0,
-                            // Sysctl-only batch — no per-PID destructive actions, so
-                            // coalition guard is irrelevant.
-                            None,
-                            0.0, // cpu_pegged_fraction — sysctl path, no PID gate
-                        );
+                        let outcomes = ActuationBroker::from_runtime(&caps, dry_run)
+                            .execute(ActuationRequest {
+                                actions: revert_actions,
+                                caps: &caps,
+                                journal_path: &journal_path,
+                                frozen: &mut frozen_dummy,
+                                learned_protected: &[],
+                                learned_interactive: &[],
+                                qos_mgr: None,
+                                memory_pressure: 0.0,
+                                thrashing_score: 0.0,
+                                coalition_guard: None,
+                                cpu_pegged_fraction: 0.0,
+                            })
+                            .outcomes;
                         if outcomes.failures == 0 {
                             sysctl_governor.mark_reverted();
                         } else {
@@ -4998,7 +5022,7 @@ fn main() -> anyhow::Result<()> {
                         apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
                         _t_chrom_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                     );
-                } // close `else` from stage budget watchdog (chromium tick)
+                }
 
                 // F1: Causal attribution for velocity-anticipatory purges
                 // [Pearl 2009] interventional reasoning. Without this the
@@ -5438,30 +5462,57 @@ fn main() -> anyhow::Result<()> {
                     admitted
                 };
 
-                // Let mature workload-specific evidence advance proven response
-                // accelerators inside their own queue slots. This is ordering
-                // only: the WorldModel cannot manufacture or strengthen actions.
-                let (final_actions, world_model_priority) =
-                    daemon_dispatch_tick::prioritize_world_model_accelerators(
-                        final_actions,
-                        &world_model,
-                        workload_mode.as_str(),
-                    );
-                if world_model_priority.positive_total > 0 {
+                // Central intent planning: resolve contradictory same-process
+                // requests and rank equivalent accelerators using conservative
+                // World Model utility. Specialist safety gates still run again
+                // in dispatch immediately before root execution.
+                let (app_launching, fluidity_degraded) = {
+                    let metrics = state.metrics.lock_recover();
+                    (
+                        metrics.metrics.app_launching,
+                        metrics.metrics.fluidity_degraded,
+                    )
+                };
+                let (final_actions, plan_report) = daemon_dispatch_tick::plan_action_intents(
+                    final_actions,
+                    &world_model,
+                    workload_mode.as_str(),
+                    snapshot.pressure.memory_pressure,
+                    app_launching,
+                    fluidity_degraded,
+                );
+                {
                     let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.action_planner_proposed_total = metrics
+                        .metrics
+                        .action_planner_proposed_total
+                        .saturating_add(plan_report.proposed);
+                    metrics.metrics.action_planner_admitted_total = metrics
+                        .metrics
+                        .action_planner_admitted_total
+                        .saturating_add(plan_report.admitted);
+                    metrics.metrics.action_planner_conflict_drops_total = metrics
+                        .metrics
+                        .action_planner_conflict_drops_total
+                        .saturating_add(plan_report.conflict_drops);
+                    metrics.metrics.action_planner_reorders_total = metrics
+                        .metrics
+                        .action_planner_reorders_total
+                        .saturating_add(plan_report.reordered);
                     metrics.metrics.world_model_utility_promotions_total = metrics
                         .metrics
                         .world_model_utility_promotions_total
-                        .saturating_add(world_model_priority.positive_total);
+                        .saturating_add(plan_report.evidence_ranked);
                     metrics.metrics.world_model_utility_reorders_total = metrics
                         .metrics
                         .world_model_utility_reorders_total
-                        .saturating_add(world_model_priority.reordered_total);
-                    if let Some(influence) = world_model_priority.last_influence.as_ref() {
-                        daemon_dispatch_tick::record_world_model_influence(
-                            &mut metrics.metrics,
-                            influence,
-                        );
+                        .saturating_add(plan_report.reordered);
+                    metrics.metrics.world_model_family_prior_uses_total = metrics
+                        .metrics
+                        .world_model_family_prior_uses_total
+                        .saturating_add(plan_report.family_priors_used);
+                    if let Some(resolution) = plan_report.last_resolution {
+                        metrics.metrics.action_planner_last_resolution = resolution;
                     }
                 }
 
@@ -6373,21 +6424,21 @@ fn main() -> anyhow::Result<()> {
                 let revert_actions = sysctl_governor.revert_to_defaults();
                 if !revert_actions.is_empty() {
                     let mut frozen_dummy = HashSet::new();
-                    let outcomes = execute_actions(
-                        revert_actions,
-                        &caps,
-                        &journal_path,
-                        &mut frozen_dummy,
-                        &[],
-                        &[],
-                        None,
-                        dry_run,
-                        // Shutdown sysctl-revert batch — no freezes in here.
-                        0.0,
-                        0.0,
-                        None,
-                        0.0, // cpu_pegged_fraction
-                    );
+                    let outcomes = ActuationBroker::from_runtime(&caps, dry_run)
+                        .execute(ActuationRequest {
+                            actions: revert_actions,
+                            caps: &caps,
+                            journal_path: &journal_path,
+                            frozen: &mut frozen_dummy,
+                            learned_protected: &[],
+                            learned_interactive: &[],
+                            qos_mgr: None,
+                            memory_pressure: 0.0,
+                            thrashing_score: 0.0,
+                            coalition_guard: None,
+                            cpu_pegged_fraction: 0.0,
+                        })
+                        .outcomes;
                     if outcomes.failures == 0 {
                         sysctl_governor.mark_reverted();
                     } else {

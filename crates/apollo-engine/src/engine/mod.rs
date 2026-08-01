@@ -1,10 +1,12 @@
 pub mod ac_cache;
 pub mod action_accumulator;
+pub mod action_planner;
 pub mod action_policy;
 pub mod action_queue;
 pub mod action_types;
 pub mod active_coalition_envelope;
 pub mod activity_sensor;
+pub mod actuation_broker;
 pub mod adaptive_governor;
 pub mod adversarial_probe;
 pub mod analytics;
