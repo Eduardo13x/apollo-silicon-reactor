@@ -509,6 +509,20 @@ pub struct RuntimeMetrics {
     pub last_error: Option<String>,
     pub last_cycle_at: Option<DateTime<Utc>>,
     pub p95_cycle_ms: f64,
+    /// Adaptive self-overhead governor. Critical sensing, execution and
+    /// learning remain active; only optional refresh/speculation is shed.
+    #[serde(default)]
+    pub apollo_overhead_level: String,
+    #[serde(default)]
+    pub apollo_overhead_full_refresh_cadence: u64,
+    #[serde(default)]
+    pub apollo_overhead_reason_budget_ms: u64,
+    #[serde(default)]
+    pub apollo_overhead_speculation_allowed: bool,
+    #[serde(default)]
+    pub apollo_overhead_constrained_cycles: u64,
+    #[serde(default)]
+    pub apollo_overhead_optional_skips_total: u64,
     pub refresh_duration_ms: f64,
     pub memory_budget_duration_ms: f64,
     pub reactor_duration_ms: f64,
@@ -1460,6 +1474,19 @@ pub struct RuntimeMetrics {
     pub world_model_context_foreign_total: u64,
     #[serde(default)]
     pub world_model_context_coherence_total: u64,
+    /// Most frequently rejected numeric field since this daemon start.
+    #[serde(default)]
+    pub world_model_context_top_rejected_field: String,
+    #[serde(default)]
+    pub world_model_context_top_rejected_field_total: u64,
+    /// Most recent field-level validation failure. Non-finite values are
+    /// represented by `None` so runtime_metrics.json remains valid JSON.
+    #[serde(default)]
+    pub world_model_context_last_rejected_field: String,
+    #[serde(default)]
+    pub world_model_context_last_rejected_reason: String,
+    #[serde(default)]
+    pub world_model_context_last_rejected_value: Option<f64>,
     #[serde(default)]
     pub world_model_context_local_gold_total: u64,
     #[serde(default)]
@@ -1506,6 +1533,43 @@ pub struct RuntimeMetrics {
     /// responsiveness actions in the bounded dispatch queue.
     #[serde(default)]
     pub world_model_utility_promotions_total: u64,
+    /// Positive candidates that actually changed position in the queue.
+    #[serde(default)]
+    pub world_model_utility_reorders_total: u64,
+    #[serde(default)]
+    pub world_model_last_influence_kind: String,
+    #[serde(default)]
+    pub world_model_last_influence_action: String,
+    #[serde(default)]
+    pub world_model_last_influence_workload: String,
+    #[serde(default)]
+    pub world_model_last_influence_scope: String,
+    #[serde(default)]
+    pub world_model_last_influence_utility: f64,
+    #[serde(default)]
+    pub world_model_last_influence_lower_bound: f64,
+    #[serde(default)]
+    pub world_model_last_influence_upper_bound: f64,
+    #[serde(default)]
+    pub world_model_last_influence_evidence: f64,
+    #[serde(default)]
+    pub world_model_last_influence_quality: f64,
+    #[serde(default)]
+    pub world_model_last_influence_margin: f64,
+    #[serde(default)]
+    pub world_model_counterfactual_eligible_total: u64,
+    #[serde(default)]
+    pub world_model_counterfactual_issued_total: u64,
+    #[serde(default)]
+    pub world_model_counterfactual_pending_total: u64,
+    #[serde(default)]
+    pub world_model_counterfactual_resolved_total: u64,
+    #[serde(default)]
+    pub world_model_counterfactual_rejected_total: u64,
+    #[serde(default)]
+    pub world_model_counterfactual_would_help_total: u64,
+    #[serde(default)]
+    pub world_model_counterfactual_control_utility: f64,
     /// Gold-only world-model telemetry. Unlike process-local medallion totals,
     /// these counters describe the persisted evidence currently available for
     /// action imagination and vetoes.
@@ -1933,6 +1997,18 @@ pub struct RuntimeMetrics {
     pub markov_prediction_eta_secs: f64,
     #[serde(default)]
     pub markov_prewarm_eligible: bool,
+    /// Transition-local prewarm calibration. Quarantine suppresses only the
+    /// speculative accelerator; prediction learning continues normally.
+    #[serde(default)]
+    pub markov_prewarm_quarantined: bool,
+    #[serde(default)]
+    pub markov_prewarm_reliability: f64,
+    #[serde(default)]
+    pub markov_prewarm_quarantines_total: u64,
+    #[serde(default)]
+    pub markov_prewarm_quarantine_skips_total: u64,
+    #[serde(default)]
+    pub markov_prewarm_probes_total: u64,
 
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]

@@ -21,7 +21,7 @@ use apollo_engine::engine::cache_warmer::CacheWarmer;
 use apollo_engine::engine::coalition::CoalitionTracker;
 use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
-use apollo_engine::engine::focus_markov::FocusMarkov;
+use apollo_engine::engine::focus_markov::{FocusMarkov, PrewarmAdmission};
 use apollo_engine::engine::freeze_intelligence::FreezeIntelligence;
 use apollo_engine::engine::jetsam_control;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -49,6 +49,7 @@ pub struct MarkovPrewarmLease {
     activated: bool,
     activated_at: Option<Instant>,
     settle_recorded: bool,
+    calibration_probe: bool,
 }
 
 #[derive(Debug)]
@@ -112,7 +113,8 @@ pub fn run_markov_tick(
     let (cache_warm_allowed, fluidity_degraded, app_launching) = {
         let m = state.metrics.lock_recover();
         (
-            cache_warm_allowed_at(m.metrics.memory_pressure),
+            cache_warm_allowed_at(m.metrics.memory_pressure)
+                && m.metrics.apollo_overhead_speculation_allowed,
             m.metrics.fluidity_degraded,
             m.metrics.app_launching,
         )
@@ -150,6 +152,9 @@ pub fn run_markov_tick(
         .unwrap_or(LeaseResolution::Pending);
     match resolution {
         LeaseResolution::Hit => {
+            if let Some(lease) = markov_prewarm.as_ref() {
+                focus_markov.record_prewarm_outcome(&lease.source_app, &lease.predicted_app, true);
+            }
             if let Some(lease) = markov_prewarm.as_mut() {
                 lease.activated = true;
                 lease.activated_at = Some(now);
@@ -162,6 +167,26 @@ pub fn run_markov_tick(
         }
         LeaseResolution::Completed | LeaseResolution::Miss => {
             if resolution == LeaseResolution::Miss {
+                if let Some(lease) = markov_prewarm.as_ref() {
+                    let before =
+                        focus_markov.prewarm_admission(&lease.source_app, &lease.predicted_app);
+                    focus_markov.record_prewarm_outcome(
+                        &lease.source_app,
+                        &lease.predicted_app,
+                        false,
+                    );
+                    let after =
+                        focus_markov.prewarm_admission(&lease.source_app, &lease.predicted_app);
+                    let mut metrics = state.metrics.lock_recover();
+                    if before != PrewarmAdmission::Quarantined
+                        && after == PrewarmAdmission::Quarantined
+                    {
+                        metrics.metrics.markov_prewarm_quarantines_total = metrics
+                            .metrics
+                            .markov_prewarm_quarantines_total
+                            .saturating_add(1);
+                    }
+                }
                 *markov_miss_count += 1;
                 state.metrics.lock_recover().metrics.markov_prewarm_misses += 1;
             }
@@ -188,17 +213,31 @@ pub fn run_markov_tick(
 
     // ── Markov observe + predicted-app pre-warm ──────────────────────────────
     let markov_prediction = focus_markov.observe(foreground_app);
+    let mut markov_acceleration_allowed = false;
     if let Some(ref pred) = markov_prediction {
         let elapsed = focus_markov.elapsed_dwell_secs();
         let time_to_switch = pred.avg_dwell_secs - elapsed;
-        let prewarm_eligible =
+        let source_app = foreground_app.unwrap_or_default();
+        let admission = focus_markov.prewarm_admission(source_app, &pred.app_name);
+        let base_eligible =
             prewarm_window_open(pred.probability, time_to_switch, cache_warm_allowed);
+        let prewarm_eligible = base_eligible && admission.allows_acceleration();
+        markov_acceleration_allowed = admission.allows_acceleration() && cache_warm_allowed;
         {
             let mut metrics = state.metrics.lock_recover();
             metrics.metrics.markov_prediction_app = pred.app_name.clone();
             metrics.metrics.markov_prediction_confidence = pred.probability;
             metrics.metrics.markov_prediction_eta_secs = time_to_switch;
             metrics.metrics.markov_prewarm_eligible = prewarm_eligible;
+            metrics.metrics.markov_prewarm_quarantined = admission == PrewarmAdmission::Quarantined;
+            metrics.metrics.markov_prewarm_reliability =
+                focus_markov.prewarm_reliability(source_app, &pred.app_name);
+            if base_eligible && admission == PrewarmAdmission::Quarantined {
+                metrics.metrics.markov_prewarm_quarantine_skips_total = metrics
+                    .metrics
+                    .markov_prewarm_quarantine_skips_total
+                    .saturating_add(1);
+            }
         }
 
         if markov_prewarm.is_none() && prewarm_eligible {
@@ -234,9 +273,12 @@ pub fn run_markov_tick(
                     activated: false,
                     activated_at: None,
                     settle_recorded: false,
+                    calibration_probe: admission == PrewarmAdmission::Probe,
                 });
                 let mut metrics = state.metrics.lock_recover();
                 metrics.metrics.markov_prewarm_attempts += 1;
+                metrics.metrics.markov_prewarm_probes_total +=
+                    u64::from(admission == PrewarmAdmission::Probe);
                 metrics.metrics.markov_prewarm_applied += u64::from(applied);
                 metrics.metrics.markov_prewarm_active = true;
                 metrics.metrics.markov_prewarm_members = members_applied as u32;
@@ -265,13 +307,15 @@ pub fn run_markov_tick(
         metrics.metrics.markov_prediction_confidence = 0.0;
         metrics.metrics.markov_prediction_eta_secs = 0.0;
         metrics.metrics.markov_prewarm_eligible = false;
+        metrics.metrics.markov_prewarm_quarantined = false;
+        metrics.metrics.markov_prewarm_reliability = 1.0;
     }
 
     // ── Universal pre-thaw: FocusMarkov → pre-thaw ALL frozen processes ──────
     // whose category matches the hint for the predicted next app.
     // [Altmann & Trafton 2002] Pre-activate resources before predicted task switch.
     if let Some(ref pred) = markov_prediction {
-        if pred.probability >= 0.35 {
+        if pred.probability >= 0.35 && markov_acceleration_allowed {
             let elapsed = focus_markov.elapsed_dwell_secs();
             let time_to_switch = pred.avg_dwell_secs - elapsed;
             if time_to_switch > -5.0 && time_to_switch < 10.0 {
@@ -625,6 +669,7 @@ pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
     let mut deferred_effects = 0u64;
     let member_count = lease.members.len();
     let cache_bytes = lease.cache_bytes;
+    let calibration_probe = lease.calibration_probe;
     for member in lease.members {
         if member.jetsam_applied {
             let effect = apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
@@ -703,6 +748,7 @@ pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
     tracing::debug!(
         member_count,
         cache_bytes,
+        calibration_probe,
         reverted,
         deferred_effects,
         "markov: released coalition lease"
@@ -745,6 +791,7 @@ mod tests {
             activated,
             activated_at: activated.then(Instant::now),
             settle_recorded: false,
+            calibration_probe: false,
         }
     }
 

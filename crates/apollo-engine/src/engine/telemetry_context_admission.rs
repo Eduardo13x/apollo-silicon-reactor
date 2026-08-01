@@ -49,6 +49,224 @@ pub enum ContextReason {
     UnknownHardware = 10,
 }
 
+impl ContextReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NonFinite => "non_finite",
+            Self::OutOfRange => "out_of_range",
+            Self::InvalidIdentity => "invalid_identity",
+            Self::Stale => "stale",
+            Self::FutureTimestamp => "future_timestamp",
+            Self::Temporal => "temporal",
+            Self::ForeignHardware => "foreign_hardware",
+            Self::Coherence => "coherence",
+            Self::RequiredCollector => "required_collector",
+            Self::UnknownInstallation => "unknown_installation",
+            Self::UnknownHardware => "unknown_hardware",
+        }
+    }
+}
+
+/// Closed field vocabulary for numeric context admission. A u64 bitset keeps
+/// per-snapshot diagnostics allocation-free while still allowing the medallion
+/// to aggregate each offending sensor independently.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[repr(u8)]
+pub enum ContextField {
+    MemoryPressure,
+    MemoryPressureRaw,
+    CompressorPressure,
+    CpuGlobalUsage,
+    CpuMeanBusy,
+    CpuMaxBusy,
+    CpuPeggedFraction,
+    StallFraction,
+    UsedRamFraction,
+    ThermalScore,
+    FluidityScore,
+    TopProcessCpu,
+    WindowserverCpuFraction,
+    SignalPressureSmooth,
+    SignalPOom30s,
+    SignalUrgency,
+    SignalEntropyAnomaly,
+    SignalTransformerAnomaly,
+    ArousalLevel,
+    MarkovPredictionConfidence,
+    PressureTotalBoost,
+    SignalPressureVelocity,
+    SwapDeltaBytesPerSec,
+    NaturalDrift,
+    NarsDriftScore,
+    ThrashingScore,
+    RefaultDeltaPerSec,
+    NetworkRetransmitsPerK,
+    NetworkListenDropRate,
+    MarkovPredictionEtaSecs,
+    UserIdleSecs,
+    PClusterTempC,
+    EClusterTempC,
+    GpuTempC,
+    NandTempC,
+    PackageWatts,
+    CpuWatts,
+    GpuWatts,
+    DramWatts,
+    AneWatts,
+    PClusterUtil,
+    EClusterUtil,
+    AneUtilPct,
+    BatteryWatts,
+    BatteryPercent,
+}
+
+impl ContextField {
+    pub const ALL: [Self; 45] = [
+        Self::MemoryPressure,
+        Self::MemoryPressureRaw,
+        Self::CompressorPressure,
+        Self::CpuGlobalUsage,
+        Self::CpuMeanBusy,
+        Self::CpuMaxBusy,
+        Self::CpuPeggedFraction,
+        Self::StallFraction,
+        Self::UsedRamFraction,
+        Self::ThermalScore,
+        Self::FluidityScore,
+        Self::TopProcessCpu,
+        Self::WindowserverCpuFraction,
+        Self::SignalPressureSmooth,
+        Self::SignalPOom30s,
+        Self::SignalUrgency,
+        Self::SignalEntropyAnomaly,
+        Self::SignalTransformerAnomaly,
+        Self::ArousalLevel,
+        Self::MarkovPredictionConfidence,
+        Self::PressureTotalBoost,
+        Self::SignalPressureVelocity,
+        Self::SwapDeltaBytesPerSec,
+        Self::NaturalDrift,
+        Self::NarsDriftScore,
+        Self::ThrashingScore,
+        Self::RefaultDeltaPerSec,
+        Self::NetworkRetransmitsPerK,
+        Self::NetworkListenDropRate,
+        Self::MarkovPredictionEtaSecs,
+        Self::UserIdleSecs,
+        Self::PClusterTempC,
+        Self::EClusterTempC,
+        Self::GpuTempC,
+        Self::NandTempC,
+        Self::PackageWatts,
+        Self::CpuWatts,
+        Self::GpuWatts,
+        Self::DramWatts,
+        Self::AneWatts,
+        Self::PClusterUtil,
+        Self::EClusterUtil,
+        Self::AneUtilPct,
+        Self::BatteryWatts,
+        Self::BatteryPercent,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::MemoryPressure => "memory_pressure",
+            Self::MemoryPressureRaw => "memory_pressure_raw",
+            Self::CompressorPressure => "compressor_pressure",
+            Self::CpuGlobalUsage => "cpu_global_usage",
+            Self::CpuMeanBusy => "cpu_mean_busy",
+            Self::CpuMaxBusy => "cpu_max_busy",
+            Self::CpuPeggedFraction => "cpu_pegged_fraction",
+            Self::StallFraction => "stall_fraction",
+            Self::UsedRamFraction => "used_ram_fraction",
+            Self::ThermalScore => "thermal_score",
+            Self::FluidityScore => "fluidity_score",
+            Self::TopProcessCpu => "top_process_cpu",
+            Self::WindowserverCpuFraction => "windowserver_cpu_fraction",
+            Self::SignalPressureSmooth => "signal_pressure_smooth",
+            Self::SignalPOom30s => "signal_p_oom_30s",
+            Self::SignalUrgency => "signal_urgency",
+            Self::SignalEntropyAnomaly => "signal_entropy_anomaly",
+            Self::SignalTransformerAnomaly => "signal_transformer_anomaly",
+            Self::ArousalLevel => "arousal_level",
+            Self::MarkovPredictionConfidence => "markov_prediction_confidence",
+            Self::PressureTotalBoost => "pressure_total_boost",
+            Self::SignalPressureVelocity => "signal_pressure_velocity",
+            Self::SwapDeltaBytesPerSec => "swap_delta_bytes_per_sec",
+            Self::NaturalDrift => "natural_drift",
+            Self::NarsDriftScore => "nars_drift_score",
+            Self::ThrashingScore => "thrashing_score",
+            Self::RefaultDeltaPerSec => "refault_delta_per_sec",
+            Self::NetworkRetransmitsPerK => "network_retransmits_per_k",
+            Self::NetworkListenDropRate => "network_listen_drop_rate",
+            Self::MarkovPredictionEtaSecs => "markov_prediction_eta_secs",
+            Self::UserIdleSecs => "user_idle_secs",
+            Self::PClusterTempC => "p_cluster_temp_c",
+            Self::EClusterTempC => "e_cluster_temp_c",
+            Self::GpuTempC => "gpu_temp_c",
+            Self::NandTempC => "nand_temp_c",
+            Self::PackageWatts => "package_watts",
+            Self::CpuWatts => "cpu_watts",
+            Self::GpuWatts => "gpu_watts",
+            Self::DramWatts => "dram_watts",
+            Self::AneWatts => "ane_watts",
+            Self::PClusterUtil => "p_cluster_util",
+            Self::EClusterUtil => "e_cluster_util",
+            Self::AneUtilPct => "ane_util_pct",
+            Self::BatteryWatts => "battery_watts",
+            Self::BatteryPercent => "battery_percent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct ContextFieldSet(u64);
+
+impl ContextFieldSet {
+    fn insert(&mut self, field: ContextField) {
+        self.0 |= 1_u64 << field as u8;
+    }
+
+    pub fn contains(self, field: ContextField) -> bool {
+        self.0 & (1_u64 << field as u8) != 0
+    }
+
+    pub fn iter(self) -> impl Iterator<Item = ContextField> {
+        ContextField::ALL
+            .into_iter()
+            .filter(move |field| self.contains(*field))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ContextFieldViolation {
+    pub field: ContextField,
+    pub reason: ContextReason,
+    pub value: f64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ValidationDiagnostics {
+    fields: ContextFieldSet,
+    primary: Option<ContextFieldViolation>,
+}
+
+impl ValidationDiagnostics {
+    fn record(&mut self, field: ContextField, reason: ContextReason, value: f64) {
+        self.fields.insert(field);
+        if self.primary.is_none() {
+            self.primary = Some(ContextFieldViolation {
+                field,
+                reason,
+                value,
+            });
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ContextReasonSet(u16);
@@ -100,6 +318,8 @@ pub struct ContextAdmission {
     pub hardware_regime: HardwareRegime,
     pub installation_id: InstallationId,
     pub local_epoch: bool,
+    pub violating_fields: ContextFieldSet,
+    pub primary_violation: Option<ContextFieldViolation>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -187,9 +407,10 @@ pub fn classify(input: ContextAdmissionInput<'_>) -> ContextAdmission {
     let context = input.context;
     let hardware_regime = HardwareRegime::from_context(context);
     let mut reasons = ContextReasonSet::default();
+    let mut diagnostics = ValidationDiagnostics::default();
 
-    validate_required_numbers(context, &mut reasons);
-    validate_optional_numbers(context, &mut reasons);
+    validate_required_numbers(context, &mut reasons, &mut diagnostics);
+    validate_optional_numbers(context, &mut reasons, &mut diagnostics);
     validate_identity(context, &mut reasons);
     validate_coherence(context, hardware_regime, &mut reasons);
     validate_time(&input, &mut reasons);
@@ -242,103 +463,166 @@ pub fn classify(input: ContextAdmissionInput<'_>) -> ContextAdmission {
         hardware_regime,
         installation_id: input.installation_id,
         local_epoch: input.local_epoch,
+        violating_fields: diagnostics.fields,
+        primary_violation: diagnostics.primary,
     }
 }
 
-fn validate_required_numbers(context: &TelemetryContextSummary, reasons: &mut ContextReasonSet) {
+fn validate_required_numbers(
+    context: &TelemetryContextSummary,
+    reasons: &mut ContextReasonSet,
+    diagnostics: &mut ValidationDiagnostics,
+) {
     let fractions = [
-        context.memory_pressure,
-        context.memory_pressure_raw,
-        context.compressor_pressure,
-        context.cpu_global_usage,
-        context.cpu_mean_busy,
-        context.cpu_max_busy,
-        context.cpu_pegged_fraction,
-        context.stall_fraction,
-        context.used_ram_fraction,
-        context.thermal_score,
-        context.fluidity_score,
-        context.top_process_cpu,
-        context.windowserver_cpu_fraction,
-        context.signal_pressure_smooth,
-        context.signal_p_oom_30s,
-        context.signal_urgency,
-        context.signal_entropy_anomaly,
-        context.signal_transformer_anomaly,
-        context.arousal_level,
-        context.markov_prediction_confidence,
+        (ContextField::MemoryPressure, context.memory_pressure),
+        (ContextField::MemoryPressureRaw, context.memory_pressure_raw),
+        (
+            ContextField::CompressorPressure,
+            context.compressor_pressure,
+        ),
+        (ContextField::CpuGlobalUsage, context.cpu_global_usage),
+        (ContextField::CpuMeanBusy, context.cpu_mean_busy),
+        (ContextField::CpuMaxBusy, context.cpu_max_busy),
+        (ContextField::CpuPeggedFraction, context.cpu_pegged_fraction),
+        (ContextField::StallFraction, context.stall_fraction),
+        (ContextField::UsedRamFraction, context.used_ram_fraction),
+        (ContextField::ThermalScore, context.thermal_score),
+        (ContextField::FluidityScore, context.fluidity_score),
+        (ContextField::TopProcessCpu, context.top_process_cpu),
+        (
+            ContextField::WindowserverCpuFraction,
+            context.windowserver_cpu_fraction,
+        ),
+        (
+            ContextField::SignalPressureSmooth,
+            context.signal_pressure_smooth,
+        ),
+        (ContextField::SignalPOom30s, context.signal_p_oom_30s),
+        (ContextField::SignalUrgency, context.signal_urgency),
+        (
+            ContextField::SignalEntropyAnomaly,
+            context.signal_entropy_anomaly,
+        ),
+        (
+            ContextField::SignalTransformerAnomaly,
+            context.signal_transformer_anomaly,
+        ),
+        (ContextField::ArousalLevel, context.arousal_level),
+        (
+            ContextField::MarkovPredictionConfidence,
+            context.markov_prediction_confidence,
+        ),
     ];
-    for value in fractions {
-        finite_range(value, 0.0, 1.0, reasons);
+    for (field, value) in fractions {
+        finite_range(field, value, 0.0, 1.0, reasons, diagnostics);
     }
     finite_range(
+        ContextField::PressureTotalBoost,
         context.pressure_total_boost,
         0.0,
         MAX_PRESSURE_TOTAL_BOOST,
         reasons,
+        diagnostics,
     );
 
     let signed = [
-        context.signal_pressure_velocity,
-        context.swap_delta_bytes_per_sec,
-        context.natural_drift,
-        context.nars_drift_score,
+        (
+            ContextField::SignalPressureVelocity,
+            context.signal_pressure_velocity,
+        ),
+        (
+            ContextField::SwapDeltaBytesPerSec,
+            context.swap_delta_bytes_per_sec,
+        ),
+        (ContextField::NaturalDrift, context.natural_drift),
+        (ContextField::NarsDriftScore, context.nars_drift_score),
     ];
-    for value in signed {
-        finite(value, reasons);
+    for (field, value) in signed {
+        finite(field, value, reasons, diagnostics);
     }
 
     let non_negative = [
-        context.thrashing_score,
-        context.refault_delta_per_sec,
-        context.network_retransmits_per_k,
-        context.network_listen_drop_rate,
-        context.markov_prediction_eta_secs,
-        context.user_idle_secs,
+        (ContextField::ThrashingScore, context.thrashing_score),
+        (
+            ContextField::RefaultDeltaPerSec,
+            context.refault_delta_per_sec,
+        ),
+        (
+            ContextField::NetworkRetransmitsPerK,
+            context.network_retransmits_per_k,
+        ),
+        (
+            ContextField::NetworkListenDropRate,
+            context.network_listen_drop_rate,
+        ),
+        (
+            ContextField::MarkovPredictionEtaSecs,
+            context.markov_prediction_eta_secs,
+        ),
+        (ContextField::UserIdleSecs, context.user_idle_secs),
     ];
-    for value in non_negative {
-        finite_min(value, 0.0, reasons);
+    for (field, value) in non_negative {
+        finite_min(field, value, 0.0, reasons, diagnostics);
     }
 }
 
-fn validate_optional_numbers(context: &TelemetryContextSummary, reasons: &mut ContextReasonSet) {
-    for value in [
-        context.p_cluster_temp_c,
-        context.e_cluster_temp_c,
-        context.gpu_temp_c,
-        context.nand_temp_c,
+fn validate_optional_numbers(
+    context: &TelemetryContextSummary,
+    reasons: &mut ContextReasonSet,
+    diagnostics: &mut ValidationDiagnostics,
+) {
+    for (field, value) in [
+        (ContextField::PClusterTempC, context.p_cluster_temp_c),
+        (ContextField::EClusterTempC, context.e_cluster_temp_c),
+        (ContextField::GpuTempC, context.gpu_temp_c),
+        (ContextField::NandTempC, context.nand_temp_c),
     ]
     .into_iter()
-    .flatten()
+    .filter_map(|(field, value)| value.map(|value| (field, value)))
     {
-        finite_range(value, MIN_TEMP_C, MAX_TEMP_C, reasons);
+        finite_range(field, value, MIN_TEMP_C, MAX_TEMP_C, reasons, diagnostics);
     }
-    for value in [
-        context.package_watts,
-        context.cpu_watts,
-        context.gpu_watts,
-        context.dram_watts,
-        context.ane_watts,
+    for (field, value) in [
+        (ContextField::PackageWatts, context.package_watts),
+        (ContextField::CpuWatts, context.cpu_watts),
+        (ContextField::GpuWatts, context.gpu_watts),
+        (ContextField::DramWatts, context.dram_watts),
+        (ContextField::AneWatts, context.ane_watts),
     ]
     .into_iter()
-    .flatten()
+    .filter_map(|(field, value)| value.map(|value| (field, value)))
     {
-        finite_range(value, 0.0, MAX_COMPONENT_WATTS, reasons);
+        finite_range(field, value, 0.0, MAX_COMPONENT_WATTS, reasons, diagnostics);
     }
-    for value in [context.p_cluster_util, context.e_cluster_util]
-        .into_iter()
-        .flatten()
+    for (field, value) in [
+        (ContextField::PClusterUtil, context.p_cluster_util),
+        (ContextField::EClusterUtil, context.e_cluster_util),
+    ]
+    .into_iter()
+    .filter_map(|(field, value)| value.map(|value| (field, value)))
     {
-        finite_range(value, 0.0, 100.0, reasons);
+        finite_range(field, value, 0.0, 100.0, reasons, diagnostics);
     }
     if let Some(value) = context.ane_util_pct {
-        finite_range(value, 0.0, 100.0, reasons);
+        finite_range(
+            ContextField::AneUtilPct,
+            value,
+            0.0,
+            100.0,
+            reasons,
+            diagnostics,
+        );
     }
     if let Some(value) = context.battery_watts {
-        finite(value, reasons);
+        finite(ContextField::BatteryWatts, value, reasons, diagnostics);
     }
     if context.battery_percent.is_some_and(|value| value > 100) {
         reasons.insert(ContextReason::OutOfRange);
+        diagnostics.record(
+            ContextField::BatteryPercent,
+            ContextReason::OutOfRange,
+            context.battery_percent.unwrap_or_default() as f64,
+        );
     }
 }
 
@@ -406,25 +690,48 @@ fn validate_time(input: &ContextAdmissionInput<'_>, reasons: &mut ContextReasonS
     }
 }
 
-fn finite(value: f64, reasons: &mut ContextReasonSet) {
+fn finite(
+    field: ContextField,
+    value: f64,
+    reasons: &mut ContextReasonSet,
+    diagnostics: &mut ValidationDiagnostics,
+) {
     if !value.is_finite() {
         reasons.insert(ContextReason::NonFinite);
+        diagnostics.record(field, ContextReason::NonFinite, value);
     }
 }
 
-fn finite_min(value: f64, min: f64, reasons: &mut ContextReasonSet) {
+fn finite_min(
+    field: ContextField,
+    value: f64,
+    min: f64,
+    reasons: &mut ContextReasonSet,
+    diagnostics: &mut ValidationDiagnostics,
+) {
     if !value.is_finite() {
         reasons.insert(ContextReason::NonFinite);
+        diagnostics.record(field, ContextReason::NonFinite, value);
     } else if value < min {
         reasons.insert(ContextReason::OutOfRange);
+        diagnostics.record(field, ContextReason::OutOfRange, value);
     }
 }
 
-fn finite_range(value: f64, min: f64, max: f64, reasons: &mut ContextReasonSet) {
+fn finite_range(
+    field: ContextField,
+    value: f64,
+    min: f64,
+    max: f64,
+    reasons: &mut ContextReasonSet,
+    diagnostics: &mut ValidationDiagnostics,
+) {
     if !value.is_finite() {
         reasons.insert(ContextReason::NonFinite);
+        diagnostics.record(field, ContextReason::NonFinite, value);
     } else if !(min..=max).contains(&value) {
         reasons.insert(ContextReason::OutOfRange);
+        diagnostics.record(field, ContextReason::OutOfRange, value);
     }
 }
 
@@ -617,7 +924,31 @@ mod tests {
         );
 
         context.pressure_total_boost = MAX_PRESSURE_TOTAL_BOOST + 0.01;
-        assert_rejected(context, ContextReason::OutOfRange);
+        let admission = classify_live(&context);
+        assert_eq!(admission.tier, ContextTier::Rejected);
+        assert!(admission.reasons.contains(ContextReason::OutOfRange));
+        assert_eq!(
+            admission.primary_violation.map(|violation| violation.field),
+            Some(ContextField::PressureTotalBoost)
+        );
+        assert!(admission
+            .violating_fields
+            .contains(ContextField::PressureTotalBoost));
+    }
+
+    #[test]
+    fn reports_each_invalid_numeric_field_without_growing_storage() {
+        let mut context = clean_context();
+        context.memory_pressure = 1.01;
+        context.gpu_watts = Some(f64::NAN);
+
+        let admission = classify_live(&context);
+
+        assert!(admission
+            .violating_fields
+            .contains(ContextField::MemoryPressure));
+        assert!(admission.violating_fields.contains(ContextField::GpuWatts));
+        assert_eq!(std::mem::size_of::<ContextFieldSet>(), 8);
     }
 
     #[test]

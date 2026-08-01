@@ -39,6 +39,17 @@ const MAX_TRACKED_APPS: usize = 100;
 /// Maximum transition targets per source app.
 const MAX_TARGETS_PER_SOURCE: usize = 30;
 
+const PREWARM_MIN_TRIALS: u32 = 5;
+const PREWARM_QUARANTINE_THRESHOLD: f64 = 0.35;
+const PREWARM_RECOVERY_THRESHOLD: f64 = 0.40;
+const PREWARM_OUTCOME_ALPHA: f64 = 0.25;
+const PREWARM_PROBE_BASE_TRANSITIONS: u64 = 16;
+const PREWARM_MAX_BACKOFF_SHIFT: u8 = 4;
+
+fn default_prewarm_reliability() -> f64 {
+    1.0
+}
+
 // ── Data structures ──────────────────────────────────────────────────────────
 
 /// Statistics for a single A→B transition.
@@ -49,6 +60,18 @@ pub struct TransitionStats {
     /// Sum of dwell times in the source app before this transition (seconds).
     /// Used to compute average time before switching to this target.
     pub total_dwell_secs: f64,
+    /// Outcome calibration for the speculative accelerator only. Transition
+    /// probabilities continue learning even while acceleration is quarantined.
+    #[serde(default)]
+    pub prewarm_trials: u32,
+    #[serde(default)]
+    pub prewarm_hits: u32,
+    #[serde(default = "default_prewarm_reliability")]
+    pub prewarm_reliability: f64,
+    #[serde(default)]
+    pub prewarm_quarantine_until_transition: u64,
+    #[serde(default)]
+    pub prewarm_backoff_level: u8,
 }
 
 impl TransitionStats {
@@ -56,6 +79,11 @@ impl TransitionStats {
         Self {
             count: 1,
             total_dwell_secs: dwell_secs,
+            prewarm_trials: 0,
+            prewarm_hits: 0,
+            prewarm_reliability: default_prewarm_reliability(),
+            prewarm_quarantine_until_transition: 0,
+            prewarm_backoff_level: 0,
         }
     }
 
@@ -66,6 +94,19 @@ impl TransitionStats {
         } else {
             0.0
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrewarmAdmission {
+    Ready,
+    Probe,
+    Quarantined,
+}
+
+impl PrewarmAdmission {
+    pub fn allows_acceleration(self) -> bool {
+        !matches!(self, Self::Quarantined)
     }
 }
 
@@ -279,6 +320,79 @@ impl FocusMarkov {
         self.state.transitions.len()
     }
 
+    /// Admission for one source→target speculative acceleration. A poor pair
+    /// is isolated without suppressing the Markov prediction itself or other
+    /// transitions, and receives exponentially spaced probes after quarantine.
+    pub fn prewarm_admission(&self, source: &str, target: &str) -> PrewarmAdmission {
+        let Some(stats) = self
+            .state
+            .transitions
+            .get(source)
+            .and_then(|targets| targets.get(target))
+        else {
+            return PrewarmAdmission::Ready;
+        };
+        if stats.prewarm_trials < PREWARM_MIN_TRIALS
+            || stats.prewarm_reliability >= PREWARM_RECOVERY_THRESHOLD
+            || stats.prewarm_quarantine_until_transition == 0
+        {
+            PrewarmAdmission::Ready
+        } else if self.state.total_transitions >= stats.prewarm_quarantine_until_transition {
+            PrewarmAdmission::Probe
+        } else {
+            PrewarmAdmission::Quarantined
+        }
+    }
+
+    pub fn prewarm_reliability(&self, source: &str, target: &str) -> f64 {
+        self.state
+            .transitions
+            .get(source)
+            .and_then(|targets| targets.get(target))
+            .map(|stats| stats.prewarm_reliability.clamp(0.0, 1.0))
+            .unwrap_or(1.0)
+    }
+
+    /// Feed a resolved acceleration lease back into its transition-local
+    /// calibration. This does not alter transition probabilities.
+    pub fn record_prewarm_outcome(&mut self, source: &str, target: &str, hit: bool) {
+        let admission_before = self.prewarm_admission(source, target);
+        let total_transitions = self.state.total_transitions;
+        let Some(stats) = self
+            .state
+            .transitions
+            .get_mut(source)
+            .and_then(|targets| targets.get_mut(target))
+        else {
+            return;
+        };
+
+        stats.prewarm_trials = stats.prewarm_trials.saturating_add(1);
+        stats.prewarm_hits = stats.prewarm_hits.saturating_add(u32::from(hit));
+        let observed = f64::from(hit);
+        stats.prewarm_reliability = (PREWARM_OUTCOME_ALPHA * observed
+            + (1.0 - PREWARM_OUTCOME_ALPHA) * stats.prewarm_reliability)
+            .clamp(0.0, 1.0);
+
+        if hit && stats.prewarm_reliability >= PREWARM_RECOVERY_THRESHOLD {
+            stats.prewarm_quarantine_until_transition = 0;
+            stats.prewarm_backoff_level = stats.prewarm_backoff_level.saturating_sub(1);
+        } else if stats.prewarm_trials >= PREWARM_MIN_TRIALS
+            && stats.prewarm_reliability < PREWARM_QUARANTINE_THRESHOLD
+        {
+            if admission_before == PrewarmAdmission::Probe {
+                stats.prewarm_backoff_level = stats
+                    .prewarm_backoff_level
+                    .saturating_add(1)
+                    .min(PREWARM_MAX_BACKOFF_SHIFT);
+            }
+            let backoff =
+                PREWARM_PROBE_BASE_TRANSITIONS.saturating_mul(1_u64 << stats.prewarm_backoff_level);
+            stats.prewarm_quarantine_until_transition = total_transitions.saturating_add(backoff);
+        }
+        self.dirty = true;
+    }
+
     /// How long the current foreground app has been in focus (seconds).
     /// Returns 0.0 if no foreground app has been observed yet.
     pub fn elapsed_dwell_secs(&self) -> f64 {
@@ -365,6 +479,60 @@ mod tests {
             pred.probability > 0.5 && pred.probability < 0.7,
             "probability should be ~0.6, got {}",
             pred.probability
+        );
+    }
+
+    #[test]
+    fn repeated_prewarm_misses_quarantine_only_that_transition() {
+        let mut m = test_markov();
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), TransitionStats::new(5.0))]),
+        );
+        m.state.transitions.insert(
+            "Safari".to_string(),
+            HashMap::from([("Mail".to_string(), TransitionStats::new(5.0))]),
+        );
+
+        for _ in 0..5 {
+            m.record_prewarm_outcome("Finder", "Terminal", false);
+        }
+
+        assert_eq!(
+            m.prewarm_admission("Finder", "Terminal"),
+            PrewarmAdmission::Quarantined
+        );
+        assert_eq!(
+            m.prewarm_admission("Safari", "Mail"),
+            PrewarmAdmission::Ready
+        );
+    }
+
+    #[test]
+    fn quarantined_transition_gets_a_spaced_probe_and_can_recover() {
+        let mut m = test_markov();
+        m.state.total_transitions = 100;
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), TransitionStats::new(5.0))]),
+        );
+        for _ in 0..5 {
+            m.record_prewarm_outcome("Finder", "Terminal", false);
+        }
+        assert_eq!(
+            m.prewarm_admission("Finder", "Terminal"),
+            PrewarmAdmission::Quarantined
+        );
+
+        m.state.total_transitions += PREWARM_PROBE_BASE_TRANSITIONS;
+        assert_eq!(
+            m.prewarm_admission("Finder", "Terminal"),
+            PrewarmAdmission::Probe
+        );
+        m.record_prewarm_outcome("Finder", "Terminal", true);
+        assert_eq!(
+            m.prewarm_admission("Finder", "Terminal"),
+            PrewarmAdmission::Ready
         );
     }
 
@@ -526,6 +694,7 @@ mod tests {
         let stats = TransitionStats {
             count: 4,
             total_dwell_secs: 100.0,
+            ..TransitionStats::new(0.0)
         };
         assert!((stats.avg_dwell_secs() - 25.0).abs() < 1e-9);
     }
@@ -535,6 +704,7 @@ mod tests {
         let stats = TransitionStats {
             count: 0,
             total_dwell_secs: 0.0,
+            ..TransitionStats::new(0.0)
         };
         assert_eq!(stats.avg_dwell_secs(), 0.0);
     }

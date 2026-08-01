@@ -71,6 +71,17 @@ fn publish_world_model_metrics(
     metrics.world_model_context_temporal_total = context.temporal_total;
     metrics.world_model_context_foreign_total = context.foreign_total;
     metrics.world_model_context_coherence_total = context.coherence_total;
+    metrics.world_model_context_top_rejected_field = context
+        .top_rejected_field
+        .map(|field| field.as_str().to_string())
+        .unwrap_or_default();
+    metrics.world_model_context_top_rejected_field_total = context.top_rejected_field_total;
+    if let Some(violation) = context.last_field_violation {
+        metrics.world_model_context_last_rejected_field = violation.field.as_str().to_string();
+        metrics.world_model_context_last_rejected_reason = violation.reason.as_str().to_string();
+        metrics.world_model_context_last_rejected_value =
+            violation.value.is_finite().then_some(violation.value);
+    }
     metrics.world_model_context_local_gold_total = context.local_gold_total;
     metrics.world_model_context_current_tier = context.current_tier.as_str().to_string();
     metrics.world_model_context_authority_phase =
@@ -86,6 +97,14 @@ fn publish_world_model_metrics(
     metrics.world_model_actuator_expired_total = context.actuator_expired_total;
     metrics.world_model_actuator_quality = context.actuator_mean_quality;
     metrics.world_model_actuator_mean_utility = context.actuator_mean_utility;
+    metrics.world_model_counterfactual_issued_total = context.controlled_holdout_issued_total;
+    metrics.world_model_counterfactual_pending_total = context.controlled_holdout_pending_total;
+    metrics.world_model_counterfactual_resolved_total = context.controlled_holdout_resolved_total;
+    metrics.world_model_counterfactual_rejected_total = context.controlled_holdout_rejected_total;
+    metrics.world_model_counterfactual_would_help_total =
+        context.controlled_holdout_would_help_total;
+    metrics.world_model_counterfactual_control_utility =
+        context.controlled_holdout_mean_control_utility;
     metrics.world_model_actuator_known_models = world_model.utility_known_actions() as u64;
     metrics.world_model_actuator_ready_models = world_model.utility_ready_actions() as u64;
     metrics.world_model_actuator_families = telemetry_medallion

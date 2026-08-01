@@ -6,6 +6,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod adaptive_overhead;
 /// Global stop flag for signal handlers (SIGTERM/SIGINT).
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
@@ -1429,6 +1430,7 @@ fn main() -> anyhow::Result<()> {
             // Reused across cycles. Its internal revisions avoid rebuilding
             // unchanged causal and actuator maps on the daemon hot path.
             let mut world_model = apollo_engine::engine::world_model::WorldModel::default();
+            let mut overhead_governor = adaptive_overhead::AdaptiveOverheadGovernor::default();
             // Feed-forward pressure relief counter [Hellerstein 2004].
             // Set to N when tabs close / heavy app terminates; decrements each cycle.
             // While > 0, reactor_weight is reduced (anticipate pressure drop).
@@ -2008,13 +2010,41 @@ fn main() -> anyhow::Result<()> {
                     power_mgr.is_on_battery(),
                 );
 
+                let overhead_input = {
+                    let metrics = state.metrics.lock_recover();
+                    adaptive_overhead::OverheadInput {
+                        p95_cycle_ms: metrics.metrics.p95_cycle_ms,
+                        reason_avg_ms: metrics.metrics.stage_reason_avg_ms,
+                        memory_pressure: metrics.metrics.memory_pressure,
+                        fluidity_degraded: metrics.metrics.fluidity_degraded,
+                    }
+                };
+                let overhead_budget = overhead_governor.observe(overhead_input);
+                {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.apollo_overhead_level =
+                        overhead_budget.level.as_str().to_string();
+                    metrics.metrics.apollo_overhead_full_refresh_cadence =
+                        overhead_budget.full_refresh_cadence;
+                    metrics.metrics.apollo_overhead_reason_budget_ms =
+                        overhead_budget.optional_reason_budget_ms;
+                    metrics.metrics.apollo_overhead_speculation_allowed =
+                        overhead_budget.allow_speculation;
+                    metrics.metrics.apollo_overhead_constrained_cycles = metrics
+                        .metrics
+                        .apollo_overhead_constrained_cycles
+                        .saturating_add(u64::from(
+                            overhead_budget.level == adaptive_overhead::OverheadLevel::Constrained,
+                        ));
+                }
+
                 // Adaptive snapshot: use lightweight path (no disk/net refresh) every cycle
-                // except a full-refresh heartbeat every 30 cycles (~15s).
+                // except for a governor-selected full-refresh heartbeat.
                 // Disk/network data from sysinfo is not consumed on the hot path — the
                 // network monitor and sysctl governor read directly from sysctl/netstat.
                 // Dropping the pressure gate removes ~15-25ms of disk/net I/O at 0.70+ pressure
                 // where the old 0.40 threshold never fired anyway.
-                let use_light = !cycle_count.is_multiple_of(30);
+                let use_light = !cycle_count.is_multiple_of(overhead_budget.full_refresh_cadence);
                 let (mut snapshot, refresh_duration) = if dry_run && use_light {
                     collector.collect_snapshot_no_process_refresh()
                 } else if use_light {
@@ -3563,8 +3593,14 @@ fn main() -> anyhow::Result<()> {
                 // Execute → Learn → Persist) always runs. [Hellerstein 2004 §9
                 // — saturation requires graceful degradation, not unbounded
                 // cycle latency that itself becomes a stressor].
-                let stage_budget_exceeded = _t_reason_start.elapsed().as_millis() > 150;
+                let stage_budget_exceeded = _t_reason_start.elapsed().as_millis()
+                    > overhead_budget.optional_reason_budget_ms as u128;
                 if stage_budget_exceeded {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.apollo_overhead_optional_skips_total = metrics
+                        .metrics
+                        .apollo_overhead_optional_skips_total
+                        .saturating_add(1);
                     // Sprint 13 perf: demoted INFO→DEBUG. ~4 k events in
                     // 6 h — fired whenever a reason stage cycle exceeded
                     // 150 ms. Stage_reason_max_ms in runtime_metrics
@@ -5405,18 +5441,28 @@ fn main() -> anyhow::Result<()> {
                 // Let mature workload-specific evidence advance proven response
                 // accelerators inside their own queue slots. This is ordering
                 // only: the WorldModel cannot manufacture or strengthen actions.
-                let (final_actions, world_model_promotions) =
+                let (final_actions, world_model_priority) =
                     daemon_dispatch_tick::prioritize_world_model_accelerators(
                         final_actions,
                         &world_model,
                         workload_mode.as_str(),
                     );
-                if world_model_promotions > 0 {
+                if world_model_priority.positive_total > 0 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.world_model_utility_promotions_total = metrics
                         .metrics
                         .world_model_utility_promotions_total
-                        .saturating_add(world_model_promotions);
+                        .saturating_add(world_model_priority.positive_total);
+                    metrics.metrics.world_model_utility_reorders_total = metrics
+                        .metrics
+                        .world_model_utility_reorders_total
+                        .saturating_add(world_model_priority.reordered_total);
+                    if let Some(influence) = world_model_priority.last_influence.as_ref() {
+                        daemon_dispatch_tick::record_world_model_influence(
+                            &mut metrics.metrics,
+                            influence,
+                        );
+                    }
                 }
 
                 // Priority action queue: buffer this cycle's decided actions and
@@ -5460,7 +5506,7 @@ fn main() -> anyhow::Result<()> {
                 // remains visible after the inner block closes (where the
                 // record_stage call lives).
                 let _t_execute_start_outer;
-                let (mut exec_outcomes, causal_qos_upgrades) = {
+                let (mut exec_outcomes, causal_qos_upgrades, counterfactual_holdouts) = {
                     use daemon_dispatch_tick::{run_dispatch_tick, DispatchTickInput};
                     // Build the coalition guard: tracker + envelope are owned
                     // long-lived in this scope; the guard is a thin borrow
@@ -5496,10 +5542,29 @@ fn main() -> anyhow::Result<()> {
                             .pegged_fraction,
                         world_model: &world_model,
                         workload: workload_mode.as_str(),
+                        cycle_count,
                     });
-                    (output.outcomes, output.causal_qos_upgrades)
+                    (
+                        output.outcomes,
+                        output.causal_qos_upgrades,
+                        output.counterfactual_holdouts,
+                    )
                 };
                 causal_qos_upgrades_cycle += causal_qos_upgrades;
+
+                for holdout in &counterfactual_holdouts {
+                    if telemetry_medallion.issue_controlled_holdout(
+                        &holdout.action,
+                        workload_mode.as_str(),
+                        cycle_count,
+                    ) {
+                        tracing::debug!(
+                            action_key = %holdout.action_key,
+                            workload = workload_mode.as_str(),
+                            "world model opened a controlled no-action arm"
+                        );
+                    }
+                }
 
                 // Warn limits are already a real, non-fatal kernel intervention.
                 // Until now they bypassed the execution audit, so OutcomeTracker

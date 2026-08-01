@@ -184,16 +184,83 @@ fn utility_model_vetoes(
     action: &RootAction,
     world_model: &apollo_engine::engine::world_model::WorldModel,
     workload: &str,
-) -> Option<String> {
+) -> Option<WorldModelInfluence> {
     if !apollo_engine::engine::telemetry_medallion::utility_veto_eligible(action) {
         return None;
     }
     let key = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)?;
+    let assessment = world_model.assess_utility(&key, workload)?;
     matches!(
-        world_model.imagine_utility(&key, workload),
+        assessment.verdict,
         apollo_engine::engine::world_model::UtilityImagined::DoNothingDominates { .. }
     )
-    .then_some(key)
+    .then(|| WorldModelInfluence::from_assessment("veto", key, workload, assessment))
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorldModelInfluence {
+    pub kind: String,
+    pub action_key: String,
+    pub workload: String,
+    pub scope: String,
+    pub utility: f64,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub evidence: f64,
+    pub quality: f64,
+    pub margin: f64,
+}
+
+impl WorldModelInfluence {
+    fn from_assessment(
+        kind: &str,
+        action_key: String,
+        workload: &str,
+        assessment: apollo_engine::engine::world_model::UtilityAssessment,
+    ) -> Self {
+        let margin = match assessment.verdict {
+            apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => margin,
+            apollo_engine::engine::world_model::UtilityImagined::DoNothingDominates {
+                predicted_utility,
+            } => predicted_utility,
+            apollo_engine::engine::world_model::UtilityImagined::Unknown => 0.0,
+        };
+        Self {
+            kind: kind.to_string(),
+            action_key,
+            workload: workload.to_string(),
+            scope: assessment.scope.as_str().to_string(),
+            utility: assessment.utility_ema,
+            lower_bound: assessment.lower_bound,
+            upper_bound: assessment.upper_bound,
+            evidence: assessment.effective_evidence,
+            quality: assessment.quality,
+            margin,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorldModelPriorityReport {
+    pub positive_total: u64,
+    pub reordered_total: u64,
+    pub last_influence: Option<WorldModelInfluence>,
+}
+
+pub fn record_world_model_influence(
+    metrics: &mut apollo_engine::engine::types::RuntimeMetrics,
+    influence: &WorldModelInfluence,
+) {
+    metrics.world_model_last_influence_kind = influence.kind.clone();
+    metrics.world_model_last_influence_action = influence.action_key.clone();
+    metrics.world_model_last_influence_workload = influence.workload.clone();
+    metrics.world_model_last_influence_scope = influence.scope.clone();
+    metrics.world_model_last_influence_utility = influence.utility;
+    metrics.world_model_last_influence_lower_bound = influence.lower_bound;
+    metrics.world_model_last_influence_upper_bound = influence.upper_bound;
+    metrics.world_model_last_influence_evidence = influence.evidence;
+    metrics.world_model_last_influence_quality = influence.quality;
+    metrics.world_model_last_influence_margin = influence.margin;
 }
 
 /// Move proven responsiveness actions ahead of exploratory accelerators before
@@ -209,8 +276,12 @@ pub fn prioritize_world_model_accelerators(
     mut actions: Vec<RootAction>,
     world_model: &apollo_engine::engine::world_model::WorldModel,
     workload: &str,
-) -> (Vec<RootAction>, u64) {
-    let mut ranked: Vec<(usize, f64)> = actions
+) -> (Vec<RootAction>, WorldModelPriorityReport) {
+    let mut ranked: Vec<(
+        usize,
+        apollo_engine::engine::world_model::UtilityAssessment,
+        String,
+    )> = actions
         .iter()
         .enumerate()
         .filter_map(|(index, action)| {
@@ -218,9 +289,10 @@ pub fn prioritize_world_model_accelerators(
                 return None;
             }
             let key = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)?;
-            match world_model.imagine_utility(&key, workload) {
-                apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => {
-                    Some((index, margin))
+            let assessment = world_model.assess_utility(&key, workload)?;
+            match assessment.verdict {
+                apollo_engine::engine::world_model::UtilityImagined::ActWins { .. } => {
+                    Some((index, assessment, key))
                 }
                 _ => None,
             }
@@ -228,7 +300,7 @@ pub fn prioritize_world_model_accelerators(
         .collect();
 
     if ranked.is_empty() {
-        return (actions, 0);
+        return (actions, WorldModelPriorityReport::default());
     }
 
     // Keep the candidate set small and stable: only the existing accelerator
@@ -239,33 +311,81 @@ pub fn prioritize_world_model_accelerators(
         .filter_map(|(index, action)| is_responsiveness_accelerator(action).then_some(index))
         .collect();
     ranked.sort_by(|left, right| {
-        right
-            .1
-            .total_cmp(&left.1)
+        let left_margin = match left.1.verdict {
+            apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => margin,
+            _ => 0.0,
+        };
+        let right_margin = match right.1.verdict {
+            apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => margin,
+            _ => 0.0,
+        };
+        right_margin
+            .total_cmp(&left_margin)
             .then_with(|| left.0.cmp(&right.0))
     });
 
     let mut ordered_accelerators: Vec<RootAction> = ranked
         .iter()
-        .map(|(index, _)| actions[*index].clone())
+        .map(|(index, _, _)| actions[*index].clone())
         .collect();
-    let proven_indexes: HashSet<usize> = ranked.iter().map(|(index, _)| *index).collect();
+    let proven_indexes: HashSet<usize> = ranked.iter().map(|(index, _, _)| *index).collect();
     ordered_accelerators.extend(
         accelerator_slots
             .iter()
             .filter(|index| !proven_indexes.contains(index))
             .map(|index| actions[*index].clone()),
     );
+    let reordered_total = ranked
+        .iter()
+        .zip(accelerator_slots.iter())
+        .filter(|((source, _, _), destination)| source != *destination)
+        .count() as u64;
     for (slot, action) in accelerator_slots.into_iter().zip(ordered_accelerators) {
         actions[slot] = action;
     }
 
-    (actions, ranked.len() as u64)
+    let influence_kind = if reordered_total > 0 {
+        "reorder"
+    } else {
+        "promote"
+    };
+    let last_influence = ranked.first().map(|(_, assessment, key)| {
+        WorldModelInfluence::from_assessment(influence_kind, key.clone(), workload, *assessment)
+    });
+    (
+        actions,
+        WorldModelPriorityReport {
+            positive_total: ranked.len() as u64,
+            reordered_total,
+            last_influence,
+        },
+    )
 }
 
 fn is_responsiveness_accelerator(action: &RootAction) -> bool {
     matches!(action, RootAction::BoostProcess { .. })
         || matches!(action, RootAction::SetThreadQoS { tier, .. } if tier == "interactive")
+}
+
+const CONTROLLED_HOLDOUT_MODULUS: u64 = 64;
+
+fn controlled_holdout_slot(cycle: u64, action_key: &str) -> bool {
+    let hash = action_key
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            hash.wrapping_mul(0x100_0000_01b3) ^ byte as u64
+        });
+    (hash ^ cycle).is_multiple_of(CONTROLLED_HOLDOUT_MODULUS)
+}
+
+fn controlled_holdout_safe(pressure: f64, app_launching: bool, fluidity_degraded: bool) -> bool {
+    pressure.is_finite() && pressure < 0.55 && !app_launching && !fluidity_degraded
+}
+
+#[derive(Debug, Clone)]
+pub struct CounterfactualHoldout {
+    pub action: RootAction,
+    pub action_key: String,
 }
 
 /// Input dependencies for the dispatch tick.
@@ -297,6 +417,7 @@ pub struct DispatchTickInput<'a> {
     /// Mature Gold-only utility predictions for discretionary actuators.
     pub world_model: &'a apollo_engine::engine::world_model::WorldModel,
     pub workload: &'a str,
+    pub cycle_count: u64,
 }
 
 /// Output results from the dispatch tick.
@@ -308,6 +429,7 @@ pub struct DispatchTickOutput {
     /// downstream observers (Phase 6 self-healing layer) in future.
     #[allow(dead_code)]
     pub dedup_stats: DedupStats,
+    pub counterfactual_holdouts: Vec<CounterfactualHoldout>,
 }
 
 /// Runs the dispatch and execution orchestration logic.
@@ -330,6 +452,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         cpu_pegged_fraction,
         world_model,
         workload,
+        cycle_count,
     } = input;
 
     // ── Filter pipeline ──────────────────────────────────────────────────────
@@ -350,10 +473,12 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     // and recovery remain governed by their specialist safety paths. An
     // immature model always abstains, so this cannot starve exploration.
     let mut utility_vetoes = 0_u64;
+    let mut last_utility_veto = None;
     filtered_actions.retain(|action| {
-        if let Some(key) = utility_model_vetoes(action, world_model, workload) {
+        if let Some(influence) = utility_model_vetoes(action, world_model, workload) {
             utility_vetoes = utility_vetoes.saturating_add(1);
-            tracing::debug!(action_key = %key, workload, "world model vetoed low-utility action");
+            tracing::debug!(action_key = %influence.action_key, workload, "world model vetoed low-utility action");
+            last_utility_veto = Some(influence);
             false
         } else {
             true
@@ -365,8 +490,10 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             .metrics
             .world_model_utility_vetoes_total
             .saturating_add(utility_vetoes);
+        if let Some(influence) = last_utility_veto.as_ref() {
+            record_world_model_influence(&mut metrics.metrics, influence);
+        }
     }
-
     // ── Per-PID dedup chokepoint ─────────────────────────────────────────────
     // Single consolidation pass before execute_actions. 14 upstream emission
     // paths (decide_actions, daemon_paging_hints, daemon_agent_actions,
@@ -437,6 +564,63 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
                 );
             }
         }
+    }
+
+    // A tiny deterministic control arm for mature, positive accelerators.
+    // Selection happens after dedup and every predictive gate so withholding
+    // one action cannot be defeated by an equivalent duplicate downstream.
+    let (app_launching, fluidity_degraded, speculation_allowed) = {
+        let metrics = state.metrics.lock_recover();
+        (
+            metrics.metrics.app_launching,
+            metrics.metrics.fluidity_degraded,
+            metrics.metrics.apollo_overhead_speculation_allowed,
+        )
+    };
+    let holdout_safe = !cb_is_open
+        && speculation_allowed
+        && controlled_holdout_safe(
+            snapshot.pressure.memory_pressure,
+            app_launching,
+            fluidity_degraded,
+        );
+    let mut counterfactual_holdouts = Vec::with_capacity(1);
+    let mut counterfactual_eligible = 0_u64;
+    if holdout_safe {
+        filtered_actions.retain(|action| {
+            if !counterfactual_holdouts.is_empty() || !is_responsiveness_accelerator(action) {
+                return true;
+            }
+            let Some(key) = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)
+            else {
+                return true;
+            };
+            let Some(assessment) = world_model.assess_utility(&key, workload) else {
+                return true;
+            };
+            if !matches!(
+                assessment.verdict,
+                apollo_engine::engine::world_model::UtilityImagined::ActWins { .. }
+            ) {
+                return true;
+            }
+            counterfactual_eligible = counterfactual_eligible.saturating_add(1);
+            if !controlled_holdout_slot(cycle_count, &key) {
+                return true;
+            }
+            counterfactual_holdouts.push(CounterfactualHoldout {
+                action: action.clone(),
+                action_key: key,
+            });
+            false
+        });
+    }
+    if counterfactual_eligible > 0 {
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.world_model_counterfactual_eligible_total = metrics
+            .metrics
+            .world_model_counterfactual_eligible_total
+            .saturating_add(counterfactual_eligible);
     }
 
     // ── Circuit breaker + execute_actions ────────────────────
@@ -567,6 +751,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         outcomes,
         causal_qos_upgrades,
         dedup_stats,
+        counterfactual_holdouts,
     }
 }
 
@@ -784,6 +969,7 @@ mod tests {
             cpu_pegged_fraction: 0.0,
             world_model: &world_model,
             workload: "idle",
+            cycle_count: 1,
         };
 
         let output = run_dispatch_tick(input);
@@ -1096,7 +1282,9 @@ mod tests {
         });
 
         assert_eq!(
-            utility_model_vetoes(&boost(100), &model, "idle").as_deref(),
+            utility_model_vetoes(&boost(100), &model, "idle")
+                .as_ref()
+                .map(|influence| influence.action_key.as_str()),
             Some("boost:p100")
         );
         assert!(utility_model_vetoes(&throttle(100), &model, "idle").is_none());
@@ -1156,13 +1344,20 @@ mod tests {
             },
         });
 
-        let (actions, promoted) = prioritize_world_model_accelerators(
+        let (actions, report) = prioritize_world_model_accelerators(
             vec![boost(100), freeze(900), boost(200)],
             &model,
             "build",
         );
 
-        assert_eq!(promoted, 1);
+        assert_eq!(report.positive_total, 1);
+        assert_eq!(report.reordered_total, 1);
+        let influence = report.last_influence.expect("reorder must be explained");
+        assert_eq!(influence.kind, "reorder");
+        assert_eq!(influence.action_key, "boost:p200");
+        assert_eq!(influence.scope, "workload");
+        assert!(influence.evidence >= 10.0);
+        assert!(influence.lower_bound > 0.0);
         assert!(matches!(
             actions[0],
             RootAction::BoostProcess { pid: 200, .. }
@@ -1175,5 +1370,85 @@ mod tests {
             actions[2],
             RootAction::BoostProcess { pid: 100, .. }
         ));
+    }
+
+    #[test]
+    fn mature_positive_utility_reports_promotion_without_reordering() {
+        use apollo_engine::engine::telemetry_medallion::{
+            ActionModelStats, HardwareRegime, TelemetryContextSummary, TelemetryMedallionMetrics,
+            TrustedTelemetryView,
+        };
+        use apollo_engine::engine::world_model::WorldModel;
+
+        let installation_id = apollo_engine::engine::installation_identity::InstallationId(1);
+        let now_unix = chrono::Utc::now().timestamp();
+        let context = TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            cpu_core_count: 10,
+            p_core_count: 4,
+            e_core_count: 6,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let action_models = [(
+            "build|boost:p200".to_string(),
+            ActionModelStats {
+                observations: 12,
+                effective_observations: 10,
+                utility_ema: 0.08,
+                evidence_mass: 12.0,
+                utility_variance_ema: 0.0001,
+                quality_ema: 0.95,
+                last_cycle: 100,
+                last_observed_unix: now_unix,
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+                installation_id,
+            },
+        )]
+        .into_iter()
+        .collect();
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id,
+            action_models: &action_models,
+            action_models_revision: 1,
+            metrics: TelemetryMedallionMetrics {
+                bronze_total: 1,
+                gold_total: 1,
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        let (actions, report) =
+            prioritize_world_model_accelerators(vec![boost(200), boost(100)], &model, "build");
+
+        assert_eq!(report.positive_total, 1);
+        assert_eq!(report.reordered_total, 0);
+        let influence = report.last_influence.expect("promotion must be explained");
+        assert_eq!(influence.kind, "promote");
+        assert_eq!(influence.action_key, "boost:p200");
+        assert!(influence.lower_bound > 0.0);
+        assert!(matches!(
+            actions[0],
+            RootAction::BoostProcess { pid: 200, .. }
+        ));
+    }
+
+    #[test]
+    fn controlled_holdout_is_sparse_deterministic_and_health_gated() {
+        let selected = (0..CONTROLLED_HOLDOUT_MODULUS)
+            .filter(|cycle| controlled_holdout_slot(*cycle, "boost:p200"))
+            .count();
+        assert_eq!(selected, 1);
+        assert!(controlled_holdout_safe(0.30, false, false));
+        assert!(!controlled_holdout_safe(0.55, false, false));
+        assert!(!controlled_holdout_safe(0.30, true, false));
+        assert!(!controlled_holdout_safe(0.30, false, true));
     }
 }

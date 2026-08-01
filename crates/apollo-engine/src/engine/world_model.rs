@@ -89,6 +89,35 @@ pub enum UtilityImagined {
     Unknown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UtilityEvidenceScope {
+    Workload,
+    Aggregate,
+}
+
+impl UtilityEvidenceScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Workload => "workload",
+            Self::Aggregate => "aggregate",
+        }
+    }
+}
+
+/// Evidence behind one utility-space verdict. This is intentionally a small
+/// value object so callers can explain a real decision without exposing the
+/// medallion's private installation identity or copying model state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UtilityAssessment {
+    pub verdict: UtilityImagined,
+    pub scope: UtilityEvidenceScope,
+    pub utility_ema: f64,
+    pub lower_bound: f64,
+    pub upper_bound: f64,
+    pub effective_evidence: f64,
+    pub quality: f64,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelAuthorityPhase {
@@ -346,19 +375,31 @@ impl WorldModel {
     /// used. Family aggregates are deliberately not allowed to veto an unseen
     /// target: a new app or thread must retain an exploration path.
     pub fn imagine_utility(&self, action_key: &str, workload: &str) -> UtilityImagined {
+        self.assess_utility(action_key, workload)
+            .map(|assessment| assessment.verdict)
+            .unwrap_or(UtilityImagined::Unknown)
+    }
+
+    pub fn assess_utility(&self, action_key: &str, workload: &str) -> Option<UtilityAssessment> {
         let Some(now_unix) = self.latest_context.as_ref().map(|ctx| ctx.timestamp_unix) else {
-            return UtilityImagined::Unknown;
+            return None;
         };
         let workload_key = format!("{workload}|{action_key}");
         // Prefer same-workload evidence only when it is mature. An immature
         // contextual bucket must not hide a mature aggregate model.
         let selected = [
-            self.utility_predicted.get(&workload_key),
-            self.utility_predicted.get(action_key),
+            (
+                UtilityEvidenceScope::Workload,
+                self.utility_predicted.get(&workload_key),
+            ),
+            (
+                UtilityEvidenceScope::Aggregate,
+                self.utility_predicted.get(action_key),
+            ),
         ]
         .into_iter()
-        .flatten()
-        .find(|stats| {
+        .filter_map(|(scope, stats)| stats.map(|stats| (scope, stats)))
+        .find(|(_, stats)| {
             utility_model_ready(
                 stats,
                 now_unix,
@@ -366,15 +407,15 @@ impl WorldModel {
                 self.current_installation_id,
             )
         });
-        let Some(stats) = selected else {
-            return UtilityImagined::Unknown;
+        let Some((scope, stats)) = selected else {
+            return None;
         };
         let effective_evidence = stats.effective_evidence_at(now_unix);
         let standard_error =
             (stats.utility_variance_ema.max(UTILITY_VARIANCE_FLOOR) / effective_evidence).sqrt();
         let lower = stats.utility_ema - UTILITY_CONFIDENCE_Z * standard_error;
         let upper = stats.utility_ema + UTILITY_CONFIDENCE_Z * standard_error;
-        if lower > DOMINANCE_MARGIN {
+        let verdict = if lower > DOMINANCE_MARGIN {
             UtilityImagined::ActWins {
                 margin: lower - DOMINANCE_MARGIN,
             }
@@ -384,7 +425,16 @@ impl WorldModel {
             }
         } else {
             UtilityImagined::Unknown
-        }
+        };
+        Some(UtilityAssessment {
+            verdict,
+            scope,
+            utility_ema: stats.utility_ema,
+            lower_bound: lower,
+            upper_bound: upper,
+            effective_evidence,
+            quality: stats.quality_ema,
+        })
     }
 
     pub fn utility_known_actions(&self) -> usize {

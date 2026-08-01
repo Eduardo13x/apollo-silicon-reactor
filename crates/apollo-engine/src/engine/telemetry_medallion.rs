@@ -21,7 +21,8 @@ use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::predictive_agent::Intervention;
 use crate::engine::signal_intelligence::SignalDigest;
 use crate::engine::telemetry_context_admission::{
-    classify, ContextAdmission, ContextAdmissionInput, ContextReasonCounters, ContextTier,
+    classify, ContextAdmission, ContextAdmissionInput, ContextField, ContextFieldViolation,
+    ContextReasonCounters, ContextTier,
 };
 use crate::engine::types::{CapabilityReport, RootAction, RuntimeMetrics};
 use chrono::Utc;
@@ -29,6 +30,9 @@ use chrono::Utc;
 const MAX_PENDING_ACTIONS: usize = 192;
 const MAX_RECENT_EVIDENCE: usize = 64;
 const MAX_ACTION_MODELS: usize = 256;
+const MAX_PENDING_CONTROLLED_HOLDOUTS: usize = 32;
+const MAX_CONTROLLED_MODELS: usize = 256;
+const CONTROLLED_HOLDOUT_HORIZON_CYCLES: u64 = 30;
 const ACTION_MODEL_EMA_ALPHA: f64 = 0.20;
 const ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
 const ACTION_MODEL_EVIDENCE_CAP: f64 = 64.0;
@@ -193,6 +197,29 @@ pub struct ActionModelStats {
     pub hardware_regime: HardwareRegime,
     /// Decision authority is local to one private Apollo installation.
     pub installation_id: InstallationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct ControlledCounterfactualStats {
+    pub observations: u32,
+    pub would_have_helped: u32,
+    /// Utility change observed while the selected action was deliberately
+    /// withheld. Negative means the no-action branch degraded.
+    pub control_utility_ema: f64,
+    pub quality_ema: f64,
+    pub last_cycle: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingControlledHoldout {
+    action_key: String,
+    workload: String,
+    family: ActuatorFamily,
+    objective: ActuatorObjective,
+    issued_cycle: u64,
+    family_issued_total_at_start: u64,
+    before: TelemetryContextSummary,
 }
 
 impl ActionModelStats {
@@ -460,6 +487,9 @@ pub struct TelemetryMedallionMetrics {
     pub temporal_total: u64,
     pub foreign_total: u64,
     pub coherence_total: u64,
+    pub top_rejected_field: Option<ContextField>,
+    pub top_rejected_field_total: u64,
+    pub last_field_violation: Option<ContextFieldViolation>,
     pub current_tier: ContextTier,
     pub mean_quality: f64,
     pub gold_rate: f64,
@@ -474,6 +504,12 @@ pub struct TelemetryMedallionMetrics {
     pub actuator_mean_quality: f64,
     pub actuator_mean_utility: f64,
     pub actuator_ready_models: u64,
+    pub controlled_holdout_issued_total: u64,
+    pub controlled_holdout_pending_total: u64,
+    pub controlled_holdout_resolved_total: u64,
+    pub controlled_holdout_rejected_total: u64,
+    pub controlled_holdout_would_help_total: u64,
+    pub controlled_holdout_mean_control_utility: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -532,6 +568,16 @@ pub struct TelemetryMedallionPersisted {
     pub actuator_utility_sum: f64,
     #[serde(default)]
     pub no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
+    #[serde(default)]
+    pub controlled_models: BTreeMap<String, ControlledCounterfactualStats>,
+    #[serde(default)]
+    pub controlled_holdout_issued_total: u64,
+    #[serde(default)]
+    pub controlled_holdout_resolved_total: u64,
+    #[serde(default)]
+    pub controlled_holdout_rejected_total: u64,
+    #[serde(default)]
+    pub controlled_holdout_pending_total: u64,
 }
 
 #[derive(Debug)]
@@ -542,6 +588,8 @@ pub struct TelemetryMedallion {
     consecutive_gold: u32,
     local_gold_total: u64,
     reason_counters: ContextReasonCounters,
+    field_rejection_counters: BTreeMap<ContextField, u64>,
+    last_field_violation: Option<ContextFieldViolation>,
     bronze_total: u64,
     silver_total: u64,
     gold_total: u64,
@@ -567,6 +615,11 @@ pub struct TelemetryMedallion {
     actuator_quality_sum: f64,
     actuator_utility_sum: f64,
     no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
+    pending_controlled_holdouts: VecDeque<PendingControlledHoldout>,
+    controlled_models: BTreeMap<String, ControlledCounterfactualStats>,
+    controlled_holdout_issued_total: u64,
+    controlled_holdout_resolved_total: u64,
+    controlled_holdout_rejected_total: u64,
 }
 
 impl Default for TelemetryMedallion {
@@ -578,6 +631,8 @@ impl Default for TelemetryMedallion {
             consecutive_gold: 0,
             local_gold_total: 0,
             reason_counters: ContextReasonCounters::default(),
+            field_rejection_counters: BTreeMap::new(),
+            last_field_violation: None,
             bronze_total: 0,
             silver_total: 0,
             gold_total: 0,
@@ -603,6 +658,11 @@ impl Default for TelemetryMedallion {
             actuator_quality_sum: 0.0,
             actuator_utility_sum: 0.0,
             no_action_delta_ema: BTreeMap::new(),
+            pending_controlled_holdouts: VecDeque::new(),
+            controlled_models: BTreeMap::new(),
+            controlled_holdout_issued_total: 0,
+            controlled_holdout_resolved_total: 0,
+            controlled_holdout_rejected_total: 0,
         }
     }
 }
@@ -668,6 +728,17 @@ impl TelemetryMedallion {
             .filter(|trace| trace.applied)
             .map(|trace| &trace.intended_action)
             .collect();
+        let applied_families: Vec<ActuatorFamily> = applied_root_actions
+            .iter()
+            .filter_map(|action| action_spec(action).map(|spec| spec.family))
+            .collect();
+        self.resolve_controlled_holdouts(
+            &summary,
+            cycle,
+            purge_recent,
+            &applied_families,
+            admission.quality,
+        );
         let external_deltas = self.external_deltas(runtime);
         let resolved_this_cycle = self.resolve_pending(
             &summary,
@@ -796,6 +867,13 @@ impl TelemetryMedallion {
 
     fn record_admission(&mut self, admission: ContextAdmission) {
         self.reason_counters.record(admission.reasons);
+        for field in admission.violating_fields.iter() {
+            let counter = self.field_rejection_counters.entry(field).or_default();
+            *counter = counter.saturating_add(1);
+        }
+        if let Some(violation) = admission.primary_violation {
+            self.last_field_violation = Some(violation);
+        }
         match admission.tier {
             ContextTier::Rejected => {
                 self.rejected_total = self.rejected_total.saturating_add(1);
@@ -810,6 +888,128 @@ impl TelemetryMedallion {
                 self.gold_total = self.gold_total.saturating_add(1);
             }
         }
+    }
+
+    /// Register a safe, dispatcher-selected control arm. The action is not
+    /// executed; its next Gold context becomes targeted no-action evidence.
+    pub fn issue_controlled_holdout(
+        &mut self,
+        action: &RootAction,
+        workload: &str,
+        cycle: u64,
+    ) -> bool {
+        if self.current_tier != ContextTier::Gold {
+            return false;
+        }
+        let Some(before) = self.latest.clone() else {
+            return false;
+        };
+        let Some(spec) = action_spec(action) else {
+            return false;
+        };
+        if !matches!(
+            spec.family,
+            ActuatorFamily::Boost | ActuatorFamily::ThreadQos
+        ) {
+            return false;
+        }
+        if self.pending_controlled_holdouts.len() >= MAX_PENDING_CONTROLLED_HOLDOUTS {
+            self.pending_controlled_holdouts.pop_front();
+            self.controlled_holdout_rejected_total =
+                self.controlled_holdout_rejected_total.saturating_add(1);
+        }
+        self.pending_controlled_holdouts
+            .push_back(PendingControlledHoldout {
+                action_key: spec.action_key,
+                workload: bounded_text(workload, 64),
+                family: spec.family,
+                objective: spec.objective,
+                issued_cycle: cycle,
+                family_issued_total_at_start: self
+                    .family_stats
+                    .get(&spec.family)
+                    .map(|stats| stats.issued_total)
+                    .unwrap_or(0),
+                before,
+            });
+        self.controlled_holdout_issued_total =
+            self.controlled_holdout_issued_total.saturating_add(1);
+        true
+    }
+
+    fn resolve_controlled_holdouts(
+        &mut self,
+        after: &TelemetryContextSummary,
+        cycle: u64,
+        purge_recent: bool,
+        current_applied_families: &[ActuatorFamily],
+        quality: f64,
+    ) {
+        let mut retained = VecDeque::with_capacity(self.pending_controlled_holdouts.len());
+        while let Some(pending) = self.pending_controlled_holdouts.pop_front() {
+            let age = cycle.saturating_sub(pending.issued_cycle);
+            if age < CONTROLLED_HOLDOUT_HORIZON_CYCLES {
+                retained.push_back(pending);
+                continue;
+            }
+            let family_issued_total = self
+                .family_stats
+                .get(&pending.family)
+                .map(|stats| stats.issued_total)
+                .unwrap_or(0);
+            let confounded = purge_recent
+                || current_applied_families.contains(&pending.family)
+                || pending.family_issued_total_at_start != family_issued_total;
+            if confounded {
+                self.controlled_holdout_rejected_total =
+                    self.controlled_holdout_rejected_total.saturating_add(1);
+                continue;
+            }
+
+            let control_delta = (utility_score(pending.objective, after)
+                - utility_score(pending.objective, &pending.before))
+            .clamp(-1.0, 1.0);
+            let per_cycle_delta = control_delta / CONTROLLED_HOLDOUT_HORIZON_CYCLES.max(1) as f64;
+            let baseline = self
+                .no_action_delta_ema
+                .entry(pending.objective)
+                .or_insert(per_cycle_delta);
+            *baseline = (0.20 * per_cycle_delta + 0.80 * *baseline).clamp(-0.05, 0.05);
+
+            let key = format!("{}|{}", pending.workload, pending.action_key);
+            if self.controlled_models.len() >= MAX_CONTROLLED_MODELS
+                && !self.controlled_models.contains_key(&key)
+            {
+                if let Some(weakest) = self
+                    .controlled_models
+                    .iter()
+                    .min_by_key(|(_, stats)| stats.observations)
+                    .map(|(key, _)| key.clone())
+                {
+                    self.controlled_models.remove(&weakest);
+                }
+            }
+            let model = self.controlled_models.entry(key).or_default();
+            model.observations = model.observations.saturating_add(1);
+            model.would_have_helped = model.would_have_helped.saturating_add(u32::from(
+                control_delta < -objective_effect_threshold(pending.objective),
+            ));
+            let alpha = 0.20;
+            model.control_utility_ema = if model.observations == 1 {
+                control_delta
+            } else {
+                alpha * control_delta + (1.0 - alpha) * model.control_utility_ema
+            };
+            model.quality_ema = if model.observations == 1 {
+                quality
+            } else {
+                alpha * quality + (1.0 - alpha) * model.quality_ema
+            };
+            model.last_cycle = cycle;
+            self.controlled_holdout_resolved_total =
+                self.controlled_holdout_resolved_total.saturating_add(1);
+        }
+        self.pending_controlled_holdouts = retained;
     }
 
     fn external_deltas(&mut self, runtime: &RuntimeMetrics) -> ExternalDeltas {
@@ -1134,6 +1334,27 @@ impl TelemetryMedallion {
 
     pub fn metrics(&self) -> TelemetryMedallionMetrics {
         let admitted = self.silver_total.saturating_add(self.gold_total);
+        let (top_rejected_field, top_rejected_field_total) = self
+            .field_rejection_counters
+            .iter()
+            .max_by(|left, right| left.1.cmp(right.1).then_with(|| right.0.cmp(left.0)))
+            .map(|(field, count)| (Some(*field), *count))
+            .unwrap_or((None, 0));
+        let controlled_would_help_total = self
+            .controlled_models
+            .values()
+            .map(|stats| stats.would_have_helped as u64)
+            .sum();
+        let controlled_utility_sum: f64 = self
+            .controlled_models
+            .values()
+            .map(|stats| stats.control_utility_ema * stats.observations as f64)
+            .sum();
+        let controlled_observations: u64 = self
+            .controlled_models
+            .values()
+            .map(|stats| stats.observations as u64)
+            .sum();
         TelemetryMedallionMetrics {
             bronze_total: self.bronze_total,
             silver_total: self.silver_total,
@@ -1147,6 +1368,9 @@ impl TelemetryMedallion {
             temporal_total: self.reason_counters.temporal,
             foreign_total: self.reason_counters.foreign_hardware,
             coherence_total: self.reason_counters.coherence,
+            top_rejected_field,
+            top_rejected_field_total,
+            last_field_violation: self.last_field_violation,
             current_tier: self.current_tier,
             mean_quality: if admitted == 0 {
                 0.0
@@ -1191,6 +1415,16 @@ impl TelemetryMedallion {
                         })
                 })
                 .count() as u64,
+            controlled_holdout_issued_total: self.controlled_holdout_issued_total,
+            controlled_holdout_pending_total: self.pending_controlled_holdouts.len() as u64,
+            controlled_holdout_resolved_total: self.controlled_holdout_resolved_total,
+            controlled_holdout_rejected_total: self.controlled_holdout_rejected_total,
+            controlled_holdout_would_help_total: controlled_would_help_total,
+            controlled_holdout_mean_control_utility: if controlled_observations == 0 {
+                0.0
+            } else {
+                (controlled_utility_sum / controlled_observations as f64).clamp(-1.0, 1.0)
+            },
         }
     }
 
@@ -1255,6 +1489,11 @@ impl TelemetryMedallion {
             actuator_quality_sum: self.actuator_quality_sum,
             actuator_utility_sum: self.actuator_utility_sum,
             no_action_delta_ema: self.no_action_delta_ema.clone(),
+            controlled_models: self.controlled_models.clone(),
+            controlled_holdout_issued_total: self.controlled_holdout_issued_total,
+            controlled_holdout_resolved_total: self.controlled_holdout_resolved_total,
+            controlled_holdout_rejected_total: self.controlled_holdout_rejected_total,
+            controlled_holdout_pending_total: self.pending_controlled_holdouts.len() as u64,
         }
     }
 
@@ -1277,6 +1516,8 @@ impl TelemetryMedallion {
         );
         self.invalid_total = state.invalid_total.min(self.rejected_total);
         self.reason_counters = ContextReasonCounters::default();
+        self.field_rejection_counters.clear();
+        self.last_field_violation = None;
         let admitted = self.silver_total.saturating_add(self.gold_total);
         self.quality_sum = if state.quality_sum.is_finite() {
             state.quality_sum.clamp(0.0, admitted as f64)
@@ -1360,6 +1601,39 @@ impl TelemetryMedallion {
         } else {
             BTreeMap::new()
         };
+        self.pending_controlled_holdouts.clear();
+        self.controlled_models = if same_origin {
+            state
+                .controlled_models
+                .into_iter()
+                .filter_map(|(key, mut stats)| {
+                    if key.len() > 384
+                        || !stats.control_utility_ema.is_finite()
+                        || !stats.quality_ema.is_finite()
+                    {
+                        return None;
+                    }
+                    stats.control_utility_ema = stats.control_utility_ema.clamp(-1.0, 1.0);
+                    stats.quality_ema = stats.quality_ema.clamp(0.0, 1.0);
+                    stats.would_have_helped = stats.would_have_helped.min(stats.observations);
+                    Some((key, stats))
+                })
+                .take(MAX_CONTROLLED_MODELS)
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        if same_origin {
+            self.controlled_holdout_issued_total = state.controlled_holdout_issued_total;
+            self.controlled_holdout_resolved_total = state.controlled_holdout_resolved_total;
+            self.controlled_holdout_rejected_total = state
+                .controlled_holdout_rejected_total
+                .saturating_add(state.controlled_holdout_pending_total);
+        } else {
+            self.controlled_holdout_issued_total = 0;
+            self.controlled_holdout_resolved_total = 0;
+            self.controlled_holdout_rejected_total = 0;
+        }
         if !same_origin {
             for evidence in &mut self.recent_evidence {
                 evidence.installation_id = state.installation_id;
@@ -1381,6 +1655,12 @@ impl TelemetryMedallion {
             self.actuator_expired_total = 0;
             self.actuator_quality_sum = 0.0;
             self.actuator_utility_sum = 0.0;
+            self.no_action_delta_ema.clear();
+            self.pending_controlled_holdouts.clear();
+            self.controlled_models.clear();
+            self.controlled_holdout_issued_total = 0;
+            self.controlled_holdout_resolved_total = 0;
+            self.controlled_holdout_rejected_total = 0;
         }
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
     }
@@ -2075,6 +2355,62 @@ mod tests {
         assert_eq!(metrics.silver_total, 0);
         assert_eq!(metrics.gold_total, 1);
         assert!(medallion.latest().is_some());
+    }
+
+    #[test]
+    fn controlled_holdout_resolves_into_targeted_no_action_evidence() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        let outcomes = ExecuteOutcomes::default();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        let action = RootAction::BoostProcess {
+            pid: 42,
+            name: "Editor".to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        };
+        assert!(medallion.issue_controlled_holdout(&action, "build", 1));
+
+        for cycle in 2..=31 {
+            observe(&mut medallion, cycle, &outcomes, &runtime);
+        }
+
+        let metrics = medallion.metrics();
+        assert_eq!(metrics.controlled_holdout_issued_total, 1);
+        assert_eq!(metrics.controlled_holdout_pending_total, 0);
+        assert_eq!(metrics.controlled_holdout_resolved_total, 1);
+        assert_eq!(metrics.controlled_holdout_rejected_total, 0);
+        assert!(medallion
+            .controlled_models
+            .contains_key("build|boost:Editor"));
+    }
+
+    #[test]
+    fn restore_rejects_pending_controlled_holdouts_instead_of_resuming_them() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        let outcomes = ExecuteOutcomes::default();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        let action = RootAction::BoostProcess {
+            pid: 42,
+            name: "Editor".to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 0,
+            start_usec: 0,
+        };
+        assert!(medallion.issue_controlled_holdout(&action, "build", 1));
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(medallion.snapshot());
+
+        let metrics = restored.metrics();
+        assert_eq!(metrics.controlled_holdout_issued_total, 1);
+        assert_eq!(metrics.controlled_holdout_pending_total, 0);
+        assert_eq!(metrics.controlled_holdout_resolved_total, 0);
+        assert_eq!(metrics.controlled_holdout_rejected_total, 1);
     }
 
     #[test]
