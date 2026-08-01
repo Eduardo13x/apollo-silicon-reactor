@@ -5511,6 +5511,40 @@ fn main() -> anyhow::Result<()> {
                         .metrics
                         .world_model_family_prior_uses_total
                         .saturating_add(plan_report.family_priors_used);
+                    metrics.metrics.world_model_temporal_memory_samples =
+                        plan_report.temporal_memory_samples;
+                    metrics.metrics.world_model_sequence_candidates_total = metrics
+                        .metrics
+                        .world_model_sequence_candidates_total
+                        .saturating_add(plan_report.temporal_candidates);
+                    metrics.metrics.world_model_sequence_rollouts_total = metrics
+                        .metrics
+                        .world_model_sequence_rollouts_total
+                        .saturating_add(plan_report.temporal_rollouts);
+                    metrics.metrics.world_model_sequence_promotions_total = metrics
+                        .metrics
+                        .world_model_sequence_promotions_total
+                        .saturating_add(plan_report.temporal_promotions);
+                    metrics.metrics.world_model_sequence_authoritative_total = metrics
+                        .metrics
+                        .world_model_sequence_authoritative_total
+                        .saturating_add(u64::from(plan_report.temporal_authoritative));
+                    metrics.metrics.world_model_sequence_expected_gain =
+                        plan_report.temporal_expected_gain;
+                    metrics.metrics.world_model_sequence_uncertainty =
+                        plan_report.temporal_uncertainty;
+                    metrics.metrics.world_model_sequence_pressure_delta =
+                        plan_report.temporal_pressure_delta;
+                    metrics.metrics.world_model_sequence_fluidity_delta =
+                        plan_report.temporal_fluidity_delta;
+                    metrics.metrics.world_model_sequence_energy_delta =
+                        plan_report.temporal_energy_delta;
+                    metrics.metrics.world_model_sequence_best_first =
+                        plan_report.temporal_best_first.unwrap_or_default();
+                    metrics.metrics.world_model_sequence_best_second =
+                        plan_report.temporal_best_second.unwrap_or_default();
+                    metrics.metrics.world_model_sequence_abstention_reason =
+                        plan_report.temporal_abstention_reason.unwrap_or_default();
                     if let Some(resolution) = plan_report.last_resolution {
                         metrics.metrics.action_planner_last_resolution = resolution;
                     }

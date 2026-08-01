@@ -13,10 +13,9 @@
 //! model predict a better future than doing nothing?"* — and an
 //! admission verdict ([`Imagined`]) the decision path can consult.
 //!
-//! Deliberately one-step (predict Δpressure over the causal-evaluation
-//! horizon, compare against the no-action drift). Multi-step rollouts /
-//! hierarchical planning [LeCun 2022 §4.3] stay future work; the
-//! dominance check alone closes the act-blind gap.
+//! The pressure veto remains deliberately one-step. A separate bounded
+//! receding-horizon lane learns joint state transitions and evaluates two-step
+//! action sequences for ranking; it cannot manufacture or authorize actions.
 //!
 //! ## References
 //! - [LeCun 2022] "A Path Towards Autonomous Machine Intelligence" §4.2 —
@@ -36,6 +35,9 @@ use crate::engine::installation_identity::InstallationId;
 use crate::engine::outcome_tracker::OutcomeTracker;
 use crate::engine::telemetry_medallion::{
     ActionModelStats, TelemetryContextSummary, TrustedTelemetryView,
+};
+use crate::engine::world_model_sequence::{
+    plan_temporal_sequence, TemporalMemory, TemporalSequencePlan,
 };
 
 /// Minimum causal-edge evidence before a prediction is trusted enough to
@@ -221,6 +223,7 @@ pub struct WorldModel {
     causal_cache_hits: u64,
     utility_refreshes: u64,
     utility_cache_hits: u64,
+    temporal_memory: TemporalMemory,
 }
 
 impl WorldModel {
@@ -380,12 +383,21 @@ impl WorldModel {
     /// action-causal prediction map or its safety thresholds.
     pub fn attach_context(&mut self, view: TrustedTelemetryView<'_>) {
         let local_gold_total = view.metrics.local_gold_total;
+        if self.current_installation_id.is_known()
+            && view.installation_id.is_known()
+            && self.current_installation_id != view.installation_id
+        {
+            self.temporal_memory.clear();
+        }
         self.context_bronze = view.metrics.bronze_total;
         self.context_silver = view.metrics.silver_total;
         self.context_gold = view.metrics.gold_total;
         self.context_quality = view.metrics.mean_quality;
         self.latest_context = view.current.cloned();
         self.current_installation_id = view.installation_id;
+        if let Some(context) = view.current {
+            self.temporal_memory.observe(context);
+        }
         if self.utility_revision == Some(view.action_models_revision) {
             self.utility_cache_hits = self.utility_cache_hits.saturating_add(1);
         } else {
@@ -621,6 +633,29 @@ impl WorldModel {
         self.latest_context.as_ref()
     }
 
+    /// Evaluate a bounded two-step receding-horizon plan over actions already
+    /// proposed by specialists. The returned scores are ranking evidence only;
+    /// safety admission and root execution remain outside the World Model.
+    pub fn plan_temporal_sequence(
+        &self,
+        action_keys: &[String],
+        workload: &str,
+    ) -> TemporalSequencePlan {
+        plan_temporal_sequence(
+            &self.temporal_memory,
+            self.latest_context.as_ref(),
+            self.current_installation_id,
+            self.authority_phase == ModelAuthorityPhase::Trusted,
+            &self.utility_predicted,
+            action_keys,
+            workload,
+        )
+    }
+
+    pub fn temporal_memory_samples(&self) -> usize {
+        self.temporal_memory.samples()
+    }
+
     pub fn authority_phase(&self) -> ModelAuthorityPhase {
         self.authority_phase
     }
@@ -733,6 +768,9 @@ mod tests {
             utility_ema: 0.08,
             evidence_mass: 20.0,
             utility_variance_ema: 0.0001,
+            state_delta_ema: Default::default(),
+            state_variance_ema: Default::default(),
+            state_evidence_mass: 0.0,
             quality_ema: 0.95,
             last_cycle: 100,
             last_observed_unix: now_unix,
@@ -982,6 +1020,9 @@ mod tests {
                     utility_ema: 0.08,
                     evidence_mass: 12.0,
                     utility_variance_ema: 0.0001,
+                    state_delta_ema: Default::default(),
+                    state_variance_ema: Default::default(),
+                    state_evidence_mass: 0.0,
                     quality_ema: 0.95,
                     last_cycle: 100,
                     last_observed_unix: now_unix,
@@ -1001,6 +1042,9 @@ mod tests {
                     utility_ema: -0.03,
                     evidence_mass: 15.0,
                     utility_variance_ema: 0.0001,
+                    state_delta_ema: Default::default(),
+                    state_variance_ema: Default::default(),
+                    state_evidence_mass: 0.0,
                     quality_ema: 0.93,
                     last_cycle: 101,
                     last_observed_unix: now_unix,

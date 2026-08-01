@@ -185,6 +185,14 @@ pub struct ActionModelStats {
     /// Exponentially weighted utility variance used by WorldModel confidence
     /// bounds. Zero is valid for a genuinely stable freshly learned model.
     pub utility_variance_ema: f64,
+    /// Counterfactual-adjusted transition of the joint machine state. These
+    /// dimensions let the World Model roll actions forward without collapsing
+    /// fluidity, energy, thermal and memory behavior into one scalar utility.
+    pub state_delta_ema: WorldStateDelta,
+    pub state_variance_ema: WorldStateDelta,
+    /// Decayed authority for the transition vector. Kept separate from utility
+    /// evidence so legacy scalar models cannot immediately drive rollouts.
+    pub state_evidence_mass: f64,
     pub quality_ema: f64,
     pub last_cycle: u64,
     /// Wall-clock freshness survives daemon cycle resets and machine imports.
@@ -231,6 +239,130 @@ impl ActionModelStats {
         let decay = 0.5_f64.powf(age_secs / ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS);
         (self.evidence_mass * decay).clamp(0.0, ACTION_MODEL_EVIDENCE_CAP)
     }
+
+    pub fn effective_state_evidence_at(&self, now_unix: i64) -> f64 {
+        if self.last_observed_unix <= 0 || now_unix < self.last_observed_unix {
+            return 0.0;
+        }
+        let age_secs = (now_unix - self.last_observed_unix) as f64;
+        let decay = 0.5_f64.powf(age_secs / ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS);
+        (self.state_evidence_mass * decay).clamp(0.0, ACTION_MODEL_EVIDENCE_CAP)
+    }
+}
+
+/// Normalized transition of the joint machine state. Lower is better for all
+/// dimensions except `fluidity`, where positive is an improvement.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct WorldStateDelta {
+    pub pressure: f64,
+    pub fluidity: f64,
+    pub energy: f64,
+    pub cpu: f64,
+    pub thermal: f64,
+    pub thrashing: f64,
+    pub stall: f64,
+}
+
+impl WorldStateDelta {
+    pub fn between(before: &TelemetryContextSummary, after: &TelemetryContextSummary) -> Self {
+        let energy = match (before.package_watts, after.package_watts) {
+            (Some(before), Some(after)) => (after - before) / 50.0,
+            _ => 0.0,
+        };
+        Self {
+            pressure: after.memory_pressure - before.memory_pressure,
+            fluidity: after.fluidity_score - before.fluidity_score,
+            energy,
+            cpu: after.cpu_max_busy - before.cpu_max_busy,
+            thermal: after.thermal_score - before.thermal_score,
+            thrashing: (after.thrashing_score - before.thrashing_score) / 50_000.0,
+            stall: after.stall_fraction - before.stall_fraction,
+        }
+        .clamped(-1.0, 1.0)
+    }
+
+    pub fn is_finite(self) -> bool {
+        [
+            self.pressure,
+            self.fluidity,
+            self.energy,
+            self.cpu,
+            self.thermal,
+            self.thrashing,
+            self.stall,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+    }
+
+    pub fn clamped(self, min: f64, max: f64) -> Self {
+        Self {
+            pressure: self.pressure.clamp(min, max),
+            fluidity: self.fluidity.clamp(min, max),
+            energy: self.energy.clamp(min, max),
+            cpu: self.cpu.clamp(min, max),
+            thermal: self.thermal.clamp(min, max),
+            thrashing: self.thrashing.clamp(min, max),
+            stall: self.stall.clamp(min, max),
+        }
+    }
+
+    pub fn scaled(self, scale: f64) -> Self {
+        Self {
+            pressure: self.pressure * scale,
+            fluidity: self.fluidity * scale,
+            energy: self.energy * scale,
+            cpu: self.cpu * scale,
+            thermal: self.thermal * scale,
+            thrashing: self.thrashing * scale,
+            stall: self.stall * scale,
+        }
+    }
+
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            pressure: self.pressure + other.pressure,
+            fluidity: self.fluidity + other.fluidity,
+            energy: self.energy + other.energy,
+            cpu: self.cpu + other.cpu,
+            thermal: self.thermal + other.thermal,
+            thrashing: self.thrashing + other.thrashing,
+            stall: self.stall + other.stall,
+        }
+    }
+
+    pub fn minus(self, other: Self) -> Self {
+        self.plus(other.scaled(-1.0))
+    }
+
+    pub(crate) fn ema(self, observation: Self, alpha: f64) -> Self {
+        self.scaled(1.0 - alpha).plus(observation.scaled(alpha))
+    }
+
+    pub(crate) fn variance_update(self, residual: Self, alpha: f64) -> Self {
+        let squared = Self {
+            pressure: residual.pressure * residual.pressure,
+            fluidity: residual.fluidity * residual.fluidity,
+            energy: residual.energy * residual.energy,
+            cpu: residual.cpu * residual.cpu,
+            thermal: residual.thermal * residual.thermal,
+            thrashing: residual.thrashing * residual.thrashing,
+            stall: residual.stall * residual.stall,
+        };
+        self.plus(squared.scaled(alpha)).scaled(1.0 - alpha)
+    }
+
+    pub fn mean_variance(self) -> f64 {
+        (self.pressure
+            + self.fluidity
+            + self.energy
+            + self.cpu
+            + self.thermal
+            + self.thrashing
+            + self.stall)
+            / 7.0
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -255,6 +387,8 @@ pub struct ResolvedActuatorEvidence {
     pub raw_utility_delta: f64,
     pub counterfactual_delta: f64,
     pub net_utility_delta: f64,
+    #[serde(default)]
+    pub net_state_delta: WorldStateDelta,
     pub effective: bool,
     pub confounder_count: u8,
     pub target_present_after: Option<bool>,
@@ -569,6 +703,8 @@ pub struct TelemetryMedallionPersisted {
     #[serde(default)]
     pub no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
     #[serde(default)]
+    pub no_action_state_delta_ema: WorldStateDelta,
+    #[serde(default)]
     pub controlled_models: BTreeMap<String, ControlledCounterfactualStats>,
     #[serde(default)]
     pub controlled_holdout_issued_total: u64,
@@ -615,6 +751,7 @@ pub struct TelemetryMedallion {
     actuator_quality_sum: f64,
     actuator_utility_sum: f64,
     no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
+    no_action_state_delta_ema: WorldStateDelta,
     pending_controlled_holdouts: VecDeque<PendingControlledHoldout>,
     controlled_models: BTreeMap<String, ControlledCounterfactualStats>,
     controlled_holdout_issued_total: u64,
@@ -658,6 +795,7 @@ impl Default for TelemetryMedallion {
             actuator_quality_sum: 0.0,
             actuator_utility_sum: 0.0,
             no_action_delta_ema: BTreeMap::new(),
+            no_action_state_delta_ema: WorldStateDelta::default(),
             pending_controlled_holdouts: VecDeque::new(),
             controlled_models: BTreeMap::new(),
             controlled_holdout_issued_total: 0,
@@ -762,6 +900,10 @@ impl TelemetryMedallion {
             && self.pending_actions.is_empty()
         {
             if let Some(previous) = self.latest.as_ref() {
+                self.no_action_state_delta_ema = self
+                    .no_action_state_delta_ema
+                    .ema(WorldStateDelta::between(previous, &summary), 0.05)
+                    .clamped(-0.05, 0.05);
                 for objective in ALL_OBJECTIVES {
                     let delta =
                         utility_score(objective, &summary) - utility_score(objective, previous);
@@ -772,7 +914,7 @@ impl TelemetryMedallion {
         }
 
         let cohort_size = issued_this_cycle.min(u16::MAX as u64) as u16;
-        let mut coordinated_members = Vec::with_capacity(root_cohort_size);
+        let mut coordinated_members = Vec::with_capacity(root_cohort_size.saturating_add(3));
         for action in applied_root_actions {
             if let Some(spec) = action_spec(action) {
                 coordinated_members.push(spec.action_key.clone());
@@ -786,8 +928,58 @@ impl TelemetryMedallion {
                 );
             }
         }
+        if external_deltas.markov_applied > 0 {
+            coordinated_members.push("markov_prewarm:predicted_app".to_string());
+        }
+        for _ in 0..external_deltas.markov_applied.min(16) {
+            self.issue(
+                ActionSpec::synthetic(
+                    ActuatorFamily::MarkovPrewarm,
+                    ActuatorObjective::Prediction,
+                    "markov_prewarm:predicted_app",
+                    runtime.markov_prediction_app.as_str(),
+                    120,
+                ),
+                &summary,
+                cycle,
+                cohort_size.max(1),
+                purge_recent,
+                true,
+            );
+        }
+        if external_deltas.interaction_activations > 0 {
+            coordinated_members.push("interaction_qos:foreground".to_string());
+        }
+        for _ in 0..external_deltas.interaction_activations.min(16) {
+            self.issue(
+                ActionSpec::synthetic(
+                    ActuatorFamily::InteractionQos,
+                    ActuatorObjective::Responsiveness,
+                    "interaction_qos:foreground",
+                    runtime.interaction_qos_reason.as_str(),
+                    30,
+                ),
+                &summary,
+                cycle,
+                cohort_size.max(1),
+                purge_recent,
+                true,
+            );
+        }
+        if let Some(spec) = applied_intervention.and_then(intervention_spec) {
+            coordinated_members.push(spec.action_key.clone());
+            self.issue(
+                spec,
+                &summary,
+                cycle,
+                cohort_size.max(1),
+                purge_recent,
+                true,
+            );
+        }
+        coordinated_members.sort();
+        coordinated_members.dedup();
         if coordinated_members.len() > 1 {
-            coordinated_members.sort();
             let family_key = coordinated_members
                 .iter()
                 .filter_map(|key| key.split_once(':').map(|(family, _)| family))
@@ -807,48 +999,6 @@ impl TelemetryMedallion {
                 1,
                 purge_recent,
                 false,
-            );
-        }
-        for _ in 0..external_deltas.markov_applied.min(16) {
-            self.issue(
-                ActionSpec::synthetic(
-                    ActuatorFamily::MarkovPrewarm,
-                    ActuatorObjective::Prediction,
-                    "markov_prewarm:predicted_app",
-                    runtime.markov_prediction_app.as_str(),
-                    120,
-                ),
-                &summary,
-                cycle,
-                cohort_size.max(1),
-                purge_recent,
-                true,
-            );
-        }
-        for _ in 0..external_deltas.interaction_activations.min(16) {
-            self.issue(
-                ActionSpec::synthetic(
-                    ActuatorFamily::InteractionQos,
-                    ActuatorObjective::Responsiveness,
-                    "interaction_qos:foreground",
-                    runtime.interaction_qos_reason.as_str(),
-                    30,
-                ),
-                &summary,
-                cycle,
-                cohort_size.max(1),
-                purge_recent,
-                true,
-            );
-        }
-        if let Some(spec) = applied_intervention.and_then(intervention_spec) {
-            self.issue(
-                spec,
-                &summary,
-                cycle,
-                cohort_size.max(1),
-                purge_recent,
-                true,
             );
         }
         let cohort_end_total = self.actuator_issued_total;
@@ -1148,6 +1298,14 @@ impl TelemetryMedallion {
         let counterfactual =
             (per_cycle_baseline * pending.horizon_cycles as f64).clamp(-0.25, 0.25);
         let net_delta = (raw_delta - counterfactual).clamp(-1.0, 1.0);
+        let raw_state_delta = WorldStateDelta::between(&pending.before, after);
+        let counterfactual_state_delta = self
+            .no_action_state_delta_ema
+            .scaled(pending.horizon_cycles as f64)
+            .clamped(-0.25, 0.25);
+        let net_state_delta = raw_state_delta
+            .minus(counterfactual_state_delta)
+            .clamped(-1.0, 1.0);
         let target_present_after = target_presence(&pending, snapshot);
 
         let finite = [
@@ -1158,7 +1316,8 @@ impl TelemetryMedallion {
             net_delta,
         ]
         .into_iter()
-        .all(f64::is_finite);
+        .all(f64::is_finite)
+            && net_state_delta.is_finite();
         let mut confounders = u8::from(pending.purge_recent);
         confounders = confounders.saturating_add(u8::from(pending.workload != after.workload));
         confounders = confounders.saturating_add(u8::from(pending.cohort_size > 1));
@@ -1219,6 +1378,11 @@ impl TelemetryMedallion {
             raw_utility_delta: finite_or_zero(raw_delta),
             counterfactual_delta: finite_or_zero(counterfactual),
             net_utility_delta: finite_or_zero(net_delta),
+            net_state_delta: if net_state_delta.is_finite() {
+                net_state_delta
+            } else {
+                WorldStateDelta::default()
+            },
             effective,
             confounder_count: confounders,
             target_present_after,
@@ -1286,6 +1450,7 @@ impl TelemetryMedallion {
             }
             let model = self.action_models.entry(key).or_default();
             let previous_mean = model.utility_ema;
+            let previous_state_mean = model.state_delta_ema;
             let same_hardware = !evidence.hardware_regime.is_known()
                 || (model.hardware_regime.is_known()
                     && model.hardware_regime == evidence.hardware_regime);
@@ -1297,6 +1462,11 @@ impl TelemetryMedallion {
                 && same_installation;
             let previous_mass = if has_local_epoch {
                 model.effective_evidence_at(evidence.resolved_timestamp_unix)
+            } else {
+                0.0
+            };
+            let previous_state_mass = if has_local_epoch {
+                model.effective_state_evidence_at(evidence.resolved_timestamp_unix)
             } else {
                 0.0
             };
@@ -1317,7 +1487,20 @@ impl TelemetryMedallion {
                 model.quality_ema = ACTION_MODEL_EMA_ALPHA * evidence.quality
                     + (1.0 - ACTION_MODEL_EMA_ALPHA) * model.quality_ema;
             }
+            if previous_state_mass <= 0.0 {
+                model.state_delta_ema = evidence.net_state_delta;
+                model.state_variance_ema = WorldStateDelta::default();
+            } else {
+                model.state_delta_ema = model
+                    .state_delta_ema
+                    .ema(evidence.net_state_delta, ACTION_MODEL_EMA_ALPHA);
+                model.state_variance_ema = model.state_variance_ema.variance_update(
+                    evidence.net_state_delta.minus(previous_state_mean),
+                    ACTION_MODEL_EMA_ALPHA,
+                );
+            }
             model.evidence_mass = (previous_mass + 1.0).min(ACTION_MODEL_EVIDENCE_CAP);
+            model.state_evidence_mass = (previous_state_mass + 1.0).min(ACTION_MODEL_EVIDENCE_CAP);
             model.last_cycle = evidence.resolved_cycle;
             model.last_observed_unix = evidence.resolved_timestamp_unix;
             model.hardware_regime = evidence.hardware_regime;
@@ -1489,6 +1672,7 @@ impl TelemetryMedallion {
             actuator_quality_sum: self.actuator_quality_sum,
             actuator_utility_sum: self.actuator_utility_sum,
             no_action_delta_ema: self.no_action_delta_ema.clone(),
+            no_action_state_delta_ema: self.no_action_state_delta_ema,
             controlled_models: self.controlled_models.clone(),
             controlled_holdout_issued_total: self.controlled_holdout_issued_total,
             controlled_holdout_resolved_total: self.controlled_holdout_resolved_total,
@@ -1540,7 +1724,10 @@ impl TelemetryMedallion {
                     && model.utility_ema.is_finite()
                     && model.utility_variance_ema.is_finite()
                     && model.evidence_mass.is_finite()
-                    && model.quality_ema.is_finite();
+                    && model.quality_ema.is_finite()
+                    && model.state_delta_ema.is_finite()
+                    && model.state_variance_ema.is_finite()
+                    && model.state_evidence_mass.is_finite();
                 if !valid {
                     return None;
                 }
@@ -1549,9 +1736,15 @@ impl TelemetryMedallion {
                 model.quality_ema = model.quality_ema.clamp(0.0, 1.0);
                 if same_origin && model.installation_id == self.installation_id {
                     model.evidence_mass = model.evidence_mass.clamp(0.0, ACTION_MODEL_EVIDENCE_CAP);
+                    model.state_evidence_mass = model
+                        .state_evidence_mass
+                        .clamp(0.0, ACTION_MODEL_EVIDENCE_CAP);
                 } else {
                     model.evidence_mass = 0.0;
+                    model.state_evidence_mass = 0.0;
                 }
+                model.state_delta_ema = model.state_delta_ema.clamped(-1.0, 1.0);
+                model.state_variance_ema = model.state_variance_ema.clamped(0.0, 1.0);
                 Some((key, model))
             })
             .take(MAX_ACTION_MODELS)
@@ -1601,6 +1794,12 @@ impl TelemetryMedallion {
         } else {
             BTreeMap::new()
         };
+        self.no_action_state_delta_ema =
+            if same_origin && state.no_action_state_delta_ema.is_finite() {
+                state.no_action_state_delta_ema.clamped(-0.05, 0.05)
+            } else {
+                WorldStateDelta::default()
+            };
         self.pending_controlled_holdouts.clear();
         self.controlled_models = if same_origin {
             state
@@ -1656,6 +1855,7 @@ impl TelemetryMedallion {
             self.actuator_quality_sum = 0.0;
             self.actuator_utility_sum = 0.0;
             self.no_action_delta_ema.clear();
+            self.no_action_state_delta_ema = WorldStateDelta::default();
             self.pending_controlled_holdouts.clear();
             self.controlled_models.clear();
             self.controlled_holdout_issued_total = 0;
@@ -2319,10 +2519,63 @@ mod tests {
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
+            net_state_delta: WorldStateDelta::default(),
             effective: utility > 0.0,
             confounder_count: 0,
             target_present_after: None,
         }
+    }
+
+    #[test]
+    fn gold_state_transitions_survive_only_on_the_local_installation() {
+        let now_unix = Utc::now().timestamp();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        for sample in 0..4 {
+            let mut evidence = gold_evidence(
+                "boost:Editor",
+                0.08,
+                now_unix + sample,
+                HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+            );
+            evidence.resolved_cycle += sample as u64;
+            evidence.net_state_delta = WorldStateDelta {
+                pressure: -0.02,
+                fluidity: 0.04,
+                energy: 0.01,
+                cpu: 0.02,
+                thermal: 0.0,
+                thrashing: -0.01,
+                stall: -0.03,
+            };
+            medallion.update_action_model(&evidence);
+        }
+
+        let local_model = medallion.action_models().get("boost:Editor").unwrap();
+        assert!(local_model.state_evidence_mass > 3.99);
+        assert!((local_model.state_delta_ema.fluidity - 0.04).abs() < 1e-9);
+        assert!((local_model.state_delta_ema.pressure + 0.02).abs() < 1e-9);
+
+        let persisted = medallion.snapshot();
+        let mut local_restore = TelemetryMedallion::new(LOCAL_ID);
+        local_restore.restore(persisted.clone());
+        assert!(
+            local_restore
+                .action_models()
+                .get("boost:Editor")
+                .unwrap()
+                .effective_state_evidence_at(now_unix + 4)
+                > 3.9
+        );
+
+        let mut foreign_restore = TelemetryMedallion::new(InstallationId(99));
+        foreign_restore.restore(persisted);
+        let foreign_model = foreign_restore.action_models().get("boost:Editor").unwrap();
+        assert_eq!(foreign_model.state_evidence_mass, 0.0);
+        assert_eq!(foreign_model.effective_state_evidence_at(now_unix + 4), 0.0);
     }
 
     #[test]
@@ -3025,6 +3278,7 @@ mod tests {
                 raw_utility_delta: 0.08,
                 counterfactual_delta: 0.0,
                 net_utility_delta: 0.08,
+                net_state_delta: WorldStateDelta::default(),
                 effective: true,
                 confounder_count: 0,
                 target_present_after: None,
@@ -3050,6 +3304,7 @@ mod tests {
             raw_utility_delta: 1.0,
             counterfactual_delta: 0.0,
             net_utility_delta: 1.0,
+            net_state_delta: WorldStateDelta::default(),
             effective: true,
             confounder_count: 0,
             target_present_after: None,
@@ -3119,6 +3374,9 @@ mod tests {
                 utility_ema: 0.08,
                 evidence_mass: 20.0,
                 utility_variance_ema: 0.0001,
+                state_delta_ema: WorldStateDelta::default(),
+                state_variance_ema: WorldStateDelta::default(),
+                state_evidence_mass: 0.0,
                 quality_ema: 0.95,
                 last_cycle: 1,
                 last_observed_unix: now_unix,

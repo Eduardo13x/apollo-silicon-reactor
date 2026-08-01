@@ -363,9 +363,50 @@ pub fn plan_action_intents(
             },
         );
     }
+    let action_keys: Vec<String> = actions
+        .iter()
+        // The central planner only reorders accelerator slots. Keeping the
+        // rollout set identical prevents it from imagining an order that the
+        // safety-priority dispatcher will intentionally refuse to execute.
+        .filter(|action| {
+            matches!(action, RootAction::BoostProcess { .. })
+                || matches!(action, RootAction::SetThreadQoS { tier, .. } if tier == "interactive")
+        })
+        .filter_map(apollo_engine::engine::telemetry_medallion::actuator_action_key)
+        .collect();
+    let temporal_plan = world_model.plan_temporal_sequence(&action_keys, workload);
+    let temporal_scale = if temporal_plan.authoritative {
+        0.50
+    } else {
+        0.20
+    };
+    let mut temporal_promotions = 0_u64;
+    for (key, score) in &temporal_plan.action_scores {
+        let gain = score.expected_gain.max(0.0) * temporal_scale;
+        if gain <= 0.0 {
+            continue;
+        }
+        temporal_promotions = temporal_promotions.saturating_add(1);
+        let evidence = context.utility_evidence.entry(key.clone()).or_default();
+        evidence.expected_benefit += gain;
+        evidence.uncertainty = evidence.uncertainty.max(score.uncertainty);
+    }
     let (planned, mut report) = plan_actions(actions, &context);
     report.evidence_ranked = exact_positive_evidence;
     report.family_priors_used = family_priors_used;
+    report.temporal_candidates = temporal_plan.candidates;
+    report.temporal_rollouts = temporal_plan.sequences_evaluated;
+    report.temporal_promotions = temporal_promotions;
+    report.temporal_memory_samples = temporal_plan.memory_samples;
+    report.temporal_expected_gain = temporal_plan.expected_gain;
+    report.temporal_uncertainty = temporal_plan.uncertainty;
+    report.temporal_pressure_delta = temporal_plan.predicted_pressure_delta;
+    report.temporal_fluidity_delta = temporal_plan.predicted_fluidity_delta;
+    report.temporal_energy_delta = temporal_plan.predicted_energy_delta;
+    report.temporal_authoritative = temporal_plan.authoritative;
+    report.temporal_best_first = temporal_plan.best_first;
+    report.temporal_best_second = temporal_plan.best_second;
+    report.temporal_abstention_reason = temporal_plan.abstention_reason.map(str::to_string);
     (planned, report)
 }
 
@@ -1307,6 +1348,7 @@ mod tests {
                     ram_gib: 16,
                 },
                 installation_id,
+                ..ActionModelStats::default()
             },
         )]
         .into_iter()
@@ -1375,6 +1417,7 @@ mod tests {
                     ram_gib: 16,
                 },
                 installation_id,
+                ..ActionModelStats::default()
             },
         )]
         .into_iter()
@@ -1453,6 +1496,7 @@ mod tests {
                     ram_gib: 16,
                 },
                 installation_id,
+                ..ActionModelStats::default()
             },
         )]
         .into_iter()
@@ -1485,6 +1529,131 @@ mod tests {
         assert!(matches!(
             actions[0],
             RootAction::BoostProcess { pid: 200, .. }
+        ));
+    }
+
+    #[test]
+    fn temporal_rollout_ranks_accelerators_without_moving_safety_actions() {
+        use apollo_engine::engine::telemetry_medallion::{
+            ActionModelStats, HardwareRegime, TelemetryContextSummary, TelemetryMedallionMetrics,
+            TrustedTelemetryView, WorldStateDelta,
+        };
+        use apollo_engine::engine::world_model::WorldModel;
+
+        let installation_id = apollo_engine::engine::installation_identity::InstallationId(1);
+        let now_unix = chrono::Utc::now().timestamp();
+        let hardware_regime = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let action_models = [
+            (
+                "boost:p100".to_string(),
+                ActionModelStats {
+                    observations: 4,
+                    state_delta_ema: WorldStateDelta::default(),
+                    state_evidence_mass: 4.0,
+                    quality_ema: 0.95,
+                    last_cycle: 6,
+                    last_observed_unix: now_unix,
+                    hardware_regime,
+                    installation_id,
+                    ..ActionModelStats::default()
+                },
+            ),
+            (
+                "boost:p200".to_string(),
+                ActionModelStats {
+                    observations: 4,
+                    utility_ema: 0.02,
+                    state_delta_ema: WorldStateDelta {
+                        fluidity: 0.10,
+                        ..WorldStateDelta::default()
+                    },
+                    state_evidence_mass: 4.0,
+                    quality_ema: 0.95,
+                    last_cycle: 6,
+                    last_observed_unix: now_unix,
+                    hardware_regime,
+                    installation_id,
+                    ..ActionModelStats::default()
+                },
+            ),
+            (
+                "freeze:p900".to_string(),
+                ActionModelStats {
+                    observations: 20,
+                    utility_ema: 0.90,
+                    state_delta_ema: WorldStateDelta {
+                        fluidity: 0.90,
+                        ..WorldStateDelta::default()
+                    },
+                    state_evidence_mass: 20.0,
+                    quality_ema: 0.99,
+                    last_cycle: 6,
+                    last_observed_unix: now_unix,
+                    hardware_regime,
+                    installation_id,
+                    ..ActionModelStats::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        let mut model = WorldModel::default();
+        for cycle in 1..=6 {
+            let context = TelemetryContextSummary {
+                cycle,
+                timestamp_unix: now_unix - (6 - cycle) as i64,
+                workload: "build".to_string(),
+                memory_pressure: 0.30,
+                fluidity_score: 0.70,
+                cpu_core_count: 10,
+                p_core_count: 4,
+                e_core_count: 6,
+                total_ram_bytes: 16 * 1024 * 1024 * 1024,
+                ..TelemetryContextSummary::default()
+            };
+            model.attach_context(TrustedTelemetryView {
+                current: Some(&context),
+                installation_id,
+                action_models: &action_models,
+                action_models_revision: 1,
+                metrics: TelemetryMedallionMetrics {
+                    bronze_total: cycle,
+                    gold_total: cycle,
+                    local_gold_total: cycle,
+                    ..TelemetryMedallionMetrics::default()
+                },
+            });
+        }
+
+        let (actions, report) = plan_action_intents(
+            vec![boost(100), freeze(900), boost(200)],
+            &model,
+            "build",
+            0.30,
+            false,
+            false,
+        );
+
+        assert_eq!(report.temporal_memory_samples, 6);
+        assert_eq!(report.temporal_candidates, 2);
+        assert!(report.temporal_rollouts >= 2);
+        assert!(report.temporal_promotions >= 1);
+        assert_eq!(report.reordered, 2);
+        assert!(matches!(
+            actions[0],
+            RootAction::BoostProcess { pid: 200, .. }
+        ));
+        assert!(matches!(
+            actions[1],
+            RootAction::FreezeProcess { pid: 900, .. }
+        ));
+        assert!(matches!(
+            actions[2],
+            RootAction::BoostProcess { pid: 100, .. }
         ));
     }
 

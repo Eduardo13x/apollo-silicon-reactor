@@ -485,6 +485,39 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.action_planner_reorders_total)
         ));
     }
+    if m.world_model_temporal_memory_samples > 0 {
+        lines.push(format!(
+            "WM-T   M{} R{} G{:+.1}%",
+            format_number(m.world_model_temporal_memory_samples),
+            format_number(m.world_model_sequence_rollouts_total),
+            m.world_model_sequence_expected_gain * 100.0
+        ));
+        if !m.world_model_sequence_best_first.is_empty() {
+            let first = m
+                .world_model_sequence_best_first
+                .split_once(':')
+                .map_or(m.world_model_sequence_best_first.as_str(), |(family, _)| {
+                    family
+                });
+            let second = m.world_model_sequence_best_second.split_once(':').map_or(
+                m.world_model_sequence_best_second.as_str(),
+                |(family, _)| family,
+            );
+            lines.push(if second.is_empty() {
+                format!("Seq    {first}")
+            } else {
+                format!("Seq    {first}>{second}")
+            });
+        } else if !m.world_model_sequence_abstention_reason.is_empty() {
+            lines.push(format!(
+                "Seq    {}",
+                m.world_model_sequence_abstention_reason
+                    .chars()
+                    .take(20)
+                    .collect::<String>()
+            ));
+        }
+    }
     lines.push(format!(
         // This is the pressure-causal imagination model, not the universal
         // actuator-learning stream shown above as `Act` / `Act+`.
@@ -1057,6 +1090,12 @@ mod tests {
         status.metrics.world_model_actuator_quality = 0.94;
         status.metrics.world_model_actuator_known_models = 7;
         status.metrics.world_model_actuator_ready_models = 2;
+        status.metrics.world_model_temporal_memory_samples = 32;
+        status.metrics.world_model_sequence_rollouts_total = 123;
+        status.metrics.world_model_sequence_expected_gain = 0.021;
+        status.metrics.world_model_sequence_best_first = "boost:Editor".to_string();
+        status.metrics.world_model_sequence_best_second =
+            "markov_prewarm:predicted_app".to_string();
         status.metrics.world_model_actuator_families =
             vec![apollo_engine::engine::types::ActuatorEvidenceStatus {
                 family: "boost".to_string(),
@@ -1084,6 +1123,10 @@ mod tests {
         assert!(think.iter().any(|line| line == "       eff 4/6 u+3%"));
         assert!(think.iter().any(|line| line == "WM-U   calibrating 2/7"));
         assert!(think.iter().any(|line| line == "WM-U+  V0 P3"));
+        assert!(think.iter().any(|line| line == "WM-T   M32 R123 G+2.1%"));
+        assert!(think
+            .iter()
+            .any(|line| line == "Seq    boost>markov_prewarm"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -1097,6 +1140,20 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "WM-U   protected · no evidence"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn think_quadrant_distinguishes_idle_temporal_model_from_cold_start() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_temporal_memory_samples = 32;
+        status.metrics.world_model_sequence_abstention_reason = "idle_no_accelerator".to_string();
+
+        let think = render_think_q(&status);
+
+        assert!(think
+            .iter()
+            .any(|line| line == "Seq    idle_no_accelerator"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

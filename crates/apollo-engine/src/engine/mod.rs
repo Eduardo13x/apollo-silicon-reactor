@@ -159,6 +159,7 @@ pub mod work_session;
 pub mod workload_classifier;
 pub mod workload_phase;
 pub mod world_model;
+pub mod world_model_sequence;
 pub mod zombie_hunter;
 
 // ── Pipeline stage abstraction ────────────────────────────────────────────────

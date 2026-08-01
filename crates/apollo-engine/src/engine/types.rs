@@ -1579,6 +1579,32 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub action_planner_last_resolution: String,
     #[serde(default)]
+    pub world_model_temporal_memory_samples: u64,
+    #[serde(default)]
+    pub world_model_sequence_candidates_total: u64,
+    #[serde(default)]
+    pub world_model_sequence_rollouts_total: u64,
+    #[serde(default)]
+    pub world_model_sequence_promotions_total: u64,
+    #[serde(default)]
+    pub world_model_sequence_authoritative_total: u64,
+    #[serde(default)]
+    pub world_model_sequence_expected_gain: f64,
+    #[serde(default)]
+    pub world_model_sequence_uncertainty: f64,
+    #[serde(default)]
+    pub world_model_sequence_pressure_delta: f64,
+    #[serde(default)]
+    pub world_model_sequence_fluidity_delta: f64,
+    #[serde(default)]
+    pub world_model_sequence_energy_delta: f64,
+    #[serde(default)]
+    pub world_model_sequence_best_first: String,
+    #[serde(default)]
+    pub world_model_sequence_best_second: String,
+    #[serde(default)]
+    pub world_model_sequence_abstention_reason: String,
+    #[serde(default)]
     pub world_model_last_influence_kind: String,
     #[serde(default)]
     pub world_model_last_influence_action: String,
