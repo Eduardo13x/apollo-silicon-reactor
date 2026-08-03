@@ -739,6 +739,7 @@ pub struct TelemetryMedallion {
     action_models: BTreeMap<String, ActionModelStats>,
     action_models_revision: u64,
     recent_evidence: VecDeque<ResolvedActuatorEvidence>,
+    new_gold_evidence: VecDeque<ResolvedActuatorEvidence>,
     external_counters: ExternalActuatorCounters,
     next_action_id: u64,
     actuator_issued_total: u64,
@@ -783,6 +784,7 @@ impl Default for TelemetryMedallion {
             action_models: BTreeMap::new(),
             action_models_revision: 0,
             recent_evidence: VecDeque::new(),
+            new_gold_evidence: VecDeque::new(),
             external_counters: ExternalActuatorCounters::default(),
             next_action_id: 0,
             actuator_issued_total: 0,
@@ -1405,6 +1407,10 @@ impl TelemetryMedallion {
         if evidence.tier == EvidenceTier::Gold {
             self.actuator_gold_total = self.actuator_gold_total.saturating_add(1);
             self.update_action_model(&evidence);
+            if self.new_gold_evidence.len() >= MAX_RECENT_EVIDENCE {
+                self.new_gold_evidence.pop_front();
+            }
+            self.new_gold_evidence.push_back(evidence.clone());
         }
 
         let stats = self.family_stats.entry(evidence.family).or_default();
@@ -1643,6 +1649,13 @@ impl TelemetryMedallion {
         &self.recent_evidence
     }
 
+    /// Drain only Gold outcomes resolved since the previous call. This queue
+    /// is intentionally not persisted: consumers must never replay historical
+    /// outcomes after a daemon restart.
+    pub fn drain_new_gold_evidence(&mut self) -> Vec<ResolvedActuatorEvidence> {
+        self.new_gold_evidence.drain(..).collect()
+    }
+
     pub fn snapshot(&self) -> TelemetryMedallionPersisted {
         TelemetryMedallionPersisted {
             actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
@@ -1843,6 +1856,7 @@ impl TelemetryMedallion {
             self.family_stats.clear();
             self.action_models.clear();
             self.recent_evidence.clear();
+            self.new_gold_evidence.clear();
             self.external_counters = ExternalActuatorCounters::default();
             self.next_action_id = 0;
             self.actuator_issued_total = 0;
@@ -3027,6 +3041,8 @@ mod tests {
             .expect("resolved evidence");
         assert_eq!(evidence.family, ActuatorFamily::MarkovPrewarm);
         assert_eq!(evidence.net_utility_delta, 1.0);
+        assert_eq!(medallion.drain_new_gold_evidence().len(), 1);
+        assert!(medallion.drain_new_gold_evidence().is_empty());
     }
 
     #[test]

@@ -504,13 +504,42 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 |(family, _)| family,
             );
             lines.push(if second.is_empty() {
-                format!("Seq    {first}")
+                format!("Seq-E  {first}")
             } else {
-                format!("Seq    {first}>{second}")
+                format!("Seq-E  {first}>{second}")
             });
         } else if !m.world_model_sequence_abstention_reason.is_empty() {
             lines.push(format!(
-                "Seq    {}",
+                "Seq-E  {}",
+                m.world_model_sequence_abstention_reason
+                    .chars()
+                    .take(20)
+                    .collect::<String>()
+            ));
+        }
+        if !m.world_model_sequence_authoritative_best_first.is_empty() {
+            let first = m
+                .world_model_sequence_authoritative_best_first
+                .split_once(':')
+                .map_or(
+                    m.world_model_sequence_authoritative_best_first.as_str(),
+                    |(family, _)| family,
+                );
+            let second = m
+                .world_model_sequence_authoritative_best_second
+                .split_once(':')
+                .map_or(
+                    m.world_model_sequence_authoritative_best_second.as_str(),
+                    |(family, _)| family,
+                );
+            lines.push(if second.is_empty() {
+                format!("Seq-A  {first}")
+            } else {
+                format!("Seq-A  {first}>{second}")
+            });
+        } else if !m.world_model_sequence_abstention_reason.is_empty() {
+            lines.push(format!(
+                "Seq-A  {}",
                 m.world_model_sequence_abstention_reason
                     .chars()
                     .take(20)
@@ -528,6 +557,12 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         m.world_model_data_quality * 100.0,
         format_number(m.world_model_utility_promotions_total)
     ));
+    if m.world_model_causal_actuator_gold_total > 0 {
+        lines.push(format!(
+            "Caus+  U{} universal Gold",
+            format_number(m.world_model_causal_actuator_gold_total)
+        ));
+    }
 
     // RL Q-table
     if m.rl_total_ticks > 0 {
@@ -1090,6 +1125,7 @@ mod tests {
         status.metrics.world_model_actuator_quality = 0.94;
         status.metrics.world_model_actuator_known_models = 7;
         status.metrics.world_model_actuator_ready_models = 2;
+        status.metrics.world_model_causal_actuator_gold_total = 42;
         status.metrics.world_model_temporal_memory_samples = 32;
         status.metrics.world_model_sequence_rollouts_total = 123;
         status.metrics.world_model_sequence_expected_gain = 0.021;
@@ -1117,6 +1153,7 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Causal 2/3 ready G127 q100% P3"));
+        assert!(think.iter().any(|line| line == "Caus+  U42 universal Gold"));
         assert!(think.iter().any(|line| line == "Ctx    G490 S7 R3 q98%"));
         assert!(think.iter().any(|line| line == "Act    G 8/10 P2 q94%"));
         assert!(think.iter().any(|line| line == "Act+   boost G5/6"));
@@ -1126,7 +1163,7 @@ mod tests {
         assert!(think.iter().any(|line| line == "WM-T   M32 R123 G+2.1%"));
         assert!(think
             .iter()
-            .any(|line| line == "Seq    boost>markov_prewarm"));
+            .any(|line| line == "Seq-E  boost>markov_prewarm"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -1153,7 +1190,10 @@ mod tests {
 
         assert!(think
             .iter()
-            .any(|line| line == "Seq    idle_no_accelerator"));
+            .any(|line| line == "Seq-E  idle_no_accelerator"));
+        assert!(think
+            .iter()
+            .any(|line| line == "Seq-A  idle_no_accelerator"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

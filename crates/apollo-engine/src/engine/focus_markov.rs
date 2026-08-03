@@ -45,9 +45,71 @@ const PREWARM_RECOVERY_THRESHOLD: f64 = 0.40;
 const PREWARM_OUTCOME_ALPHA: f64 = 0.25;
 const PREWARM_PROBE_BASE_TRANSITIONS: u64 = 16;
 const PREWARM_MAX_BACKOFF_SHIFT: u8 = 4;
+const PREWARM_MIN_CONTEXT_TRIALS: u32 = 5;
+const PREWARM_CONTEXT_PRIOR_WEIGHT: f64 = 4.0;
+const MAX_PREWARM_CONTEXTS_PER_TRANSITION: usize = 12;
+const PREWARM_CONTEXT_KEY_LIMIT: u16 = 144;
 
 fn default_prewarm_reliability() -> f64 {
     1.0
+}
+
+/// Bounded operating context for speculative pre-warm calibration. The source
+/// app already carries the previous-app signal, so this key adds orthogonal
+/// workload, time, pressure, and interaction state without unbounded strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrewarmContext {
+    key: u16,
+}
+
+impl PrewarmContext {
+    pub fn new(workload: &str, hour: u8, pressure: f64, interactive: bool) -> Self {
+        let workload_bucket = match workload {
+            "idle" => 0,
+            "browsing" => 1,
+            "build" | "coding" => 2,
+            "llm-inference" | "ai-session" => 3,
+            "mediaplayback" | "media-session" => 4,
+            _ => 5,
+        };
+        let daypart = (hour.min(23) / 6) as u16;
+        let pressure_bucket = if !pressure.is_finite() || pressure >= 0.65 {
+            2
+        } else if pressure >= 0.45 {
+            1
+        } else {
+            0
+        };
+        let key =
+            (((workload_bucket * 4 + daypart) * 3 + pressure_bucket) * 2) + u16::from(interactive);
+        Self { key }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrewarmCalibrationStats {
+    #[serde(default)]
+    pub trials: u32,
+    #[serde(default)]
+    pub hits: u32,
+    #[serde(default = "default_prewarm_reliability")]
+    pub reliability: f64,
+    #[serde(default)]
+    pub quarantine_until_transition: u64,
+    #[serde(default)]
+    pub backoff_level: u8,
+}
+
+impl PrewarmCalibrationStats {
+    fn new(prior_reliability: f64) -> Self {
+        Self {
+            trials: 0,
+            hits: 0,
+            reliability: prior_reliability.clamp(0.0, 1.0),
+            quarantine_until_transition: 0,
+            backoff_level: 0,
+        }
+    }
 }
 
 // ── Data structures ──────────────────────────────────────────────────────────
@@ -72,6 +134,10 @@ pub struct TransitionStats {
     pub prewarm_quarantine_until_transition: u64,
     #[serde(default)]
     pub prewarm_backoff_level: u8,
+    /// Context-local outcome calibration. Keys are bounded categorical IDs,
+    /// never process names or free-form telemetry.
+    #[serde(default)]
+    pub prewarm_contexts: HashMap<u16, PrewarmCalibrationStats>,
 }
 
 impl TransitionStats {
@@ -84,6 +150,7 @@ impl TransitionStats {
             prewarm_reliability: default_prewarm_reliability(),
             prewarm_quarantine_until_transition: 0,
             prewarm_backoff_level: 0,
+            prewarm_contexts: HashMap::new(),
         }
     }
 
@@ -150,7 +217,8 @@ pub struct FocusMarkov {
 impl FocusMarkov {
     /// Create a new tracker, loading persisted state if available.
     pub fn new(persist_path: PathBuf) -> Self {
-        let state = Self::load_state(&persist_path).unwrap_or_default();
+        let mut state = Self::load_state(&persist_path).unwrap_or_default();
+        sanitize_state(&mut state);
         Self {
             state,
             persist_path,
@@ -332,16 +400,40 @@ impl FocusMarkov {
         else {
             return PrewarmAdmission::Ready;
         };
-        if stats.prewarm_trials < PREWARM_MIN_TRIALS
-            || stats.prewarm_reliability >= PREWARM_RECOVERY_THRESHOLD
-            || stats.prewarm_quarantine_until_transition == 0
-        {
-            PrewarmAdmission::Ready
-        } else if self.state.total_transitions >= stats.prewarm_quarantine_until_transition {
-            PrewarmAdmission::Probe
-        } else {
-            PrewarmAdmission::Quarantined
+        calibration_admission(
+            stats.prewarm_trials,
+            stats.prewarm_reliability,
+            stats.prewarm_quarantine_until_transition,
+            self.state.total_transitions,
+        )
+    }
+
+    pub fn prewarm_admission_with_context(
+        &self,
+        source: &str,
+        target: &str,
+        context: PrewarmContext,
+    ) -> PrewarmAdmission {
+        let Some(stats) = self
+            .state
+            .transitions
+            .get(source)
+            .and_then(|targets| targets.get(target))
+        else {
+            return PrewarmAdmission::Ready;
+        };
+        let Some(context_stats) = stats.prewarm_contexts.get(&context.key) else {
+            return self.prewarm_admission(source, target);
+        };
+        if context_stats.trials < PREWARM_MIN_CONTEXT_TRIALS {
+            return self.prewarm_admission(source, target);
         }
+        calibration_admission(
+            context_stats.trials,
+            context_stats.reliability,
+            context_stats.quarantine_until_transition,
+            self.state.total_transitions,
+        )
     }
 
     pub fn prewarm_reliability(&self, source: &str, target: &str) -> f64 {
@@ -353,10 +445,72 @@ impl FocusMarkov {
             .unwrap_or(1.0)
     }
 
+    pub fn prewarm_reliability_with_context(
+        &self,
+        source: &str,
+        target: &str,
+        context: PrewarmContext,
+    ) -> f64 {
+        let Some(stats) = self
+            .state
+            .transitions
+            .get(source)
+            .and_then(|targets| targets.get(target))
+        else {
+            return 1.0;
+        };
+        let global = stats.prewarm_reliability.clamp(0.0, 1.0);
+        let Some(context_stats) = stats.prewarm_contexts.get(&context.key) else {
+            return global;
+        };
+        let weight = context_stats.trials as f64
+            / (context_stats.trials as f64 + PREWARM_CONTEXT_PRIOR_WEIGHT);
+        (global * (1.0 - weight) + context_stats.reliability.clamp(0.0, 1.0) * weight)
+            .clamp(0.0, 1.0)
+    }
+
+    pub fn prewarm_context_trials(
+        &self,
+        source: &str,
+        target: &str,
+        context: PrewarmContext,
+    ) -> u32 {
+        self.state
+            .transitions
+            .get(source)
+            .and_then(|targets| targets.get(target))
+            .and_then(|stats| stats.prewarm_contexts.get(&context.key))
+            .map(|stats| stats.trials)
+            .unwrap_or(0)
+    }
+
     /// Feed a resolved acceleration lease back into its transition-local
     /// calibration. This does not alter transition probabilities.
     pub fn record_prewarm_outcome(&mut self, source: &str, target: &str, hit: bool) {
-        let admission_before = self.prewarm_admission(source, target);
+        self.record_prewarm_outcome_inner(source, target, hit, None);
+    }
+
+    pub fn record_prewarm_outcome_with_context(
+        &mut self,
+        source: &str,
+        target: &str,
+        hit: bool,
+        context: PrewarmContext,
+    ) {
+        self.record_prewarm_outcome_inner(source, target, hit, Some(context));
+    }
+
+    fn record_prewarm_outcome_inner(
+        &mut self,
+        source: &str,
+        target: &str,
+        hit: bool,
+        context: Option<PrewarmContext>,
+    ) {
+        let global_admission_before = self.prewarm_admission(source, target);
+        let context_admission_before = context
+            .map(|context| self.prewarm_admission_with_context(source, target, context))
+            .unwrap_or(global_admission_before);
         let total_transitions = self.state.total_transitions;
         let Some(stats) = self
             .state
@@ -367,28 +521,47 @@ impl FocusMarkov {
             return;
         };
 
-        stats.prewarm_trials = stats.prewarm_trials.saturating_add(1);
-        stats.prewarm_hits = stats.prewarm_hits.saturating_add(u32::from(hit));
-        let observed = f64::from(hit);
-        stats.prewarm_reliability = (PREWARM_OUTCOME_ALPHA * observed
-            + (1.0 - PREWARM_OUTCOME_ALPHA) * stats.prewarm_reliability)
-            .clamp(0.0, 1.0);
+        let prior_reliability = stats.prewarm_reliability.clamp(0.0, 1.0);
+        update_calibration(
+            &mut stats.prewarm_trials,
+            &mut stats.prewarm_hits,
+            &mut stats.prewarm_reliability,
+            &mut stats.prewarm_quarantine_until_transition,
+            &mut stats.prewarm_backoff_level,
+            hit,
+            global_admission_before,
+            total_transitions,
+            PREWARM_MIN_TRIALS,
+        );
 
-        if hit && stats.prewarm_reliability >= PREWARM_RECOVERY_THRESHOLD {
-            stats.prewarm_quarantine_until_transition = 0;
-            stats.prewarm_backoff_level = stats.prewarm_backoff_level.saturating_sub(1);
-        } else if stats.prewarm_trials >= PREWARM_MIN_TRIALS
-            && stats.prewarm_reliability < PREWARM_QUARANTINE_THRESHOLD
-        {
-            if admission_before == PrewarmAdmission::Probe {
-                stats.prewarm_backoff_level = stats
-                    .prewarm_backoff_level
-                    .saturating_add(1)
-                    .min(PREWARM_MAX_BACKOFF_SHIFT);
+        if let Some(context) = context {
+            if !stats.prewarm_contexts.contains_key(&context.key)
+                && stats.prewarm_contexts.len() >= MAX_PREWARM_CONTEXTS_PER_TRANSITION
+            {
+                if let Some(evict) = stats
+                    .prewarm_contexts
+                    .iter()
+                    .min_by_key(|(_, calibration)| calibration.trials)
+                    .map(|(key, _)| *key)
+                {
+                    stats.prewarm_contexts.remove(&evict);
+                }
             }
-            let backoff =
-                PREWARM_PROBE_BASE_TRANSITIONS.saturating_mul(1_u64 << stats.prewarm_backoff_level);
-            stats.prewarm_quarantine_until_transition = total_transitions.saturating_add(backoff);
+            let context_stats = stats
+                .prewarm_contexts
+                .entry(context.key)
+                .or_insert_with(|| PrewarmCalibrationStats::new(prior_reliability));
+            update_calibration(
+                &mut context_stats.trials,
+                &mut context_stats.hits,
+                &mut context_stats.reliability,
+                &mut context_stats.quarantine_until_transition,
+                &mut context_stats.backoff_level,
+                hit,
+                context_admission_before,
+                total_transitions,
+                PREWARM_MIN_CONTEXT_TRIALS,
+            );
         }
         self.dirty = true;
     }
@@ -416,6 +589,100 @@ impl FocusMarkov {
     fn load_state(path: &Path) -> Option<MarkovState> {
         let data = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&data).ok()
+    }
+}
+
+fn calibration_admission(
+    trials: u32,
+    reliability: f64,
+    quarantine_until_transition: u64,
+    total_transitions: u64,
+) -> PrewarmAdmission {
+    if trials < PREWARM_MIN_TRIALS
+        || reliability >= PREWARM_RECOVERY_THRESHOLD
+        || quarantine_until_transition == 0
+    {
+        PrewarmAdmission::Ready
+    } else if total_transitions >= quarantine_until_transition {
+        PrewarmAdmission::Probe
+    } else {
+        PrewarmAdmission::Quarantined
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_calibration(
+    trials: &mut u32,
+    hits: &mut u32,
+    reliability: &mut f64,
+    quarantine_until_transition: &mut u64,
+    backoff_level: &mut u8,
+    hit: bool,
+    admission_before: PrewarmAdmission,
+    total_transitions: u64,
+    min_trials: u32,
+) {
+    *trials = trials.saturating_add(1);
+    *hits = hits.saturating_add(u32::from(hit));
+    *reliability = (PREWARM_OUTCOME_ALPHA * f64::from(hit)
+        + (1.0 - PREWARM_OUTCOME_ALPHA) * reliability.clamp(0.0, 1.0))
+    .clamp(0.0, 1.0);
+
+    if hit && *reliability >= PREWARM_RECOVERY_THRESHOLD {
+        *quarantine_until_transition = 0;
+        *backoff_level = backoff_level.saturating_sub(1);
+    } else if *trials >= min_trials && *reliability < PREWARM_QUARANTINE_THRESHOLD {
+        if admission_before == PrewarmAdmission::Probe {
+            *backoff_level = backoff_level
+                .saturating_add(1)
+                .min(PREWARM_MAX_BACKOFF_SHIFT);
+        }
+        let backoff = PREWARM_PROBE_BASE_TRANSITIONS.saturating_mul(1_u64 << *backoff_level);
+        *quarantine_until_transition = total_transitions.saturating_add(backoff);
+    }
+}
+
+fn sanitize_state(state: &mut MarkovState) {
+    for targets in state.transitions.values_mut() {
+        for stats in targets.values_mut() {
+            if !stats.total_dwell_secs.is_finite() || stats.total_dwell_secs < 0.0 {
+                stats.total_dwell_secs = 0.0;
+            }
+            stats.prewarm_hits = stats.prewarm_hits.min(stats.prewarm_trials);
+            stats.prewarm_reliability = if stats.prewarm_reliability.is_finite() {
+                stats.prewarm_reliability.clamp(0.0, 1.0)
+            } else {
+                default_prewarm_reliability()
+            };
+            stats.prewarm_backoff_level =
+                stats.prewarm_backoff_level.min(PREWARM_MAX_BACKOFF_SHIFT);
+            let global_reliability = stats.prewarm_reliability;
+            stats.prewarm_contexts.retain(|key, calibration| {
+                if *key >= PREWARM_CONTEXT_KEY_LIMIT {
+                    return false;
+                }
+                calibration.hits = calibration.hits.min(calibration.trials);
+                calibration.reliability = if calibration.reliability.is_finite() {
+                    calibration.reliability.clamp(0.0, 1.0)
+                } else {
+                    global_reliability
+                };
+                calibration.backoff_level =
+                    calibration.backoff_level.min(PREWARM_MAX_BACKOFF_SHIFT);
+                true
+            });
+            while stats.prewarm_contexts.len() > MAX_PREWARM_CONTEXTS_PER_TRANSITION {
+                let Some(evict) = stats
+                    .prewarm_contexts
+                    .iter()
+                    .min_by_key(|(_, calibration)| calibration.trials)
+                    .map(|(key, _)| *key)
+                else {
+                    break;
+                };
+                stats.prewarm_contexts.remove(&evict);
+            }
+        }
     }
 }
 
@@ -534,6 +801,82 @@ mod tests {
             m.prewarm_admission("Finder", "Terminal"),
             PrewarmAdmission::Ready
         );
+    }
+
+    #[test]
+    fn mature_contexts_calibrate_independently_without_bypassing_warmup() {
+        let mut m = test_markov();
+        m.state.total_transitions = 100;
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), TransitionStats::new(5.0))]),
+        );
+        let poor = PrewarmContext::new("idle", 2, 0.20, false);
+        let useful = PrewarmContext::new("build", 14, 0.52, true);
+
+        for _ in 0..5 {
+            m.record_prewarm_outcome_with_context("Finder", "Terminal", false, poor);
+        }
+        assert_eq!(
+            m.prewarm_admission_with_context("Finder", "Terminal", poor),
+            PrewarmAdmission::Quarantined
+        );
+
+        for _ in 0..4 {
+            m.record_prewarm_outcome_with_context("Finder", "Terminal", true, useful);
+        }
+        assert_eq!(m.prewarm_context_trials("Finder", "Terminal", useful), 4);
+        assert_eq!(
+            m.prewarm_admission_with_context("Finder", "Terminal", useful),
+            m.prewarm_admission("Finder", "Terminal"),
+            "an immature context must inherit global admission"
+        );
+        m.record_prewarm_outcome_with_context("Finder", "Terminal", true, useful);
+
+        assert_eq!(
+            m.prewarm_admission_with_context("Finder", "Terminal", poor),
+            PrewarmAdmission::Quarantined
+        );
+        assert_eq!(
+            m.prewarm_admission_with_context("Finder", "Terminal", useful),
+            PrewarmAdmission::Ready
+        );
+        assert!(
+            m.prewarm_reliability_with_context("Finder", "Terminal", useful)
+                > m.prewarm_reliability_with_context("Finder", "Terminal", poor)
+        );
+    }
+
+    #[test]
+    fn context_calibration_is_bounded_per_transition() {
+        let mut m = test_markov();
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), TransitionStats::new(5.0))]),
+        );
+        for index in 0..24 {
+            let workload = match index % 6 {
+                0 => "idle",
+                1 => "browsing",
+                2 => "build",
+                3 => "llm-inference",
+                4 => "mediaplayback",
+                _ => "other",
+            };
+            let context = PrewarmContext::new(
+                workload,
+                (index % 24) as u8,
+                match index % 3 {
+                    0 => 0.20,
+                    1 => 0.50,
+                    _ => 0.75,
+                },
+                index % 2 == 0,
+            );
+            m.record_prewarm_outcome_with_context("Finder", "Terminal", true, context);
+        }
+        let stats = &m.state.transitions["Finder"]["Terminal"];
+        assert!(stats.prewarm_contexts.len() <= MAX_PREWARM_CONTEXTS_PER_TRANSITION);
     }
 
     #[test]

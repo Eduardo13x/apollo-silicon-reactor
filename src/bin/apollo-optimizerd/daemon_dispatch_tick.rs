@@ -375,21 +375,31 @@ pub fn plan_action_intents(
         .filter_map(apollo_engine::engine::telemetry_medallion::actuator_action_key)
         .collect();
     let temporal_plan = world_model.plan_temporal_sequence(&action_keys, workload);
-    let temporal_scale = if temporal_plan.authoritative {
-        0.50
-    } else {
-        0.20
-    };
     let mut temporal_promotions = 0_u64;
     for (key, score) in &temporal_plan.action_scores {
-        let gain = score.expected_gain.max(0.0) * temporal_scale;
+        let exploratory_gain = score.expected_gain.max(0.0) * 0.20;
+        let authoritative = temporal_plan
+            .authoritative
+            .then(|| temporal_plan.authoritative_action_scores.get(key))
+            .flatten();
+        let authoritative_gain = authoritative
+            .map(|score| score.expected_gain.max(0.0) * 0.50)
+            .unwrap_or(0.0);
+        let (gain, uncertainty) = if authoritative_gain > exploratory_gain {
+            (
+                authoritative_gain,
+                authoritative.map_or(score.uncertainty, |score| score.uncertainty),
+            )
+        } else {
+            (exploratory_gain, score.uncertainty)
+        };
         if gain <= 0.0 {
             continue;
         }
         temporal_promotions = temporal_promotions.saturating_add(1);
         let evidence = context.utility_evidence.entry(key.clone()).or_default();
         evidence.expected_benefit += gain;
-        evidence.uncertainty = evidence.uncertainty.max(score.uncertainty);
+        evidence.uncertainty = evidence.uncertainty.max(uncertainty);
     }
     let (planned, mut report) = plan_actions(actions, &context);
     report.evidence_ranked = exact_positive_evidence;
@@ -404,8 +414,16 @@ pub fn plan_action_intents(
     report.temporal_fluidity_delta = temporal_plan.predicted_fluidity_delta;
     report.temporal_energy_delta = temporal_plan.predicted_energy_delta;
     report.temporal_authoritative = temporal_plan.authoritative;
+    report.temporal_authoritative_rollouts = temporal_plan.authoritative_sequences_evaluated;
+    report.temporal_authoritative_expected_gain = temporal_plan.authoritative_expected_gain;
+    report.temporal_authoritative_uncertainty = temporal_plan.authoritative_uncertainty;
+    report.temporal_authoritative_pressure_delta = temporal_plan.authoritative_pressure_delta;
+    report.temporal_authoritative_fluidity_delta = temporal_plan.authoritative_fluidity_delta;
+    report.temporal_authoritative_energy_delta = temporal_plan.authoritative_energy_delta;
     report.temporal_best_first = temporal_plan.best_first;
     report.temporal_best_second = temporal_plan.best_second;
+    report.temporal_authoritative_best_first = temporal_plan.authoritative_best_first;
+    report.temporal_authoritative_best_second = temporal_plan.authoritative_best_second;
     report.temporal_abstention_reason = temporal_plan.abstention_reason.map(str::to_string);
     (planned, report)
 }

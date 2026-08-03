@@ -5529,6 +5529,14 @@ fn main() -> anyhow::Result<()> {
                         .metrics
                         .world_model_sequence_authoritative_total
                         .saturating_add(u64::from(plan_report.temporal_authoritative));
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_rollouts_total = metrics
+                        .metrics
+                        .world_model_sequence_authoritative_rollouts_total
+                        .saturating_add(plan_report.temporal_authoritative_rollouts);
+                    metrics.metrics.world_model_sequence_authoritative =
+                        plan_report.temporal_authoritative;
                     metrics.metrics.world_model_sequence_expected_gain =
                         plan_report.temporal_expected_gain;
                     metrics.metrics.world_model_sequence_uncertainty =
@@ -5539,10 +5547,40 @@ fn main() -> anyhow::Result<()> {
                         plan_report.temporal_fluidity_delta;
                     metrics.metrics.world_model_sequence_energy_delta =
                         plan_report.temporal_energy_delta;
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_expected_gain =
+                        plan_report.temporal_authoritative_expected_gain;
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_uncertainty =
+                        plan_report.temporal_authoritative_uncertainty;
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_pressure_delta =
+                        plan_report.temporal_authoritative_pressure_delta;
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_fluidity_delta =
+                        plan_report.temporal_authoritative_fluidity_delta;
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_energy_delta =
+                        plan_report.temporal_authoritative_energy_delta;
                     metrics.metrics.world_model_sequence_best_first =
                         plan_report.temporal_best_first.unwrap_or_default();
                     metrics.metrics.world_model_sequence_best_second =
                         plan_report.temporal_best_second.unwrap_or_default();
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_best_first = plan_report
+                        .temporal_authoritative_best_first
+                        .unwrap_or_default();
+                    metrics
+                        .metrics
+                        .world_model_sequence_authoritative_best_second = plan_report
+                        .temporal_authoritative_best_second
+                        .unwrap_or_default();
                     metrics.metrics.world_model_sequence_abstention_reason =
                         plan_report.temporal_abstention_reason.unwrap_or_default();
                     if let Some(resolution) = plan_report.last_resolution {
@@ -5850,6 +5888,20 @@ fn main() -> anyhow::Result<()> {
                         arousal_level: arousal_state.level as f64,
                     },
                 );
+                let mut causal_actuator_gold = 0_u64;
+                for evidence in telemetry_medallion.drain_new_gold_evidence() {
+                    causal_actuator_gold = causal_actuator_gold.saturating_add(u64::from(
+                        lctx.causal_graph
+                            .observe_actuator_outcome(&evidence, installation_id),
+                    ));
+                }
+                if causal_actuator_gold > 0 {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.world_model_causal_actuator_gold_total = metrics
+                        .metrics
+                        .world_model_causal_actuator_gold_total
+                        .saturating_add(causal_actuator_gold);
+                }
                 // Refresh the facade after observation so metrics history and
                 // dashboard consume this cycle's context and any outcomes that
                 // just matured. Dispatch already used the prior-cycle model.

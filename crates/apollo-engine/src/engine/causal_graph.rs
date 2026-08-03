@@ -21,6 +21,8 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
 
 use crate::engine::data_medallion::CuratedLabel;
+use crate::engine::installation_identity::InstallationId;
+use crate::engine::telemetry_medallion::{ActuatorFamily, EvidenceTier, ResolvedActuatorEvidence};
 
 /// Hard cap for in-cycle edge count. Raised from 500 → 1500 after canary
 /// telemetry showed the graph was saturating immediately, causing edges to be
@@ -74,6 +76,13 @@ const CURATED_EFFECTIVE_DELTA: f32 = 0.01;
 const MAX_CURATED_PRESSURE_DELTA: f32 = 0.35;
 const CURATED_RETENTION_WEIGHT: f32 = 0.05;
 const CURATED_MATURE_EVIDENCE: f32 = 10.0;
+
+fn known_curated_workload(workload: &str) -> bool {
+    matches!(
+        workload,
+        "idle" | "browsing" | "build" | "llm-inference" | "any"
+    )
+}
 
 /// Phase 4.2 — Class of external systemic event that can confound Apollo's
 /// causal attribution. These are NOT Apollo actions; they are environmental
@@ -681,14 +690,10 @@ impl CausalGraph {
         cycle: u64,
         label: CuratedLabel,
     ) -> bool {
-        let known_workload = matches!(
-            workload,
-            "idle" | "browsing" | "build" | "llm-inference" | "any"
-        );
         if !label.is_gold()
             || label.rejection.is_some()
             || action_key.is_empty()
-            || !known_workload
+            || !known_curated_workload(workload)
             || !pressure_drop.is_finite()
             || pressure_drop.abs() > MAX_CURATED_PRESSURE_DELTA as f64
             || !label.quality_score.is_finite()
@@ -697,18 +702,67 @@ impl CausalGraph {
             return false;
         }
 
+        self.observe_curated_values(
+            action_key,
+            workload,
+            pressure_drop,
+            cycle,
+            label.quality_score,
+        )
+    }
+
+    /// Admit a universal-medallion Gold result into the same pressure-causal
+    /// endpoint. Legacy pressure actions keep their LearningPipeline writer so
+    /// one physical intervention can never be counted twice.
+    pub fn observe_actuator_outcome(
+        &mut self,
+        evidence: &ResolvedActuatorEvidence,
+        local_installation_id: InstallationId,
+    ) -> bool {
+        if evidence.tier != EvidenceTier::Gold
+            || matches!(
+                evidence.family,
+                ActuatorFamily::Throttle | ActuatorFamily::Freeze | ActuatorFamily::Memorystatus
+            )
+            || evidence.action_key.is_empty()
+            || !local_installation_id.is_known()
+            || evidence.installation_id != local_installation_id
+            || !known_curated_workload(&evidence.workload)
+            || !evidence.quality.is_finite()
+            || !(0.0..=1.0).contains(&evidence.quality)
+            || !evidence.net_state_delta.pressure.is_finite()
+        {
+            return false;
+        }
+
+        let pressure_drop = -evidence.net_state_delta.pressure;
+        if pressure_drop.abs() > MAX_CURATED_PRESSURE_DELTA as f64 {
+            return false;
+        }
+        self.observe_curated_values(
+            &evidence.action_key,
+            &evidence.workload,
+            pressure_drop,
+            evidence.resolved_cycle,
+            evidence.quality,
+        )
+    }
+
+    fn observe_curated_values(
+        &mut self,
+        action_key: &str,
+        workload: &str,
+        pressure_drop: f64,
+        cycle: u64,
+        quality: f64,
+    ) -> bool {
         let key = (action_key.to_string(), EFFECT_PRESSURE_DROP.to_string());
         {
             let edge = self
                 .edges
                 .entry(key)
                 .or_insert_with(|| CausalEdge::new(action_key, EFFECT_PRESSURE_DROP));
-            edge.observe_curated(
-                workload,
-                pressure_drop as f32,
-                label.quality_score as f32,
-                cycle,
-            );
+            edge.observe_curated(workload, pressure_drop as f32, quality as f32, cycle);
         }
         self.compact_edges_if_needed();
         self.curated_revision = self.curated_revision.wrapping_add(1);
@@ -1422,6 +1476,7 @@ impl CausalGraph {
 mod tests {
     use super::*;
     use crate::engine::data_medallion::{DataMedallion, MedallionObservation, MedallionTier};
+    use crate::engine::telemetry_medallion::{ActuatorObjective, HardwareRegime, WorldStateDelta};
 
     #[test]
     fn test_new_edge_uninformed() {
@@ -1475,6 +1530,55 @@ mod tests {
         assert_eq!(evidence.aggregate.avg_pressure_drop, 0.08);
         assert_eq!(evidence.contextual.unwrap().observations, 1);
         assert_eq!(graph.curated_action_count(), 1);
+        assert_eq!(graph.curated_gold_evidence_total(), 1);
+    }
+
+    #[test]
+    fn universal_gold_bridge_preserves_action_identity_without_legacy_duplicates() {
+        let mut graph = CausalGraph::new();
+        let evidence = ResolvedActuatorEvidence {
+            id: 7,
+            family: ActuatorFamily::Boost,
+            objective: ActuatorObjective::Responsiveness,
+            action_key: "boost:Editor".to_string(),
+            target: "Editor".to_string(),
+            workload: "build".to_string(),
+            issued_cycle: 10,
+            resolved_cycle: 14,
+            resolved_timestamp_unix: 1_800_000_000,
+            hardware_regime: HardwareRegime::default(),
+            installation_id: InstallationId(7),
+            horizon_cycles: 4,
+            tier: EvidenceTier::Gold,
+            quality: 0.96,
+            raw_utility_delta: 0.08,
+            counterfactual_delta: 0.01,
+            net_utility_delta: 0.07,
+            net_state_delta: WorldStateDelta {
+                pressure: -0.05,
+                fluidity: 0.04,
+                ..WorldStateDelta::default()
+            },
+            effective: true,
+            confounder_count: 0,
+            target_present_after: Some(true),
+        };
+
+        assert!(graph.observe_actuator_outcome(&evidence, InstallationId(7)));
+        let (_, prediction) = graph
+            .curated_prediction_evidence("build")
+            .next()
+            .expect("bridged prediction");
+        assert!((prediction.aggregate.avg_pressure_drop - 0.05).abs() < f32::EPSILON);
+
+        let mut foreign = evidence.clone();
+        foreign.installation_id = InstallationId(8);
+        assert!(!graph.observe_actuator_outcome(&foreign, InstallationId(7)));
+
+        let mut legacy = evidence;
+        legacy.family = ActuatorFamily::Throttle;
+        legacy.action_key = "throttle:Editor".to_string();
+        assert!(!graph.observe_actuator_outcome(&legacy, InstallationId(7)));
         assert_eq!(graph.curated_gold_evidence_total(), 1);
     }
 

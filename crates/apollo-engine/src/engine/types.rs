@@ -1589,6 +1589,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub world_model_sequence_authoritative_total: u64,
     #[serde(default)]
+    pub world_model_sequence_authoritative_rollouts_total: u64,
+    #[serde(default)]
+    pub world_model_sequence_authoritative: bool,
+    #[serde(default)]
     pub world_model_sequence_expected_gain: f64,
     #[serde(default)]
     pub world_model_sequence_uncertainty: f64,
@@ -1599,9 +1603,23 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub world_model_sequence_energy_delta: f64,
     #[serde(default)]
+    pub world_model_sequence_authoritative_expected_gain: f64,
+    #[serde(default)]
+    pub world_model_sequence_authoritative_uncertainty: f64,
+    #[serde(default)]
+    pub world_model_sequence_authoritative_pressure_delta: f64,
+    #[serde(default)]
+    pub world_model_sequence_authoritative_fluidity_delta: f64,
+    #[serde(default)]
+    pub world_model_sequence_authoritative_energy_delta: f64,
+    #[serde(default)]
     pub world_model_sequence_best_first: String,
     #[serde(default)]
     pub world_model_sequence_best_second: String,
+    #[serde(default)]
+    pub world_model_sequence_authoritative_best_first: String,
+    #[serde(default)]
+    pub world_model_sequence_authoritative_best_second: String,
     #[serde(default)]
     pub world_model_sequence_abstention_reason: String,
     #[serde(default)]
@@ -1671,6 +1689,10 @@ pub struct RuntimeMetrics {
     pub world_model_ready_actions: u64,
     #[serde(default)]
     pub world_model_gold_evidence: u64,
+    /// Gold outcomes from the universal actuator medallion admitted into the
+    /// pressure-causal graph (legacy pressure actions excluded to avoid dupes).
+    #[serde(default)]
+    pub world_model_causal_actuator_gold_total: u64,
     #[serde(default)]
     pub world_model_contextual_actions: u64,
     #[serde(default)]
@@ -2095,6 +2117,9 @@ pub struct RuntimeMetrics {
     pub markov_prewarm_quarantined: bool,
     #[serde(default)]
     pub markov_prewarm_reliability: f64,
+    /// Samples in the current bounded workload/time/pressure/activity bucket.
+    #[serde(default)]
+    pub markov_prewarm_context_trials: u32,
     #[serde(default)]
     pub markov_prewarm_quarantines_total: u64,
     #[serde(default)]

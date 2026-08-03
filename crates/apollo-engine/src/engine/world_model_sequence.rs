@@ -20,6 +20,9 @@ const BEAM_WIDTH: usize = 4;
 const STEP_CYCLES: f64 = 4.0;
 const MIN_STATE_EVIDENCE: f64 = 4.0;
 const MIN_MODEL_QUALITY: f64 = 0.85;
+const MIN_AUTHORITATIVE_STATE_EVIDENCE: f64 = 8.0;
+const MIN_AUTHORITATIVE_MODEL_QUALITY: f64 = 0.90;
+const MAX_AUTHORITATIVE_UNCERTAINTY: f64 = 0.20;
 const MODEL_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -31,7 +34,10 @@ pub struct SequenceActionScore {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct TemporalSequencePlan {
+    /// Best-effort scores, including family priors and immature exact models.
     pub action_scores: HashMap<String, SequenceActionScore>,
+    /// Scores backed only by mature, local, exact transition evidence.
+    pub authoritative_action_scores: HashMap<String, SequenceActionScore>,
     pub best_first: Option<String>,
     pub best_second: Option<String>,
     pub expected_gain: f64,
@@ -42,7 +48,15 @@ pub struct TemporalSequencePlan {
     pub candidates: u64,
     pub sequences_evaluated: u64,
     pub memory_samples: u64,
+    pub authoritative_sequences_evaluated: u64,
     pub authoritative: bool,
+    pub authoritative_best_first: Option<String>,
+    pub authoritative_best_second: Option<String>,
+    pub authoritative_expected_gain: f64,
+    pub authoritative_uncertainty: f64,
+    pub authoritative_pressure_delta: f64,
+    pub authoritative_fluidity_delta: f64,
+    pub authoritative_energy_delta: f64,
     pub abstention_reason: Option<&'static str>,
 }
 
@@ -170,6 +184,7 @@ struct Candidate {
     utility: f64,
     uncertainty: f64,
     exact: bool,
+    authoritative: bool,
     dispatchable: bool,
 }
 
@@ -180,7 +195,7 @@ struct Trajectory {
     score: f64,
     uncertainty: f64,
     final_state: JointState,
-    exact: bool,
+    authoritative: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -249,7 +264,7 @@ pub fn plan_temporal_sequence(
     let drift = memory.dynamics_per_cycle.scaled(STEP_CYCLES);
     let baseline_one = current.apply(drift);
     let baseline_two = baseline_one.apply(drift);
-    let mut trajectories = Vec::new();
+    let mut one_step_trajectories = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         if !candidate.dispatchable {
             continue;
@@ -269,19 +284,36 @@ pub fn plan_temporal_sequence(
                 exact_evidence: candidate.exact,
             },
         );
-        trajectories.push(Trajectory {
+        if candidate.authoritative {
+            plan.authoritative_action_scores.insert(
+                candidate.key.clone(),
+                SequenceActionScore {
+                    expected_gain: score,
+                    uncertainty: candidate.uncertainty,
+                    exact_evidence: true,
+                },
+            );
+            plan.authoritative_sequences_evaluated =
+                plan.authoritative_sequences_evaluated.saturating_add(1);
+        }
+        one_step_trajectories.push(Trajectory {
             first: index,
             second: None,
             score,
             uncertainty: candidate.uncertainty,
             final_state: state,
-            exact: candidate.exact,
+            authoritative: candidate.authoritative,
         });
     }
-    trajectories.sort_by(|left, right| right.score.total_cmp(&left.score));
-    trajectories.truncate(BEAM_WIDTH);
-
-    let beams = trajectories.clone();
+    one_step_trajectories.sort_by(|left, right| right.score.total_cmp(&left.score));
+    let beams: Vec<_> = one_step_trajectories
+        .iter()
+        .take(BEAM_WIDTH)
+        .cloned()
+        .collect();
+    // Keep every one-step candidate eligible for the authoritative lane even
+    // when an exploratory prior occupies the bounded expansion beam.
+    let mut trajectories = one_step_trajectories;
     for beam in beams {
         for (second_index, second) in candidates.iter().enumerate() {
             if second_index == beam.first {
@@ -291,6 +323,7 @@ pub fn plan_temporal_sequence(
             let mut final_state = beam.final_state.apply(drift).apply(second.effect);
             let mut learned_utility = first.utility + 0.90 * second.utility;
             let mut exact = first.exact && second.exact;
+            let mut authoritative = false;
             let mut uncertainty = (first.uncertainty + second.uncertainty) * 0.5;
             if let Some(synergy) = coordinated_effect(
                 &first.key,
@@ -303,6 +336,8 @@ pub fn plan_temporal_sequence(
                 learned_utility += 0.50 * synergy.utility;
                 uncertainty = (uncertainty + synergy.uncertainty) * 0.5;
                 exact &= synergy.exact;
+                authoritative =
+                    first.authoritative && second.authoritative && synergy.authoritative;
             }
             let state_gain = 0.45 * (beam.final_state.utility() - baseline_one.utility())
                 + 0.55 * (final_state.utility() - baseline_two.utility());
@@ -320,19 +355,34 @@ pub fn plan_temporal_sequence(
                     exact_evidence: exact,
                 };
             }
+            if authoritative {
+                plan.authoritative_sequences_evaluated =
+                    plan.authoritative_sequences_evaluated.saturating_add(1);
+                let entry = plan
+                    .authoritative_action_scores
+                    .entry(first.key.clone())
+                    .or_default();
+                if score > entry.expected_gain {
+                    *entry = SequenceActionScore {
+                        expected_gain: score,
+                        uncertainty,
+                        exact_evidence: true,
+                    };
+                }
+            }
             trajectories.push(Trajectory {
                 first: beam.first,
                 second: Some(second_index),
                 score,
                 uncertainty,
                 final_state,
-                exact,
+                authoritative,
             });
         }
     }
 
     let Some(best) = trajectories
-        .into_iter()
+        .iter()
         .max_by(|left, right| left.score.total_cmp(&right.score))
     else {
         plan.abstention_reason = Some("transition_evidence");
@@ -351,8 +401,38 @@ pub fn plan_temporal_sequence(
     plan.predicted_pressure_delta = predicted.pressure;
     plan.predicted_fluidity_delta = predicted.fluidity;
     plan.predicted_energy_delta = predicted.energy;
-    plan.authoritative = authority_trusted && best.exact && best.score > 0.0;
-    plan.abstention_reason = (!plan.authoritative).then_some("ranking_only");
+
+    if let Some(best_authoritative) = trajectories
+        .iter()
+        .filter(|trajectory| trajectory.authoritative)
+        .max_by(|left, right| left.score.total_cmp(&right.score))
+    {
+        let final_baseline = if best_authoritative.second.is_some() {
+            baseline_two
+        } else {
+            baseline_one
+        };
+        let predicted = best_authoritative.final_state.delta_from(final_baseline);
+        plan.authoritative_best_first = Some(candidates[best_authoritative.first].key.clone());
+        plan.authoritative_best_second = best_authoritative
+            .second
+            .map(|index| candidates[index].key.clone());
+        plan.authoritative_expected_gain = best_authoritative.score;
+        plan.authoritative_uncertainty = best_authoritative.uncertainty.clamp(0.0, 1.0);
+        plan.authoritative_pressure_delta = predicted.pressure;
+        plan.authoritative_fluidity_delta = predicted.fluidity;
+        plan.authoritative_energy_delta = predicted.energy;
+        plan.authoritative = authority_trusted && best_authoritative.score > 0.0;
+        plan.abstention_reason = if !authority_trusted {
+            Some("authority_phase")
+        } else if best_authoritative.score <= 0.0 {
+            Some("nonpositive_authority")
+        } else {
+            None
+        };
+    } else {
+        plan.abstention_reason = Some("ranking_only");
+    }
     plan
 }
 
@@ -370,33 +450,63 @@ fn candidate_for_key(
 ) -> Option<Candidate> {
     let workload_key = format!("{workload}|{key}");
     let family_key = key.split_once(':').map(|(family, _)| format!("{family}:*"));
-    let selected = [
-        (models.get(&workload_key), true),
-        (models.get(key), true),
-        (family_key.as_ref().and_then(|key| models.get(key)), false),
-    ]
-    .into_iter()
-    .find_map(|(model, exact)| {
-        model
-            .filter(|model| transition_model_ready(model, context, installation_id))
-            .map(|model| (model, exact))
-    })?;
-    let (model, exact) = selected;
-    let evidence = model
-        .effective_state_evidence_at(context.timestamp_unix)
-        .max(1.0);
-    let state_uncertainty = (model.state_variance_ema.mean_variance().max(0.0) / evidence).sqrt();
-    let utility_uncertainty = (model.utility_variance_ema.max(0.0001) / evidence).sqrt();
+    let mut options = Vec::with_capacity(3);
+    for (model, exact, contextual) in [
+        (models.get(&workload_key), true, true),
+        (models.get(key), true, false),
+        (
+            family_key.as_ref().and_then(|key| models.get(key)),
+            false,
+            false,
+        ),
+    ] {
+        let Some(model) =
+            model.filter(|model| transition_model_ready(model, context, installation_id))
+        else {
+            continue;
+        };
+        let evidence = model
+            .effective_state_evidence_at(context.timestamp_unix)
+            .max(1.0);
+        let uncertainty = model_uncertainty(model, evidence, exact);
+        let authoritative = exact
+            && evidence >= MIN_AUTHORITATIVE_STATE_EVIDENCE
+            && model.quality_ema >= MIN_AUTHORITATIVE_MODEL_QUALITY
+            && uncertainty <= MAX_AUTHORITATIVE_UNCERTAINTY;
+        options.push((
+            model,
+            exact,
+            contextual,
+            evidence,
+            uncertainty,
+            authoritative,
+        ));
+    }
+    let (model, exact, _, _, uncertainty, authoritative) =
+        options.into_iter().max_by(|left, right| {
+            left.5
+                .cmp(&right.5)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+                .then_with(|| right.4.total_cmp(&left.4))
+                .then_with(|| left.3.total_cmp(&right.3))
+        })?;
     let prior_scale = if exact { 1.0 } else { 0.50 };
     Some(Candidate {
         key: key.to_string(),
         effect: model.state_delta_ema.scaled(prior_scale),
         utility: model.utility_ema * prior_scale,
-        uncertainty: (state_uncertainty + utility_uncertainty + if exact { 0.0 } else { 0.25 })
-            .clamp(0.0, 1.0),
+        uncertainty,
         exact,
+        authoritative,
         dispatchable,
     })
+}
+
+fn model_uncertainty(model: &ActionModelStats, evidence: f64, exact: bool) -> f64 {
+    let state_uncertainty = (model.state_variance_ema.mean_variance().max(0.0) / evidence).sqrt();
+    let utility_uncertainty = (model.utility_variance_ema.max(0.0001) / evidence).sqrt();
+    (state_uncertainty + utility_uncertainty + if exact { 0.0 } else { 0.25 }).clamp(0.0, 1.0)
 }
 
 fn coordinated_effect(
@@ -615,6 +725,61 @@ mod tests {
         );
         assert_eq!(plan.abstention_reason, Some("transition_evidence"));
         assert!(plan.action_scores.is_empty());
+    }
+
+    #[test]
+    fn immature_exact_transition_stays_in_exploratory_lane() {
+        let (memory, latest) = warmed_memory();
+        let mut immature = model(&latest, 0.08, 0.04);
+        immature.observations = 4;
+        immature.evidence_mass = 4.0;
+        immature.state_evidence_mass = 4.0;
+        let models = HashMap::from([("boost:Editor".to_string(), immature)]);
+        let plan = plan_temporal_sequence(
+            &memory,
+            Some(&latest),
+            LOCAL_ID,
+            true,
+            &models,
+            &["boost:Editor".to_string()],
+            "coding",
+        );
+
+        assert!(plan.action_scores.contains_key("boost:Editor"));
+        assert!(plan.authoritative_action_scores.is_empty());
+        assert!(!plan.authoritative);
+        assert_eq!(plan.abstention_reason, Some("ranking_only"));
+    }
+
+    #[test]
+    fn speculative_winner_does_not_hide_authoritative_one_step() {
+        let (memory, latest) = warmed_memory();
+        let models = HashMap::from([
+            ("boost:Editor".to_string(), model(&latest, 0.03, 0.02)),
+            ("markov_prewarm:*".to_string(), model(&latest, 0.80, 0.45)),
+        ]);
+        let plan = plan_temporal_sequence(
+            &memory,
+            Some(&latest),
+            LOCAL_ID,
+            true,
+            &models,
+            &["boost:Editor".to_string()],
+            "coding",
+        );
+
+        assert_eq!(plan.best_first.as_deref(), Some("boost:Editor"));
+        assert_eq!(
+            plan.best_second.as_deref(),
+            Some("markov_prewarm:predicted_app")
+        );
+        assert_eq!(
+            plan.authoritative_best_first.as_deref(),
+            Some("boost:Editor")
+        );
+        assert_eq!(plan.authoritative_best_second, None);
+        assert!(plan.authoritative);
+        assert!(plan.authoritative_expected_gain > 0.0);
     }
 
     #[test]
