@@ -31,6 +31,8 @@ use apollo_engine::engine::temporal_predictor::TemporalPredictor;
 use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 use chrono::{Timelike, Utc};
 
+const TEMPORAL_PREWARM_COOLDOWN_SECS: u64 = 120;
+
 pub struct MarkovTickOutput {
     pub temporal_hour: u8,
     pub temporal_weekday: u8,
@@ -62,6 +64,8 @@ pub struct MarkovPrewarmLease {
 pub struct MarkovShadowTracker {
     active: Option<MarkovShadowLease>,
     sampled_pair: Option<(String, String)>,
+    temporal_last_app: Option<String>,
+    temporal_last_at: Option<Instant>,
 }
 
 #[derive(Debug)]
@@ -314,14 +318,32 @@ pub fn run_markov_tick(
             probability_floor,
         );
         let prewarm_eligible = base_eligible && admission.allows_acceleration();
-        markov_acceleration_allowed = admission.allows_acceleration() && cache_warm_allowed;
+        // Cache-only probes may test a cold/new context. Reversible kernel
+        // acceleration is reserved for mature transition evidence.
+        markov_acceleration_allowed = admission.allows_kernel_acceleration() && cache_warm_allowed;
+        let probe_transitions_remaining = focus_markov.prewarm_probe_transitions_remaining(
+            source_app,
+            &pred.app_name,
+            calibration_context,
+        );
+        let mut blocker = prewarm_blocker(
+            pred.probability,
+            time_to_switch,
+            cache_warm_allowed,
+            probability_floor,
+            admission,
+        );
         {
             let mut metrics = state.metrics.lock_recover();
             metrics.metrics.markov_prediction_app = pred.app_name.clone();
             metrics.metrics.markov_prediction_confidence = pred.probability;
             metrics.metrics.markov_prediction_eta_secs = time_to_switch;
+            metrics.metrics.markov_prediction_dwell_observations = pred.dwell_observations;
+            metrics.metrics.markov_prediction_dwell_deviation_secs = pred.dwell_deviation_secs;
             metrics.metrics.markov_prewarm_eligible = prewarm_eligible;
             metrics.metrics.markov_prewarm_quarantined = admission == PrewarmAdmission::Quarantined;
+            metrics.metrics.markov_prewarm_admission = admission.as_str().to_string();
+            metrics.metrics.markov_prewarm_blocker = blocker.to_string();
             metrics.metrics.markov_prewarm_reliability = focus_markov
                 .prewarm_reliability_with_context(source_app, &pred.app_name, calibration_context);
             metrics.metrics.markov_prewarm_context_trials = focus_markov.prewarm_context_trials(
@@ -329,6 +351,8 @@ pub fn run_markov_tick(
                 &pred.app_name,
                 calibration_context,
             );
+            metrics.metrics.markov_prewarm_probe_transitions_remaining =
+                probe_transitions_remaining;
             if contextual_bias.is_informative() {
                 metrics.metrics.world_model_contextual_markov_total = metrics
                     .metrics
@@ -357,15 +381,17 @@ pub fn run_markov_tick(
                         .markov_shadow_superseded_total
                         .saturating_add(1);
                 }
-                let (members, cache_bytes, unfrozen_count) = acquire_coalition_prewarm(
-                    pid,
-                    state,
-                    collector,
-                    process_tree,
-                    coalition_tracker,
-                    cache_warmer,
-                    frozen_state_path,
-                );
+                let (members, cache_bytes, unfrozen_count, conflict_skips) =
+                    acquire_coalition_prewarm(
+                        pid,
+                        state,
+                        collector,
+                        process_tree,
+                        coalition_tracker,
+                        cache_warmer,
+                        frozen_state_path,
+                        admission.allows_kernel_acceleration(),
+                    );
                 let members_applied = members.len() as u64;
                 let kernel_members = members
                     .iter()
@@ -398,6 +424,12 @@ pub fn run_markov_tick(
                 metrics.metrics.markov_prewarm_probes_total +=
                     u64::from(admission == PrewarmAdmission::Probe);
                 metrics.metrics.markov_prewarm_applied += u64::from(applied);
+                metrics.metrics.markov_prewarm_cache_only_total +=
+                    u64::from(admission == PrewarmAdmission::Probe && applied);
+                metrics.metrics.markov_prewarm_conflict_skips_total = metrics
+                    .metrics
+                    .markov_prewarm_conflict_skips_total
+                    .saturating_add(conflict_skips);
                 metrics.metrics.markov_prewarm_active = true;
                 metrics.metrics.markov_prewarm_members = members_applied as u32;
                 metrics.metrics.markov_prewarm_members_applied += members_applied;
@@ -417,6 +449,9 @@ pub fn run_markov_tick(
                     kernel_members,
                     "markov: acquired predictive coalition acceleration lease"
                 );
+            } else {
+                blocker = "target-not-running";
+                state.metrics.lock_recover().metrics.markov_prewarm_blocker = blocker.to_string();
             }
         }
 
@@ -450,10 +485,15 @@ pub fn run_markov_tick(
         metrics.metrics.markov_prediction_app.clear();
         metrics.metrics.markov_prediction_confidence = 0.0;
         metrics.metrics.markov_prediction_eta_secs = 0.0;
+        metrics.metrics.markov_prediction_dwell_observations = 0;
+        metrics.metrics.markov_prediction_dwell_deviation_secs = 0.0;
         metrics.metrics.markov_prewarm_eligible = false;
         metrics.metrics.markov_prewarm_quarantined = false;
-        metrics.metrics.markov_prewarm_reliability = 1.0;
+        metrics.metrics.markov_prewarm_admission.clear();
+        metrics.metrics.markov_prewarm_blocker = "no-prediction".to_string();
+        metrics.metrics.markov_prewarm_reliability = 0.5;
         metrics.metrics.markov_prewarm_context_trials = 0;
+        metrics.metrics.markov_prewarm_probe_transitions_remaining = 0;
     }
 
     // ── Universal pre-thaw: FocusMarkov → pre-thaw ALL frozen processes ──────
@@ -533,15 +573,44 @@ pub fn run_markov_tick(
             .collect();
         let temporal_preds = temporal_predictor.predict(hour, weekday, &markov_probs);
 
-        // At most one temporal-only candidate is useful per cycle. The old
-        // loop rescanned the entire process table up to five times (N+1) and
-        // could speculatively fault several unrelated executables into cache.
-        if cache_warm_allowed {
+        // Temporal-only warming is cache advisory and bounded to one candidate
+        // per focus transition. It consumes the same World Model context as
+        // Markov but never mutates QoS/jetsam state or competes for a ledger key.
+        if cache_warm_allowed && foreground_changed {
+            let contextual_bias =
+                world_model.contextual_action_bias("markov_prewarm:predicted_app", &workload);
+            let negative_bias = (-contextual_bias.score).clamp(0.0, 1.0);
+            let probability_floor = 0.15 + 0.05 * negative_bias;
+            let temporal_floor = 0.30 + 0.10 * negative_bias;
             if let Some(tpred) = temporal_preds.iter().find(|tpred| {
-                tpred.temporal_score > 0.3 && tpred.probability > 0.15 && tpred.markov_score < 0.30
+                !app_names_match(&tpred.app_name, fg_name)
+                    && tpred.temporal_score > temporal_floor
+                    && tpred.probability > probability_floor
+                    && tpred.markov_score < 0.30
             }) {
-                if let Some(pid) = find_running_pid(collector, &tpred.app_name) {
-                    cache_warmer.warm_pid(pid);
+                let cooldown_open = markov_shadow
+                    .temporal_last_at
+                    .is_none_or(|last| last.elapsed().as_secs() >= TEMPORAL_PREWARM_COOLDOWN_SECS);
+                let candidate_changed =
+                    markov_shadow.temporal_last_app.as_deref() != Some(tpred.app_name.as_str());
+                if cooldown_open || candidate_changed {
+                    if let Some(pid) = find_running_pid(collector, &tpred.app_name) {
+                        let bytes = cache_warmer.warm_pid(pid);
+                        markov_shadow.temporal_last_app = Some(tpred.app_name.clone());
+                        markov_shadow.temporal_last_at = Some(Instant::now());
+                        let mut metrics = state.metrics.lock_recover();
+                        metrics.metrics.temporal_prewarm_attempts =
+                            metrics.metrics.temporal_prewarm_attempts.saturating_add(1);
+                        metrics.metrics.temporal_prewarm_applied = metrics
+                            .metrics
+                            .temporal_prewarm_applied
+                            .saturating_add(u64::from(bytes > 0));
+                        metrics.metrics.temporal_prewarm_cache_bytes = metrics
+                            .metrics
+                            .temporal_prewarm_cache_bytes
+                            .saturating_add(bytes);
+                        metrics.metrics.temporal_prewarm_last_app = tpred.app_name.clone();
+                    }
                 }
             }
         }
@@ -631,7 +700,8 @@ fn acquire_coalition_prewarm(
     coalition_tracker: &CoalitionTracker,
     cache_warmer: &mut CacheWarmer,
     frozen_state_path: &Path,
-) -> (Vec<PrewarmedMember>, u64, u64) {
+    allow_kernel_acceleration: bool,
+) -> (Vec<PrewarmedMember>, u64, u64, u64) {
     let candidates = coalition_candidates(root_pid, collector, process_tree, coalition_tracker);
     let eligible: Vec<(u32, String, bool)> = candidates
         .into_iter()
@@ -651,10 +721,16 @@ fn acquire_coalition_prewarm(
     let thawed = {
         let mut frozen_guard = state.frozen_state.lock_recover();
         let entries: std::collections::HashMap<u32, apollo_engine::engine::types::FrozenEntry> =
-            eligible
-                .iter()
-                .filter_map(|(pid, _, _)| frozen_guard.get(pid).map(|entry| (*pid, entry.clone())))
-                .collect();
+            if allow_kernel_acceleration {
+                eligible
+                    .iter()
+                    .filter_map(|(pid, _, _)| {
+                        frozen_guard.get(pid).map(|entry| (*pid, entry.clone()))
+                    })
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
         let outcome = unfreeze_pids_verified_outcome(&entries);
         for pid in outcome.forgettable_pids() {
             frozen_guard.remove(&pid);
@@ -670,18 +746,39 @@ fn acquire_coalition_prewarm(
 
     let mut members = Vec::with_capacity(eligible.len());
     let mut total_cache_bytes = 0u64;
+    let mut conflict_skips = 0u64;
     for (pid, _name, kernel_boost_allowed) in eligible {
-        let prior_jetsam = kernel_boost_allowed
+        let kernel_boost_allowed = kernel_boost_allowed && allow_kernel_acceleration;
+        let jetsam_effect =
+            apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority { pid, prior: -1 };
+        let tier_effect = apollo_engine::engine::effect_ledger::AppliedEffect::MachTier { pid };
+        let task_effect = apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid };
+        let jetsam_available = kernel_boost_allowed
+            && !apollo_engine::engine::effect_ledger::is_global_tracked(&jetsam_effect);
+        let tier_available = kernel_boost_allowed
+            && !apollo_engine::engine::effect_ledger::is_global_tracked(&tier_effect);
+        let task_available = kernel_boost_allowed
+            && !apollo_engine::engine::effect_ledger::is_global_tracked(&task_effect);
+        conflict_skips = conflict_skips
+            .saturating_add(u64::from(kernel_boost_allowed && !jetsam_available))
+            .saturating_add(u64::from(kernel_boost_allowed && !tier_available))
+            .saturating_add(u64::from(kernel_boost_allowed && !task_available));
+
+        let prior_jetsam = jetsam_available
             .then(|| jetsam_control::get_priority(pid).unwrap_or(-1))
             .unwrap_or(-1);
-        let jetsam_applied = kernel_boost_allowed
+        let jetsam_applied = jetsam_available
             && jetsam_control::set_priority(pid, jetsam_control::priority::FOREGROUND).is_ok();
-        let (tier_applied, task_qos_applied) = if kernel_boost_allowed {
+        let (tier_applied, task_qos_applied) = if tier_available || task_available {
             let mut qos = state.mach_qos.lock_recover();
-            let tier = qos.set_tier(pid, SchedulingTier::Foreground);
-            let task_qos =
-                qos.set_latency_and_throughput(pid, LatencyTier::Interactive, ThroughputTier::High);
-            (tier.mutated, task_qos.mutated)
+            let tier = tier_available.then(|| qos.set_tier(pid, SchedulingTier::Foreground));
+            let task_qos = task_available.then(|| {
+                qos.set_latency_and_throughput(pid, LatencyTier::Interactive, ThroughputTier::High)
+            });
+            (
+                tier.is_some_and(|outcome| outcome.mutated),
+                task_qos.is_some_and(|outcome| outcome.mutated),
+            )
         } else {
             (false, false)
         };
@@ -729,7 +826,12 @@ fn acquire_coalition_prewarm(
         }
     }
 
-    (members, total_cache_bytes, thawed.len() as u64)
+    (
+        members,
+        total_cache_bytes,
+        thawed.len() as u64,
+        conflict_skips,
+    )
 }
 
 fn prewarm_window_open(
@@ -742,6 +844,26 @@ fn prewarm_window_open(
         && probability >= probability_floor.clamp(0.50, 0.54)
         && time_to_switch.is_finite()
         && (-2.0..=12.0).contains(&time_to_switch)
+}
+
+fn prewarm_blocker(
+    probability: f64,
+    time_to_switch: f64,
+    resources_healthy: bool,
+    probability_floor: f64,
+    admission: PrewarmAdmission,
+) -> &'static str {
+    if !resources_healthy {
+        "resource-gate"
+    } else if probability < probability_floor.clamp(0.50, 0.54) {
+        "confidence"
+    } else if !time_to_switch.is_finite() || !(-2.0..=12.0).contains(&time_to_switch) {
+        "timing"
+    } else if admission == PrewarmAdmission::Quarantined {
+        "quarantine"
+    } else {
+        "ready"
+    }
 }
 
 fn contextual_prewarm_probability_floor(bias: ContextualActionBias) -> f64 {
@@ -1015,6 +1137,30 @@ mod tests {
         assert!(!prewarm_window_open(0.49, 2.0, true, 0.50));
         assert!(!prewarm_window_open(0.90, 13.0, true, 0.50));
         assert!(!prewarm_window_open(0.90, 2.0, false, 0.50));
+    }
+
+    #[test]
+    fn prewarm_blocker_reports_the_first_real_gate() {
+        assert_eq!(
+            prewarm_blocker(0.90, 2.0, false, 0.50, PrewarmAdmission::Ready),
+            "resource-gate"
+        );
+        assert_eq!(
+            prewarm_blocker(0.49, 2.0, true, 0.50, PrewarmAdmission::Ready),
+            "confidence"
+        );
+        assert_eq!(
+            prewarm_blocker(0.90, 20.0, true, 0.50, PrewarmAdmission::Ready),
+            "timing"
+        );
+        assert_eq!(
+            prewarm_blocker(0.90, 2.0, true, 0.50, PrewarmAdmission::Quarantined),
+            "quarantine"
+        );
+        assert_eq!(
+            prewarm_blocker(0.90, 2.0, true, 0.50, PrewarmAdmission::Probe),
+            "ready"
+        );
     }
 
     #[test]

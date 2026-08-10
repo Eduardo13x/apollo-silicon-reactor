@@ -1431,6 +1431,8 @@ fn main() -> anyhow::Result<()> {
             // Reused across cycles. Its internal revisions avoid rebuilding
             // unchanged causal and actuator maps on the daemon hot path.
             let mut world_model = apollo_engine::engine::world_model::WorldModel::default();
+            let mut gpu_imagination =
+                apollo_engine::engine::gpu_imagination::GpuImaginationWorker::spawn_metal_only();
             let mut overhead_governor = adaptive_overhead::AdaptiveOverheadGovernor::default();
             // Feed-forward pressure relief counter [Hellerstein 2004].
             // Set to N when tabs close / heavy app terminates; decrements each cycle.
@@ -5469,21 +5471,55 @@ fn main() -> anyhow::Result<()> {
                 // requests and rank equivalent accelerators using conservative
                 // World Model utility. Specialist safety gates still run again
                 // in dispatch immediately before root execution.
-                let (app_launching, fluidity_degraded) = {
+                let gpu_gate = {
                     let metrics = state.metrics.lock_recover();
-                    (
-                        metrics.metrics.app_launching,
-                        metrics.metrics.fluidity_degraded,
+                    apollo_engine::engine::gpu_imagination::GpuImaginationGate {
+                        speculation_allowed: metrics.metrics.apollo_overhead_speculation_allowed,
+                        memory_pressure: snapshot.pressure.memory_pressure,
+                        gpu_load: metrics
+                            .metrics
+                            .ioreport_gpu_pct
+                            .max(fluidity_state.gpu_render_load as f64),
+                        gpu_watts: metrics.metrics.energy_gpu_watts.unwrap_or(0.0),
+                        thermal_nominal: snapshot.pressure.thermal_level == "nominal",
+                        app_launching: metrics.metrics.app_launching,
+                        fluidity_degraded: metrics.metrics.fluidity_degraded,
+                    }
+                };
+                let gpu_external_candidates = {
+                    let metrics = state.metrics.lock_recover();
+                    daemon_dispatch_tick::build_gpu_candidate_portfolio(
+                        &world_model,
+                        workload_mode.as_str(),
+                        &metrics.metrics,
                     )
                 };
-                let (final_actions, plan_report) = daemon_dispatch_tick::plan_action_intents(
-                    final_actions,
-                    &world_model,
-                    workload_mode.as_str(),
-                    snapshot.pressure.memory_pressure,
-                    app_launching,
-                    fluidity_degraded,
-                );
+                let (final_actions, plan_report) =
+                    daemon_dispatch_tick::plan_action_intents_with_gpu(
+                        final_actions,
+                        &world_model,
+                        workload_mode.as_str(),
+                        snapshot.pressure.memory_pressure,
+                        gpu_gate.app_launching,
+                        gpu_gate.fluidity_degraded,
+                        daemon_dispatch_tick::GpuPlannerRuntime {
+                            cycle: cycle_count,
+                            worker: &mut gpu_imagination,
+                            gate: gpu_gate,
+                            external_candidates: gpu_external_candidates,
+                        },
+                    );
+                if let Some(result) = plan_report.gpu_imagination_result.as_ref() {
+                    world_model.attach_gpu_imagination(result);
+                    telemetry_medallion.observe_gpu_imagination(result, cycle_count);
+                    for action_key in &plan_report.gpu_imagination_supported_actions {
+                        telemetry_medallion.mark_gpu_prediction_consumed(
+                            action_key,
+                            workload_mode.as_str(),
+                            cycle_count,
+                        );
+                    }
+                }
                 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.action_planner_proposed_total = metrics
@@ -5570,6 +5606,69 @@ fn main() -> anyhow::Result<()> {
                         .saturating_add(u64::from(plan_report.dynamics_baseline_used));
                     metrics.metrics.world_model_dynamics_mean_uncertainty =
                         plan_report.dynamics_mean_uncertainty;
+                    metrics.metrics.gpu_imagination_backend =
+                        plan_report.gpu_imagination_backend.clone();
+                    metrics.metrics.gpu_imagination_device =
+                        plan_report.gpu_imagination_device.clone();
+                    metrics.metrics.gpu_imagination_last_submit_outcome =
+                        plan_report.gpu_imagination_submit_outcome.clone();
+                    if let Some(error) = plan_report.gpu_imagination_error.as_ref() {
+                        metrics.metrics.gpu_imagination_last_error = error.clone();
+                    }
+                    match plan_report.gpu_imagination_submit_outcome.as_str() {
+                        "submitted" => {
+                            metrics.metrics.gpu_imagination_jobs_submitted_total = metrics
+                                .metrics
+                                .gpu_imagination_jobs_submitted_total
+                                .saturating_add(1);
+                        }
+                        "busy" | "overhead-budget" | "memory-pressure" | "gpu-busy"
+                        | "gpu-power" | "thermal" | "app-launch" | "fluidity" => {
+                            metrics.metrics.gpu_imagination_skips_total = metrics
+                                .metrics
+                                .gpu_imagination_skips_total
+                                .saturating_add(1);
+                        }
+                        _ => {}
+                    }
+                    metrics.metrics.gpu_imagination_support_uses_total = metrics
+                        .metrics
+                        .gpu_imagination_support_uses_total
+                        .saturating_add(plan_report.gpu_imagination_support_uses);
+                    if plan_report.gpu_imagination_completed {
+                        if let Some(error) = plan_report.gpu_imagination_error.as_ref() {
+                            metrics.metrics.gpu_imagination_jobs_failed_total = metrics
+                                .metrics
+                                .gpu_imagination_jobs_failed_total
+                                .saturating_add(1);
+                            metrics.metrics.gpu_imagination_last_error = error.clone();
+                        } else {
+                            metrics.metrics.gpu_imagination_jobs_completed_total = metrics
+                                .metrics
+                                .gpu_imagination_jobs_completed_total
+                                .saturating_add(1);
+                            metrics.metrics.gpu_imagination_last_error.clear();
+                        }
+                        metrics.metrics.gpu_imagination_samples_total = metrics
+                            .metrics
+                            .gpu_imagination_samples_total
+                            .saturating_add(plan_report.gpu_imagination_samples);
+                        metrics.metrics.gpu_imagination_gpu_time_ns_total = metrics
+                            .metrics
+                            .gpu_imagination_gpu_time_ns_total
+                            .saturating_add(plan_report.gpu_imagination_gpu_time_ns);
+                        metrics.metrics.gpu_imagination_wall_time_ns_total = metrics
+                            .metrics
+                            .gpu_imagination_wall_time_ns_total
+                            .saturating_add(plan_report.gpu_imagination_wall_time_ns);
+                        if let Some(best) = plan_report.gpu_imagination_best_action.as_ref() {
+                            metrics.metrics.gpu_imagination_last_best_action = best.clone();
+                            metrics.metrics.gpu_imagination_last_positive_probability =
+                                plan_report.gpu_imagination_best_positive_probability;
+                            metrics.metrics.gpu_imagination_last_p10_gain =
+                                plan_report.gpu_imagination_best_p10_gain;
+                        }
+                    }
                     metrics.metrics.world_model_sequence_expected_gain =
                         plan_report.temporal_expected_gain;
                     metrics.metrics.world_model_sequence_uncertainty =

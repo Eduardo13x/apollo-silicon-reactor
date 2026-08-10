@@ -1591,6 +1591,27 @@ pub struct RuntimeMetrics {
     pub world_model_actuator_quality: f64,
     #[serde(default)]
     pub world_model_actuator_mean_utility: f64,
+    /// GPU imagination lineage. Bronze is a completed forecast, Silver means
+    /// an existing specialist action consumed it, and Gold means the measured
+    /// actuator outcome calibrated that forecast on this hardware regime.
+    #[serde(default)]
+    pub world_model_gpu_bronze_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_silver_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_gold_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_rejected_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_pending_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_calibrated_models: u64,
+    #[serde(default)]
+    pub world_model_gpu_calibration_mae: f64,
+    #[serde(default)]
+    pub world_model_gpu_calibration_brier: f64,
+    #[serde(default)]
+    pub world_model_gpu_calibration_quality: f64,
     /// Action/workload utility models retained for observation, excluding
     /// family-only aggregates. They may be stale or belong to another machine.
     #[serde(default)]
@@ -1699,6 +1720,38 @@ pub struct RuntimeMetrics {
     pub world_model_dynamics_baseline_uses_total: u64,
     #[serde(default)]
     pub world_model_dynamics_mean_uncertainty: f64,
+    /// Asynchronous Metal Monte Carlo advisor. It contributes bounded ranking
+    /// evidence only and never creates, vetoes, or executes an action.
+    #[serde(default)]
+    pub gpu_imagination_backend: String,
+    #[serde(default)]
+    pub gpu_imagination_device: String,
+    #[serde(default)]
+    pub gpu_imagination_jobs_submitted_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_jobs_completed_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_jobs_failed_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_skips_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_samples_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_gpu_time_ns_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_wall_time_ns_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_support_uses_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_last_submit_outcome: String,
+    #[serde(default)]
+    pub gpu_imagination_last_error: String,
+    #[serde(default)]
+    pub gpu_imagination_last_best_action: String,
+    #[serde(default)]
+    pub gpu_imagination_last_positive_probability: f64,
+    #[serde(default)]
+    pub gpu_imagination_last_p10_gain: f64,
     #[serde(default)]
     pub world_model_sequence_best_first: String,
     #[serde(default)]
@@ -2240,7 +2293,16 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub markov_prediction_eta_secs: f64,
     #[serde(default)]
+    pub markov_prediction_dwell_observations: u32,
+    #[serde(default)]
+    pub markov_prediction_dwell_deviation_secs: f64,
+    #[serde(default)]
     pub markov_prewarm_eligible: bool,
+    /// Current admission and first blocking gate for the predicted pair.
+    #[serde(default)]
+    pub markov_prewarm_admission: String,
+    #[serde(default)]
+    pub markov_prewarm_blocker: String,
     /// Transition-local prewarm calibration. Quarantine suppresses only the
     /// speculative accelerator; prediction learning continues normally.
     #[serde(default)]
@@ -2251,11 +2313,31 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub markov_prewarm_context_trials: u32,
     #[serde(default)]
+    pub markov_prewarm_probe_transitions_remaining: u64,
+    #[serde(default)]
     pub markov_prewarm_quarantines_total: u64,
     #[serde(default)]
     pub markov_prewarm_quarantine_skips_total: u64,
     #[serde(default)]
     pub markov_prewarm_probes_total: u64,
+    /// Probe leases change cache only; mature leases may use reversible QoS.
+    #[serde(default)]
+    pub markov_prewarm_cache_only_total: u64,
+    /// Kernel mutations skipped because another Apollo actuator already owned
+    /// that PID/effect kind in the unified ledger.
+    #[serde(default)]
+    pub markov_prewarm_conflict_skips_total: u64,
+
+    /// Temporal-only cache prefetches are bounded to one candidate per focus
+    /// transition and never mutate QoS/jetsam state.
+    #[serde(default)]
+    pub temporal_prewarm_attempts: u64,
+    #[serde(default)]
+    pub temporal_prewarm_applied: u64,
+    #[serde(default)]
+    pub temporal_prewarm_cache_bytes: u64,
+    #[serde(default)]
+    pub temporal_prewarm_last_app: String,
 
     /// B.4 purge band split (2026-06-10). Legacy aggregate keeps the sum.
     #[serde(default)]

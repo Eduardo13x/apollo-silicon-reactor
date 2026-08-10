@@ -10,13 +10,14 @@
 //! Context Gold remains descriptive. Actuator Gold requires an applied action,
 //! a later observation, coherent telemetry, and low-confounding context.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
 use crate::collector::SystemSnapshot;
 use crate::engine::causal_dynamics::CausalDynamicsModel;
 use crate::engine::execute_actions::ExecuteOutcomes;
+use crate::engine::gpu_imagination::GpuImaginationResult;
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::predictive_agent::Intervention;
@@ -35,6 +36,9 @@ const MAX_EPISODES_PER_FAMILY: usize = 12;
 const MAX_ACTION_MODELS: usize = 256;
 const MAX_PENDING_CONTROLLED_HOLDOUTS: usize = 32;
 const MAX_CONTROLLED_MODELS: usize = 256;
+const MAX_GPU_PREDICTIONS: usize = 256;
+const MAX_GPU_CALIBRATION_MODELS: usize = 256;
+const GPU_PREDICTION_MATCH_MAX_AGE_CYCLES: u64 = 30;
 const CONTROLLED_HOLDOUT_HORIZON_CYCLES: u64 = 30;
 const ACTION_MODEL_EMA_ALPHA: f64 = 0.20;
 const ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
@@ -43,6 +47,7 @@ const ACTION_MODEL_EVIDENCE_CAP: f64 = 64.0;
 // operating-system side effect occurred. Do not carry that bias forward.
 const ACTUATOR_EVIDENCE_SCHEMA_VERSION: u32 = 2;
 const TELEMETRY_CONTEXT_SCHEMA_VERSION: u32 = 3;
+const GPU_PREDICTION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(default)]
@@ -98,11 +103,12 @@ pub enum ActuatorFamily {
     PredictivePurge,
     ChromiumEcore,
     ChromiumPurge,
+    ChromiumJetsam,
     Coordinated,
 }
 
 impl ActuatorFamily {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Boost,
         Self::Throttle,
         Self::Freeze,
@@ -121,6 +127,7 @@ impl ActuatorFamily {
         Self::PredictivePurge,
         Self::ChromiumEcore,
         Self::ChromiumPurge,
+        Self::ChromiumJetsam,
         Self::Coordinated,
     ];
 
@@ -144,6 +151,7 @@ impl ActuatorFamily {
             Self::PredictivePurge => "predictive_purge",
             Self::ChromiumEcore => "chromium_ecore",
             Self::ChromiumPurge => "chromium_purge",
+            Self::ChromiumJetsam => "chromium_jetsam",
             Self::Coordinated => "coordinated",
         }
     }
@@ -417,6 +425,82 @@ pub struct ResolvedActuatorEvidence {
     pub target_present_after: Option<bool>,
 }
 
+/// Compact Bronze -> Silver -> Gold lineage for one GPU-imagined candidate.
+/// Raw Monte Carlo samples remain ephemeral; only decision-relevant summaries
+/// and their later measured outcome are persisted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GpuPredictionEvidence {
+    pub generation: u64,
+    pub action_key: String,
+    pub workload: String,
+    pub issued_cycle: u64,
+    pub expected_gain: f64,
+    pub uncertainty: f64,
+    pub mean_gain: f64,
+    pub p10_gain: f64,
+    pub positive_probability: f64,
+    pub rank_support: f64,
+    pub context_score: f64,
+    pub samples: u64,
+    pub gpu_time_ns: u64,
+    pub used_cycle: Option<u64>,
+    pub resolved_cycle: Option<u64>,
+    pub tier: EvidenceTier,
+    pub actual_utility: Option<f64>,
+    pub absolute_error: Option<f64>,
+    pub brier_score: Option<f64>,
+    pub p10_covered: Option<bool>,
+    pub quality: f64,
+    pub hardware_regime: HardwareRegime,
+    pub installation_id: InstallationId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct GpuCalibrationStats {
+    pub predictions: u32,
+    pub used: u32,
+    pub resolved: u32,
+    pub gold: u32,
+    pub signed_error_ema: f64,
+    pub absolute_error_ema: f64,
+    pub brier_ema: f64,
+    pub p10_coverage_ema: f64,
+    pub quality_ema: f64,
+    pub evidence_mass: f64,
+    pub last_cycle: u64,
+    pub last_observed_unix: i64,
+    pub hardware_regime: HardwareRegime,
+    pub installation_id: InstallationId,
+}
+
+impl GpuCalibrationStats {
+    pub fn trust(&self, context: &TelemetryContextSummary, installation_id: InstallationId) -> f64 {
+        if self.installation_id != installation_id
+            || !self.hardware_regime.matches_context(context)
+            || self.gold == 0
+            || self.last_observed_unix <= 0
+            || context.timestamp_unix < self.last_observed_unix
+            || context.timestamp_unix - self.last_observed_unix
+                > ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS as i64 * 2
+        {
+            return 0.0;
+        }
+        let age_secs = (context.timestamp_unix - self.last_observed_unix) as f64;
+        let recency = 0.5_f64.powf(age_secs / ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS);
+        let maturity = (self.evidence_mass * recency / 10.0).sqrt().clamp(0.0, 1.0);
+        (maturity * self.quality_ema.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    }
+}
+
+pub fn gpu_calibration_key(action_key: &str, workload: &str) -> String {
+    format!(
+        "{}|{}",
+        bounded_text(action_key, 320),
+        bounded_text(workload, 64)
+    )
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct ActuatorEpisodeContext {
@@ -550,6 +634,8 @@ struct PendingActuatorEvidence {
     issued_total_at_start: u64,
     purge_recent: bool,
     event_resolved: bool,
+    #[serde(default)]
+    gpu_prediction_generation: Option<u64>,
     before: TelemetryContextSummary,
 }
 
@@ -564,6 +650,7 @@ struct ExternalActuatorCounters {
     acceleration_io_promotions: u64,
     chromium_ecore_demotions: u64,
     chromium_purge_hints: u64,
+    chromium_jetsam_demotions: u64,
 }
 
 impl ExternalActuatorCounters {
@@ -577,6 +664,7 @@ impl ExternalActuatorCounters {
             acceleration_io_promotions: runtime.acceleration_lease_io_promotions_total,
             chromium_ecore_demotions: runtime.chromium_ecore_demotions_total,
             chromium_purge_hints: runtime.chromium_purge_hints_total,
+            chromium_jetsam_demotions: runtime.chromium_jetsam_demotions_total,
         }
     }
 }
@@ -591,6 +679,7 @@ struct ExternalDeltas {
     io_promotions: u64,
     chromium_ecore_demotions: u64,
     chromium_purge_hints: u64,
+    chromium_jetsam_demotions: u64,
 }
 
 #[derive(Debug)]
@@ -794,6 +883,15 @@ pub struct TelemetryMedallionMetrics {
     pub controlled_holdout_rejected_total: u64,
     pub controlled_holdout_would_help_total: u64,
     pub controlled_holdout_mean_control_utility: f64,
+    pub gpu_prediction_bronze_total: u64,
+    pub gpu_prediction_silver_total: u64,
+    pub gpu_prediction_gold_total: u64,
+    pub gpu_prediction_rejected_total: u64,
+    pub gpu_prediction_pending_total: u64,
+    pub gpu_prediction_calibrated_models: u64,
+    pub gpu_prediction_mean_absolute_error: f64,
+    pub gpu_prediction_mean_brier: f64,
+    pub gpu_prediction_mean_quality: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -868,6 +966,20 @@ pub struct TelemetryMedallionPersisted {
     pub controlled_holdout_pending_total: u64,
     #[serde(default)]
     pub causal_dynamics: CausalDynamicsModel,
+    #[serde(default)]
+    pub gpu_prediction_schema_version: u32,
+    #[serde(default)]
+    pub gpu_predictions: Vec<GpuPredictionEvidence>,
+    #[serde(default)]
+    pub gpu_calibration_models: BTreeMap<String, GpuCalibrationStats>,
+    #[serde(default)]
+    pub gpu_prediction_bronze_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_silver_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_gold_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_rejected_total: u64,
 }
 
 #[derive(Debug)]
@@ -915,6 +1027,14 @@ pub struct TelemetryMedallion {
     controlled_holdout_resolved_total: u64,
     controlled_holdout_rejected_total: u64,
     causal_dynamics: CausalDynamicsModel,
+    gpu_predictions: VecDeque<GpuPredictionEvidence>,
+    gpu_calibration_models: BTreeMap<String, GpuCalibrationStats>,
+    gpu_same_cycle_consumed: BTreeSet<(u64, String, String)>,
+    gpu_calibration_revision: u64,
+    gpu_prediction_bronze_total: u64,
+    gpu_prediction_silver_total: u64,
+    gpu_prediction_gold_total: u64,
+    gpu_prediction_rejected_total: u64,
 }
 
 impl Default for TelemetryMedallion {
@@ -963,6 +1083,14 @@ impl Default for TelemetryMedallion {
             controlled_holdout_resolved_total: 0,
             controlled_holdout_rejected_total: 0,
             causal_dynamics: CausalDynamicsModel::default(),
+            gpu_predictions: VecDeque::new(),
+            gpu_calibration_models: BTreeMap::new(),
+            gpu_same_cycle_consumed: BTreeSet::new(),
+            gpu_calibration_revision: 0,
+            gpu_prediction_bronze_total: 0,
+            gpu_prediction_silver_total: 0,
+            gpu_prediction_gold_total: 0,
+            gpu_prediction_rejected_total: 0,
         }
     }
 }
@@ -978,6 +1106,8 @@ pub struct TrustedTelemetryView<'a> {
     pub episodic_evidence: &'a VecDeque<ResolvedActuatorEvidence>,
     pub causal_dynamics: &'a CausalDynamicsModel,
     pub causal_dynamics_revision: u64,
+    pub gpu_calibration_models: &'a BTreeMap<String, GpuCalibrationStats>,
+    pub gpu_calibration_revision: u64,
     pub metrics: TelemetryMedallionMetrics,
 }
 
@@ -990,9 +1120,296 @@ impl TelemetryMedallion {
         }
     }
 
+    /// Admit compact GPU forecasts as Bronze evidence. The Monte Carlo sample
+    /// buffer is intentionally discarded by the worker; only summaries needed
+    /// for later causal calibration cross the medallion boundary.
+    pub fn observe_gpu_imagination(&mut self, result: &GpuImaginationResult, cycle: u64) -> u64 {
+        self.expire_unused_gpu_predictions(cycle);
+        if result.error.is_some() || result.candidates.is_empty() {
+            return 0;
+        }
+        let hardware_regime = self
+            .latest
+            .as_ref()
+            .map(HardwareRegime::from_context)
+            .unwrap_or_default();
+        let per_candidate_samples = result.samples / result.candidates.len() as u64;
+        let per_candidate_gpu_ns = result.gpu_time_ns / result.candidates.len() as u64;
+        let mut admitted = 0_u64;
+        for candidate in &result.candidates {
+            let finite = [
+                candidate.expected_gain,
+                candidate.uncertainty,
+                candidate.mean_gain,
+                candidate.p10_gain,
+                candidate.positive_probability,
+                candidate.rank_support,
+                candidate.context_score,
+            ]
+            .into_iter()
+            .all(f64::is_finite);
+            if candidate.action_key.is_empty()
+                || result.workload.is_empty()
+                || !finite
+                || self.gpu_predictions.iter().any(|prediction| {
+                    prediction.generation == result.generation
+                        && prediction.action_key == candidate.action_key
+                        && prediction.workload == result.workload
+                })
+            {
+                continue;
+            }
+            if self.gpu_predictions.len() >= MAX_GPU_PREDICTIONS
+                && self
+                    .gpu_predictions
+                    .pop_front()
+                    .is_some_and(|prediction| prediction.resolved_cycle.is_none())
+            {
+                self.gpu_prediction_rejected_total =
+                    self.gpu_prediction_rejected_total.saturating_add(1);
+            }
+            self.gpu_predictions.push_back(GpuPredictionEvidence {
+                generation: result.generation,
+                action_key: bounded_text(&candidate.action_key, 320),
+                workload: bounded_text(&result.workload, 64),
+                issued_cycle: cycle,
+                expected_gain: candidate.expected_gain.clamp(-1.0, 1.0),
+                uncertainty: candidate.uncertainty.clamp(0.0, 1.0),
+                mean_gain: candidate.mean_gain.clamp(-1.0, 1.0),
+                p10_gain: candidate.p10_gain.clamp(-1.0, 1.0),
+                positive_probability: candidate.positive_probability.clamp(0.0, 1.0),
+                rank_support: candidate.rank_support.clamp(-0.005, 0.005),
+                context_score: candidate.context_score.clamp(-0.08, 0.08),
+                samples: per_candidate_samples,
+                gpu_time_ns: per_candidate_gpu_ns,
+                used_cycle: None,
+                resolved_cycle: None,
+                tier: EvidenceTier::Bronze,
+                actual_utility: None,
+                absolute_error: None,
+                brier_score: None,
+                p10_covered: None,
+                quality: 0.0,
+                hardware_regime,
+                installation_id: self.installation_id,
+            });
+            self.gpu_prediction_bronze_total = self.gpu_prediction_bronze_total.saturating_add(1);
+            self.update_gpu_prediction_count(
+                &candidate.action_key,
+                &result.workload,
+                hardware_regime,
+                cycle,
+            );
+            admitted = admitted.saturating_add(1);
+        }
+        admitted
+    }
+
+    fn expire_unused_gpu_predictions(&mut self, cycle: u64) {
+        self.gpu_same_cycle_consumed
+            .retain(|(authorized_cycle, _, _)| *authorized_cycle >= cycle);
+        for prediction in self.gpu_predictions.iter_mut().filter(|prediction| {
+            prediction.used_cycle.is_none()
+                && prediction.resolved_cycle.is_none()
+                && cycle.saturating_sub(prediction.issued_cycle)
+                    > GPU_PREDICTION_MATCH_MAX_AGE_CYCLES
+        }) {
+            prediction.resolved_cycle = Some(cycle);
+            self.gpu_prediction_rejected_total =
+                self.gpu_prediction_rejected_total.saturating_add(1);
+        }
+    }
+
+    fn calibration_keys(action_key: &str, workload: &str) -> [String; 2] {
+        [
+            gpu_calibration_key(action_key, workload),
+            gpu_calibration_key(action_key, "*"),
+        ]
+    }
+
+    fn ensure_gpu_calibration_capacity(&mut self, keys: &[String]) {
+        let missing = keys
+            .iter()
+            .filter(|key| !self.gpu_calibration_models.contains_key(*key))
+            .count();
+        while self.gpu_calibration_models.len().saturating_add(missing) > MAX_GPU_CALIBRATION_MODELS
+        {
+            let Some(evict) = self
+                .gpu_calibration_models
+                .iter()
+                .filter(|(key, _)| !keys.contains(key))
+                .min_by_key(|(_, stats)| (stats.gold, stats.last_cycle))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.gpu_calibration_models.remove(&evict);
+        }
+    }
+
+    fn update_gpu_prediction_count(
+        &mut self,
+        action_key: &str,
+        workload: &str,
+        hardware_regime: HardwareRegime,
+        cycle: u64,
+    ) {
+        let keys = Self::calibration_keys(action_key, workload);
+        self.ensure_gpu_calibration_capacity(&keys);
+        for key in keys {
+            let stats = self.gpu_calibration_models.entry(key).or_default();
+            stats.predictions = stats.predictions.saturating_add(1);
+            stats.last_cycle = cycle;
+            stats.hardware_regime = hardware_regime;
+            stats.installation_id = self.installation_id;
+        }
+        self.gpu_calibration_revision = self.gpu_calibration_revision.wrapping_add(1);
+    }
+
+    fn mark_gpu_prediction_used(
+        &mut self,
+        action_key: &str,
+        workload: &str,
+        cycle: u64,
+    ) -> Option<u64> {
+        let same_cycle_authorized = self.gpu_same_cycle_consumed.iter().any(
+            |(authorized_cycle, authorized_action, authorized_workload)| {
+                *authorized_cycle == cycle
+                    && authorized_workload == workload
+                    && gpu_action_matches(authorized_action, action_key)
+            },
+        );
+        let prediction = self.gpu_predictions.iter_mut().rev().find(|prediction| {
+            gpu_action_matches(&prediction.action_key, action_key)
+                && prediction.workload == workload
+                && prediction.resolved_cycle.is_none()
+                && (cycle > prediction.issued_cycle || same_cycle_authorized)
+                && cycle.saturating_sub(prediction.issued_cycle)
+                    <= GPU_PREDICTION_MATCH_MAX_AGE_CYCLES
+                && (prediction.used_cycle.is_none() || prediction.used_cycle == Some(cycle))
+        })?;
+        let newly_used = prediction.used_cycle.is_none();
+        if newly_used {
+            prediction.used_cycle = Some(cycle);
+            prediction.tier = EvidenceTier::Silver;
+        }
+        let generation = prediction.generation;
+        if newly_used {
+            let calibration_action_key = prediction.action_key.clone();
+            let keys = Self::calibration_keys(&calibration_action_key, workload);
+            for key in keys {
+                if let Some(stats) = self.gpu_calibration_models.get_mut(&key) {
+                    stats.used = stats.used.saturating_add(1);
+                    stats.last_cycle = cycle;
+                }
+            }
+            self.gpu_prediction_silver_total = self.gpu_prediction_silver_total.saturating_add(1);
+            self.gpu_calibration_revision = self.gpu_calibration_revision.wrapping_add(1);
+            self.gpu_same_cycle_consumed.retain(
+                |(authorized_cycle, authorized_action, authorized_workload)| {
+                    !(*authorized_cycle == cycle
+                        && authorized_workload == workload
+                        && gpu_action_matches(authorized_action, action_key))
+                },
+            );
+        }
+        Some(generation)
+    }
+
+    /// Record an action key the central planner demonstrably ranked with the
+    /// newly completed GPU batch. External lanes do not call this: they mark
+    /// use naturally on a later cycle after reading World Model context.
+    pub fn mark_gpu_prediction_consumed(
+        &mut self,
+        action_key: &str,
+        workload: &str,
+        cycle: u64,
+    ) -> bool {
+        let Some(_prediction) = self.gpu_predictions.iter().rev().find(|prediction| {
+            gpu_action_matches(&prediction.action_key, action_key)
+                && prediction.workload == workload
+                && prediction.issued_cycle == cycle
+                && prediction.resolved_cycle.is_none()
+        }) else {
+            return false;
+        };
+        self.gpu_same_cycle_consumed.insert((
+            cycle,
+            bounded_text(action_key, 320),
+            bounded_text(workload, 64),
+        ));
+        true
+    }
+
+    fn resolve_gpu_prediction(
+        &mut self,
+        generation: Option<u64>,
+        evidence: &ResolvedActuatorEvidence,
+    ) {
+        let Some(generation) = generation else {
+            return;
+        };
+        let Some(index) = self.gpu_predictions.iter().position(|prediction| {
+            prediction.generation == generation
+                && gpu_action_matches(&prediction.action_key, &evidence.action_key)
+                && prediction.workload == evidence.workload
+                && prediction.resolved_cycle.is_none()
+        }) else {
+            return;
+        };
+        let prediction = &mut self.gpu_predictions[index];
+        let calibration_action_key = prediction.action_key.clone();
+        prediction.resolved_cycle = Some(evidence.resolved_cycle);
+        prediction.actual_utility = Some(evidence.net_utility_delta);
+        prediction.quality = evidence.quality;
+        if evidence.tier == EvidenceTier::Bronze {
+            self.gpu_prediction_rejected_total =
+                self.gpu_prediction_rejected_total.saturating_add(1);
+            return;
+        }
+        let signed_error = evidence.net_utility_delta - prediction.mean_gain;
+        let absolute_error = signed_error.abs().clamp(0.0, 2.0);
+        let observed_positive = u8::from(evidence.net_utility_delta > 0.0) as f64;
+        let brier = (prediction.positive_probability - observed_positive)
+            .powi(2)
+            .clamp(0.0, 1.0);
+        let p10_covered = evidence.net_utility_delta >= prediction.p10_gain;
+        prediction.absolute_error = Some(absolute_error);
+        prediction.brier_score = Some(brier);
+        prediction.p10_covered = Some(p10_covered);
+        prediction.tier = evidence.tier;
+        if evidence.tier != EvidenceTier::Gold {
+            return;
+        }
+        self.gpu_prediction_gold_total = self.gpu_prediction_gold_total.saturating_add(1);
+        let calibration_quality =
+            (evidence.quality * (1.0 - absolute_error.min(1.0)) * (1.0 - brier)).clamp(0.0, 1.0);
+        let keys = Self::calibration_keys(&calibration_action_key, &evidence.workload);
+        for key in keys {
+            let stats = self.gpu_calibration_models.entry(key).or_default();
+            let alpha = if stats.resolved == 0 { 1.0 } else { 0.20 };
+            stats.resolved = stats.resolved.saturating_add(1);
+            stats.gold = stats.gold.saturating_add(1);
+            stats.signed_error_ema = alpha * signed_error + (1.0 - alpha) * stats.signed_error_ema;
+            stats.absolute_error_ema =
+                alpha * absolute_error + (1.0 - alpha) * stats.absolute_error_ema;
+            stats.brier_ema = alpha * brier + (1.0 - alpha) * stats.brier_ema;
+            stats.p10_coverage_ema =
+                alpha * u8::from(p10_covered) as f64 + (1.0 - alpha) * stats.p10_coverage_ema;
+            stats.quality_ema = alpha * calibration_quality + (1.0 - alpha) * stats.quality_ema;
+            stats.evidence_mass = (stats.evidence_mass + evidence.quality).clamp(0.0, 64.0);
+            stats.last_cycle = evidence.resolved_cycle;
+            stats.last_observed_unix = evidence.resolved_timestamp_unix;
+            stats.hardware_regime = evidence.hardware_regime;
+            stats.installation_id = evidence.installation_id;
+        }
+        self.gpu_calibration_revision = self.gpu_calibration_revision.wrapping_add(1);
+    }
+
     /// Admit one complete live snapshot. Bronze always advances for a cycle;
     /// Silver/Gold only advance when the normalized measurements are usable.
     pub fn observe(&mut self, observation: TelemetryObservation<'_>) -> ContextAdmission {
+        self.expire_unused_gpu_predictions(observation.cycle);
         let summary = summarize(&observation);
         let TelemetryObservation {
             snapshot,
@@ -1063,6 +1480,7 @@ impl TelemetryMedallion {
             .saturating_add(external_deltas.io_promotions)
             .saturating_add(external_deltas.chromium_ecore_demotions)
             .saturating_add(external_deltas.chromium_purge_hints)
+            .saturating_add(external_deltas.chromium_jetsam_demotions)
             .saturating_add(u64::from(applied_intervention.is_some()));
 
         if self.consecutive_gold >= 2
@@ -1201,6 +1619,25 @@ impl TelemetryMedallion {
                     "chromium_purge:purgeable_renderer",
                     "background_renderer",
                     12,
+                ),
+                &summary,
+                cycle,
+                cohort_size.max(1),
+                purge_recent,
+                false,
+            );
+        }
+        if external_deltas.chromium_jetsam_demotions > 0 {
+            coordinated_members.push("chromium_jetsam:background_renderer".to_string());
+        }
+        for _ in 0..external_deltas.chromium_jetsam_demotions.min(16) {
+            self.issue(
+                ActionSpec::synthetic(
+                    ActuatorFamily::ChromiumJetsam,
+                    ActuatorObjective::Efficiency,
+                    "chromium_jetsam:background_renderer",
+                    "background_renderer",
+                    30,
                 ),
                 &summary,
                 cycle,
@@ -1437,6 +1874,12 @@ impl TelemetryMedallion {
         if runtime.chromium_purge_hints_total < self.external_counters.chromium_purge_hints {
             self.external_counters.chromium_purge_hints = runtime.chromium_purge_hints_total;
         }
+        if runtime.chromium_jetsam_demotions_total
+            < self.external_counters.chromium_jetsam_demotions
+        {
+            self.external_counters.chromium_jetsam_demotions =
+                runtime.chromium_jetsam_demotions_total;
+        }
         ExternalDeltas {
             markov_applied: runtime
                 .markov_prewarm_applied
@@ -1462,6 +1905,9 @@ impl TelemetryMedallion {
             chromium_purge_hints: runtime
                 .chromium_purge_hints_total
                 .saturating_sub(self.external_counters.chromium_purge_hints),
+            chromium_jetsam_demotions: runtime
+                .chromium_jetsam_demotions_total
+                .saturating_sub(self.external_counters.chromium_jetsam_demotions),
         }
     }
 
@@ -1479,6 +1925,8 @@ impl TelemetryMedallion {
                 self.expire_unresolved(evicted.family);
             }
         }
+        let gpu_prediction_generation =
+            self.mark_gpu_prediction_used(&spec.action_key, &before.workload, cycle);
         self.next_action_id = self.next_action_id.saturating_add(1);
         self.actuator_issued_total = self.actuator_issued_total.saturating_add(1);
         let family_stats = self.family_stats.entry(spec.family).or_default();
@@ -1497,6 +1945,7 @@ impl TelemetryMedallion {
             issued_total_at_start: self.actuator_issued_total,
             purge_recent,
             event_resolved,
+            gpu_prediction_generation,
             before: before.clone(),
         });
     }
@@ -1553,6 +2002,7 @@ impl TelemetryMedallion {
         cycle: u64,
         explicit_score: Option<f64>,
     ) {
+        let gpu_prediction_generation = pending.gpu_prediction_generation;
         let before_utility = utility_score(pending.objective, &pending.before);
         let after_utility =
             explicit_score.unwrap_or_else(|| utility_score(pending.objective, after));
@@ -1674,6 +2124,7 @@ impl TelemetryMedallion {
             confounder_count: confounders,
             target_present_after,
         };
+        self.resolve_gpu_prediction(gpu_prediction_generation, &evidence);
         self.admit_resolved(evidence);
     }
 
@@ -1870,6 +2321,31 @@ impl TelemetryMedallion {
             .values()
             .map(|stats| stats.observations as u64)
             .sum();
+        let calibrated_gpu_models: Vec<&GpuCalibrationStats> = self
+            .gpu_calibration_models
+            .iter()
+            .filter(|(key, stats)| {
+                !key.ends_with("|*")
+                    && stats.gold > 0
+                    && stats.installation_id == self.installation_id
+            })
+            .map(|(_, stats)| stats)
+            .collect();
+        let gpu_gold_weight: f64 = calibrated_gpu_models
+            .iter()
+            .map(|stats| stats.gold as f64)
+            .sum();
+        let gpu_weighted_mean = |value: fn(&GpuCalibrationStats) -> f64| {
+            if gpu_gold_weight <= f64::EPSILON {
+                0.0
+            } else {
+                calibrated_gpu_models
+                    .iter()
+                    .map(|stats| value(stats) * stats.gold as f64)
+                    .sum::<f64>()
+                    / gpu_gold_weight
+            }
+        };
         TelemetryMedallionMetrics {
             bronze_total: self.bronze_total,
             silver_total: self.silver_total,
@@ -1940,6 +2416,21 @@ impl TelemetryMedallion {
             } else {
                 (controlled_utility_sum / controlled_observations as f64).clamp(-1.0, 1.0)
             },
+            gpu_prediction_bronze_total: self.gpu_prediction_bronze_total,
+            gpu_prediction_silver_total: self.gpu_prediction_silver_total,
+            gpu_prediction_gold_total: self.gpu_prediction_gold_total,
+            gpu_prediction_rejected_total: self.gpu_prediction_rejected_total,
+            gpu_prediction_pending_total: self
+                .gpu_predictions
+                .iter()
+                .filter(|prediction| prediction.resolved_cycle.is_none())
+                .count() as u64,
+            gpu_prediction_calibrated_models: calibrated_gpu_models.len() as u64,
+            gpu_prediction_mean_absolute_error: gpu_weighted_mean(|stats| stats.absolute_error_ema)
+                .clamp(0.0, 2.0),
+            gpu_prediction_mean_brier: gpu_weighted_mean(|stats| stats.brier_ema).clamp(0.0, 1.0),
+            gpu_prediction_mean_quality: gpu_weighted_mean(|stats| stats.quality_ema)
+                .clamp(0.0, 1.0),
         }
     }
 
@@ -1960,6 +2451,8 @@ impl TelemetryMedallion {
             episodic_evidence: &self.episodic_evidence,
             causal_dynamics: &self.causal_dynamics,
             causal_dynamics_revision: self.causal_dynamics.publication_revision(),
+            gpu_calibration_models: &self.gpu_calibration_models,
+            gpu_calibration_revision: self.gpu_calibration_revision,
             metrics: self.metrics(),
         }
     }
@@ -2028,6 +2521,13 @@ impl TelemetryMedallion {
             controlled_holdout_rejected_total: self.controlled_holdout_rejected_total,
             controlled_holdout_pending_total: self.pending_controlled_holdouts.len() as u64,
             causal_dynamics: self.causal_dynamics.clone(),
+            gpu_prediction_schema_version: GPU_PREDICTION_SCHEMA_VERSION,
+            gpu_predictions: self.gpu_predictions.iter().cloned().collect(),
+            gpu_calibration_models: self.gpu_calibration_models.clone(),
+            gpu_prediction_bronze_total: self.gpu_prediction_bronze_total,
+            gpu_prediction_silver_total: self.gpu_prediction_silver_total,
+            gpu_prediction_gold_total: self.gpu_prediction_gold_total,
+            gpu_prediction_rejected_total: self.gpu_prediction_rejected_total,
         }
     }
 
@@ -2209,6 +2709,92 @@ impl TelemetryMedallion {
         self.causal_dynamics = state
             .causal_dynamics
             .sanitized_for_restore(self.installation_id, same_origin);
+        let reset_gpu_predictions =
+            !same_origin || state.gpu_prediction_schema_version < GPU_PREDICTION_SCHEMA_VERSION;
+        self.gpu_predictions.clear();
+        self.gpu_calibration_models.clear();
+        self.gpu_same_cycle_consumed.clear();
+        if !reset_gpu_predictions {
+            let abandoned = state
+                .gpu_predictions
+                .iter()
+                .filter(|prediction| prediction.resolved_cycle.is_none())
+                .count() as u64;
+            self.gpu_predictions = state
+                .gpu_predictions
+                .into_iter()
+                .filter(|prediction| {
+                    prediction.resolved_cycle.is_some()
+                        && prediction.action_key.len() <= 320
+                        && prediction.workload.len() <= 64
+                        && prediction.installation_id == self.installation_id
+                        && [
+                            prediction.expected_gain,
+                            prediction.uncertainty,
+                            prediction.mean_gain,
+                            prediction.p10_gain,
+                            prediction.positive_probability,
+                            prediction.rank_support,
+                            prediction.context_score,
+                            prediction.quality,
+                        ]
+                        .into_iter()
+                        .all(f64::is_finite)
+                        && prediction.actual_utility.is_none_or(f64::is_finite)
+                        && prediction.absolute_error.is_none_or(f64::is_finite)
+                        && prediction.brier_score.is_none_or(f64::is_finite)
+                })
+                .take(MAX_GPU_PREDICTIONS)
+                .collect();
+            self.gpu_calibration_models = state
+                .gpu_calibration_models
+                .into_iter()
+                .filter_map(|(key, mut stats)| {
+                    if key.len() > 384
+                        || stats.installation_id != self.installation_id
+                        || ![
+                            stats.signed_error_ema,
+                            stats.absolute_error_ema,
+                            stats.brier_ema,
+                            stats.p10_coverage_ema,
+                            stats.quality_ema,
+                            stats.evidence_mass,
+                        ]
+                        .into_iter()
+                        .all(f64::is_finite)
+                    {
+                        return None;
+                    }
+                    stats.used = stats.used.min(stats.predictions);
+                    stats.resolved = stats.resolved.min(stats.used);
+                    stats.gold = stats.gold.min(stats.resolved);
+                    stats.signed_error_ema = stats.signed_error_ema.clamp(-2.0, 2.0);
+                    stats.absolute_error_ema = stats.absolute_error_ema.clamp(0.0, 2.0);
+                    stats.brier_ema = stats.brier_ema.clamp(0.0, 1.0);
+                    stats.p10_coverage_ema = stats.p10_coverage_ema.clamp(0.0, 1.0);
+                    stats.quality_ema = stats.quality_ema.clamp(0.0, 1.0);
+                    stats.evidence_mass = stats.evidence_mass.clamp(0.0, 64.0);
+                    Some((key, stats))
+                })
+                .take(MAX_GPU_CALIBRATION_MODELS)
+                .collect();
+            self.gpu_prediction_bronze_total = state.gpu_prediction_bronze_total;
+            self.gpu_prediction_silver_total = state
+                .gpu_prediction_silver_total
+                .min(self.gpu_prediction_bronze_total);
+            self.gpu_prediction_gold_total = state
+                .gpu_prediction_gold_total
+                .min(self.gpu_prediction_silver_total);
+            self.gpu_prediction_rejected_total = state
+                .gpu_prediction_rejected_total
+                .saturating_add(abandoned)
+                .min(self.gpu_prediction_bronze_total);
+        } else {
+            self.gpu_prediction_bronze_total = 0;
+            self.gpu_prediction_silver_total = 0;
+            self.gpu_prediction_gold_total = 0;
+            self.gpu_prediction_rejected_total = 0;
+        }
         if !same_origin {
             for evidence in &mut self.recent_evidence {
                 evidence.installation_id = state.installation_id;
@@ -2241,14 +2827,31 @@ impl TelemetryMedallion {
             self.controlled_holdout_resolved_total = 0;
             self.controlled_holdout_rejected_total = 0;
             self.causal_dynamics = CausalDynamicsModel::new(self.installation_id);
+            self.gpu_predictions.clear();
+            self.gpu_calibration_models.clear();
+            self.gpu_same_cycle_consumed.clear();
+            self.gpu_prediction_bronze_total = 0;
+            self.gpu_prediction_silver_total = 0;
+            self.gpu_prediction_gold_total = 0;
+            self.gpu_prediction_rejected_total = 0;
         }
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
         self.controlled_models_revision = self.controlled_models_revision.wrapping_add(1);
+        self.gpu_calibration_revision = self.gpu_calibration_revision.wrapping_add(1);
     }
 }
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn gpu_action_matches(predicted: &str, observed: &str) -> bool {
+    predicted == observed
+        || (predicted == "interaction_qos:foreground"
+            && observed.starts_with("interaction_qos:foreground@"))
+        || (predicted == "predictive_prethrottle:noise"
+            && observed.starts_with("predictive_prethrottle:"))
+        || (predicted == "predictive_purge:kernel" && observed.starts_with("predictive_purge:"))
 }
 
 fn action_spec(action: &RootAction) -> Option<ActionSpec> {
@@ -3358,7 +3961,7 @@ mod tests {
         silver_runtime.collector_pressure_alive = false;
         observe(
             &mut medallion,
-            2,
+            3,
             &ExecuteOutcomes::default(),
             &silver_runtime,
         );
@@ -3643,6 +4246,7 @@ mod tests {
         let runtime = RuntimeMetrics {
             chromium_ecore_demotions_total: 1,
             chromium_purge_hints_total: 1,
+            chromium_jetsam_demotions_total: 1,
             ..healthy_runtime()
         };
         observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
@@ -3654,6 +4258,10 @@ mod tests {
         assert!(medallion.pending_actions.iter().any(|pending| {
             pending.family == ActuatorFamily::ChromiumPurge
                 && pending.action_key == "chromium_purge:purgeable_renderer"
+        }));
+        assert!(medallion.pending_actions.iter().any(|pending| {
+            pending.family == ActuatorFamily::ChromiumJetsam
+                && pending.action_key == "chromium_jetsam:background_renderer"
         }));
     }
 
@@ -4038,6 +4646,7 @@ mod tests {
             issued_total_at_start: 1,
             purge_recent: false,
             event_resolved: false,
+            gpu_prediction_generation: None,
             before: TelemetryContextSummary::default(),
         });
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);
@@ -4115,5 +4724,134 @@ mod tests {
         let mut foreign = TelemetryMedallion::new(InstallationId(99));
         foreign.restore(persisted);
         assert_eq!(foreign.causal_dynamics.metrics(None).action_models, 0);
+    }
+
+    #[test]
+    fn gpu_prediction_advances_bronze_silver_gold_and_persists_calibration() {
+        use crate::engine::gpu_imagination::{
+            GpuCandidateAdvice, GpuImaginationBackend, GpuImaginationResult,
+        };
+
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        observe(&mut medallion, 2, &ExecuteOutcomes::default(), &runtime);
+        let before = medallion.latest().cloned().expect("live context");
+        let result = GpuImaginationResult {
+            generation: 2,
+            workload: "idle".to_string(),
+            backend: GpuImaginationBackend::Metal,
+            device_name: "Apple M4".to_string(),
+            samples: 4_096,
+            gpu_time_ns: 8_000,
+            wall_time_ns: 20_000,
+            candidates: vec![GpuCandidateAdvice {
+                action_key: "markov_prewarm:predicted_app".to_string(),
+                expected_gain: 0.04,
+                uncertainty: 0.20,
+                mean_gain: 0.035,
+                p10_gain: 0.01,
+                positive_probability: 0.80,
+                rank_support: 0.003,
+                context_score: 0.04,
+            }],
+            error: None,
+        };
+        assert_eq!(medallion.observe_gpu_imagination(&result, 2), 1);
+        assert_eq!(medallion.metrics().gpu_prediction_bronze_total, 1);
+
+        medallion.issue(
+            ActionSpec::synthetic(
+                ActuatorFamily::MarkovPrewarm,
+                ActuatorObjective::Prediction,
+                "markov_prewarm:predicted_app",
+                "Editor",
+                1,
+            ),
+            &before,
+            3,
+            1,
+            false,
+            true,
+        );
+        assert_eq!(medallion.metrics().gpu_prediction_silver_total, 1);
+        let pending = medallion
+            .pending_actions
+            .pop_front()
+            .expect("pending action");
+        let mut after = before.clone();
+        after.cycle = 4;
+        after.timestamp_unix = after.timestamp_unix.saturating_add(1);
+        medallion.resolve_one(pending, &after, &snapshot(), 4, Some(0.75));
+
+        let metrics = medallion.metrics();
+        assert_eq!(metrics.gpu_prediction_gold_total, 1);
+        assert_eq!(metrics.gpu_prediction_pending_total, 0);
+        assert_eq!(metrics.gpu_prediction_calibrated_models, 1);
+        assert!(metrics.gpu_prediction_mean_absolute_error.is_finite());
+        assert!(metrics.gpu_prediction_mean_brier.is_finite());
+
+        let persisted = medallion.snapshot();
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(persisted);
+        assert_eq!(restored.metrics().gpu_prediction_gold_total, 1);
+        assert_eq!(restored.metrics().gpu_prediction_calibrated_models, 1);
+        assert_eq!(restored.metrics().gpu_prediction_pending_total, 0);
+    }
+
+    #[test]
+    fn same_cycle_gpu_advice_becomes_silver_only_after_confirmed_issue() {
+        use crate::engine::gpu_imagination::{
+            GpuCandidateAdvice, GpuImaginationBackend, GpuImaginationResult,
+        };
+
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        observe(&mut medallion, 2, &ExecuteOutcomes::default(), &runtime);
+        let before = medallion.latest().cloned().expect("live context");
+        let result = GpuImaginationResult {
+            generation: 2,
+            workload: "idle".to_string(),
+            backend: GpuImaginationBackend::Metal,
+            candidates: vec![GpuCandidateAdvice {
+                action_key: "boost:Editor".to_string(),
+                expected_gain: 0.03,
+                uncertainty: 0.20,
+                mean_gain: 0.025,
+                p10_gain: 0.005,
+                positive_probability: 0.75,
+                rank_support: 0.002,
+                context_score: 0.03,
+            }],
+            samples: 4_096,
+            ..GpuImaginationResult::default()
+        };
+        medallion.observe_gpu_imagination(&result, 2);
+        assert!(medallion.mark_gpu_prediction_consumed("boost:Editor", "idle", 2));
+        assert_eq!(medallion.metrics().gpu_prediction_silver_total, 0);
+
+        medallion.issue(
+            ActionSpec::synthetic(
+                ActuatorFamily::Boost,
+                ActuatorObjective::Responsiveness,
+                "boost:Editor",
+                "Editor",
+                3,
+            ),
+            &before,
+            2,
+            1,
+            false,
+            false,
+        );
+        assert_eq!(medallion.metrics().gpu_prediction_silver_total, 1);
+        assert_eq!(
+            medallion
+                .pending_actions
+                .back()
+                .and_then(|pending| pending.gpu_prediction_generation),
+            Some(2)
+        );
     }
 }

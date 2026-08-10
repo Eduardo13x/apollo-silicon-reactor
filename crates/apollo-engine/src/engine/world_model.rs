@@ -32,11 +32,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::causal_dynamics::{CausalDynamicsMetrics, CausalDynamicsModel};
 use crate::engine::causal_graph::CausalGraph;
+use crate::engine::gpu_imagination::{GpuCandidateAdvice, GpuImaginationResult};
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::outcome_tracker::OutcomeTracker;
 use crate::engine::telemetry_medallion::{
-    ActionModelStats, ActuatorEpisodeContext, ControlledCounterfactualStats, EvidenceTier,
-    ResolvedActuatorEvidence, TelemetryContextSummary, TrustedTelemetryView,
+    gpu_calibration_key, ActionModelStats, ActuatorEpisodeContext, ControlledCounterfactualStats,
+    EvidenceTier, GpuCalibrationStats, ResolvedActuatorEvidence, TelemetryContextSummary,
+    TrustedTelemetryView,
 };
 use crate::engine::world_model_sequence::{
     plan_temporal_sequence_with_dynamics, TemporalMemory, TemporalSequencePlan,
@@ -71,6 +73,9 @@ const EPISODIC_MIN_QUALITY: f64 = 0.85;
 const EPISODIC_MIN_SIMILARITY: f64 = 0.55;
 const EPISODIC_NEIGHBORS: usize = 8;
 const EPISODIC_MAX_RANK_SUPPORT: f64 = 0.012;
+const GPU_ADVICE_MAX_AGE_CYCLES: u64 = 30;
+const GPU_COLD_START_TRUST: f64 = 0.25;
+const GPU_MAX_RANK_SUPPORT: f64 = 0.005;
 type EpisodicNeighbor = (f64, f64, f64, bool, f64);
 
 /// The model's verdict for a candidate action.
@@ -157,6 +162,8 @@ pub struct ContextualActionBias {
     pub score: f64,
     pub model_observations: u32,
     pub episodic_observations: u32,
+    pub gpu_predictions: u32,
+    pub gpu_calibration_trust: f64,
     /// True only when a mature exact/workload utility model contributed.
     pub authoritative: bool,
 }
@@ -164,8 +171,17 @@ pub struct ContextualActionBias {
 impl ContextualActionBias {
     pub fn is_informative(self) -> bool {
         self.score.abs() > f64::EPSILON
-            && (self.model_observations > 0 || self.episodic_observations > 0)
+            && (self.model_observations > 0
+                || self.episodic_observations > 0
+                || self.gpu_predictions > 0)
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct GpuAdviceEntry {
+    generation: u64,
+    workload: String,
+    advice: GpuCandidateAdvice,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +295,10 @@ pub struct WorldModel {
     temporal_memory: TemporalMemory,
     causal_dynamics: CausalDynamicsModel,
     causal_dynamics_revision: Option<u64>,
+    gpu_advice: HashMap<String, GpuAdviceEntry>,
+    gpu_advice_generation: Option<u64>,
+    gpu_calibration: HashMap<String, GpuCalibrationStats>,
+    gpu_calibration_revision: Option<u64>,
 }
 
 impl WorldModel {
@@ -446,6 +466,10 @@ impl WorldModel {
             self.episodic_evidence.clear();
             self.episodic_revision = None;
             self.causal_dynamics_revision = None;
+            self.gpu_advice.clear();
+            self.gpu_advice_generation = None;
+            self.gpu_calibration.clear();
+            self.gpu_calibration_revision = None;
         }
         self.context_bronze = view.metrics.bronze_total;
         self.context_silver = view.metrics.silver_total;
@@ -503,6 +527,15 @@ impl WorldModel {
             );
             self.controlled_revision = Some(view.controlled_models_revision);
         }
+        if self.gpu_calibration_revision != Some(view.gpu_calibration_revision) {
+            self.gpu_calibration.clear();
+            self.gpu_calibration.extend(
+                view.gpu_calibration_models
+                    .iter()
+                    .map(|(key, stats)| (key.clone(), stats.clone())),
+            );
+            self.gpu_calibration_revision = Some(view.gpu_calibration_revision);
+        }
         self.authority_phase = if self.latest_context.is_none() {
             if local_gold_total == 0 {
                 ModelAuthorityPhase::Protected
@@ -514,6 +547,114 @@ impl WorldModel {
         } else {
             ModelAuthorityPhase::Trusted
         };
+    }
+
+    /// Attach one completed GPU batch as short-lived context. Candidates are
+    /// still owned by their specialist lanes; this cache cannot manufacture
+    /// or authorize an action.
+    pub fn attach_gpu_imagination(&mut self, result: &GpuImaginationResult) -> u64 {
+        if result.error.is_some()
+            || result.workload.is_empty()
+            || result.candidates.is_empty()
+            || self
+                .gpu_advice_generation
+                .is_some_and(|generation| result.generation < generation)
+        {
+            return 0;
+        }
+        self.gpu_advice.clear();
+        for advice in &result.candidates {
+            if advice.action_key.is_empty()
+                || ![
+                    advice.expected_gain,
+                    advice.uncertainty,
+                    advice.mean_gain,
+                    advice.p10_gain,
+                    advice.positive_probability,
+                    advice.rank_support,
+                    advice.context_score,
+                ]
+                .into_iter()
+                .all(f64::is_finite)
+            {
+                continue;
+            }
+            self.gpu_advice.insert(
+                gpu_calibration_key(&advice.action_key, &result.workload),
+                GpuAdviceEntry {
+                    generation: result.generation,
+                    workload: result.workload.clone(),
+                    advice: advice.clone(),
+                },
+            );
+        }
+        self.gpu_advice_generation = Some(result.generation);
+        self.gpu_advice.len() as u64
+    }
+
+    fn gpu_calibration_for(
+        &self,
+        action_key: &str,
+        workload: &str,
+    ) -> Option<&GpuCalibrationStats> {
+        self.gpu_calibration
+            .get(&gpu_calibration_key(action_key, workload))
+            .or_else(|| {
+                self.gpu_calibration
+                    .get(&gpu_calibration_key(action_key, "*"))
+            })
+    }
+
+    fn gpu_calibration_trust(&self, action_key: &str, workload: &str) -> f64 {
+        let Some(context) = self.latest_context.as_ref() else {
+            return 0.0;
+        };
+        let Some(stats) = self.gpu_calibration_for(action_key, workload) else {
+            return GPU_COLD_START_TRUST;
+        };
+        let learned_trust = stats.trust(context, self.current_installation_id);
+        let calibration_reliability = (1.0 - stats.absolute_error_ema / 0.25).clamp(0.10, 1.0)
+            * (1.0 - stats.brier_ema).clamp(0.10, 1.0).sqrt();
+        (GPU_COLD_START_TRUST
+            + (1.0 - GPU_COLD_START_TRUST) * learned_trust * calibration_reliability)
+            .clamp(GPU_COLD_START_TRUST, 1.0)
+    }
+
+    fn gpu_context_support(&self, action_key: &str, workload: &str) -> Option<(f64, f64)> {
+        let context = self.latest_context.as_ref()?;
+        let entry = self
+            .gpu_advice
+            .get(&gpu_calibration_key(action_key, workload))?;
+        if entry.workload != workload
+            || context.cycle < entry.generation
+            || context.cycle.saturating_sub(entry.generation) > GPU_ADVICE_MAX_AGE_CYCLES
+        {
+            return None;
+        }
+        let trust = self.gpu_calibration_trust(action_key, workload);
+        let correction = self
+            .gpu_calibration_for(action_key, workload)
+            .filter(|stats| stats.trust(context, self.current_installation_id) > 0.0)
+            .map_or(0.0, |stats| stats.signed_error_ema * 0.10);
+        let support = ((entry.advice.context_score + correction).clamp(-0.08, 0.08) * trust)
+            .clamp(-0.08, 0.08);
+        Some((support, trust))
+    }
+
+    /// Calibrate the GPU's tiny central-planner ranking support against
+    /// same-hardware Gold outcomes. The result remains ranking-only.
+    pub fn calibrate_gpu_rank_support(
+        &self,
+        action_key: &str,
+        workload: &str,
+        raw_support: f64,
+    ) -> f64 {
+        if !raw_support.is_finite() {
+            return 0.0;
+        }
+        (raw_support.clamp(-GPU_MAX_RANK_SUPPORT, GPU_MAX_RANK_SUPPORT)
+            * self.gpu_calibration_trust(action_key, workload))
+        .clamp(-GPU_MAX_RANK_SUPPORT, GPU_MAX_RANK_SUPPORT)
     }
 
     pub fn cache_stats(&self) -> (u64, u64, u64, u64) {
@@ -772,7 +913,7 @@ impl WorldModel {
     /// into a small advisory signal. Callers may tune an action they already
     /// admitted, but must retain their physical, safety, and capability gates.
     pub fn contextual_action_bias(&self, action_key: &str, workload: &str) -> ContextualActionBias {
-        if let Some(assessment) = self.assess_utility(action_key, workload) {
+        let mut bias = if let Some(assessment) = self.assess_utility(action_key, workload) {
             let model_signal = match assessment.verdict {
                 UtilityImagined::ActWins { margin } => (margin / 0.03).clamp(0.0, 1.0),
                 UtilityImagined::DoNothingDominates { predicted_utility } => {
@@ -800,7 +941,7 @@ impl WorldModel {
             } else {
                 0.0
             };
-            return ContextualActionBias {
+            ContextualActionBias {
                 score: score.clamp(-1.0, 1.0),
                 model_observations: assessment
                     .effective_evidence
@@ -808,18 +949,25 @@ impl WorldModel {
                     .clamp(0.0, f64::from(u32::MAX)) as u32,
                 episodic_observations: assessment.episodic_observations,
                 authoritative: assessment.verdict != UtilityImagined::Unknown,
-            };
-        }
-
-        let Some(episodic) = self.recall_similar_episodes(action_key, workload) else {
-            return ContextualActionBias::default();
+                ..ContextualActionBias::default()
+            }
+        } else if let Some(episodic) = self.recall_similar_episodes(action_key, workload) {
+            ContextualActionBias {
+                score: (episodic.rank_support / EPISODIC_MAX_RANK_SUPPORT).clamp(-1.0, 1.0),
+                model_observations: 0,
+                episodic_observations: episodic.observations,
+                authoritative: false,
+                ..ContextualActionBias::default()
+            }
+        } else {
+            ContextualActionBias::default()
         };
-        ContextualActionBias {
-            score: (episodic.rank_support / EPISODIC_MAX_RANK_SUPPORT).clamp(-1.0, 1.0),
-            model_observations: 0,
-            episodic_observations: episodic.observations,
-            authoritative: false,
+        if let Some((support, trust)) = self.gpu_context_support(action_key, workload) {
+            bias.score = (bias.score + support).clamp(-1.0, 1.0);
+            bias.gpu_predictions = 1;
+            bias.gpu_calibration_trust = trust;
         }
+        bias
     }
 
     fn counterfactual_rank_support(
@@ -1255,6 +1403,8 @@ mod tests {
             episodic_evidence: &VecDeque::new(),
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: local_gold_total,
                 gold_total: local_gold_total,
@@ -1262,6 +1412,70 @@ mod tests {
                 ..TelemetryMedallionMetrics::default()
             },
         });
+    }
+
+    #[test]
+    fn fresh_gpu_advice_is_bounded_and_never_authoritative_by_itself() {
+        use crate::engine::gpu_imagination::{
+            GpuCandidateAdvice, GpuImaginationBackend, GpuImaginationResult,
+        };
+
+        let context = m4_context(Utc::now().timestamp());
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &BTreeMap::new(), 1);
+        model.gpu_calibration.insert(
+            gpu_calibration_key("markov_prewarm:predicted_app", "build"),
+            GpuCalibrationStats {
+                predictions: 20,
+                used: 20,
+                resolved: 20,
+                gold: 20,
+                signed_error_ema: -1.0,
+                absolute_error_ema: 1.0,
+                brier_ema: 1.0,
+                p10_coverage_ema: 0.0,
+                quality_ema: 1.0,
+                evidence_mass: 20.0,
+                last_cycle: 99,
+                last_observed_unix: context.timestamp_unix,
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 4,
+                    ram_gib: 8,
+                },
+                installation_id: InstallationId(99),
+            },
+        );
+        assert_eq!(
+            model.attach_gpu_imagination(&GpuImaginationResult {
+                generation: 100,
+                workload: "build".to_string(),
+                backend: GpuImaginationBackend::Metal,
+                device_name: "Apple M4".to_string(),
+                samples: 4_096,
+                gpu_time_ns: 8_000,
+                wall_time_ns: 20_000,
+                candidates: vec![GpuCandidateAdvice {
+                    action_key: "markov_prewarm:predicted_app".to_string(),
+                    expected_gain: 0.04,
+                    uncertainty: 0.20,
+                    mean_gain: 0.035,
+                    p10_gain: 0.01,
+                    positive_probability: 0.80,
+                    rank_support: 0.003,
+                    context_score: 0.08,
+                }],
+                error: None,
+            }),
+            1
+        );
+
+        let bias = model.contextual_action_bias("markov_prewarm:predicted_app", "build");
+        assert!(bias.score > 0.0);
+        assert!(bias.score <= 0.08);
+        assert_eq!(bias.gpu_predictions, 1);
+        assert_eq!(bias.gpu_calibration_trust, GPU_COLD_START_TRUST);
+        assert!(!bias.authoritative);
     }
 
     #[test]
@@ -1301,6 +1515,8 @@ mod tests {
             episodic_evidence: &VecDeque::new(),
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -1381,6 +1597,8 @@ mod tests {
             episodic_evidence: &episodes,
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: episodes.len() as u64,
                 ..TelemetryMedallionMetrics::default()
@@ -1453,6 +1671,8 @@ mod tests {
             episodic_evidence: &episodes,
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 22,
                 ..TelemetryMedallionMetrics::default()
@@ -1529,6 +1749,8 @@ mod tests {
             episodic_evidence: &episodes,
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 2,
                 ..TelemetryMedallionMetrics::default()
@@ -1968,6 +2190,8 @@ mod tests {
             episodic_evidence: &VecDeque::new(),
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 1,
                 ..TelemetryMedallionMetrics::default()
@@ -2018,6 +2242,8 @@ mod tests {
             episodic_evidence: &VecDeque::new(),
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 1,
                 ..TelemetryMedallionMetrics::default()
@@ -2072,6 +2298,8 @@ mod tests {
             episodic_evidence: &VecDeque::new(),
             causal_dynamics: &CausalDynamicsModel::default(),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 1,
                 ..TelemetryMedallionMetrics::default()

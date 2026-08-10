@@ -97,6 +97,15 @@ fn publish_world_model_metrics(
     metrics.world_model_actuator_expired_total = context.actuator_expired_total;
     metrics.world_model_actuator_quality = context.actuator_mean_quality;
     metrics.world_model_actuator_mean_utility = context.actuator_mean_utility;
+    metrics.world_model_gpu_bronze_total = context.gpu_prediction_bronze_total;
+    metrics.world_model_gpu_silver_total = context.gpu_prediction_silver_total;
+    metrics.world_model_gpu_gold_total = context.gpu_prediction_gold_total;
+    metrics.world_model_gpu_rejected_total = context.gpu_prediction_rejected_total;
+    metrics.world_model_gpu_pending_total = context.gpu_prediction_pending_total;
+    metrics.world_model_gpu_calibrated_models = context.gpu_prediction_calibrated_models;
+    metrics.world_model_gpu_calibration_mae = context.gpu_prediction_mean_absolute_error;
+    metrics.world_model_gpu_calibration_brier = context.gpu_prediction_mean_brier;
+    metrics.world_model_gpu_calibration_quality = context.gpu_prediction_mean_quality;
     metrics.world_model_counterfactual_issued_total = context.controlled_holdout_issued_total;
     metrics.world_model_counterfactual_pending_total = context.controlled_holdout_pending_total;
     metrics.world_model_counterfactual_resolved_total = context.controlled_holdout_resolved_total;

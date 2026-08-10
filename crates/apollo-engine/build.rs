@@ -47,5 +47,20 @@ fn main() {
         // ── CoreAudio (used by coreaudio_active.rs) ─────────────────────
         // AudioObjectGetPropertyData lives in CoreAudio.framework.
         println!("cargo:rustc-link-lib=framework=CoreAudio");
+
+        // ── Metal GPU imagination bridge ────────────────────────────────
+        // The control loop stays in Rust/CPU. This bridge owns one Metal
+        // compute pipeline used by the asynchronous Monte Carlo advisor.
+        cc::Build::new()
+            .file("native/gpu_imagination_bridge.mm")
+            .flag("-fobjc-arc")
+            .flag("-O2")
+            .flag("-isysroot")
+            .flag(&sdk_path)
+            .compile("gpu_imagination_bridge");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=dylib=c++");
+        println!("cargo:rerun-if-changed=native/gpu_imagination_bridge.mm");
     }
 }

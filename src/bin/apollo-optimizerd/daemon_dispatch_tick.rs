@@ -21,6 +21,9 @@ use apollo_engine::engine::daemon_helpers::write_frozen_state;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::degradation::DegradationInputs;
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
+use apollo_engine::engine::gpu_imagination::{
+    GpuImaginationCandidate, GpuImaginationGate, GpuImaginationRequest, GpuImaginationWorker,
+};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
@@ -313,6 +316,134 @@ pub fn plan_action_intents(
     app_launching: bool,
     fluidity_degraded: bool,
 ) -> (Vec<RootAction>, PlanReport) {
+    plan_action_intents_inner(
+        actions,
+        world_model,
+        workload,
+        memory_pressure,
+        app_launching,
+        fluidity_degraded,
+        None,
+    )
+}
+
+pub struct GpuPlannerRuntime<'a> {
+    pub cycle: u64,
+    pub worker: &'a mut GpuImaginationWorker,
+    pub gate: GpuImaginationGate,
+    pub external_candidates: Vec<GpuImaginationCandidate>,
+}
+
+fn gpu_portfolio_candidate(
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+    action_key: &str,
+    specialist_gain: f64,
+    specialist_uncertainty: f64,
+) -> GpuImaginationCandidate {
+    let (expected_gain, uncertainty) = if let Some(assessment) =
+        world_model.assess_utility(action_key, workload)
+    {
+        (
+            (specialist_gain * 0.35
+                + assessment.utility_ema * 0.65
+                + assessment.counterfactual_support
+                + assessment.episodic_support)
+                .clamp(-1.0, 1.0),
+            ((assessment.upper_bound - assessment.lower_bound).abs() * 0.70
+                + specialist_uncertainty * 0.30)
+                .clamp(0.0, 1.0),
+        )
+    } else if let Some(prior) = world_model.assess_family_prior(action_key) {
+        (
+            (specialist_gain * 0.70 + prior.utility_ema * 0.30).clamp(-1.0, 1.0),
+            ((prior.upper_bound - prior.lower_bound).abs() * 0.40 + specialist_uncertainty * 0.60)
+                .clamp(0.0, 1.0),
+        )
+    } else {
+        (specialist_gain, specialist_uncertainty)
+    };
+    GpuImaginationCandidate {
+        action_key: action_key.to_string(),
+        expected_gain,
+        uncertainty,
+    }
+}
+
+/// Build the live cross-engine candidate set. These are existing specialist
+/// actions, not new commands: the GPU only estimates robustness so each
+/// owning lane can tune its already-admitted decision through the World Model.
+pub fn build_gpu_candidate_portfolio(
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+    runtime: &apollo_engine::engine::types::RuntimeMetrics,
+) -> Vec<GpuImaginationCandidate> {
+    let mut candidates = Vec::with_capacity(12);
+    let mut push = |action_key: &str, gain: f64, uncertainty: f64| {
+        candidates.push(gpu_portfolio_candidate(
+            world_model,
+            workload,
+            action_key,
+            gain,
+            uncertainty,
+        ));
+    };
+
+    if !runtime.markov_prediction_app.is_empty() && runtime.markov_prediction_confidence > 0.0 {
+        let confidence = runtime.markov_prediction_confidence.clamp(0.0, 1.0);
+        push(
+            "markov_prewarm:predicted_app",
+            0.01 + confidence * 0.03,
+            1.0 - confidence,
+        );
+    }
+    if runtime.interaction_qos_active || runtime.app_launching || runtime.window_op_active {
+        push("interaction_qos:foreground", 0.020, 0.30);
+        push("io_shaping:interactive_release", 0.012, 0.40);
+    }
+    if runtime.chromium_renderers_total > 0 {
+        push("chromium_ecore:background_renderer", 0.015, 0.35);
+        push("chromium_purge:purgeable_renderer", 0.008, 0.55);
+        push("chromium_jetsam:background_renderer", 0.006, 0.60);
+    }
+    if runtime.predictive_agent_active {
+        push("predictive_threshold:tighten", 0.010, 0.50);
+        push("predictive_profile:aggressive", 0.010, 0.50);
+        push("predictive_prethrottle:noise", 0.006, 0.60);
+        push("predictive_purge:kernel", 0.006, 0.60);
+    }
+    candidates
+}
+
+pub fn plan_action_intents_with_gpu(
+    actions: Vec<RootAction>,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+    memory_pressure: f64,
+    app_launching: bool,
+    fluidity_degraded: bool,
+    gpu: GpuPlannerRuntime<'_>,
+) -> (Vec<RootAction>, PlanReport) {
+    plan_action_intents_inner(
+        actions,
+        world_model,
+        workload,
+        memory_pressure,
+        app_launching,
+        fluidity_degraded,
+        Some(gpu),
+    )
+}
+
+fn plan_action_intents_inner(
+    actions: Vec<RootAction>,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+    memory_pressure: f64,
+    app_launching: bool,
+    fluidity_degraded: bool,
+    mut gpu: Option<GpuPlannerRuntime<'_>>,
+) -> (Vec<RootAction>, PlanReport) {
     let mut context = PlanningContext {
         memory_pressure,
         app_launching,
@@ -405,6 +536,65 @@ pub fn plan_action_intents(
         .filter_map(apollo_engine::engine::telemetry_medallion::actuator_action_key)
         .collect();
     let temporal_plan = world_model.plan_temporal_sequence(&action_keys, workload);
+    let mut gpu_backend = String::new();
+    let mut gpu_device = String::new();
+    let mut gpu_submit_outcome = String::new();
+    let mut gpu_completed = None;
+    let mut gpu_initialization_error = None;
+    let mut gpu_support_uses = 0_u64;
+    let mut gpu_supported_actions = Vec::new();
+    if let Some(runtime) = gpu.as_mut() {
+        gpu_completed = runtime.worker.take_completed();
+        if let Some(result) = runtime.worker.latest().cloned() {
+            if result.is_fresh_for(runtime.cycle, workload) {
+                let mut supported_keys = HashSet::new();
+                for key in &action_keys {
+                    if !supported_keys.insert(key) {
+                        continue;
+                    }
+                    let Some(raw_support) = result.support_for(key) else {
+                        continue;
+                    };
+                    let support =
+                        world_model.calibrate_gpu_rank_support(key, workload, raw_support);
+                    if support.abs() <= f64::EPSILON {
+                        continue;
+                    }
+                    let evidence = context.utility_evidence.entry(key.clone()).or_default();
+                    evidence.expected_benefit += support;
+                    gpu_support_uses = gpu_support_uses.saturating_add(1);
+                    gpu_supported_actions.push(key.clone());
+                }
+            }
+        }
+        let mut gpu_candidates: Vec<_> = temporal_plan
+            .action_scores
+            .iter()
+            .map(|(key, score)| GpuImaginationCandidate {
+                action_key: key.clone(),
+                expected_gain: score.expected_gain,
+                uncertainty: score.uncertainty,
+            })
+            .collect();
+        gpu_candidates.sort_by(|left, right| {
+            right
+                .expected_gain
+                .total_cmp(&left.expected_gain)
+                .then_with(|| left.uncertainty.total_cmp(&right.uncertainty))
+                .then_with(|| left.action_key.cmp(&right.action_key))
+        });
+        // Reserve half the bounded Metal batch for cross-engine specialists,
+        // so a large process cohort cannot starve Markov/Chromium/QoS advice.
+        gpu_candidates.truncate(12);
+        gpu_candidates.extend(runtime.external_candidates.iter().cloned());
+        gpu_submit_outcome = GpuImaginationRequest::new(runtime.cycle, workload, gpu_candidates)
+            .map(|request| runtime.worker.try_submit(request, runtime.gate).as_str())
+            .unwrap_or("no-candidates")
+            .to_string();
+        gpu_backend = runtime.worker.backend().as_str().to_string();
+        gpu_device = runtime.worker.device_name().to_string();
+        gpu_initialization_error = runtime.worker.initialization_error().map(str::to_string);
+    }
     let mut temporal_promotions = 0_u64;
     for (key, score) in &temporal_plan.action_scores {
         let exploratory_gain = score.expected_gain.max(0.0) * 0.20;
@@ -457,6 +647,26 @@ pub fn plan_action_intents(
     report.dynamics_authoritative_predictions = temporal_plan.dynamics_authoritative_predictions;
     report.dynamics_baseline_used = temporal_plan.dynamics_baseline_used;
     report.dynamics_mean_uncertainty = temporal_plan.dynamics_mean_uncertainty;
+    report.gpu_imagination_backend = gpu_backend;
+    report.gpu_imagination_device = gpu_device;
+    report.gpu_imagination_submit_outcome = gpu_submit_outcome;
+    report.gpu_imagination_support_uses = gpu_support_uses;
+    report.gpu_imagination_supported_actions = gpu_supported_actions;
+    if let Some(result) = gpu_completed {
+        report.gpu_imagination_result = Some(result.clone());
+        report.gpu_imagination_completed = true;
+        report.gpu_imagination_error = result.error.clone();
+        report.gpu_imagination_samples = result.samples;
+        report.gpu_imagination_gpu_time_ns = result.gpu_time_ns;
+        report.gpu_imagination_wall_time_ns = result.wall_time_ns;
+        if let Some(best) = result.best() {
+            report.gpu_imagination_best_action = Some(best.action_key.clone());
+            report.gpu_imagination_best_positive_probability = best.positive_probability;
+            report.gpu_imagination_best_p10_gain = best.p10_gain;
+        }
+    } else {
+        report.gpu_imagination_error = gpu_initialization_error;
+    }
     report.temporal_best_first = temporal_plan.best_first;
     report.temporal_best_second = temporal_plan.best_second;
     report.temporal_authoritative_best_first = temporal_plan.authoritative_best_first;
@@ -1420,6 +1630,8 @@ mod tests {
             causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
             ),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -1495,6 +1707,8 @@ mod tests {
             causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
             ),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -1593,6 +1807,8 @@ mod tests {
             causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
             ),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 1,
                 ..TelemetryMedallionMetrics::default()
@@ -1677,6 +1893,8 @@ mod tests {
             causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
             ),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 2,
                 ..TelemetryMedallionMetrics::default()
@@ -1753,6 +1971,8 @@ mod tests {
             causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
             ),
             causal_dynamics_revision: 0,
+            gpu_calibration_models: &BTreeMap::new(),
+            gpu_calibration_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -1872,6 +2092,8 @@ mod tests {
                 causal_dynamics:
                     &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(),
                 causal_dynamics_revision: 0,
+                gpu_calibration_models: &BTreeMap::new(),
+                gpu_calibration_revision: 0,
                 metrics: TelemetryMedallionMetrics {
                     bronze_total: cycle,
                     gold_total: cycle,
@@ -1919,5 +2141,33 @@ mod tests {
         assert!(!controlled_holdout_safe(0.55, false, false));
         assert!(!controlled_holdout_safe(0.30, true, false));
         assert!(!controlled_holdout_safe(0.30, false, true));
+    }
+
+    #[test]
+    fn gpu_portfolio_covers_live_specialists_without_root_actions() {
+        let runtime = apollo_engine::engine::types::RuntimeMetrics {
+            markov_prediction_app: "Editor".to_string(),
+            markov_prediction_confidence: 0.80,
+            chromium_renderers_total: 6,
+            interaction_qos_active: true,
+            predictive_agent_active: true,
+            ..apollo_engine::engine::types::RuntimeMetrics::default()
+        };
+        let model = apollo_engine::engine::world_model::WorldModel::default();
+        let candidates = build_gpu_candidate_portfolio(&model, "build", &runtime);
+        let keys: HashSet<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.action_key.as_str())
+            .collect();
+
+        assert!(keys.contains("markov_prewarm:predicted_app"));
+        assert!(keys.contains("interaction_qos:foreground"));
+        assert!(keys.contains("io_shaping:interactive_release"));
+        assert!(keys.contains("chromium_ecore:background_renderer"));
+        assert!(keys.contains("chromium_purge:purgeable_renderer"));
+        assert!(keys.contains("chromium_jetsam:background_renderer"));
+        assert!(keys.contains("predictive_profile:aggressive"));
+        assert!(keys.contains("predictive_purge:kernel"));
+        assert_eq!(keys.len(), candidates.len());
     }
 }

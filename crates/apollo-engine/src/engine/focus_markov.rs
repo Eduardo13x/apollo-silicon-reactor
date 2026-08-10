@@ -39,6 +39,10 @@ const MAX_TRACKED_APPS: usize = 100;
 /// Maximum transition targets per source app.
 const MAX_TARGETS_PER_SOURCE: usize = 30;
 
+/// Calibration semantics version. Version 2 separates cold calibration from
+/// trusted kernel acceleration and replaces lifetime dwell timing with a
+/// recency-adaptive estimate. Old outcome scores are not comparable.
+const PREWARM_CALIBRATION_SCHEMA: u32 = 2;
 const PREWARM_MIN_TRIALS: u32 = 5;
 const PREWARM_QUARANTINE_THRESHOLD: f64 = 0.35;
 const PREWARM_RECOVERY_THRESHOLD: f64 = 0.40;
@@ -49,9 +53,12 @@ const PREWARM_MIN_CONTEXT_TRIALS: u32 = 5;
 const PREWARM_CONTEXT_PRIOR_WEIGHT: f64 = 4.0;
 const MAX_PREWARM_CONTEXTS_PER_TRANSITION: usize = 12;
 const PREWARM_CONTEXT_KEY_LIMIT: u16 = 144;
+const DWELL_EWMA_ALPHA: f64 = 0.55;
+const MAX_DWELL_SAMPLE_SECS: f64 = 3_600.0;
+const MAX_LEGACY_DWELL_ESTIMATE_SECS: f64 = 120.0;
 
 fn default_prewarm_reliability() -> f64 {
-    1.0
+    0.5
 }
 
 /// Bounded operating context for speculative pre-warm calibration. The source
@@ -122,6 +129,16 @@ pub struct TransitionStats {
     /// Sum of dwell times in the source app before this transition (seconds).
     /// Used to compute average time before switching to this target.
     pub total_dwell_secs: f64,
+    /// Recent dwell estimate for this transition. Lifetime means react too
+    /// slowly after a hardware migration or a workflow change.
+    #[serde(default)]
+    pub recent_dwell_secs: f64,
+    /// EWMA absolute deviation used for observability and future uncertainty
+    /// calibration without retaining raw activity history.
+    #[serde(default)]
+    pub recent_dwell_deviation_secs: f64,
+    #[serde(default)]
+    pub recent_dwell_observations: u32,
     /// Outcome calibration for the speculative accelerator only. Transition
     /// probabilities continue learning even while acceleration is quarantined.
     #[serde(default)]
@@ -142,9 +159,13 @@ pub struct TransitionStats {
 
 impl TransitionStats {
     fn new(dwell_secs: f64) -> Self {
+        let dwell_secs = sanitize_dwell_sample(dwell_secs);
         Self {
             count: 1,
             total_dwell_secs: dwell_secs,
+            recent_dwell_secs: dwell_secs,
+            recent_dwell_deviation_secs: 0.0,
+            recent_dwell_observations: 1,
             prewarm_trials: 0,
             prewarm_hits: 0,
             prewarm_reliability: default_prewarm_reliability(),
@@ -162,6 +183,48 @@ impl TransitionStats {
             0.0
         }
     }
+
+    /// Timing estimate used by the live prewarmer. New observations adapt in
+    /// a few transitions; legacy files fall back to a bounded lifetime mean
+    /// until the first local observation arrives.
+    pub fn predicted_dwell_secs(&self) -> f64 {
+        if self.recent_dwell_observations > 0
+            && self.recent_dwell_secs.is_finite()
+            && self.recent_dwell_secs >= 0.0
+        {
+            self.recent_dwell_secs
+        } else {
+            self.avg_dwell_secs()
+                .clamp(0.0, MAX_LEGACY_DWELL_ESTIMATE_SECS)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SourceDwellStats {
+    #[serde(default)]
+    pub recent_dwell_secs: f64,
+    #[serde(default)]
+    pub recent_dwell_deviation_secs: f64,
+    #[serde(default)]
+    pub observations: u32,
+}
+
+impl SourceDwellStats {
+    fn observe(&mut self, dwell_secs: f64) {
+        let dwell_secs = sanitize_dwell_sample(dwell_secs);
+        if self.observations == 0 {
+            self.recent_dwell_secs = dwell_secs;
+            self.recent_dwell_deviation_secs = 0.0;
+        } else {
+            let previous = self.recent_dwell_secs;
+            self.recent_dwell_secs = previous + DWELL_EWMA_ALPHA * (dwell_secs - previous);
+            let absolute_error = (dwell_secs - previous).abs();
+            self.recent_dwell_deviation_secs +=
+                DWELL_EWMA_ALPHA * (absolute_error - self.recent_dwell_deviation_secs);
+        }
+        self.observations = self.observations.saturating_add(1);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,6 +238,18 @@ impl PrewarmAdmission {
     pub fn allows_acceleration(self) -> bool {
         !matches!(self, Self::Quarantined)
     }
+
+    pub fn allows_kernel_acceleration(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Probe => "probe",
+            Self::Quarantined => "quarantined",
+        }
+    }
 }
 
 /// A prediction: which app is most likely next and with what confidence.
@@ -186,6 +261,10 @@ pub struct FocusPrediction {
     pub probability: f64,
     /// Average dwell time before this transition (seconds).
     pub avg_dwell_secs: f64,
+    /// Number of local recency samples backing `avg_dwell_secs`. Zero means
+    /// the estimate came from a bounded legacy lifetime average.
+    pub dwell_observations: u32,
+    pub dwell_deviation_secs: f64,
     /// PID of the predicted app (if currently running).
     pub pid: Option<u32>,
 }
@@ -195,8 +274,14 @@ pub struct FocusPrediction {
 pub struct MarkovState {
     /// transitions[source_app][target_app] = TransitionStats
     pub transitions: HashMap<String, HashMap<String, TransitionStats>>,
+    /// Recent time-to-switch per foreground source app. This adapts timing
+    /// even when the most likely destination changes.
+    #[serde(default)]
+    pub source_dwell: HashMap<String, SourceDwellStats>,
     /// Total transitions observed (lifetime counter).
     pub total_transitions: u64,
+    #[serde(default)]
+    pub prewarm_calibration_schema: u32,
 }
 
 // ── Markov Tracker ───────────────────────────────────────────────────────────
@@ -218,15 +303,19 @@ impl FocusMarkov {
     /// Create a new tracker, loading persisted state if available.
     pub fn new(persist_path: PathBuf) -> Self {
         let mut state = Self::load_state(&persist_path).unwrap_or_default();
-        sanitize_state(&mut state);
-        Self {
+        let migrated = sanitize_state(&mut state);
+        let mut tracker = Self {
             state,
             persist_path,
             last_app: None,
             last_switch_at: None,
-            dirty: false,
+            dirty: migrated,
             transitions_since_persist: 0,
+        };
+        if migrated {
+            tracker.persist();
         }
+        tracker
     }
 
     /// Record a foreground app observation. Call every daemon cycle.
@@ -273,11 +362,28 @@ impl FocusMarkov {
 
     /// Record a transition from `from` to `to` with the given dwell time.
     fn record_transition(&mut self, from: String, to: String, dwell_secs: f64) {
+        self.state
+            .source_dwell
+            .entry(from.clone())
+            .or_default()
+            .observe(dwell_secs);
         let targets = self.state.transitions.entry(from).or_default();
 
         if let Some(stats) = targets.get_mut(&to) {
-            stats.count += 1;
+            let dwell_secs = sanitize_dwell_sample(dwell_secs);
+            stats.count = stats.count.saturating_add(1);
             stats.total_dwell_secs += dwell_secs;
+            if stats.recent_dwell_observations == 0 {
+                stats.recent_dwell_secs = dwell_secs;
+                stats.recent_dwell_deviation_secs = 0.0;
+            } else {
+                let previous = stats.recent_dwell_secs;
+                stats.recent_dwell_secs = previous + DWELL_EWMA_ALPHA * (dwell_secs - previous);
+                let absolute_error = (dwell_secs - previous).abs();
+                stats.recent_dwell_deviation_secs = stats.recent_dwell_deviation_secs
+                    + DWELL_EWMA_ALPHA * (absolute_error - stats.recent_dwell_deviation_secs);
+            }
+            stats.recent_dwell_observations = stats.recent_dwell_observations.saturating_add(1);
         } else {
             // Evict least-used target if at capacity.
             if targets.len() >= MAX_TARGETS_PER_SOURCE {
@@ -305,6 +411,7 @@ impl FocusMarkov {
                 .min_by_key(|(_, targets)| targets.values().map(|t| t.count).sum::<u32>())
                 .map(|(k, _)| k.clone())
             {
+                self.state.source_dwell.remove(&min_key);
                 self.state.transitions.remove(&min_key);
             }
         }
@@ -332,10 +439,23 @@ impl FocusMarkov {
             return None; // Not confident enough.
         }
 
+        let source_timing = self
+            .state
+            .source_dwell
+            .get(current_app)
+            .filter(|timing| timing.observations > 0);
         Some(FocusPrediction {
             app_name: best_name.clone(),
             probability,
-            avg_dwell_secs: best_stats.avg_dwell_secs(),
+            avg_dwell_secs: source_timing
+                .map(|timing| timing.recent_dwell_secs)
+                .unwrap_or_else(|| best_stats.predicted_dwell_secs()),
+            dwell_observations: source_timing
+                .map(|timing| timing.observations)
+                .unwrap_or(best_stats.recent_dwell_observations),
+            dwell_deviation_secs: source_timing
+                .map(|timing| timing.recent_dwell_deviation_secs)
+                .unwrap_or(best_stats.recent_dwell_deviation_secs),
             pid: None, // Caller fills this in from the process table.
         })
     }
@@ -355,12 +475,25 @@ impl FocusMarkov {
             return vec![];
         }
 
+        let source_timing = self
+            .state
+            .source_dwell
+            .get(current_app)
+            .filter(|timing| timing.observations > 0);
         let mut predictions: Vec<FocusPrediction> = targets
             .iter()
             .map(|(name, stats)| FocusPrediction {
                 app_name: name.clone(),
                 probability: stats.count as f64 / total as f64,
-                avg_dwell_secs: stats.avg_dwell_secs(),
+                avg_dwell_secs: source_timing
+                    .map(|timing| timing.recent_dwell_secs)
+                    .unwrap_or_else(|| stats.predicted_dwell_secs()),
+                dwell_observations: source_timing
+                    .map(|timing| timing.observations)
+                    .unwrap_or(stats.recent_dwell_observations),
+                dwell_deviation_secs: source_timing
+                    .map(|timing| timing.recent_dwell_deviation_secs)
+                    .unwrap_or(stats.recent_dwell_deviation_secs),
                 pid: None,
             })
             .collect();
@@ -405,6 +538,7 @@ impl FocusMarkov {
             stats.prewarm_reliability,
             stats.prewarm_quarantine_until_transition,
             self.state.total_transitions,
+            PREWARM_MIN_TRIALS,
         )
     }
 
@@ -422,17 +556,25 @@ impl FocusMarkov {
         else {
             return PrewarmAdmission::Ready;
         };
+        let global_admission = self.prewarm_admission(source, target);
         let Some(context_stats) = stats.prewarm_contexts.get(&context.key) else {
-            return self.prewarm_admission(source, target);
+            // A new context may collect bounded cache-only probes even when an
+            // old global calibration is quarantined.
+            return if global_admission == PrewarmAdmission::Quarantined {
+                PrewarmAdmission::Probe
+            } else {
+                global_admission
+            };
         };
         if context_stats.trials < PREWARM_MIN_CONTEXT_TRIALS {
-            return self.prewarm_admission(source, target);
+            return PrewarmAdmission::Probe;
         }
         calibration_admission(
             context_stats.trials,
             context_stats.reliability,
             context_stats.quarantine_until_transition,
             self.state.total_transitions,
+            PREWARM_MIN_CONTEXT_TRIALS,
         )
     }
 
@@ -482,6 +624,31 @@ impl FocusMarkov {
             .and_then(|stats| stats.prewarm_contexts.get(&context.key))
             .map(|stats| stats.trials)
             .unwrap_or(0)
+    }
+
+    /// Remaining foreground transitions before a quarantined pair can run a
+    /// bounded probe. Zero means ready/probe-now or no calibration exists.
+    pub fn prewarm_probe_transitions_remaining(
+        &self,
+        source: &str,
+        target: &str,
+        context: PrewarmContext,
+    ) -> u64 {
+        let Some(stats) = self
+            .state
+            .transitions
+            .get(source)
+            .and_then(|targets| targets.get(target))
+        else {
+            return 0;
+        };
+        let until = stats
+            .prewarm_contexts
+            .get(&context.key)
+            .filter(|context_stats| context_stats.trials >= PREWARM_MIN_CONTEXT_TRIALS)
+            .map(|context_stats| context_stats.quarantine_until_transition)
+            .unwrap_or(stats.prewarm_quarantine_until_transition);
+        until.saturating_sub(self.state.total_transitions)
     }
 
     /// Feed a resolved acceleration lease back into its transition-local
@@ -597,13 +764,13 @@ fn calibration_admission(
     reliability: f64,
     quarantine_until_transition: u64,
     total_transitions: u64,
+    min_trials: u32,
 ) -> PrewarmAdmission {
-    if trials < PREWARM_MIN_TRIALS
-        || reliability >= PREWARM_RECOVERY_THRESHOLD
-        || quarantine_until_transition == 0
-    {
+    if trials < min_trials {
+        PrewarmAdmission::Probe
+    } else if reliability >= PREWARM_RECOVERY_THRESHOLD {
         PrewarmAdmission::Ready
-    } else if total_transitions >= quarantine_until_transition {
+    } else if quarantine_until_transition == 0 || total_transitions >= quarantine_until_transition {
         PrewarmAdmission::Probe
     } else {
         PrewarmAdmission::Quarantined
@@ -622,17 +789,25 @@ fn update_calibration(
     total_transitions: u64,
     min_trials: u32,
 ) {
+    let was_mature = *trials >= min_trials;
     *trials = trials.saturating_add(1);
     *hits = hits.saturating_add(u32::from(hit));
     *reliability = (PREWARM_OUTCOME_ALPHA * f64::from(hit)
         + (1.0 - PREWARM_OUTCOME_ALPHA) * reliability.clamp(0.0, 1.0))
     .clamp(0.0, 1.0);
 
-    if hit && *reliability >= PREWARM_RECOVERY_THRESHOLD {
+    if hit && admission_before == PrewarmAdmission::Probe && was_mature {
+        // A spaced probe hit is fresh evidence under the current workload.
+        // Let the next eligible lease be trusted, while later misses can
+        // immediately demote it again.
+        *reliability = reliability.max(PREWARM_RECOVERY_THRESHOLD);
+        *quarantine_until_transition = 0;
+        *backoff_level = backoff_level.saturating_sub(1);
+    } else if hit && *reliability >= PREWARM_RECOVERY_THRESHOLD {
         *quarantine_until_transition = 0;
         *backoff_level = backoff_level.saturating_sub(1);
     } else if *trials >= min_trials && *reliability < PREWARM_QUARANTINE_THRESHOLD {
-        if admission_before == PrewarmAdmission::Probe {
+        if admission_before == PrewarmAdmission::Probe && was_mature {
             *backoff_level = backoff_level
                 .saturating_add(1)
                 .min(PREWARM_MAX_BACKOFF_SHIFT);
@@ -642,11 +817,41 @@ fn update_calibration(
     }
 }
 
-fn sanitize_state(state: &mut MarkovState) {
+fn sanitize_dwell_sample(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, MAX_DWELL_SAMPLE_SECS)
+    } else {
+        0.0
+    }
+}
+
+fn sanitize_state(state: &mut MarkovState) -> bool {
+    let reset_calibration = state.prewarm_calibration_schema < PREWARM_CALIBRATION_SCHEMA;
     for targets in state.transitions.values_mut() {
         for stats in targets.values_mut() {
             if !stats.total_dwell_secs.is_finite() || stats.total_dwell_secs < 0.0 {
                 stats.total_dwell_secs = 0.0;
+            }
+            if !stats.recent_dwell_secs.is_finite() || stats.recent_dwell_secs < 0.0 {
+                stats.recent_dwell_secs = 0.0;
+                stats.recent_dwell_observations = 0;
+            }
+            if !stats.recent_dwell_deviation_secs.is_finite()
+                || stats.recent_dwell_deviation_secs < 0.0
+            {
+                stats.recent_dwell_deviation_secs = 0.0;
+            }
+            stats.recent_dwell_secs = stats.recent_dwell_secs.min(MAX_DWELL_SAMPLE_SECS);
+            stats.recent_dwell_deviation_secs =
+                stats.recent_dwell_deviation_secs.min(MAX_DWELL_SAMPLE_SECS);
+            if reset_calibration {
+                stats.prewarm_trials = 0;
+                stats.prewarm_hits = 0;
+                stats.prewarm_reliability = default_prewarm_reliability();
+                stats.prewarm_quarantine_until_transition = 0;
+                stats.prewarm_backoff_level = 0;
+                stats.prewarm_contexts.clear();
+                continue;
             }
             stats.prewarm_hits = stats.prewarm_hits.min(stats.prewarm_trials);
             stats.prewarm_reliability = if stats.prewarm_reliability.is_finite() {
@@ -684,6 +889,23 @@ fn sanitize_state(state: &mut MarkovState) {
             }
         }
     }
+    state.source_dwell.retain(|source, timing| {
+        if source.is_empty()
+            || !timing.recent_dwell_secs.is_finite()
+            || timing.recent_dwell_secs < 0.0
+            || !timing.recent_dwell_deviation_secs.is_finite()
+            || timing.recent_dwell_deviation_secs < 0.0
+        {
+            return false;
+        }
+        timing.recent_dwell_secs = timing.recent_dwell_secs.min(MAX_DWELL_SAMPLE_SECS);
+        timing.recent_dwell_deviation_secs = timing
+            .recent_dwell_deviation_secs
+            .min(MAX_DWELL_SAMPLE_SECS);
+        true
+    });
+    state.prewarm_calibration_schema = PREWARM_CALIBRATION_SCHEMA;
+    reset_calibration
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -771,7 +993,8 @@ mod tests {
         );
         assert_eq!(
             m.prewarm_admission("Safari", "Mail"),
-            PrewarmAdmission::Ready
+            PrewarmAdmission::Probe,
+            "cold transitions may cache-probe but cannot mutate kernel QoS"
         );
     }
 
@@ -828,8 +1051,8 @@ mod tests {
         assert_eq!(m.prewarm_context_trials("Finder", "Terminal", useful), 4);
         assert_eq!(
             m.prewarm_admission_with_context("Finder", "Terminal", useful),
-            m.prewarm_admission("Finder", "Terminal"),
-            "an immature context must inherit global admission"
+            PrewarmAdmission::Probe,
+            "an immature context gets bounded cache-only probes"
         );
         m.record_prewarm_outcome_with_context("Finder", "Terminal", true, useful);
 
@@ -877,6 +1100,116 @@ mod tests {
         }
         let stats = &m.state.transitions["Finder"]["Terminal"];
         assert!(stats.prewarm_contexts.len() <= MAX_PREWARM_CONTEXTS_PER_TRANSITION);
+    }
+
+    #[test]
+    fn cold_transition_starts_as_probe_not_full_acceleration() {
+        let mut m = test_markov();
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), TransitionStats::new(5.0))]),
+        );
+        assert_eq!(
+            m.prewarm_admission("Finder", "Terminal"),
+            PrewarmAdmission::Probe
+        );
+        assert!(!m
+            .prewarm_admission("Finder", "Terminal")
+            .allows_kernel_acceleration());
+    }
+
+    #[test]
+    fn probe_hit_recovers_even_from_a_saturated_old_penalty() {
+        let mut m = test_markov();
+        m.state.total_transitions = 200;
+        let mut stats = TransitionStats::new(5.0);
+        stats.prewarm_trials = 100;
+        stats.prewarm_reliability = 1e-12;
+        stats.prewarm_quarantine_until_transition = 200;
+        stats.prewarm_backoff_level = PREWARM_MAX_BACKOFF_SHIFT;
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), stats)]),
+        );
+        assert_eq!(
+            m.prewarm_admission("Finder", "Terminal"),
+            PrewarmAdmission::Probe
+        );
+        m.record_prewarm_outcome("Finder", "Terminal", true);
+        assert_eq!(
+            m.prewarm_admission("Finder", "Terminal"),
+            PrewarmAdmission::Ready
+        );
+    }
+
+    #[test]
+    fn schema_migration_preserves_transitions_and_resets_stale_calibration() {
+        let mut stats = TransitionStats::new(210.0);
+        stats.count = 20;
+        stats.total_dwell_secs = 4_200.0;
+        stats.recent_dwell_observations = 0;
+        stats.prewarm_trials = 40;
+        stats.prewarm_hits = 1;
+        stats.prewarm_reliability = 1e-8;
+        stats.prewarm_quarantine_until_transition = 9_999;
+        stats.prewarm_backoff_level = 4;
+        let mut state = MarkovState {
+            transitions: HashMap::from([(
+                "Finder".to_string(),
+                HashMap::from([("Terminal".to_string(), stats)]),
+            )]),
+            source_dwell: HashMap::new(),
+            total_transitions: 500,
+            prewarm_calibration_schema: 1,
+        };
+
+        assert!(sanitize_state(&mut state));
+        let migrated = &state.transitions["Finder"]["Terminal"];
+        assert_eq!(migrated.count, 20);
+        assert_eq!(migrated.total_dwell_secs, 4_200.0);
+        assert_eq!(migrated.prewarm_trials, 0);
+        assert_eq!(migrated.prewarm_reliability, default_prewarm_reliability());
+        assert_eq!(migrated.prewarm_quarantine_until_transition, 0);
+        assert_eq!(state.prewarm_calibration_schema, PREWARM_CALIBRATION_SCHEMA);
+    }
+
+    #[test]
+    fn first_local_dwell_sample_replaces_legacy_timing() {
+        let mut m = test_markov();
+        let mut legacy = TransitionStats::new(210.0);
+        legacy.count = 20;
+        legacy.total_dwell_secs = 4_200.0;
+        legacy.recent_dwell_secs = 0.0;
+        legacy.recent_dwell_observations = 0;
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), legacy)]),
+        );
+
+        m.record_transition("Finder".to_string(), "Terminal".to_string(), 12.0);
+        let prediction = m.predict("Finder").expect("prediction");
+        assert_eq!(prediction.dwell_observations, 1);
+        assert!((prediction.avg_dwell_secs - 12.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn source_timing_adapts_even_when_the_destination_differs() {
+        let mut m = test_markov();
+        let mut legacy = TransitionStats::new(210.0);
+        legacy.count = 20;
+        legacy.total_dwell_secs = 4_200.0;
+        legacy.recent_dwell_secs = 0.0;
+        legacy.recent_dwell_observations = 0;
+        m.state.transitions.insert(
+            "Finder".to_string(),
+            HashMap::from([("Terminal".to_string(), legacy)]),
+        );
+
+        m.record_transition("Finder".to_string(), "Safari".to_string(), 9.0);
+        let prediction = m.predict("Finder").expect("legacy destination still wins");
+        assert_eq!(prediction.app_name, "Terminal");
+        assert_eq!(prediction.dwell_observations, 1);
+        assert!((prediction.avg_dwell_secs - 9.0).abs() < f64::EPSILON);
     }
 
     #[test]

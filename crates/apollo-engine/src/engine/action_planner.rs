@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::engine::action_types::RootAction;
+use crate::engine::gpu_imagination::GpuImaginationResult;
 use crate::engine::telemetry_medallion::actuator_action_key;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -56,6 +57,20 @@ pub struct PlanReport {
     pub dynamics_authoritative_predictions: u64,
     pub dynamics_baseline_used: bool,
     pub dynamics_mean_uncertainty: f64,
+    pub gpu_imagination_backend: String,
+    pub gpu_imagination_device: String,
+    pub gpu_imagination_submit_outcome: String,
+    pub gpu_imagination_completed: bool,
+    pub gpu_imagination_error: Option<String>,
+    pub gpu_imagination_samples: u64,
+    pub gpu_imagination_gpu_time_ns: u64,
+    pub gpu_imagination_wall_time_ns: u64,
+    pub gpu_imagination_support_uses: u64,
+    pub gpu_imagination_supported_actions: Vec<String>,
+    pub gpu_imagination_best_action: Option<String>,
+    pub gpu_imagination_best_positive_probability: f64,
+    pub gpu_imagination_best_p10_gain: f64,
+    pub gpu_imagination_result: Option<GpuImaginationResult>,
     pub temporal_best_first: Option<String>,
     pub temporal_best_second: Option<String>,
     pub temporal_authoritative_best_first: Option<String>,

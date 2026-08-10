@@ -274,16 +274,30 @@ pub fn run_chromium_tick(
 
     // Query only when the specialist emitted the corresponding action. Both
     // searches are bounded and remain off the idle path.
-    let ecore_bias = chromium_actions
+    let ecore_bias = if chromium_actions
         .iter()
         .any(|action| matches!(action, ChromiumAction::DemoteToEcores { .. }))
-        .then(|| world_model.contextual_action_bias("chromium_ecore:background_renderer", workload))
-        .unwrap_or_default();
-    let purge_bias = chromium_actions
+    {
+        world_model.contextual_action_bias("chromium_ecore:background_renderer", workload)
+    } else {
+        ContextualActionBias::default()
+    };
+    let purge_bias = if chromium_actions
         .iter()
         .any(|action| matches!(action, ChromiumAction::PurgePurgeable { .. }))
-        .then(|| world_model.contextual_action_bias("chromium_purge:purgeable_renderer", workload))
-        .unwrap_or_default();
+    {
+        world_model.contextual_action_bias("chromium_purge:purgeable_renderer", workload)
+    } else {
+        ContextualActionBias::default()
+    };
+    let jetsam_bias = if chromium_actions
+        .iter()
+        .any(|action| matches!(action, ChromiumAction::DemoteJetsam { .. }))
+    {
+        world_model.contextual_action_bias("chromium_jetsam:background_renderer", workload)
+    } else {
+        ContextualActionBias::default()
+    };
 
     // Non-SIGSTOP actions run UNCONDITIONALLY. DemoteToEcores uses
     // PRIO_DARWIN_BG (turnstile-compatible, commit 97410cd) and PurgePurgeable
@@ -354,6 +368,16 @@ pub fn run_chromium_tick(
                 }
             }
             ChromiumAction::DemoteJetsam { pid, name } => {
+                let allowed = contextual_chromium_action_allowed(jetsam_bias, pressure_smooth);
+                record_chromium_context(
+                    state,
+                    "chromium_jetsam:background_renderer",
+                    jetsam_bias,
+                    !allowed,
+                );
+                if !allowed {
+                    continue;
+                }
                 const OWNER: &str = "chromium visible background: jetsam BACKGROUND";
                 const TTL: std::time::Duration = std::time::Duration::from_secs(30);
                 match apply_reversible_background_jetsam(*pid, Some(name), TTL, OWNER) {

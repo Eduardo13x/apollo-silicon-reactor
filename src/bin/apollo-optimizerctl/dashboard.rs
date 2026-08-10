@@ -676,6 +676,51 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             ));
         }
     }
+    if !m.gpu_imagination_backend.is_empty() {
+        let mean_gpu_ms = if m.gpu_imagination_jobs_completed_total > 0 {
+            m.gpu_imagination_gpu_time_ns_total as f64
+                / m.gpu_imagination_jobs_completed_total as f64
+                / 1_000_000.0
+        } else {
+            0.0
+        };
+        lines.push(format!(
+            "GPU-I  {} J{} S{} t{:.2}ms",
+            m.gpu_imagination_backend,
+            format_number(m.gpu_imagination_jobs_completed_total),
+            format_number(m.gpu_imagination_samples_total),
+            mean_gpu_ms
+        ));
+        if m.gpu_imagination_jobs_completed_total == 0
+            && !m.gpu_imagination_last_submit_outcome.is_empty()
+        {
+            lines.push(format!("GPU-G  {}", m.gpu_imagination_last_submit_outcome));
+        }
+        if !m.gpu_imagination_last_best_action.is_empty() {
+            let action = m.gpu_imagination_last_best_action.split_once(':').map_or(
+                m.gpu_imagination_last_best_action.as_str(),
+                |(family, _)| family,
+            );
+            lines.push(format!(
+                "GPU+   {} p{:.0}% d{:+.1}%",
+                action.chars().take(13).collect::<String>(),
+                m.gpu_imagination_last_positive_probability * 100.0,
+                m.gpu_imagination_last_p10_gain * 100.0
+            ));
+        }
+        if m.world_model_gpu_bronze_total > 0 {
+            lines.push(format!(
+                "GPU-M  B{} S{} G{} P{} M{} q{:.0}% e{:.1}%",
+                format_number(m.world_model_gpu_bronze_total),
+                format_number(m.world_model_gpu_silver_total),
+                format_number(m.world_model_gpu_gold_total),
+                format_number(m.world_model_gpu_pending_total),
+                format_number(m.world_model_gpu_calibrated_models),
+                m.world_model_gpu_calibration_quality * 100.0,
+                m.world_model_gpu_calibration_mae * 100.0
+            ));
+        }
+    }
     lines.push(format!(
         // This is the pressure-causal imagination model, not the universal
         // actuator-learning stream shown above as `Act` / `Act+`.
@@ -732,6 +777,32 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             } else {
                 ""
             }
+        ));
+    }
+    if !m.markov_prediction_app.is_empty() {
+        let app: String = m.markov_prediction_app.chars().take(11).collect();
+        lines.push(format!(
+            "Mk-P   {} {:.0}% eta{:.0}s {}",
+            app,
+            m.markov_prediction_confidence * 100.0,
+            m.markov_prediction_eta_secs,
+            if m.markov_prewarm_blocker.is_empty() {
+                m.markov_prewarm_admission.as_str()
+            } else {
+                m.markov_prewarm_blocker.as_str()
+            }
+        ));
+        lines.push(format!(
+            "Warm   M{}/{} H{}/{} T{} C{}",
+            format_number(m.markov_prewarm_applied),
+            format_number(m.markov_prewarm_attempts),
+            format_number(m.markov_prewarm_hits),
+            format_number(
+                m.markov_prewarm_hits
+                    .saturating_add(m.markov_prewarm_misses)
+            ),
+            format_number(m.temporal_prewarm_applied),
+            format_number(m.markov_prewarm_conflict_skips_total),
         ));
     }
 
@@ -1339,6 +1410,13 @@ mod tests {
             .world_model_dynamics_authoritative_predictions_total = 3;
         status.metrics.world_model_dynamics_baseline_uses_total = 8;
         status.metrics.world_model_dynamics_mean_uncertainty = 0.071;
+        status.metrics.gpu_imagination_backend = "metal".to_string();
+        status.metrics.gpu_imagination_jobs_completed_total = 3;
+        status.metrics.gpu_imagination_samples_total = 196_608;
+        status.metrics.gpu_imagination_gpu_time_ns_total = 1_260_000;
+        status.metrics.gpu_imagination_last_best_action = "boost:Editor".to_string();
+        status.metrics.gpu_imagination_last_positive_probability = 0.82;
+        status.metrics.gpu_imagination_last_p10_gain = 0.012;
         status.metrics.world_model_actuator_families =
             vec![apollo_engine::engine::types::ActuatorEvidenceStatus {
                 family: "boost".to_string(),
@@ -1382,6 +1460,10 @@ mod tests {
             .iter()
             .any(|line| line == "WM-D   shadow A0 R4/6 V42 e3.2%"));
         assert!(think.iter().any(|line| line == "MPC-D  P17 R9 A3 B8 u7.1%"));
+        assert!(think
+            .iter()
+            .any(|line| line == "GPU-I  metal J3 S196,608 t0.42ms"));
+        assert!(think.iter().any(|line| line == "GPU+   boost p82% d+1.2%"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -1395,6 +1477,21 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "WM-U   protected · no evidence"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn think_quadrant_explains_gpu_imagination_without_completed_jobs() {
+        let mut status = dashboard_status();
+        status.metrics.gpu_imagination_backend = "metal".to_string();
+        status.metrics.gpu_imagination_last_submit_outcome = "no-candidates".to_string();
+
+        let think = render_think_q(&status);
+
+        assert!(think
+            .iter()
+            .any(|line| line == "GPU-I  metal J0 S0 t0.00ms"));
+        assert!(think.iter().any(|line| line == "GPU-G  no-candidates"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
