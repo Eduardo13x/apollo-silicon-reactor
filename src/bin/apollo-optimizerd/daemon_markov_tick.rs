@@ -28,6 +28,7 @@ use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::{LatencyTier, SchedulingTier, ThroughputTier};
 use apollo_engine::engine::process_tree::ProcessTree;
 use apollo_engine::engine::temporal_predictor::TemporalPredictor;
+use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 use chrono::{Timelike, Utc};
 
 pub struct MarkovTickOutput {
@@ -50,6 +51,24 @@ pub struct MarkovPrewarmLease {
     activated_at: Option<Instant>,
     settle_recorded: bool,
     calibration_probe: bool,
+    calibration_context: PrewarmContext,
+}
+
+/// Passive prediction tracking. It never owns an actuator or kernel resource;
+/// it only scores the next foreground transition against one Markov forecast.
+/// `sampled_pair` prevents repeated timeout samples while the user remains in
+/// the same foreground episode.
+#[derive(Debug, Default)]
+pub struct MarkovShadowTracker {
+    active: Option<MarkovShadowLease>,
+    sampled_pair: Option<(String, String)>,
+}
+
+#[derive(Debug)]
+struct MarkovShadowLease {
+    source_app: String,
+    predicted_app: String,
+    expires_at: Instant,
     calibration_context: PrewarmContext,
 }
 
@@ -97,6 +116,7 @@ pub fn run_markov_tick(
     focus_markov: &mut FocusMarkov,
     temporal_predictor: &mut TemporalPredictor,
     markov_prewarm: &mut Option<MarkovPrewarmLease>,
+    markov_shadow: &mut MarkovShadowTracker,
     markov_hit_count: &mut u32,
     markov_miss_count: &mut u32,
     state: &SharedState,
@@ -105,13 +125,14 @@ pub fn run_markov_tick(
     coalition_tracker: &CoalitionTracker,
     cache_warmer: &mut CacheWarmer,
     frozen_state_path: &Path,
+    world_model: &WorldModel,
 ) -> MarkovTickOutput {
     // Fight-hunt fix (2026-06-10): prefetch is a luxury. Under pressure the
     // maintenance/survival paths are EVICTING file cache while these
     // warm_pid calls fault pages back in — Apollo fighting itself,
     // amplifying thrashing. Gate all speculative cache warming on pressure.
     let now = Instant::now();
-    let (cache_warm_allowed, fluidity_degraded, app_launching, calibration_context) = {
+    let (cache_warm_allowed, fluidity_degraded, app_launching, calibration_context, workload) = {
         let m = state.metrics.lock_recover();
         let pressure = m.metrics.memory_pressure;
         (
@@ -124,8 +145,48 @@ pub fn run_markov_tick(
                 pressure,
                 m.metrics.app_launching || m.metrics.window_op_active,
             ),
+            m.metrics.current_workload.clone(),
         )
     };
+
+    // A foreground transition starts a new sampling episode. Resolve the old
+    // passive forecast first, then permit one forecast for the new source app.
+    let foreground_changed = foreground_app != last_fg_name;
+    let shadow_resolution = markov_shadow
+        .active
+        .as_ref()
+        .map(|lease| shadow_lease_resolution(lease, foreground_app, now))
+        .unwrap_or(LeaseResolution::Pending);
+    if matches!(
+        shadow_resolution,
+        LeaseResolution::Hit | LeaseResolution::Miss
+    ) {
+        if let Some(lease) = markov_shadow.active.take() {
+            let hit = shadow_resolution == LeaseResolution::Hit;
+            focus_markov.record_prewarm_outcome_with_context(
+                &lease.source_app,
+                &lease.predicted_app,
+                hit,
+                lease.calibration_context,
+            );
+            let mut metrics = state.metrics.lock_recover();
+            metrics.metrics.markov_shadow_active = false;
+            metrics.metrics.markov_shadow_resolved_total = metrics
+                .metrics
+                .markov_shadow_resolved_total
+                .saturating_add(1);
+            if hit {
+                metrics.metrics.markov_shadow_hits =
+                    metrics.metrics.markov_shadow_hits.saturating_add(1);
+            } else {
+                metrics.metrics.markov_shadow_misses =
+                    metrics.metrics.markov_shadow_misses.saturating_add(1);
+            }
+        }
+    }
+    if foreground_changed {
+        markov_shadow.sampled_pair = None;
+    }
 
     if let Some(lease) = markov_prewarm.as_mut() {
         let target_is_foreground = foreground_app
@@ -242,8 +303,16 @@ pub fn run_markov_tick(
             &pred.app_name,
             calibration_context,
         );
-        let base_eligible =
-            prewarm_window_open(pred.probability, time_to_switch, cache_warm_allowed);
+        let contextual_bias =
+            world_model.contextual_action_bias("markov_prewarm:predicted_app", &workload);
+        let probability_floor = contextual_prewarm_probability_floor(contextual_bias);
+        let prediction_eligible = prediction_window_open(pred.probability, time_to_switch);
+        let base_eligible = prewarm_window_open(
+            pred.probability,
+            time_to_switch,
+            cache_warm_allowed,
+            probability_floor,
+        );
         let prewarm_eligible = base_eligible && admission.allows_acceleration();
         markov_acceleration_allowed = admission.allows_acceleration() && cache_warm_allowed;
         {
@@ -260,6 +329,15 @@ pub fn run_markov_tick(
                 &pred.app_name,
                 calibration_context,
             );
+            if contextual_bias.is_informative() {
+                metrics.metrics.world_model_contextual_markov_total = metrics
+                    .metrics
+                    .world_model_contextual_markov_total
+                    .saturating_add(1);
+                metrics.metrics.world_model_contextual_last_action =
+                    "markov_prewarm:predicted_app".to_string();
+                metrics.metrics.world_model_contextual_last_bias = contextual_bias.score;
+            }
             if base_eligible && admission == PrewarmAdmission::Quarantined {
                 metrics.metrics.markov_prewarm_quarantine_skips_total = metrics
                     .metrics
@@ -271,6 +349,14 @@ pub fn run_markov_tick(
         if markov_prewarm.is_none() && prewarm_eligible {
             let predicted_pid = find_running_pid(collector, &pred.app_name);
             if let Some(pid) = predicted_pid {
+                if markov_shadow.active.take().is_some() {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.markov_shadow_active = false;
+                    metrics.metrics.markov_shadow_superseded_total = metrics
+                        .metrics
+                        .markov_shadow_superseded_total
+                        .saturating_add(1);
+                }
                 let (members, cache_bytes, unfrozen_count) = acquire_coalition_prewarm(
                     pid,
                     state,
@@ -289,7 +375,10 @@ pub fn run_markov_tick(
                     .count();
                 let applied = !members.is_empty();
 
-                let lease_secs = (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0);
+                let lease_secs = contextual_prewarm_lease_secs(
+                    (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0),
+                    contextual_bias,
+                );
                 let acquired_at = Instant::now();
                 *markov_prewarm = Some(MarkovPrewarmLease {
                     source_app: foreground_app.unwrap_or_default().to_string(),
@@ -329,6 +418,32 @@ pub fn run_markov_tick(
                     "markov: acquired predictive coalition acceleration lease"
                 );
             }
+        }
+
+        // Score one passive prediction when no real lease is available. This
+        // includes quarantined transitions and targets that are not running;
+        // no cache, QoS, jetsam, signal, or process mutation occurs here.
+        let pair = (source_app.to_string(), pred.app_name.clone());
+        if markov_prewarm.is_none()
+            && markov_shadow.active.is_none()
+            && prediction_eligible
+            && !source_app.is_empty()
+            && markov_shadow.sampled_pair.as_ref() != Some(&pair)
+        {
+            let lease_secs = (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0);
+            markov_shadow.active = Some(MarkovShadowLease {
+                source_app: pair.0.clone(),
+                predicted_app: pair.1.clone(),
+                expires_at: now + Duration::from_secs_f64(lease_secs),
+                calibration_context,
+            });
+            markov_shadow.sampled_pair = Some(pair);
+            let mut metrics = state.metrics.lock_recover();
+            metrics.metrics.markov_shadow_predictions_total = metrics
+                .metrics
+                .markov_shadow_predictions_total
+                .saturating_add(1);
+            metrics.metrics.markov_shadow_active = true;
         }
     } else {
         let mut metrics = state.metrics.lock_recover();
@@ -617,11 +732,60 @@ fn acquire_coalition_prewarm(
     (members, total_cache_bytes, thawed.len() as u64)
 }
 
-fn prewarm_window_open(probability: f64, time_to_switch: f64, resources_healthy: bool) -> bool {
+fn prewarm_window_open(
+    probability: f64,
+    time_to_switch: f64,
+    resources_healthy: bool,
+    probability_floor: f64,
+) -> bool {
     resources_healthy
-        && probability >= 0.50
+        && probability >= probability_floor.clamp(0.50, 0.54)
         && time_to_switch.is_finite()
         && (-2.0..=12.0).contains(&time_to_switch)
+}
+
+fn contextual_prewarm_probability_floor(bias: ContextualActionBias) -> f64 {
+    if !bias.is_informative() {
+        return 0.50;
+    }
+    let score = bias.score.clamp(-1.0, 1.0);
+    if score < 0.0 {
+        0.50 - 0.04 * score
+    } else {
+        0.50
+    }
+}
+
+fn contextual_prewarm_lease_secs(base_secs: f64, bias: ContextualActionBias) -> f64 {
+    if !bias.is_informative() {
+        return base_secs.clamp(5.0, 20.0);
+    }
+    (base_secs * (1.0 + 0.15 * bias.score.clamp(-1.0, 1.0))).clamp(5.0, 20.0)
+}
+
+fn prediction_window_open(probability: f64, time_to_switch: f64) -> bool {
+    probability >= 0.50 && time_to_switch.is_finite() && (-2.0..=12.0).contains(&time_to_switch)
+}
+
+fn shadow_lease_resolution(
+    lease: &MarkovShadowLease,
+    foreground_app: Option<&str>,
+    now: Instant,
+) -> LeaseResolution {
+    if foreground_app
+        .map(|app| app_names_match(app, &lease.predicted_app))
+        .unwrap_or(false)
+    {
+        LeaseResolution::Hit
+    } else if foreground_app
+        .map(|app| !app_names_match(app, &lease.source_app))
+        .unwrap_or(false)
+        || now >= lease.expires_at
+    {
+        LeaseResolution::Miss
+    } else {
+        LeaseResolution::Pending
+    }
 }
 
 fn maybe_record_settle(
@@ -846,11 +1010,72 @@ mod tests {
 
     #[test]
     fn prewarm_window_is_confident_imminent_and_pressure_safe() {
-        assert!(prewarm_window_open(0.70, 8.0, true));
-        assert!(prewarm_window_open(0.50, -2.0, true));
-        assert!(!prewarm_window_open(0.49, 2.0, true));
-        assert!(!prewarm_window_open(0.90, 13.0, true));
-        assert!(!prewarm_window_open(0.90, 2.0, false));
+        assert!(prewarm_window_open(0.70, 8.0, true, 0.50));
+        assert!(prewarm_window_open(0.50, -2.0, true, 0.50));
+        assert!(!prewarm_window_open(0.49, 2.0, true, 0.50));
+        assert!(!prewarm_window_open(0.90, 13.0, true, 0.50));
+        assert!(!prewarm_window_open(0.90, 2.0, false, 0.50));
+    }
+
+    #[test]
+    fn contextual_prewarm_bias_stays_inside_the_specialist_window() {
+        let positive = ContextualActionBias {
+            score: 1.0,
+            model_observations: 20,
+            ..ContextualActionBias::default()
+        };
+        let negative = ContextualActionBias {
+            score: -1.0,
+            model_observations: 20,
+            authoritative: true,
+            ..ContextualActionBias::default()
+        };
+        assert_eq!(contextual_prewarm_probability_floor(positive), 0.50);
+        assert_eq!(contextual_prewarm_probability_floor(negative), 0.54);
+        assert_eq!(
+            contextual_prewarm_probability_floor(ContextualActionBias::default()),
+            0.50
+        );
+        assert!(!prewarm_window_open(0.49, 2.0, true, 0.50));
+        assert!(!prewarm_window_open(0.53, 2.0, true, 0.54));
+        assert!(!prewarm_window_open(0.90, 2.0, false, 0.50));
+        assert_eq!(contextual_prewarm_lease_secs(10.0, positive), 11.5);
+        assert_eq!(contextual_prewarm_lease_secs(10.0, negative), 8.5);
+    }
+
+    #[test]
+    fn passive_prediction_window_does_not_depend_on_actuator_headroom() {
+        assert!(prediction_window_open(0.70, 8.0));
+        assert!(prediction_window_open(0.50, -2.0));
+        assert!(!prediction_window_open(0.49, 2.0));
+        assert!(!prediction_window_open(0.90, 13.0));
+    }
+
+    #[test]
+    fn shadow_prediction_scores_transition_or_deadline_without_actuation() {
+        let now = Instant::now();
+        let lease = MarkovShadowLease {
+            source_app: "Finder".to_string(),
+            predicted_app: "Terminal".to_string(),
+            expires_at: now + Duration::from_secs(10),
+            calibration_context: PrewarmContext::new("coding", 12, 0.30, false),
+        };
+        assert_eq!(
+            shadow_lease_resolution(&lease, Some("Finder"), now),
+            LeaseResolution::Pending
+        );
+        assert_eq!(
+            shadow_lease_resolution(&lease, Some("terminal"), now),
+            LeaseResolution::Hit
+        );
+        assert_eq!(
+            shadow_lease_resolution(&lease, Some("Safari"), now),
+            LeaseResolution::Miss
+        );
+        assert_eq!(
+            shadow_lease_resolution(&lease, Some("Finder"), lease.expires_at),
+            LeaseResolution::Miss
+        );
     }
 
     #[test]

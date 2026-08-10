@@ -38,16 +38,24 @@ use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 use apollo_engine::engine::build_tracker::BuildPhase;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::fluidity::FluidityState;
+use apollo_engine::engine::io_tiering::IoShaper;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::CycleStage;
-use apollo_engine::engine::mach_qos::{LatencyTier, SchedulingTier, ThroughputTier};
+use apollo_engine::engine::mach_qos::{LatencyTier, TaskPolicyLease, ThroughputTier};
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
 use apollo_engine::engine::pipeline::periodic_stage::{
     run_periodic, PeriodicContext, PeriodicResult,
 };
+use apollo_engine::engine::process_classifier::ProcessSnapshot;
+use apollo_engine::engine::process_identity::ProcessIdentity;
+use apollo_engine::engine::process_tree::ProcessTree;
+use apollo_engine::engine::safety::{
+    can_boost, hard_protected_contains, is_chromium_family, ProcessInterventionClass,
+};
 use apollo_engine::engine::swap_predictor::SwapForecast;
 use apollo_engine::engine::thermal_bailout::ThermalAction;
+use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 
 use crate::cognitive_tick::{CognitiveDecision, CognitiveState};
 
@@ -79,27 +87,205 @@ impl InteractionReason {
     }
 }
 
-#[derive(Debug)]
-struct ActiveInteractionLease {
-    pid: u32,
-    prior_tier: SchedulingTier,
-    expires_at: Instant,
-    reason: InteractionReason,
-    tier_mutated: bool,
-    task_qos_mutated: bool,
+const MAX_ACCELERATION_MEMBERS: usize = 4;
+const MAX_CONTINUOUS_LEASE: Duration = Duration::from_secs(12);
+const LEASE_COOLDOWN: Duration = Duration::from_secs(2);
+const LEDGER_GRACE: Duration = Duration::from_secs(5);
+const TASK_QOS_OWNER: &str = "acceleration lease: interactive task QoS";
+const NICE_OWNER: &str = "acceleration lease: nice fallback";
+const LEASE_NICE: i32 = -2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseTtlBand {
+    Short,
+    Standard,
+    Long,
 }
 
-/// Short-lived QoS ownership for direct user interaction. Keeping the input
-/// history in the controller lets us detect HID idle-time resets without an
-/// additional IOKit query.
+impl LeaseTtlBand {
+    const ALL: [Self; 3] = [Self::Short, Self::Standard, Self::Long];
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Short => "short",
+            Self::Standard => "standard",
+            Self::Long => "long",
+        }
+    }
+
+    fn action_key(self) -> &'static str {
+        match self {
+            Self::Short => "interaction_qos:foreground@short",
+            Self::Standard => "interaction_qos:foreground@standard",
+            Self::Long => "interaction_qos:foreground@long",
+        }
+    }
+
+    fn from_bias(bias: ContextualActionBias) -> Self {
+        if !bias.score.is_finite() || !bias.is_informative() || bias.score.abs() < 0.25 {
+            Self::Standard
+        } else if bias.score < 0.0 {
+            Self::Short
+        } else {
+            Self::Long
+        }
+    }
+
+    fn ttl(self, reason: InteractionReason) -> Duration {
+        let factor = match self {
+            Self::Short => 0.90,
+            Self::Standard => 1.0,
+            Self::Long => 1.10,
+        };
+        reason.ttl().mul_f64(factor)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LeaseTtlDecision {
+    band: LeaseTtlBand,
+    exploratory: bool,
+}
+
+fn learned_lease_ttl_band(world_model: &WorldModel, workload: &str) -> Option<LeaseTtlBand> {
+    let mut candidates = Vec::with_capacity(LeaseTtlBand::ALL.len());
+    for band in LeaseTtlBand::ALL {
+        if let Some(assessment) = world_model.assess_utility(band.action_key(), workload) {
+            candidates.push((
+                band,
+                assessment.lower_bound,
+                assessment.upper_bound,
+                assessment.quality,
+            ));
+        }
+    }
+    select_distinct_ttl_band(candidates)
+}
+
+fn select_distinct_ttl_band(
+    mut candidates: Vec<(LeaseTtlBand, f64, f64, f64)>,
+) -> Option<LeaseTtlBand> {
+    if candidates.len() < 2 {
+        return None;
+    }
+    candidates.sort_by(|left, right| {
+        right
+            .1
+            .total_cmp(&left.1)
+            .then_with(|| right.3.total_cmp(&left.3))
+    });
+    let best = candidates[0];
+    let runner_up = candidates[1];
+    (best.1 > runner_up.2 + 0.002).then_some(best.0)
+}
+
+fn contextual_io_release_allowed(bias: ContextualActionBias) -> bool {
+    !bias.authoritative || bias.score > -0.50
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccelerationFamily {
+    General,
+    Chromium,
+}
+
+impl AccelerationFamily {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::General => "general",
+            Self::Chromium => "chromium",
+        }
+    }
+
+    fn allows_explicit_task_qos(self) -> bool {
+        self == Self::General
+    }
+}
+
+#[derive(Debug, Clone)]
+struct AccelerationCandidate {
+    pid: u32,
+    name: String,
+    score: f64,
+}
+
+#[derive(Debug)]
+struct AccelerationSelection {
+    root_pid: u32,
+    family: AccelerationFamily,
+    members: Vec<AccelerationCandidate>,
+}
+
+#[derive(Debug)]
+struct LeasedMember {
+    pid: u32,
+    name: String,
+    start_sec: u64,
+    start_usec: u64,
+    task_qos_mutated: bool,
+    policy_lease: Option<TaskPolicyLease>,
+    prior_nice: Option<i32>,
+}
+
+#[derive(Debug)]
+struct ActiveAccelerationLease {
+    root_pid: u32,
+    family: AccelerationFamily,
+    members: Vec<LeasedMember>,
+    acquired_at: Instant,
+    expires_at: Instant,
+    hard_deadline: Instant,
+    reason: InteractionReason,
+    ttl_band: LeaseTtlBand,
+    ttl_exploratory: bool,
+}
+
+/// Short-lived, bounded acceleration ownership for the active application
+/// family. Input history detects HID idle resets without another IOKit query.
 #[derive(Debug, Default)]
-pub struct InteractionQoSController {
-    active: Option<ActiveInteractionLease>,
+pub struct AccelerationLeaseBroker {
+    active: Option<ActiveAccelerationLease>,
     last_idle_secs: Option<f64>,
     build_was_active: bool,
+    app_launch_was_active: bool,
+    window_op_was_active: bool,
+    cooldown_until: Option<Instant>,
+    parameter_sequence: u64,
+    parameter_exploration_arm: usize,
 }
 
-impl InteractionQoSController {
+impl AccelerationLeaseBroker {
+    fn preview_ttl_band(
+        &self,
+        contextual_bias: ContextualActionBias,
+        learned: Option<LeaseTtlBand>,
+    ) -> LeaseTtlDecision {
+        let next_sequence = self.parameter_sequence.saturating_add(1);
+        // One bounded arm probe every eight admitted leases. The treatment is
+        // at most +/-10% and never extends the hard deadline; randomized-style
+        // variation is needed to learn parameter causality instead of merely
+        // reinforcing whichever duration the aggregate action already used.
+        if next_sequence.is_multiple_of(8) {
+            let band = LeaseTtlBand::ALL[self.parameter_exploration_arm % 3];
+            LeaseTtlDecision {
+                band,
+                exploratory: true,
+            }
+        } else {
+            LeaseTtlDecision {
+                band: learned.unwrap_or_else(|| LeaseTtlBand::from_bias(contextual_bias)),
+                exploratory: false,
+            }
+        }
+    }
+
+    fn commit_ttl_decision(&mut self, decision: LeaseTtlDecision) {
+        self.parameter_sequence = self.parameter_sequence.saturating_add(1);
+        if decision.exploratory {
+            self.parameter_exploration_arm = self.parameter_exploration_arm.wrapping_add(1);
+        }
+    }
+
     fn select_reason(
         &mut self,
         fluidity_state: &FluidityState,
@@ -115,9 +301,17 @@ impl InteractionQoSController {
         let build_started = build_active && !self.build_was_active;
         self.build_was_active = build_active;
 
-        if fluidity_state.app_launching() {
+        let app_launch_active = fluidity_state.app_launching();
+        let app_launch_started = app_launch_active && !self.app_launch_was_active;
+        self.app_launch_was_active = app_launch_active;
+
+        let window_op_active = fluidity_state.window_op_active();
+        let window_op_started = window_op_active && !self.window_op_was_active;
+        self.window_op_was_active = window_op_active;
+
+        if app_launch_started {
             Some(InteractionReason::AppLaunch)
-        } else if fluidity_state.window_op_active() {
+        } else if window_op_started {
             Some(InteractionReason::WindowOperation)
         } else if build_started {
             Some(InteractionReason::BuildStart)
@@ -129,115 +323,926 @@ impl InteractionQoSController {
     }
 }
 
-/// Apply a bounded user-interaction QoS lease and restore the previous tier as
-/// soon as its signal expires. QoS is a scheduler hint on Apple Silicon; it is
-/// deliberately not described as physical P/E-core affinity.
-pub fn update_interaction_qos(
-    state: &SharedState,
-    controller: &mut InteractionQoSController,
-    fluidity_state: &FluidityState,
-    thermal_action: &ThermalAction,
-    foreground_pid: Option<u32>,
-    build_phase: BuildPhase,
-    idle_secs: f64,
+fn candidate_precedes(lhs: &AccelerationCandidate, rhs: &AccelerationCandidate) -> bool {
+    lhs.score > rhs.score || (lhs.score == rhs.score && lhs.pid < rhs.pid)
+}
+
+/// Keep only the highest-utility family members in O(n * K), where K is the
+/// fixed lease cap. This avoids sorting a Chromium coalition just to retain
+/// its first few members.
+fn insert_bounded_candidate(
+    selected: &mut Vec<AccelerationCandidate>,
+    candidate: AccelerationCandidate,
 ) {
-    let now = Instant::now();
-    let reason = controller.select_reason(fluidity_state, build_phase, idle_secs);
-    let target_pid = if matches!(reason, Some(InteractionReason::AppLaunch)) {
-        fluidity_state.launch_pid.or(foreground_pid)
+    if let Some(index) = selected
+        .iter()
+        .position(|existing| existing.pid == candidate.pid)
+    {
+        if !candidate_precedes(&candidate, &selected[index]) {
+            return;
+        }
+        selected.remove(index);
+    }
+    let position = selected
+        .iter()
+        .position(|existing| candidate_precedes(&candidate, existing))
+        .unwrap_or(selected.len());
+    if position < MAX_ACCELERATION_MEMBERS {
+        selected.insert(position, candidate);
+        selected.truncate(MAX_ACCELERATION_MEMBERS);
+    } else if selected.len() < MAX_ACCELERATION_MEMBERS {
+        selected.push(candidate);
+    }
+}
+
+fn is_build_member(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ProcessInterventionClass::for_name(name) == ProcessInterventionClass::BuildTool
+        || matches!(
+            lower.as_str(),
+            "cargo" | "clang" | "clang++" | "swiftc" | "xcodebuild" | "ninja" | "make" | "cmake"
+        )
+}
+
+fn build_target_score(snapshot: &ProcessSnapshot) -> f64 {
+    let lower = snapshot.name.to_ascii_lowercase();
+    let coordinator = matches!(
+        lower.as_str(),
+        "cargo" | "xcodebuild" | "ninja" | "make" | "cmake"
+    );
+    let cpu = if snapshot.cpu_percent.is_finite() {
+        f64::from(snapshot.cpu_percent.max(0.0))
     } else {
-        foreground_pid
+        0.0
+    };
+    (if coordinator { 1_000_000.0 } else { 500_000.0 }) + cpu * 100.0
+}
+
+fn select_build_target(snapshots: &[ProcessSnapshot]) -> Option<u32> {
+    let mut best: Option<(u32, f64)> = None;
+    for snapshot in snapshots {
+        if snapshot.is_zombie
+            || !is_build_member(&snapshot.name)
+            || hard_protected_contains(&snapshot.name)
+            || !can_boost(&snapshot.name)
+        {
+            continue;
+        }
+        let score = build_target_score(snapshot);
+        if best.is_none_or(|(pid, best_score)| {
+            score > best_score || (score == best_score && snapshot.pid < pid)
+        }) {
+            best = Some((snapshot.pid, score));
+        }
+    }
+    best.map(|(pid, _)| pid)
+}
+
+fn read_nice(pid: u32) -> std::io::Result<i32> {
+    unsafe {
+        *libc::__error() = 0;
+        let value = libc::getpriority(libc::PRIO_PROCESS, pid);
+        if value == -1 && *libc::__error() != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(value)
+        }
+    }
+}
+
+fn write_nice(pid: u32, value: i32) -> std::io::Result<()> {
+    unsafe {
+        *libc::__error() = 0;
+        let rc = libc::setpriority(libc::PRIO_PROCESS, pid, value);
+        if rc == -1 && *libc::__error() != 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn nice_fallback_target(prior: i32) -> Option<i32> {
+    (prior >= 0).then_some(LEASE_NICE)
+}
+
+fn apply_nice_fallback(pid: u32) -> std::io::Result<Option<i32>> {
+    let prior = read_nice(pid)?;
+    // Respect an existing priority boost from macOS, the app, or another
+    // Apollo producer. This fallback is intentionally much milder than the
+    // legacy -10 boost and always restores the exact captured value.
+    let Some(target) = nice_fallback_target(prior) else {
+        return Ok(None);
+    };
+    write_nice(pid, target)?;
+    Ok(Some(prior))
+}
+
+fn member_role_bonus(name: &str, reason: InteractionReason) -> f64 {
+    let lower = name.to_ascii_lowercase();
+    let chromium_role = if lower.contains("gpu") {
+        900.0
+    } else if lower.contains("renderer") {
+        800.0
+    } else if lower.contains("helper") {
+        300.0
+    } else {
+        0.0
+    };
+    let build_role = if matches!(reason, InteractionReason::BuildStart) && is_build_member(name) {
+        25_000.0
+    } else {
+        0.0
+    };
+    chromium_role + build_role
+}
+
+fn select_acceleration_family(
+    target_pid: u32,
+    reason: InteractionReason,
+    process_tree: &ProcessTree,
+    snapshots: &[ProcessSnapshot],
+) -> Option<AccelerationSelection> {
+    if matches!(reason, InteractionReason::BuildStart) {
+        let mut selected = Vec::with_capacity(MAX_ACCELERATION_MEMBERS);
+        for snapshot in snapshots {
+            if snapshot.is_zombie
+                || !is_build_member(&snapshot.name)
+                || hard_protected_contains(&snapshot.name)
+                || !can_boost(&snapshot.name)
+            {
+                continue;
+            }
+            insert_bounded_candidate(
+                &mut selected,
+                AccelerationCandidate {
+                    pid: snapshot.pid,
+                    name: snapshot.name.clone(),
+                    score: build_target_score(snapshot),
+                },
+            );
+        }
+        return (!selected.is_empty()).then_some(AccelerationSelection {
+            root_pid: target_pid,
+            family: AccelerationFamily::General,
+            members: selected,
+        });
+    }
+
+    let root_pid = process_tree
+        .resolve_root_pid(target_pid)
+        .unwrap_or(target_pid);
+    if root_pid <= 1 {
+        return None;
+    }
+
+    let mut family_pids = process_tree.cascade_pids(target_pid);
+    if family_pids.is_empty() {
+        family_pids.push(target_pid);
+    }
+    if !family_pids.contains(&root_pid) {
+        family_pids.push(root_pid);
+    }
+
+    let by_pid: HashMap<u32, &ProcessSnapshot> = snapshots
+        .iter()
+        .map(|snapshot| (snapshot.pid, snapshot))
+        .collect();
+    let root_name = process_tree
+        .resolve_app_name(target_pid)
+        .or_else(|| by_pid.get(&root_pid).map(|snapshot| snapshot.name.as_str()))?;
+    if hard_protected_contains(root_name) {
+        return None;
+    }
+    let family = if is_chromium_family(root_name)
+        || family_pids.iter().any(|pid| {
+            by_pid
+                .get(pid)
+                .is_some_and(|snapshot| is_chromium_family(&snapshot.name))
+        }) {
+        AccelerationFamily::Chromium
+    } else {
+        AccelerationFamily::General
     };
 
-    let must_release = thermal_action.force_ecores
-        || controller.active.as_ref().is_some_and(|lease| {
-            now >= lease.expires_at || target_pid.is_some_and(|pid| pid != lease.pid)
-        });
-    if must_release {
-        release_interaction_qos(controller, state);
-    }
-
-    if thermal_action.force_ecores {
-        return;
-    }
-
-    if let (Some(reason), Some(pid)) = (reason, target_pid) {
-        if let Some(active) = controller.active.as_mut() {
-            if active.pid == pid {
-                active.expires_at = now + reason.ttl();
-                active.reason = reason;
-                let mut metrics = state.metrics.lock_recover();
-                metrics.metrics.interaction_qos_reason = reason.as_str().to_string();
-                return;
-            }
+    let mut selected = Vec::with_capacity(MAX_ACCELERATION_MEMBERS);
+    for pid in family_pids {
+        let Some(snapshot) = by_pid.get(&pid).copied() else {
+            continue;
+        };
+        if snapshot.is_zombie || hard_protected_contains(&snapshot.name) {
+            continue;
+        }
+        let intervention = ProcessInterventionClass::for_name(&snapshot.name);
+        if intervention == ProcessInterventionClass::ProtectedSystem {
+            continue;
+        }
+        // Chromium gets only the existing foreground-tier inheritance. The
+        // explicit latency/throughput boost remains forbidden by B.6.
+        if family == AccelerationFamily::General && !can_boost(&snapshot.name) {
+            continue;
         }
 
-        let mut qos = state.mach_qos.lock_recover();
-        let prior_tier = qos.current_tier(pid).unwrap_or(SchedulingTier::Normal);
-        let tier_mutated = qos.set_tier(pid, SchedulingTier::Foreground).mutated;
-        let task_qos_mutated = qos
-            .set_latency_and_throughput(pid, LatencyTier::Interactive, ThroughputTier::High)
-            .mutated;
-        drop(qos);
+        let cpu = if snapshot.cpu_percent.is_finite() {
+            f64::from(snapshot.cpu_percent.max(0.0))
+        } else {
+            0.0
+        };
+        let contention = snapshot.cpu_contention.unwrap_or(0.0).clamp(0.0, 1.0);
+        let role_bonus = member_role_bonus(&snapshot.name, reason);
+        let is_root = pid == root_pid;
+        let active_child = cpu >= 0.25
+            || contention >= 0.05
+            || snapshot.has_gui_window
+            || snapshot.wakeups_per_sec >= 5.0
+            || (matches!(reason, InteractionReason::AppLaunch) && role_bonus > 0.0);
+        if !is_root && !active_child {
+            continue;
+        }
 
-        if tier_mutated || task_qos_mutated {
-            controller.active = Some(ActiveInteractionLease {
+        let score = if is_root { 1_000_000.0 } else { 0.0 }
+            + if snapshot.has_gui_window {
+                10_000.0
+            } else {
+                0.0
+            }
+            + role_bonus
+            + cpu * 100.0
+            + contention * 1_000.0
+            + f64::from(snapshot.wakeups_per_sec.max(0.0).min(1_000.0));
+        insert_bounded_candidate(
+            &mut selected,
+            AccelerationCandidate {
                 pid,
-                prior_tier,
-                expires_at: now + reason.ttl(),
-                reason,
-                tier_mutated,
+                name: snapshot.name.clone(),
+                score,
+            },
+        );
+    }
+
+    (!selected.is_empty()).then_some(AccelerationSelection {
+        root_pid,
+        family,
+        members: selected,
+    })
+}
+
+fn refresh_owned_effects(lease: &ActiveAccelerationLease, now: Instant) {
+    let ttl = lease
+        .expires_at
+        .saturating_duration_since(now)
+        .saturating_add(LEDGER_GRACE);
+    for member in &lease.members {
+        if member.task_qos_mutated {
+            apollo_engine::engine::effect_ledger::refresh_global_if_justification(
+                &apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid: member.pid },
+                ttl,
+                member.start_sec,
+                TASK_QOS_OWNER,
+            );
+        }
+        if let Some(prior) = member.prior_nice {
+            apollo_engine::engine::effect_ledger::refresh_global_if_justification(
+                &apollo_engine::engine::effect_ledger::AppliedEffect::Nice {
+                    pid: member.pid,
+                    prior,
+                },
+                ttl,
+                member.start_sec,
+                NICE_OWNER,
+            );
+        }
+    }
+}
+
+fn acquire_acceleration_lease(
+    state: &SharedState,
+    controller: &mut AccelerationLeaseBroker,
+    io_shaper: &mut IoShaper,
+    selection: AccelerationSelection,
+    reason: InteractionReason,
+    ttl_decision: LeaseTtlDecision,
+    allow_io_promotion: bool,
+    io_bias: ContextualActionBias,
+    now: Instant,
+) {
+    let ttl = ttl_decision.band.ttl(reason);
+    let ledger_ttl = ttl.saturating_add(LEDGER_GRACE);
+    let mut identity_skips = 0u64;
+    let mut capability_skips = 0u64;
+    let mut nice_fallbacks = 0u64;
+    let mut nice_failures = 0u64;
+    let mut conflict_skips = 0u64;
+    let mut prepared = Vec::with_capacity(selection.members.len());
+    for candidate in selection.members {
+        if let Some(identity) = ProcessIdentity::from_pid(candidate.pid) {
+            let task_effect =
+                apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid: candidate.pid };
+            let nice_effect = apollo_engine::engine::effect_ledger::AppliedEffect::Nice {
+                pid: candidate.pid,
+                prior: 0,
+            };
+            let task_conflict = selection.family.allows_explicit_task_qos()
+                && apollo_engine::engine::effect_ledger::is_global_tracked(&task_effect);
+            let nice_conflict = selection.family.allows_explicit_task_qos()
+                && apollo_engine::engine::effect_ledger::is_global_tracked(&nice_effect);
+            conflict_skips = conflict_skips
+                .saturating_add(u64::from(task_conflict))
+                .saturating_add(u64::from(nice_conflict));
+            prepared.push((candidate, identity, task_conflict, nice_conflict));
+        } else {
+            identity_skips = identity_skips.saturating_add(1);
+        }
+    }
+
+    let mut members = Vec::with_capacity(prepared.len());
+    let selected_pids: Vec<u32> = prepared
+        .iter()
+        .map(|(candidate, _, _, _)| candidate.pid)
+        .collect();
+    let mut qos = state.mach_qos.lock_recover();
+    let io_promotions = if allow_io_promotion {
+        io_shaper.promote_interactive(&selected_pids, Some(&mut qos))
+    } else {
+        0
+    };
+    for (candidate, identity, task_conflict, nice_conflict) in prepared {
+        // Chromium keeps the existing non-invasive foreground inheritance and
+        // can only receive an Apollo-owned I/O release above. TASK_CATEGORY
+        // is deliberately excluded here: several hardened GUI apps accept
+        // foreground elevation but reject TASK_UNSPECIFIED rollback.
+        if !selection.family.allows_explicit_task_qos() {
+            continue;
+        }
+        let mut policy_lease = None;
+        let mut task_qos_mutated = false;
+        if !task_conflict {
+            if let Some(lease) = qos.acquire_task_policy_lease(candidate.pid) {
+                task_qos_mutated = qos
+                    .set_latency_and_throughput_with_lease(
+                        &lease,
+                        LatencyTier::Interactive,
+                        ThroughputTier::High,
+                    )
+                    .mutated;
+                if task_qos_mutated {
+                    policy_lease = Some(lease);
+                } else {
+                    capability_skips = capability_skips.saturating_add(1);
+                }
+            } else {
+                capability_skips = capability_skips.saturating_add(1);
+            }
+        }
+        let prior_nice = if task_qos_mutated || nice_conflict {
+            None
+        } else {
+            match apply_nice_fallback(candidate.pid) {
+                Ok(prior) => prior,
+                Err(_) => {
+                    nice_failures = nice_failures.saturating_add(1);
+                    None
+                }
+            }
+        };
+        nice_fallbacks = nice_fallbacks.saturating_add(u64::from(prior_nice.is_some()));
+        if task_qos_mutated || prior_nice.is_some() {
+            members.push(LeasedMember {
+                pid: candidate.pid,
+                name: candidate.name,
+                start_sec: identity.start_sec,
+                start_usec: identity.start_usec,
                 task_qos_mutated,
+                policy_lease,
+                prior_nice,
             });
-            let mut metrics = state.metrics.lock_recover();
+        }
+    }
+    drop(qos);
+
+    for member in &members {
+        if member.task_qos_mutated {
+            apollo_engine::engine::effect_ledger::record_global(
+                apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid: member.pid },
+                ledger_ttl,
+                member.start_sec,
+                TASK_QOS_OWNER,
+            );
+        }
+        if let Some(prior) = member.prior_nice {
+            apollo_engine::engine::effect_ledger::record_global(
+                apollo_engine::engine::effect_ledger::AppliedEffect::Nice {
+                    pid: member.pid,
+                    prior,
+                },
+                ledger_ttl,
+                member.start_sec,
+                NICE_OWNER,
+            );
+        }
+    }
+
+    let member_count = members.len() as u32;
+    if member_count > 0 {
+        controller.commit_ttl_decision(ttl_decision);
+    }
+    {
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.acceleration_lease_identity_skips_total = metrics
+            .metrics
+            .acceleration_lease_identity_skips_total
+            .saturating_add(identity_skips);
+        metrics.metrics.acceleration_lease_capability_skips_total = metrics
+            .metrics
+            .acceleration_lease_capability_skips_total
+            .saturating_add(capability_skips);
+        metrics.metrics.acceleration_lease_nice_fallbacks_total = metrics
+            .metrics
+            .acceleration_lease_nice_fallbacks_total
+            .saturating_add(nice_fallbacks);
+        metrics.metrics.acceleration_lease_nice_failures_total = metrics
+            .metrics
+            .acceleration_lease_nice_failures_total
+            .saturating_add(nice_failures);
+        metrics.metrics.acceleration_lease_conflict_skips_total = metrics
+            .metrics
+            .acceleration_lease_conflict_skips_total
+            .saturating_add(conflict_skips);
+        metrics.metrics.acceleration_lease_io_promotions_total = metrics
+            .metrics
+            .acceleration_lease_io_promotions_total
+            .saturating_add(u64::from(io_promotions));
+        if io_bias.is_informative() {
+            metrics.metrics.world_model_contextual_io_total = metrics
+                .metrics
+                .world_model_contextual_io_total
+                .saturating_add(1);
+            metrics.metrics.world_model_contextual_last_action =
+                "io_shaping:interactive_release".to_string();
+            metrics.metrics.world_model_contextual_last_bias = io_bias.score;
+        }
+        if member_count > 0 || io_promotions > 0 {
+            metrics.metrics.acceleration_lease_last_family = selection.family.as_str().to_string();
+            match selection.family {
+                AccelerationFamily::General => {
+                    metrics.metrics.acceleration_lease_general_total = metrics
+                        .metrics
+                        .acceleration_lease_general_total
+                        .saturating_add(1);
+                }
+                AccelerationFamily::Chromium => {
+                    metrics.metrics.acceleration_lease_chromium_total = metrics
+                        .metrics
+                        .acceleration_lease_chromium_total
+                        .saturating_add(1);
+                }
+            }
+        }
+        if member_count > 0 {
             metrics.metrics.interaction_qos_activations = metrics
                 .metrics
                 .interaction_qos_activations
                 .saturating_add(1);
             metrics.metrics.interaction_qos_active = true;
             metrics.metrics.interaction_qos_reason = reason.as_str().to_string();
-            tracing::debug!(
-                pid,
-                reason = reason.as_str(),
-                "interaction QoS lease acquired"
+            metrics.metrics.interaction_qos_ttl_band = ttl_decision.band.as_str().to_string();
+            metrics.metrics.interaction_qos_ttl_ms = ttl.as_millis().min(u64::MAX as u128) as u64;
+            metrics.metrics.interaction_qos_ttl_exploratory = ttl_decision.exploratory;
+            metrics.metrics.interaction_qos_parameter_explorations_total = metrics
+                .metrics
+                .interaction_qos_parameter_explorations_total
+                .saturating_add(u64::from(ttl_decision.exploratory));
+            metrics.metrics.acceleration_lease_members_active = member_count;
+            metrics.metrics.acceleration_lease_members_applied_total = metrics
+                .metrics
+                .acceleration_lease_members_applied_total
+                .saturating_add(u64::from(member_count));
+            metrics.metrics.acceleration_lease_family = selection.family.as_str().to_string();
+        }
+    }
+
+    if member_count > 0 || io_promotions > 0 {
+        tracing::debug!(
+            root_pid = selection.root_pid,
+            family = selection.family.as_str(),
+            members = member_count,
+            io_promotions,
+            reason = reason.as_str(),
+            "acceleration lease acquired"
+        );
+        if member_count > 0 {
+            controller.active = Some(ActiveAccelerationLease {
+                root_pid: selection.root_pid,
+                family: selection.family,
+                members,
+                acquired_at: now,
+                expires_at: now + ttl,
+                hard_deadline: now + MAX_CONTINUOUS_LEASE,
+                reason,
+                ttl_band: ttl_decision.band,
+                ttl_exploratory: ttl_decision.exploratory,
+            });
+        }
+    }
+    if member_count == 0 {
+        // No reversible lease was needed (already optimal, I/O-only, or
+        // kernel-denied). Suppress repeated identity/syscall probes for the
+        // remainder of this interaction window.
+        controller.cooldown_until = Some(now + ttl.min(LEASE_COOLDOWN));
+    }
+}
+
+/// Apply a bounded family acceleration lease and restore only effects this
+/// broker still owns. QoS is a scheduler hint on Apple Silicon, not physical
+/// P/E-core affinity. Chromium keeps its non-invasive B.6 policy.
+#[allow(clippy::too_many_arguments)]
+pub fn update_acceleration_lease(
+    state: &SharedState,
+    controller: &mut AccelerationLeaseBroker,
+    fluidity_state: &FluidityState,
+    thermal_action: &ThermalAction,
+    foreground_pid: Option<u32>,
+    build_phase: BuildPhase,
+    idle_secs: f64,
+    process_tree: &ProcessTree,
+    snapshots: &[ProcessSnapshot],
+    io_shaper: &mut IoShaper,
+    world_model: &WorldModel,
+    workload: &str,
+) {
+    let now = Instant::now();
+    let reason = controller.select_reason(fluidity_state, build_phase, idle_secs);
+    let target_pid = match reason {
+        Some(InteractionReason::AppLaunch) => fluidity_state.launch_pid.or(foreground_pid),
+        Some(InteractionReason::BuildStart) => select_build_target(snapshots).or(foreground_pid),
+        _ => foreground_pid,
+    };
+    let target_root = target_pid.map(|pid| {
+        if matches!(reason, Some(InteractionReason::BuildStart)) {
+            pid
+        } else {
+            process_tree.resolve_root_pid(pid).unwrap_or(pid)
+        }
+    });
+
+    if thermal_action.force_ecores {
+        release_acceleration_lease(controller, state);
+        return;
+    }
+
+    if controller
+        .active
+        .as_ref()
+        .is_some_and(|lease| now >= lease.hard_deadline)
+    {
+        release_acceleration_lease(controller, state);
+        controller.cooldown_until = Some(now + LEASE_COOLDOWN);
+        return;
+    }
+
+    let must_release = controller.active.as_ref().is_some_and(|lease| {
+        now >= lease.expires_at || target_root.is_some_and(|root_pid| root_pid != lease.root_pid)
+    });
+    if must_release {
+        release_acceleration_lease(controller, state);
+    }
+
+    if reason.is_none()
+        || target_pid.is_none()
+        || controller.cooldown_until.is_some_and(|until| now < until)
+    {
+        return;
+    }
+
+    // Context search is bounded but still unnecessary on idle cycles. Query
+    // only after a specialist interaction signal has passed the local gates.
+    let interaction_bias =
+        world_model.contextual_action_bias("interaction_qos:foreground", workload);
+    let io_bias = world_model.contextual_action_bias("io_shaping:interactive_release", workload);
+    let learned_ttl_band = learned_lease_ttl_band(world_model, workload);
+
+    if let (Some(reason), Some(pid), Some(root_pid)) = (reason, target_pid, target_root) {
+        if let Some(active) = controller.active.as_mut() {
+            if active.root_pid == root_pid {
+                let ttl = active.ttl_band.ttl(reason);
+                active.expires_at = (now + ttl).min(active.hard_deadline);
+                active.reason = reason;
+                refresh_owned_effects(active, now);
+                let mut metrics = state.metrics.lock_recover();
+                metrics.metrics.interaction_qos_reason = reason.as_str().to_string();
+                metrics.metrics.interaction_qos_ttl_band = active.ttl_band.as_str().to_string();
+                metrics.metrics.interaction_qos_ttl_ms =
+                    ttl.as_millis().min(u64::MAX as u128) as u64;
+                metrics.metrics.interaction_qos_ttl_exploratory = active.ttl_exploratory;
+                metrics.metrics.acceleration_lease_renewals_total = metrics
+                    .metrics
+                    .acceleration_lease_renewals_total
+                    .saturating_add(1);
+                if interaction_bias.is_informative() {
+                    metrics.metrics.world_model_contextual_interaction_total = metrics
+                        .metrics
+                        .world_model_contextual_interaction_total
+                        .saturating_add(1);
+                    metrics.metrics.world_model_contextual_last_action =
+                        "interaction_qos:foreground".to_string();
+                    metrics.metrics.world_model_contextual_last_bias = interaction_bias.score;
+                }
+                return;
+            }
+        }
+
+        if let Some(selection) = select_acceleration_family(pid, reason, process_tree, snapshots) {
+            let ttl_decision = controller.preview_ttl_band(interaction_bias, learned_ttl_band);
+            if interaction_bias.is_informative() {
+                let mut metrics = state.metrics.lock_recover();
+                metrics.metrics.world_model_contextual_interaction_total = metrics
+                    .metrics
+                    .world_model_contextual_interaction_total
+                    .saturating_add(1);
+                metrics.metrics.world_model_contextual_last_action =
+                    "interaction_qos:foreground".to_string();
+                metrics.metrics.world_model_contextual_last_bias = interaction_bias.score;
+            }
+            acquire_acceleration_lease(
+                state,
+                controller,
+                io_shaper,
+                selection,
+                reason,
+                ttl_decision,
+                contextual_io_release_allowed(io_bias),
+                io_bias,
+                now,
             );
         }
     }
 }
 
-pub fn release_interaction_qos(controller: &mut InteractionQoSController, state: &SharedState) {
+pub fn release_acceleration_lease(controller: &mut AccelerationLeaseBroker, state: &SharedState) {
     let Some(lease) = controller.active.take() else {
         return;
     };
-    let mut qos = state.mach_qos.lock_recover();
-    if lease.tier_mutated {
-        qos.set_tier(lease.pid, lease.prior_tier);
+
+    let mut reverted_members = 0u64;
+    let mut reverted_effects = 0u64;
+    let mut identity_skips = 0u64;
+    for member in &lease.members {
+        let task_effect =
+            apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid: member.pid };
+        let nice_effect = member.prior_nice.map(|prior| {
+            apollo_engine::engine::effect_ledger::AppliedEffect::Nice {
+                pid: member.pid,
+                prior,
+            }
+        });
+        if !ProcessIdentity::verify(
+            member.pid,
+            Some(&member.name),
+            member.start_sec,
+            member.start_usec,
+        ) {
+            apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                &task_effect,
+                TASK_QOS_OWNER,
+            );
+            if let Some(effect) = nice_effect.as_ref() {
+                apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                    effect, NICE_OWNER,
+                );
+            }
+            state.mach_qos.lock_recover().remove(member.pid);
+            identity_skips = identity_skips.saturating_add(1);
+            continue;
+        }
+
+        let mut member_reverted = false;
+        let owns_task_qos = member.task_qos_mutated
+            && apollo_engine::engine::effect_ledger::is_global_owner(&task_effect, TASK_QOS_OWNER);
+        let owns_nice = nice_effect.as_ref().is_some_and(|effect| {
+            apollo_engine::engine::effect_ledger::is_global_owner(effect, NICE_OWNER)
+        });
+        let mut qos = state.mach_qos.lock_recover();
+        let task_qos_restored = if owns_task_qos {
+            member.policy_lease.as_ref().is_some_and(|policy_lease| {
+                qos.set_latency_and_throughput_with_lease(
+                    policy_lease,
+                    LatencyTier::Default,
+                    ThroughputTier::Default,
+                )
+                .mutated
+            })
+        } else {
+            false
+        };
+        drop(qos);
+        let nice_restored = if owns_nice {
+            member
+                .prior_nice
+                .is_some_and(|prior| write_nice(member.pid, prior).is_ok())
+        } else {
+            false
+        };
+
+        if task_qos_restored {
+            apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                &task_effect,
+                TASK_QOS_OWNER,
+            );
+            reverted_effects = reverted_effects.saturating_add(1);
+            member_reverted = true;
+        }
+        if nice_restored {
+            if let Some(effect) = nice_effect.as_ref() {
+                apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                    effect, NICE_OWNER,
+                );
+            }
+            reverted_effects = reverted_effects.saturating_add(1);
+            member_reverted = true;
+        }
+        reverted_members = reverted_members.saturating_add(u64::from(member_reverted));
     }
-    if lease.task_qos_mutated {
-        qos.set_latency_and_throughput(lease.pid, LatencyTier::Default, ThroughputTier::Default);
-    }
-    drop(qos);
 
     let mut metrics = state.metrics.lock_recover();
     metrics.metrics.interaction_qos_reverts =
         metrics.metrics.interaction_qos_reverts.saturating_add(1);
     metrics.metrics.interaction_qos_active = false;
     metrics.metrics.interaction_qos_reason.clear();
+    metrics.metrics.acceleration_lease_members_active = 0;
+    metrics.metrics.acceleration_lease_member_reverts_total = metrics
+        .metrics
+        .acceleration_lease_member_reverts_total
+        .saturating_add(reverted_members);
+    metrics.metrics.acceleration_lease_identity_skips_total = metrics
+        .metrics
+        .acceleration_lease_identity_skips_total
+        .saturating_add(identity_skips);
+    metrics.metrics.acceleration_lease_family.clear();
+    metrics.metrics.reverts_applied = metrics
+        .metrics
+        .reverts_applied
+        .saturating_add(reverted_effects);
     tracing::debug!(
-        pid = lease.pid,
+        root_pid = lease.root_pid,
+        family = lease.family.as_str(),
+        members = lease.members.len(),
+        held_ms = lease.acquired_at.elapsed().as_millis(),
         reason = lease.reason.as_str(),
-        "interaction QoS lease released"
+        reverted_members,
+        identity_skips,
+        "acceleration lease released"
     );
 }
 
 #[cfg(test)]
 mod interaction_qos_tests {
     use super::*;
+    use apollo_engine::engine::process_tree::ProcessEntry;
+
+    #[test]
+    fn contextual_acceleration_tuning_is_bounded_and_cannot_grant_io_authority() {
+        let positive = ContextualActionBias {
+            score: 1.0,
+            model_observations: 20,
+            authoritative: true,
+            ..ContextualActionBias::default()
+        };
+        let negative = ContextualActionBias {
+            score: -1.0,
+            model_observations: 20,
+            authoritative: true,
+            ..ContextualActionBias::default()
+        };
+        let preliminary_negative = ContextualActionBias {
+            authoritative: false,
+            ..negative
+        };
+
+        assert_eq!(LeaseTtlBand::from_bias(positive), LeaseTtlBand::Long);
+        assert_eq!(LeaseTtlBand::from_bias(negative), LeaseTtlBand::Short);
+        assert_eq!(
+            LeaseTtlBand::Long.ttl(InteractionReason::Input),
+            Duration::from_millis(1_760)
+        );
+        assert_eq!(
+            LeaseTtlBand::Short.ttl(InteractionReason::Input),
+            Duration::from_millis(1_440)
+        );
+        assert!(contextual_io_release_allowed(positive));
+        assert!(!contextual_io_release_allowed(negative));
+        assert!(contextual_io_release_allowed(preliminary_negative));
+    }
+
+    #[test]
+    fn parameter_exploration_is_sparse_bounded_and_rotates_all_arms() {
+        let mut broker = AccelerationLeaseBroker::default();
+        let neutral = ContextualActionBias::default();
+        let mut explored = Vec::new();
+        for _ in 0..24 {
+            let decision = broker.preview_ttl_band(neutral, None);
+            if decision.exploratory {
+                explored.push(decision.band);
+            } else {
+                assert_eq!(decision.band, LeaseTtlBand::Standard);
+            }
+            broker.commit_ttl_decision(decision);
+        }
+        assert_eq!(
+            explored,
+            vec![
+                LeaseTtlBand::Short,
+                LeaseTtlBand::Standard,
+                LeaseTtlBand::Long
+            ]
+        );
+        for band in LeaseTtlBand::ALL {
+            let ttl = band.ttl(InteractionReason::AppLaunch);
+            assert!((Duration::from_millis(4_500)..=Duration::from_millis(5_500)).contains(&ttl));
+            assert!(ttl < MAX_CONTINUOUS_LEASE);
+        }
+    }
+
+    #[test]
+    fn failed_lease_does_not_consume_a_parameter_probe() {
+        let mut broker = AccelerationLeaseBroker::default();
+        let neutral = ContextualActionBias::default();
+        for _ in 0..7 {
+            let decision = broker.preview_ttl_band(neutral, None);
+            broker.commit_ttl_decision(decision);
+        }
+
+        let failed_preview = broker.preview_ttl_band(neutral, None);
+        assert!(failed_preview.exploratory);
+        assert_eq!(failed_preview.band, LeaseTtlBand::Short);
+        // No commit models a kernel/capability rejection. The same probe must
+        // be retried rather than silently rotating past it.
+        let retry = broker.preview_ttl_band(neutral, None);
+        assert_eq!(retry, failed_preview);
+
+        broker.commit_ttl_decision(retry);
+        assert!(!broker.preview_ttl_band(neutral, None).exploratory);
+    }
+
+    #[test]
+    fn learned_parameter_choice_requires_separated_confidence_intervals() {
+        assert_eq!(
+            select_distinct_ttl_band(vec![(LeaseTtlBand::Long, 0.02, 0.04, 0.95)]),
+            None
+        );
+        assert_eq!(
+            select_distinct_ttl_band(vec![
+                (LeaseTtlBand::Long, 0.03, 0.05, 0.95),
+                (LeaseTtlBand::Standard, 0.02, 0.04, 0.95),
+            ]),
+            None
+        );
+        assert_eq!(
+            select_distinct_ttl_band(vec![
+                (LeaseTtlBand::Long, 0.05, 0.06, 0.95),
+                (LeaseTtlBand::Standard, 0.01, 0.02, 0.95),
+                (LeaseTtlBand::Short, -0.02, 0.0, 0.95),
+            ]),
+            Some(LeaseTtlBand::Long)
+        );
+    }
+
+    fn entry(pid: u32, ppid: u32, name: &str, cpu: f32) -> ProcessEntry {
+        ProcessEntry {
+            pid,
+            ppid,
+            name: name.to_string(),
+            cpu_usage: cpu,
+            memory_bytes: 1_000_000,
+        }
+    }
+
+    fn snapshot(pid: u32, name: &str, cpu: f32) -> ProcessSnapshot {
+        ProcessSnapshot {
+            pid,
+            name: name.to_string(),
+            cpu_percent: cpu,
+            rss_bytes: 1_000_000,
+            is_zombie: false,
+            secs_since_foreground: 0,
+            secs_since_user_interaction: 0,
+            has_network: false,
+            has_gui_window: false,
+            wakeups_per_sec: 0.0,
+            parent_alive: true,
+            process_uptime_secs: 10,
+            faults_total: 0,
+            pageins_total: 0,
+            is_translated: false,
+            mach_port_count: 0,
+            cpu_contention: None,
+            is_app_bundle: false,
+        }
+    }
 
     #[test]
     fn hid_reset_emits_one_short_input_signal() {
         let fluidity = FluidityState::new();
-        let mut controller = InteractionQoSController::default();
+        let mut controller = AccelerationLeaseBroker::default();
 
         assert_eq!(
             controller.select_reason(&fluidity, BuildPhase::Idle, 8.0),
@@ -256,7 +1261,7 @@ mod interaction_qos_tests {
     #[test]
     fn build_only_signals_on_starting_edge() {
         let fluidity = FluidityState::new();
-        let mut controller = InteractionQoSController::default();
+        let mut controller = AccelerationLeaseBroker::default();
 
         assert_eq!(
             controller.select_reason(&fluidity, BuildPhase::Starting, 0.0),
@@ -275,7 +1280,7 @@ mod interaction_qos_tests {
     #[test]
     fn launch_has_priority_over_window_and_input() {
         let mut fluidity = FluidityState::new();
-        let mut controller = InteractionQoSController::default();
+        let mut controller = AccelerationLeaseBroker::default();
         controller.select_reason(&fluidity, BuildPhase::Idle, 9.0);
         fluidity.windowserver_cpu_spike = true;
         fluidity.launch_active = true;
@@ -287,9 +1292,39 @@ mod interaction_qos_tests {
     }
 
     #[test]
+    fn sustained_launch_and_window_levels_emit_only_once() {
+        let mut fluidity = FluidityState::new();
+        let mut controller = AccelerationLeaseBroker::default();
+        fluidity.launch_active = true;
+        fluidity.windowserver_cpu_spike = true;
+
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 1.0),
+            Some(InteractionReason::AppLaunch)
+        );
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 1.1),
+            None,
+            "sustained levels are state, not fresh acceleration events"
+        );
+
+        fluidity.launch_active = false;
+        fluidity.windowserver_cpu_spike = false;
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 1.2),
+            None
+        );
+        fluidity.windowserver_cpu_spike = true;
+        assert_eq!(
+            controller.select_reason(&fluidity, BuildPhase::Idle, 1.3),
+            Some(InteractionReason::WindowOperation)
+        );
+    }
+
+    #[test]
     fn invalid_idle_sample_does_not_poison_reset_detection() {
         let fluidity = FluidityState::new();
-        let mut controller = InteractionQoSController::default();
+        let mut controller = AccelerationLeaseBroker::default();
         controller.select_reason(&fluidity, BuildPhase::Idle, 7.0);
 
         assert_eq!(
@@ -300,6 +1335,167 @@ mod interaction_qos_tests {
             controller.select_reason(&fluidity, BuildPhase::Idle, 0.0),
             None
         );
+    }
+
+    #[test]
+    fn chromium_selection_keeps_root_and_active_helpers_only() {
+        let tree = ProcessTree::build(&[
+            entry(200, 1, "Google Chrome", 1.0),
+            entry(201, 200, "Google Chrome Helper (Renderer)", 8.0),
+            entry(202, 200, "Google Chrome Helper (GPU)", 3.0),
+            entry(203, 200, "Google Chrome Helper (Renderer)", 0.0),
+            entry(300, 1, "Unrelated App", 90.0),
+        ]);
+        let snapshots = vec![
+            snapshot(200, "Google Chrome", 1.0),
+            snapshot(201, "Google Chrome Helper (Renderer)", 8.0),
+            snapshot(202, "Google Chrome Helper (GPU)", 3.0),
+            snapshot(203, "Google Chrome Helper (Renderer)", 0.0),
+            snapshot(300, "Unrelated App", 90.0),
+        ];
+
+        let selection =
+            select_acceleration_family(200, InteractionReason::Input, &tree, &snapshots)
+                .expect("foreground Chrome family");
+        let pids: Vec<u32> = selection.members.iter().map(|member| member.pid).collect();
+
+        assert_eq!(selection.family, AccelerationFamily::Chromium);
+        assert!(!selection.family.allows_explicit_task_qos());
+        assert_eq!(pids, vec![200, 201, 202]);
+        assert!(
+            !pids.contains(&203),
+            "idle renderer stays under macOS control"
+        );
+        assert!(!pids.contains(&300), "unrelated process cannot enter lease");
+    }
+
+    #[test]
+    fn build_selection_prioritizes_compiler_and_stays_bounded() {
+        let tree = ProcessTree::build(&[
+            entry(400, 1, "Codex", 1.0),
+            entry(401, 400, "rustc", 12.0),
+            entry(402, 400, "cargo", 6.0),
+            entry(403, 400, "clang", 4.0),
+            entry(404, 400, "worker-a", 80.0),
+            entry(405, 400, "worker-b", 70.0),
+        ]);
+        let snapshots = vec![
+            snapshot(400, "Codex", 1.0),
+            snapshot(401, "rustc", 12.0),
+            snapshot(402, "cargo", 6.0),
+            snapshot(403, "clang", 4.0),
+            snapshot(404, "worker-a", 80.0),
+            snapshot(405, "worker-b", 70.0),
+        ];
+
+        let target = select_build_target(&snapshots).expect("active build target");
+        let selection =
+            select_acceleration_family(target, InteractionReason::BuildStart, &tree, &snapshots)
+                .expect("build family");
+        let pids: Vec<u32> = selection.members.iter().map(|member| member.pid).collect();
+
+        assert_eq!(selection.family, AccelerationFamily::General);
+        assert!(selection.family.allows_explicit_task_qos());
+        assert_eq!(target, 402, "coordinator owns the bounded build lease");
+        assert_eq!(selection.root_pid, 402);
+        assert_eq!(pids.len(), 3);
+        assert!(
+            pids.contains(&401),
+            "compiler role outranks generic workers"
+        );
+        assert!(pids.contains(&402), "build coordinator remains represented");
+        assert!(!pids.contains(&400), "protected parent is not mutated");
+        assert!(
+            !pids.contains(&404),
+            "generic workers stay out of build lease"
+        );
+    }
+
+    #[test]
+    fn protected_and_system_roots_never_receive_a_lease() {
+        let protected_tree = ProcessTree::build(&[entry(500, 1, "WindowServer", 40.0)]);
+        let protected_snapshots = vec![snapshot(500, "WindowServer", 40.0)];
+        assert!(select_acceleration_family(
+            500,
+            InteractionReason::Input,
+            &protected_tree,
+            &protected_snapshots,
+        )
+        .is_none());
+
+        let launchd_tree = ProcessTree::build(&[entry(1, 0, "launchd", 1.0)]);
+        let launchd_snapshots = vec![snapshot(1, "launchd", 1.0)];
+        assert!(select_acceleration_family(
+            1,
+            InteractionReason::Input,
+            &launchd_tree,
+            &launchd_snapshots,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn bounded_top_k_has_deterministic_tie_breaking() {
+        let mut selected = Vec::new();
+        for pid in [9, 2, 7, 4, 1, 8] {
+            insert_bounded_candidate(
+                &mut selected,
+                AccelerationCandidate {
+                    pid,
+                    name: format!("p{pid}"),
+                    score: 10.0,
+                },
+            );
+        }
+        let pids: Vec<u32> = selected.iter().map(|member| member.pid).collect();
+        assert_eq!(pids, vec![1, 2, 4, 7]);
+    }
+
+    #[test]
+    fn bounded_top_k_deduplicates_pid_and_keeps_best_sample() {
+        let mut selected = Vec::new();
+        insert_bounded_candidate(
+            &mut selected,
+            AccelerationCandidate {
+                pid: 42,
+                name: "first".to_string(),
+                score: 1.0,
+            },
+        );
+        insert_bounded_candidate(
+            &mut selected,
+            AccelerationCandidate {
+                pid: 42,
+                name: "newer".to_string(),
+                score: 2.0,
+            },
+        );
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].name, "newer");
+    }
+
+    #[test]
+    fn event_ttls_fit_inside_the_continuous_budget() {
+        for reason in [
+            InteractionReason::Input,
+            InteractionReason::WindowOperation,
+            InteractionReason::BuildStart,
+            InteractionReason::AppLaunch,
+        ] {
+            assert!(reason.ttl() <= MAX_CONTINUOUS_LEASE);
+            assert!(reason.ttl() <= Duration::from_secs(5));
+        }
+        assert!(LEASE_COOLDOWN < MAX_CONTINUOUS_LEASE);
+    }
+
+    #[test]
+    fn nice_fallback_is_mild_and_never_overwrites_existing_boost() {
+        assert_eq!(LEASE_NICE, -2);
+        assert_eq!(nice_fallback_target(0), Some(-2));
+        assert_eq!(nice_fallback_target(10), Some(-2));
+        assert_eq!(nice_fallback_target(-1), None);
+        assert_eq!(nice_fallback_target(-10), None);
     }
 }
 

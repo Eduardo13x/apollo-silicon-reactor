@@ -31,6 +31,7 @@
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 
+use crate::engine::learning_pipeline::ActionKind;
 use crate::engine::optimization_skills::OptimizationSkill;
 use crate::engine::outcome_tracker::ExperienceMemory;
 use crate::engine::safety::is_protected_name;
@@ -96,6 +97,9 @@ pub fn induce(
     // Used by group skill a_ok/b_ok individual evidence check.
     let mut by_process: HashMap<&str, ProcessStats> = HashMap::new();
     for rec in experience.records() {
+        if rec.action_type != Some(ActionKind::Throttle) {
+            continue;
+        }
         if rec.pressure_at_action < MIN_PRESSURE_AT_ACTION {
             continue;
         }
@@ -168,6 +172,9 @@ pub fn induce(
     {
         let mut buckets: HashMap<(i32, i32), Vec<&str>> = HashMap::new();
         for rec in experience.records() {
+            if rec.action_type != Some(ActionKind::Throttle) {
+                continue;
+            }
             if rec.pressure_drop < BATCH_MIN_DROP {
                 continue;
             }
@@ -286,6 +293,7 @@ mod tests {
                     pressure_drop: if i % 2 == 0 { 0.04 } else { 0.0 },
                     effective: i % 2 == 0,
                     workload: 0,
+                    action_type: Some(ActionKind::Throttle),
                 });
             }
         }
@@ -311,6 +319,28 @@ mod tests {
             group.is_some(),
             "high co-occurrence should bypass individual evidence check"
         );
+    }
+
+    #[test]
+    fn freeze_episodes_do_not_induce_throttle_skills() {
+        let mut mem = ExperienceMemory::new(100);
+        for _ in 0..3 {
+            for name in ["background_a", "background_b"] {
+                mem.push(ExperienceRecord {
+                    process_name: name.to_string(),
+                    pressure_at_action: 0.70,
+                    pressure_drop: 0.08,
+                    effective: true,
+                    workload: 1,
+                    action_type: Some(ActionKind::Freeze),
+                });
+            }
+        }
+        let pairs = vec![("background_a", "background_b", MIN_COOCCUR)];
+
+        let skills = induce(&mem, &pairs, &HashSet::new(), &[], "build");
+
+        assert!(skills.is_empty());
     }
 
     #[test]
@@ -350,6 +380,7 @@ mod tests {
                     pressure_drop: *drop,
                     effective: true,
                     workload: 0,
+                    action_type: Some(ActionKind::Throttle),
                 });
             }
         }
@@ -376,6 +407,7 @@ mod tests {
                     pressure_drop: 0.02, // below BATCH_MIN_DROP=0.05
                     effective: true,
                     workload: 0,
+                    action_type: Some(ActionKind::Throttle),
                 });
             }
         }
@@ -401,6 +433,7 @@ mod tests {
                     pressure_drop: *drop,
                     effective: true,
                     workload: 0,
+                    action_type: Some(ActionKind::Throttle),
                 });
             }
         }
@@ -446,6 +479,7 @@ mod tests {
                     pressure_drop: *drop,
                     effective: true,
                     workload: 0,
+                    action_type: Some(ActionKind::Throttle),
                 });
             }
         }
@@ -471,6 +505,7 @@ mod tests {
                     pressure_drop: *drop,
                     effective: true,
                     workload: 0,
+                    action_type: Some(ActionKind::Throttle),
                 });
             }
         }

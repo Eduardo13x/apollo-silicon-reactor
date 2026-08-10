@@ -17,6 +17,7 @@ pub mod blocked_action_journal;
 pub mod build_tracker;
 pub mod cache_warmer;
 pub mod capabilities;
+pub mod causal_dynamics;
 pub mod causal_graph;
 pub mod cg_display;
 pub mod cg_window;

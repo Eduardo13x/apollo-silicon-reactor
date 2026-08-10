@@ -533,6 +533,8 @@ pub fn execute_actions(
                     // must be BOOSTABLE. True OS-kernel processes (WindowServer, kernel_task)
                     // fail gracefully via is_sip_protected() in set_tier().
                     if *pid == my_pid || name.contains("apollo-optimizer") {
+                        out.push_skip(format!("boost-no-mutation:{name}:pid={pid}"));
+                        block_reason = Some(BlockReason::NoMutation);
                         return Ok(());
                     }
                     // Inv#11 (2026-06-06): real start_sec verify closes the
@@ -626,6 +628,10 @@ pub fn execute_actions(
                         }
                     }
                     out.boosts_applied += (action_applied || dry_run) as u64;
+                    if !dry_run && !action_applied {
+                        out.push_skip(format!("boost-no-mutation:{name}:pid={pid}"));
+                        block_reason = Some(BlockReason::NoMutation);
+                    }
                     // FIX-4-v2 (2026-06-07): phantom-enrollment guard.
                     // Only enroll a PendingObservation for the Hellerstein
                     // 2004 §9.3 effect-decay watchdog when the Mach
@@ -1140,7 +1146,15 @@ pub fn execute_actions(
                 RootAction::SetSysctl(s) => {
                     let key = s.key();
                     let value = s.value();
-                    if !allowlist.contains(key) || !caps.can_sysctl {
+                    if !allowlist.contains(key) {
+                        out.invalid_sysctl_denied += 1;
+                        out.push_skip(format!("sysctl-not-allowlisted:{key}"));
+                        block_reason = Some(BlockReason::InvalidSysctl);
+                        return Ok(());
+                    }
+                    if !caps.can_sysctl {
+                        out.push_skip(format!("sysctl-capability-unavailable:{key}"));
+                        block_reason = Some(BlockReason::SysctlFailed);
                         return Ok(());
                     }
                     // Defense-in-depth range check. The
@@ -1506,6 +1520,12 @@ pub fn execute_actions(
         if journal_reason.starts_with("skip:sysctl-noop:") {
             continue;
         }
+        // A non-mutating boost is expected for an already-foreground or
+        // SIP-protected process. Keep it in PolicyDecisionTrace for runtime
+        // observability, but avoid persistent journal I/O for a retryable no-op.
+        if journal_reason.starts_with("skip:boost-no-mutation:") {
+            continue;
+        }
 
         // Phase 5.3 wiring (2026-05-16): cycle-wide journal chokepoint.
         // Build a structured `Rationale` from the action's own
@@ -1713,6 +1733,81 @@ mod tests {
                 .iter()
                 .any(|reason| reason.starts_with("memorystatus-send-unsupported:")),
             "unsupported channel must be visible as a blocked action"
+        );
+    }
+
+    #[test]
+    fn unavailable_sysctl_capability_has_an_explicit_skip_reason() {
+        let outcomes = run(
+            vec![RootAction::set_sysctl(
+                "vm.compressor_eval_period_in_msecs",
+                "250",
+                "test capability gate",
+                DecisionReason::PressureContext,
+            )],
+            &[],
+            &[],
+        );
+
+        assert_eq!(outcomes.sysctl_applied, 0);
+        assert!(outcomes.top_skipped.iter().any(|reason| {
+            reason == "sysctl-capability-unavailable:vm.compressor_eval_period_in_msecs"
+        }));
+        assert!(matches!(
+            outcomes.audit_traces.as_slice(),
+            [PolicyDecisionTrace {
+                applied: false,
+                block_reason: Some(BlockReason::SysctlFailed),
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn boost_without_mutation_stays_auditable_without_journal_flood() {
+        let journal = std::env::temp_dir().join("apollo-test-boost-no-mutation.jsonl");
+        let _ = std::fs::remove_file(&journal);
+        let pid = std::process::id();
+        let mut frozen = HashSet::new();
+
+        let outcomes = execute_actions(
+            vec![RootAction::BoostProcess {
+                pid,
+                name: "apollo-optimizer-test".to_string(),
+                reason: "self-protection no-op".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+                start_sec: 0,
+                start_usec: 0,
+            }],
+            &make_caps(),
+            &journal,
+            &mut frozen,
+            &[],
+            &[],
+            None,
+            false,
+            0.0,
+            0.0,
+            None,
+            0.0,
+        );
+
+        assert!(
+            matches!(
+                outcomes.audit_traces.as_slice(),
+                [PolicyDecisionTrace {
+                    applied: false,
+                    block_reason: Some(BlockReason::NoMutation),
+                    ..
+                }]
+            ),
+            "unexpected traces: {:#?}",
+            outcomes.audit_traces
+        );
+        let entries = crate::engine::journal::read_journal(&journal).expect("read journal");
+        assert!(
+            entries.is_empty(),
+            "expected no-op boost to skip journal I/O"
         );
     }
 

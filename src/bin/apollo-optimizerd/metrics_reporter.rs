@@ -145,6 +145,22 @@ fn publish_world_model_metrics(
     metrics.world_model_causal_cache_hits = causal_hits;
     metrics.world_model_utility_refreshes = utility_refreshes;
     metrics.world_model_utility_cache_hits = utility_hits;
+    metrics.world_model_episodic_memory_samples = world_model.episodic_memory_samples() as u64;
+    metrics.world_model_episodic_memory_families = world_model.episodic_memory_families() as u64;
+    let dynamics = world_model.causal_dynamics_metrics();
+    metrics.world_model_dynamics_phase = dynamics.phase.as_str().to_string();
+    metrics.world_model_dynamics_action_models = dynamics.action_models;
+    metrics.world_model_dynamics_ready_models = dynamics.ready_models;
+    metrics.world_model_dynamics_ranking_models = dynamics.ranking_eligible_models;
+    metrics.world_model_dynamics_authoritative_models = dynamics.authoritative_models;
+    metrics.world_model_dynamics_baseline_models = dynamics.baseline_models;
+    metrics.world_model_dynamics_baseline_ready_models = dynamics.baseline_ready_models;
+    metrics.world_model_dynamics_gold_updates = dynamics.gold_action_updates;
+    metrics.world_model_dynamics_no_action_updates = dynamics.no_action_updates;
+    metrics.world_model_dynamics_validation_samples = dynamics.validation_samples;
+    metrics.world_model_dynamics_validation_mae = dynamics.validation_mae;
+    metrics.world_model_dynamics_validation_coverage = dynamics.validation_coverage;
+    metrics.world_model_dynamics_publication_revision = dynamics.publication_revision;
 }
 
 /// Update predictive agent + signal intelligence metrics for status reporting.

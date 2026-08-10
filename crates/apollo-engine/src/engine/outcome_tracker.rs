@@ -170,6 +170,10 @@ struct PendingOutcome {
     watts_before: f64,
     swap_gb_at_throttle: f64,
     action_type: super::learning_pipeline::ActionKind,
+    /// Workload observed when the action was emitted. `u8::MAX` means a
+    /// legacy caller did not provide context and resolution-time context is
+    /// used as a compatibility fallback.
+    workload_at_action: u8,
 }
 
 // ── Survival-bias closure: blocked-action counterfactual learning ────────────
@@ -278,6 +282,11 @@ pub struct ExperienceRecord {
     /// are weighted 2× since workload context strongly affects outcomes.
     #[serde(default)]
     pub workload: u8,
+    /// Exact actuator family that produced this episode. Old persisted
+    /// records predate this field and remain `None`; actuator-specific gates
+    /// must not guess what produced ambiguous evidence.
+    #[serde(default)]
+    pub action_type: Option<super::learning_pipeline::ActionKind>,
 }
 
 /// Ring buffer of experience records with similarity query.
@@ -323,10 +332,30 @@ impl ExperienceMemory {
         pressure: f64,
         band: f64,
     ) -> Option<(f64, f64)> {
+        self.query_similar_action_with_band(
+            process,
+            pressure,
+            band,
+            super::learning_pipeline::ActionKind::Throttle,
+        )
+    }
+
+    /// Action-aware similarity query. Episodes from another actuator family
+    /// are not interchangeable evidence even when they target the same PID.
+    pub fn query_similar_action_with_band(
+        &self,
+        process: &str,
+        pressure: f64,
+        band: f64,
+        action_type: super::learning_pipeline::ActionKind,
+    ) -> Option<(f64, f64)> {
         let mut sum_drop = 0.0_f64;
         let mut count = 0u32;
         for r in &self.records {
-            if r.process_name == process && (r.pressure_at_action - pressure).abs() <= band {
+            if r.process_name == process
+                && r.action_type == Some(action_type)
+                && (r.pressure_at_action - pressure).abs() <= band
+            {
                 sum_drop += r.pressure_drop;
                 count += 1;
             }
@@ -350,11 +379,33 @@ impl ExperienceMemory {
         band: f64,
         current_workload: u8,
     ) -> Option<(f64, f64)> {
+        self.query_similar_action_contextual(
+            process,
+            pressure,
+            band,
+            current_workload,
+            super::learning_pipeline::ActionKind::Throttle,
+        )
+    }
+
+    /// Action- and workload-aware replay query. Action type is a hard
+    /// boundary; matching workload is a soft 2x similarity weight.
+    pub fn query_similar_action_contextual(
+        &self,
+        process: &str,
+        pressure: f64,
+        band: f64,
+        current_workload: u8,
+        action_type: super::learning_pipeline::ActionKind,
+    ) -> Option<(f64, f64)> {
         let mut weighted_drop = 0.0_f64;
         let mut total_weight = 0.0_f64;
         let mut count = 0u32;
         for r in &self.records {
-            if r.process_name == process && (r.pressure_at_action - pressure).abs() <= band {
+            if r.process_name == process
+                && r.action_type == Some(action_type)
+                && (r.pressure_at_action - pressure).abs() <= band
+            {
                 let w = if r.workload == current_workload {
                     2.0
                 } else {
@@ -400,12 +451,15 @@ impl ExperienceMemory {
         let old_count = self.records.len() - keep_recent;
         let old_records: Vec<ExperienceRecord> = self.records.drain(..old_count).collect();
 
-        // Compress: average by process name.
-        let mut groups: std::collections::HashMap<String, (f64, f64, u32, u32)> =
-            std::collections::HashMap::new();
+        // Compress within an episode class. Merging action types or workloads
+        // would recreate the attribution bug this memory is meant to prevent.
+        let mut groups: std::collections::HashMap<
+            (String, Option<super::learning_pipeline::ActionKind>, u8),
+            (f64, f64, u32, u32),
+        > = std::collections::HashMap::new();
         for r in &old_records {
             let e = groups
-                .entry(r.process_name.clone())
+                .entry((r.process_name.clone(), r.action_type, r.workload))
                 .or_insert((0.0, 0.0, 0, 0));
             e.0 += r.pressure_at_action;
             e.1 += r.pressure_drop;
@@ -416,13 +470,14 @@ impl ExperienceMemory {
         }
 
         // Re-insert compressed summaries at front.
-        for (name, (sum_pressure, sum_drop, count, eff_count)) in groups {
+        for ((name, action_type, workload), (sum_pressure, sum_drop, count, eff_count)) in groups {
             self.records.push_front(ExperienceRecord {
                 process_name: name,
                 pressure_at_action: sum_pressure / count as f64,
                 pressure_drop: sum_drop / count as f64,
                 effective: eff_count * 2 >= count, // majority vote
-                workload: 0,                       // compressed summaries lose workload specificity
+                workload,
+                action_type,
             });
         }
     }
@@ -755,6 +810,29 @@ impl OutcomeTracker {
         swap_gb: f64,
         action_type: super::learning_pipeline::ActionKind,
     ) {
+        self.record_action_with_context(
+            process_name,
+            pressure_before,
+            watts_before,
+            swap_gb,
+            action_type,
+            u8::MAX,
+        );
+    }
+
+    /// Record an action with the workload that existed at emission time.
+    /// Resolution can happen tens of seconds later under a different workload;
+    /// using that later label would teach the correct outcome to the wrong
+    /// episode.
+    pub fn record_action_with_context(
+        &mut self,
+        process_name: &str,
+        pressure_before: f64,
+        watts_before: f64,
+        swap_gb: f64,
+        action_type: super::learning_pipeline::ActionKind,
+        workload_at_action: u8,
+    ) {
         // Actualiza contador de throttles para el peso Bayesiano.
         let w = self.weights.entry(process_name.to_string()).or_default();
         w.throttle_count += 1;
@@ -766,6 +844,7 @@ impl OutcomeTracker {
             watts_before,
             swap_gb_at_throttle: swap_gb,
             action_type,
+            workload_at_action,
         });
 
         // Cap: si la cola crece demasiado, descarta los más viejos sin resolver.
@@ -1058,7 +1137,12 @@ impl OutcomeTracker {
                 pressure_at_action: outcome.pressure_before,
                 pressure_drop,
                 effective,
-                workload,
+                workload: if outcome.workload_at_action == u8::MAX {
+                    workload
+                } else {
+                    outcome.workload_at_action
+                },
+                action_type: Some(outcome.action_type),
             });
 
             // Track per-process time-to-effect for adaptive wait (Phase 7).
@@ -2041,6 +2125,7 @@ mod tests {
             watts_before: 2.0,
             swap_gb_at_throttle: 0.0,
             action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+            workload_at_action: u8::MAX,
         });
         // Also add throttle_count so weights exist.
         tracker.weights.insert(
@@ -2070,6 +2155,7 @@ mod tests {
             watts_before: 2.0,
             swap_gb_at_throttle: 0.0,
             action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+            workload_at_action: u8::MAX,
         });
         tracker.weights.insert(
             "Dropbox".to_string(),
@@ -2232,6 +2318,7 @@ mod tests {
                 pressure_drop: 0.05,
                 effective: true,
                 workload: 0,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
         assert_eq!(mem.len(), 3);
@@ -2257,6 +2344,7 @@ mod tests {
                 pressure_drop: 0.05,
                 effective: true,
                 workload: 0,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
         assert!(mem.query_similar("Dropbox", 0.70).is_none());
@@ -2268,6 +2356,7 @@ mod tests {
             pressure_drop: 0.03,
             effective: true,
             workload: 0,
+            action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
         });
         let (avg_drop, confidence) = mem.query_similar("Dropbox", 0.70).unwrap();
         assert!((avg_drop - (0.05 + 0.05 + 0.03) / 3.0).abs() < 1e-6);
@@ -2285,6 +2374,7 @@ mod tests {
                 pressure_drop: 0.08,
                 effective: true,
                 workload: 0,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
         // 3 records at pressure 0.30 (too far from 0.70)
@@ -2295,6 +2385,7 @@ mod tests {
                 pressure_drop: -0.01,
                 effective: false,
                 workload: 0,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
         // Query at 0.70 should only match first 3.
@@ -2318,6 +2409,7 @@ mod tests {
                 pressure_drop: 0.10,
                 effective: true,
                 workload: 1,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
         // 3 records at workload=0 (idle), drop=0.02
@@ -2328,6 +2420,7 @@ mod tests {
                 pressure_drop: 0.02,
                 effective: true,
                 workload: 0,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
         // Standard query: all 6 records equally weighted
@@ -2353,11 +2446,74 @@ mod tests {
                 pressure_drop: 0.05,
                 effective: true,
                 workload: 3,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
         assert!(mem
             .query_similar_contextual("Safari", 0.65, 0.10, 3)
             .is_none());
+    }
+
+    #[test]
+    fn experience_queries_do_not_mix_actuator_families() {
+        use crate::engine::learning_pipeline::ActionKind;
+
+        let mut mem = ExperienceMemory::new(100);
+        for _ in 0..3 {
+            mem.push(ExperienceRecord {
+                process_name: "worker".into(),
+                pressure_at_action: 0.70,
+                pressure_drop: -0.02,
+                effective: false,
+                workload: 1,
+                action_type: Some(ActionKind::Throttle),
+            });
+            mem.push(ExperienceRecord {
+                process_name: "worker".into(),
+                pressure_at_action: 0.70,
+                pressure_drop: 0.10,
+                effective: true,
+                workload: 1,
+                action_type: Some(ActionKind::Freeze),
+            });
+        }
+
+        let (throttle_drop, _) = mem.query_similar("worker", 0.70).unwrap();
+        let (freeze_drop, _) = mem
+            .query_similar_action_with_band("worker", 0.70, 0.10, ActionKind::Freeze)
+            .unwrap();
+
+        assert!((throttle_drop - -0.02).abs() < 1e-9);
+        assert!((freeze_drop - 0.10).abs() < 1e-9);
+    }
+
+    #[test]
+    fn experience_uses_emission_workload_not_resolution_workload() {
+        use crate::engine::learning_pipeline::ActionKind;
+
+        let mut tracker = OutcomeTracker::new();
+        tracker.record_action_with_context("compiler", 0.75, 2.0, 0.0, ActionKind::Throttle, 1);
+        tracker.pending[0].throttled_at = Instant::now() - std::time::Duration::from_secs(31);
+
+        tracker.tick_with_params(0.70, 30, 0.01, 3);
+
+        let episode = tracker.experience.records().back().unwrap();
+        assert_eq!(episode.workload, 1, "build context must survive resolution");
+        assert_eq!(episode.action_type, Some(ActionKind::Throttle));
+    }
+
+    #[test]
+    fn legacy_experience_does_not_guess_an_actuator_family() {
+        let record: ExperienceRecord = serde_json::from_value(serde_json::json!({
+            "process_name": "legacy",
+            "pressure_at_action": 0.7,
+            "pressure_drop": 0.04,
+            "effective": true,
+            "workload": 1
+        }))
+        .unwrap();
+
+        assert_eq!(record.action_type, None);
     }
 
     // ── Outcome acceleration tests (Phase 7) ──────────────────────────────────
@@ -2397,6 +2553,7 @@ mod tests {
             watts_before: 2.0,
             swap_gb_at_throttle: 1.0,
             action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+            workload_at_action: u8::MAX,
         });
         tracker.pending.push_back(super::PendingOutcome {
             process_name: "App2".into(),
@@ -2405,6 +2562,7 @@ mod tests {
             watts_before: 1.5,
             swap_gb_at_throttle: 0.5,
             action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+            workload_at_action: u8::MAX,
         });
         assert_eq!(tracker.pending.len(), 2);
         let batch = tracker.urgency_flush(0.70); // pressure dropped to 0.70
@@ -2522,6 +2680,7 @@ mod tests {
             watts_before: 1.0,
             swap_gb_at_throttle: 0.0,
             action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+            workload_at_action: u8::MAX,
         });
         tracker.urgency_flush(0.70);
         // Should have tracked effect time for SlowApp
@@ -2613,6 +2772,7 @@ mod tests {
             watts_before: 1.0,
             swap_gb_at_throttle: 0.0,
             action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+            workload_at_action: u8::MAX,
         });
         tracker.weights.insert(
             "test_proc".into(),
@@ -2959,6 +3119,7 @@ mod tests {
                     watts_before: 5.0,
                     swap_gb_at_throttle: 0.0,
                     action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+                    workload_at_action: u8::MAX,
                 });
         }
         // Use high current pressure so outcomes resolve as effective
@@ -2983,6 +3144,7 @@ mod tests {
                     watts_before: 5.0,
                     swap_gb_at_throttle: 0.0,
                     action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+                    workload_at_action: u8::MAX,
                 });
         }
         tracker.tick(0.70); // pressure stayed same → drop=0 → NOT effective
@@ -3150,6 +3312,7 @@ mod tests {
                     watts_before: 2.0,
                     swap_gb_at_throttle: 0.1, // minimal swap
                     action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+                    workload_at_action: u8::MAX,
                 });
         }
         routine.tick(0.40); // no drop → ineffective
@@ -3171,6 +3334,7 @@ mod tests {
                     watts_before: 2.0,
                     swap_gb_at_throttle: 7.5, // near-full swap → max arousal
                     action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+                    workload_at_action: u8::MAX,
                 });
         }
         crisis.tick(0.90); // no drop → ineffective
@@ -3214,6 +3378,7 @@ mod tests {
                     watts_before: 3.0,
                     swap_gb_at_throttle: 2.0,
                     action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+                    workload_at_action: u8::MAX,
                 });
         }
         tracker.tick(0.70); // 0.75→0.70 drop = effective
@@ -3233,6 +3398,7 @@ mod tests {
                     watts_before: 3.0,
                     swap_gb_at_throttle: 5.0,
                     action_type: crate::engine::learning_pipeline::ActionKind::Throttle,
+                    workload_at_action: u8::MAX,
                 });
         }
         tracker.tick(0.70); // no drop = ineffective

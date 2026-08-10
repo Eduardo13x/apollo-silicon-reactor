@@ -32,6 +32,7 @@ use apollo_engine::engine::process_classifier::ProcessSnapshot;
 use apollo_engine::engine::process_identity::ProcessIdentity;
 use apollo_engine::engine::types::{FreezeSource, FrozenEntry};
 use apollo_engine::engine::window_sensor::WorkloadIntent;
+use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 
 /// True when Apollo should hold off Chromium E-core demotion to protect a live
 /// Meet/call: audio is actively flowing AND memory is not in genuine crisis.
@@ -39,6 +40,44 @@ use apollo_engine::engine::window_sensor::WorkloadIntent;
 /// [2026-06-18 call-safety — scheduler axis]
 pub(crate) fn ecore_demote_suppressed_for_call(audio_flowing: bool, pressure_smooth: f32) -> bool {
     audio_flowing && pressure_smooth < 0.75
+}
+
+/// The World Model may suppress a soft Chromium action only with mature,
+/// strongly-negative evidence. Real memory pressure remains the authority:
+/// at/above 0.65 the existing specialist decision always proceeds.
+pub(crate) fn contextual_chromium_action_allowed(
+    bias: ContextualActionBias,
+    pressure_smooth: f32,
+) -> bool {
+    !pressure_smooth.is_finite()
+        || !bias.score.is_finite()
+        || pressure_smooth >= 0.65
+        || !bias.authoritative
+        || bias.score > -0.60
+}
+
+fn record_chromium_context(
+    state: &SharedState,
+    action_key: &'static str,
+    bias: ContextualActionBias,
+    suppressed: bool,
+) {
+    if !bias.is_informative() {
+        return;
+    }
+    let mut metrics = state.metrics.lock_recover();
+    metrics.metrics.world_model_contextual_chromium_total = metrics
+        .metrics
+        .world_model_contextual_chromium_total
+        .saturating_add(1);
+    metrics
+        .metrics
+        .world_model_contextual_chromium_suppressed_total = metrics
+        .metrics
+        .world_model_contextual_chromium_suppressed_total
+        .saturating_add(u64::from(suppressed));
+    metrics.metrics.world_model_contextual_last_action = action_key.to_string();
+    metrics.metrics.world_model_contextual_last_bias = bias.score;
 }
 
 /// Per-cycle Chromium renderer management tick.
@@ -84,6 +123,8 @@ pub fn run_chromium_tick(
     call_in_progress: bool,
     llm_active: bool,
     external_4k_attached: bool,
+    world_model: &WorldModel,
+    workload: &str,
 ) {
     // Step 2 (2026-05-11): conditional SIGSTOP enablement on crisis only.
     // Historical context (commit 712b927, Apr 21): SIGSTOP on chromium renderers
@@ -231,6 +272,19 @@ pub fn run_chromium_tick(
     let audio_flowing = apollo_engine::engine::coreaudio_active::is_audio_running_somewhere();
     let demote_unsafe_for_call = ecore_demote_suppressed_for_call(audio_flowing, pressure_smooth);
 
+    // Query only when the specialist emitted the corresponding action. Both
+    // searches are bounded and remain off the idle path.
+    let ecore_bias = chromium_actions
+        .iter()
+        .any(|action| matches!(action, ChromiumAction::DemoteToEcores { .. }))
+        .then(|| world_model.contextual_action_bias("chromium_ecore:background_renderer", workload))
+        .unwrap_or_default();
+    let purge_bias = chromium_actions
+        .iter()
+        .any(|action| matches!(action, ChromiumAction::PurgePurgeable { .. }))
+        .then(|| world_model.contextual_action_bias("chromium_purge:purgeable_renderer", workload))
+        .unwrap_or_default();
+
     // Non-SIGSTOP actions run UNCONDITIONALLY. DemoteToEcores uses
     // PRIO_DARWIN_BG (turnstile-compatible, commit 97410cd) and PurgePurgeable
     // marks pages volatile via mach_vm_purgable_control — neither triggers the
@@ -239,11 +293,23 @@ pub fn run_chromium_tick(
         match action {
             ChromiumAction::DemoteToEcores { pid, name } => {
                 if demote_unsafe_for_call {
+                    chromium_mgr.confirm_ecore_demotion(*pid, false);
                     tracing::debug!(
                         pid = pid,
                         name = name.as_str(),
                         "chromium: E-core demotion suppressed (audio active — protect Meet)"
                     );
+                    continue;
+                }
+                let allowed = contextual_chromium_action_allowed(ecore_bias, pressure_smooth);
+                record_chromium_context(
+                    state,
+                    "chromium_ecore:background_renderer",
+                    ecore_bias,
+                    !allowed,
+                );
+                if !allowed {
+                    chromium_mgr.confirm_ecore_demotion(*pid, false);
                     continue;
                 }
                 tracing::debug!(
@@ -265,7 +331,27 @@ pub fn run_chromium_tick(
                     policy: apollo_engine::engine::mediator::MachPolicyKind::Background,
                 };
                 let pre = apollo_engine::engine::mediator::PreCondition::default();
-                let _ = apollo_engine::engine::mediator::mediate(&eff, &pre, &effector);
+                let result = apollo_engine::engine::mediator::mediate(&eff, &pre, &effector);
+                let confirmed = result.as_ref().is_ok_and(|receipt| {
+                    receipt.after.mach_policy
+                        == Some(apollo_engine::engine::mediator::MachPolicyKind::Background)
+                });
+                chromium_mgr.confirm_ecore_demotion(*pid, confirmed);
+                if confirmed {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.chromium_ecore_demotions_total = metrics
+                        .metrics
+                        .chromium_ecore_demotions_total
+                        .saturating_add(1);
+                }
+                if let Err(error) = result {
+                    tracing::debug!(
+                        pid,
+                        name = name.as_str(),
+                        error = ?error,
+                        "chromium: E-core demotion not confirmed"
+                    );
+                }
             }
             ChromiumAction::DemoteJetsam { pid, name } => {
                 const OWNER: &str = "chromium visible background: jetsam BACKGROUND";
@@ -297,6 +383,17 @@ pub fn run_chromium_tick(
                 }
             }
             ChromiumAction::PurgePurgeable { pid, name } => {
+                let allowed = contextual_chromium_action_allowed(purge_bias, pressure_smooth);
+                record_chromium_context(
+                    state,
+                    "chromium_purge:purgeable_renderer",
+                    purge_bias,
+                    !allowed,
+                );
+                if !allowed {
+                    chromium_mgr.confirm_purge_observation(*pid, false);
+                    continue;
+                }
                 // RAM Switch-5 (2026-06-03): route through PurgeableEffector
                 // via mediator chokepoint. The effector internally walks
                 // purgeable VM regions and issues madvise; the no_op signal
@@ -319,6 +416,18 @@ pub fn run_chromium_tick(
                     Ok(r) if !r.no_op => 1, // 1 = "at least one region purged"
                     _ => 0,
                 };
+                let purge_noop = receipt.as_ref().is_ok_and(|result| result.no_op);
+                chromium_mgr.confirm_purge_observation(*pid, purged > 0);
+                {
+                    let mut metrics = state.metrics.lock_recover();
+                    if purged > 0 {
+                        metrics.metrics.chromium_purge_hints_total =
+                            metrics.metrics.chromium_purge_hints_total.saturating_add(1);
+                    } else if purge_noop {
+                        metrics.metrics.chromium_purge_noops_total =
+                            metrics.metrics.chromium_purge_noops_total.saturating_add(1);
+                    }
+                }
                 tracing::debug!(
                     pid = pid,
                     name = name.as_str(),
@@ -432,7 +541,8 @@ pub fn run_chromium_tick(
 
 #[cfg(test)]
 mod tests {
-    use super::ecore_demote_suppressed_for_call;
+    use super::{contextual_chromium_action_allowed, ecore_demote_suppressed_for_call};
+    use apollo_engine::engine::world_model::ContextualActionBias;
 
     #[test]
     fn ecore_demote_protects_call_unless_crisis() {
@@ -444,5 +554,46 @@ mod tests {
         assert!(!ecore_demote_suppressed_for_call(true, 0.90));
         // No audio → never suppressed (normal behavior).
         assert!(!ecore_demote_suppressed_for_call(false, 0.50));
+    }
+
+    #[test]
+    fn chromium_context_requires_mature_negative_evidence_and_yields_to_pressure() {
+        let preliminary_negative = ContextualActionBias {
+            score: -1.0,
+            episodic_observations: 8,
+            authoritative: false,
+            ..ContextualActionBias::default()
+        };
+        let mature_negative = ContextualActionBias {
+            score: -0.80,
+            model_observations: 20,
+            authoritative: true,
+            ..ContextualActionBias::default()
+        };
+        let mature_positive = ContextualActionBias {
+            score: 0.80,
+            model_observations: 20,
+            authoritative: true,
+            ..ContextualActionBias::default()
+        };
+
+        assert!(contextual_chromium_action_allowed(
+            preliminary_negative,
+            0.30
+        ));
+        assert!(!contextual_chromium_action_allowed(mature_negative, 0.30));
+        assert!(contextual_chromium_action_allowed(mature_negative, 0.65));
+        assert!(contextual_chromium_action_allowed(mature_positive, 0.30));
+        assert!(contextual_chromium_action_allowed(
+            mature_negative,
+            f32::NAN
+        ));
+        assert!(contextual_chromium_action_allowed(
+            ContextualActionBias {
+                score: f64::NAN,
+                ..mature_negative
+            },
+            0.30
+        ));
     }
 }

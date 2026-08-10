@@ -104,6 +104,9 @@ const MAX_FOREGROUND_FROZEN_CYCLES: u8 = 3;
 /// [Notebook 2026-05-03] one-shot dedup is "INSUFFICIENT FOR M1 8GB" —
 /// browser purgeable allocations grow continuously.
 const RE_PURGE_INTERVAL_CYCLES: u64 = 500;
+/// Backoff after a kernel-rejected E-core demotion. At the manager's normal
+/// cadence this is roughly one minute and prevents per-cycle retry storms.
+const ECORE_RETRY_COOLDOWN_CYCLES: u64 = 120;
 
 /// Adaptive velocity threshold for `PurgePurgeable` hints, in bytes/sec.
 ///
@@ -313,6 +316,8 @@ pub struct ChromiumManager {
     prev_fg_browser: Option<String>,
     /// PIDs already sent to E-core demotion — avoid repeat calls each cycle.
     ecore_demoted: HashSet<u32>,
+    /// Earliest manager cycle at which an unconfirmed demotion may be retried.
+    ecore_retry_after: HashMap<u32, u64>,
     /// PIDs that received a purgeable-region hint under velocity escalation,
     /// mapped to the cycle counter at which the last hint fired. Re-emit once
     /// `RE_PURGE_INTERVAL_CYCLES` have elapsed so long-lived renderers that
@@ -383,6 +388,7 @@ impl ChromiumManager {
             ecore_count: 0,
             prev_fg_browser: None,
             ecore_demoted: HashSet::new(),
+            ecore_retry_after: HashMap::new(),
             markov_predictions: Vec::new(),
             elapsed_dwell_secs: 0.0,
             arousal_thaw_all: false,
@@ -832,6 +838,8 @@ impl ChromiumManager {
         // Prune dead PIDs from ecore_demoted set (Bug fix #4)
         self.ecore_demoted
             .retain(|pid| self.renderers.contains_key(pid));
+        self.ecore_retry_after
+            .retain(|pid, _| self.renderers.contains_key(pid));
         // Same prune for the velocity-escalation purge dedup so a recycled PID
         // is allowed to be purged again (purgeable regions are reset when a
         // process exits — the new owner has its own region map).
@@ -947,7 +955,11 @@ impl ChromiumManager {
             } else {
                 !is_fg_browser
             };
-            if demote_eligible && !info.frozen && !self.ecore_demoted.contains(pid) {
+            let retry_ready = self
+                .ecore_retry_after
+                .get(pid)
+                .is_none_or(|retry_at| self.cycle_counter >= *retry_at);
+            if demote_eligible && !info.frozen && !self.ecore_demoted.contains(pid) && retry_ready {
                 tracing::debug!(
                     pid = *pid,
                     name = info.name.as_str(),
@@ -1235,6 +1247,7 @@ impl ChromiumManager {
                     // Without this removal the `ecore_demoted` set grows forever
                     // and thawed renderers are never re-demoted.
                     self.ecore_demoted.remove(pid);
+                    self.ecore_retry_after.remove(pid);
                     if let Some(info) = self.renderers.get_mut(pid) {
                         info.frozen = false;
                         info.consecutive_idle_cycles = 0;
@@ -1513,6 +1526,32 @@ impl ChromiumManager {
                 info.frozen = true;
                 info.thaw_cooldown_cycles = 0;
             }
+        }
+    }
+
+    /// Keep an optimistic E-core demotion only when the mediated postcondition
+    /// confirms that the process is actually in Background policy.
+    pub fn confirm_ecore_demotion(&mut self, pid: u32, confirmed: bool) {
+        if confirmed {
+            self.ecore_retry_after.remove(&pid);
+        } else if self.ecore_demoted.remove(&pid) {
+            self.ecore_demotions = self.ecore_demotions.saturating_sub(1);
+            self.ecore_retry_after.insert(
+                pid,
+                self.cycle_counter
+                    .saturating_add(ECORE_RETRY_COOLDOWN_CYCLES),
+            );
+        }
+    }
+
+    /// Remove an optimistically queued purge from causal attribution when the
+    /// World Model suppressed it or the kernel reported a no-op. The cadence
+    /// marker intentionally remains: repeatedly walking the same renderer's VM
+    /// map after a no-op would add overhead without creating new evidence.
+    pub fn confirm_purge_observation(&mut self, pid: u32, causally_applied: bool) {
+        if !causally_applied {
+            self.purged_this_cycle
+                .retain(|(queued_pid, _)| *queued_pid != pid);
         }
     }
 
@@ -2017,6 +2056,48 @@ mod tests {
         assert_eq!(m.frozen_renderers, 0);
         assert_eq!(m.estimated_freed_mb, 0.0);
         assert!(m.browsers_managed.is_empty());
+    }
+
+    #[test]
+    fn failed_ecore_demotion_is_removed_from_metrics() {
+        let mut mgr = ChromiumManager::new();
+        mgr.ecore_demoted.insert(42);
+        mgr.ecore_demotions = 1;
+
+        mgr.confirm_ecore_demotion(42, false);
+
+        assert_eq!(mgr.metrics().ecore_renderers, 0);
+        assert_eq!(mgr.ecore_demotions, 0);
+        assert_eq!(
+            mgr.ecore_retry_after.get(&42),
+            Some(&ECORE_RETRY_COOLDOWN_CYCLES)
+        );
+    }
+
+    #[test]
+    fn confirmed_ecore_demotion_remains_in_metrics() {
+        let mut mgr = ChromiumManager::new();
+        mgr.ecore_demoted.insert(42);
+        mgr.ecore_demotions = 1;
+
+        mgr.confirm_ecore_demotion(42, true);
+
+        assert_eq!(mgr.metrics().ecore_renderers, 1);
+        assert_eq!(mgr.ecore_demotions, 1);
+        assert!(!mgr.ecore_retry_after.contains_key(&42));
+    }
+
+    #[test]
+    fn unapplied_purge_is_removed_from_causal_drain_but_keeps_cadence() {
+        let mut mgr = ChromiumManager::new();
+        mgr.velocity_purged.insert(42, 100);
+        mgr.purged_this_cycle
+            .push((42, "Brave Renderer".to_string()));
+
+        mgr.confirm_purge_observation(42, false);
+
+        assert!(mgr.drain_purged_this_cycle().is_empty());
+        assert_eq!(mgr.velocity_purged.get(&42), Some(&100));
     }
 
     #[test]

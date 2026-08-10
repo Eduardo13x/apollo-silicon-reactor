@@ -191,6 +191,10 @@ impl EffectLedger {
         }
     }
 
+    fn contains(&self, effect: &AppliedEffect) -> bool {
+        self.entries.contains_key(&(effect.pid(), effect.kind()))
+    }
+
     fn is_owned_by(&self, effect: &AppliedEffect, justification: &'static str) -> bool {
         self.entries
             .get(&(effect.pid(), effect.kind()))
@@ -302,6 +306,13 @@ pub fn forget_global_if_justification(effect: &AppliedEffect, justification: &'s
 
 pub fn is_global_owner(effect: &AppliedEffect, justification: &'static str) -> bool {
     with_global(|ledger| ledger.is_owned_by(effect, justification))
+}
+
+/// Returns true when any Apollo producer currently owns this effect kind for
+/// the PID. Lease-style producers use this before mutation so they do not
+/// replace another producer's rollback backstop.
+pub fn is_global_tracked(effect: &AppliedEffect) -> bool {
+    with_global(|ledger| ledger.contains(effect))
 }
 
 pub fn refresh_global_if_justification(
@@ -576,6 +587,19 @@ mod tests {
         assert!(ledger.refresh_if_justification(&effect, Duration::from_secs(1), 1, "new-owner"));
         assert!(ledger.forget_if_justification(&effect, "new-owner"));
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn contains_detects_effect_kind_conflicts() {
+        let mut ledger = EffectLedger::new();
+        let tier = AppliedEffect::MachTier { pid: 901_010 };
+        let task = AppliedEffect::TaskQoS { pid: 901_010 };
+        ledger.record(tier, DEFAULT_TTL, 1, "tier-owner");
+
+        assert!(ledger.contains(&tier));
+        assert!(!ledger.contains(&task));
+        ledger.forget(&tier);
+        assert!(!ledger.contains(&tier));
     }
 
     /// Strangler-fig phase-2: the memory-budget tracker migrated its memlimit

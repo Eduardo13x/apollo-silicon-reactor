@@ -84,6 +84,9 @@ pub enum BlockReason {
     BudgetExhausted,
     /// Process-level cooldown is still active.
     CooldownActive,
+    /// The actuator completed safely but the target was already in the
+    /// requested state or macOS declined an additional mutation.
+    NoMutation,
     /// Action blocked by dry-run mode.
     DryRun,
     /// Action blocked by global safety circuit-breaker.

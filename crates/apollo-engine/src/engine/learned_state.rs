@@ -1896,6 +1896,7 @@ mod tests {
                 pressure_drop: 0.03,
                 effective: i % 3 == 0,
                 workload: 0,
+                action_type: Some(crate::engine::learning_pipeline::ActionKind::Throttle),
             });
         }
 

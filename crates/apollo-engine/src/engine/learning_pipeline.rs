@@ -51,6 +51,7 @@ use crate::engine::data_medallion::{
 use crate::engine::effectiveness_tracker::EffectivenessTracker;
 use crate::engine::optimization_skills::SkillRegistry;
 use crate::engine::outcome_tracker::OutcomeTracker;
+use serde::{Deserialize, Serialize};
 
 // ── Learner trait ─────────────────────────────────────────────────────────────
 
@@ -96,8 +97,10 @@ pub struct LearningObservation {
     pub action_type: ActionKind,
 }
 
-#[derive(Clone, Debug, Copy, PartialEq, Eq)]
+#[derive(Clone, Debug, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ActionKind {
+    #[default]
     Throttle,
     Freeze,
     Memorystatus,

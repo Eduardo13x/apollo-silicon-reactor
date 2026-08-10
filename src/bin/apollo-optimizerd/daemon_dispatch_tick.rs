@@ -321,37 +321,67 @@ pub fn plan_action_intents(
     };
     let mut family_priors_used = 0_u64;
     let mut exact_positive_evidence = 0_u64;
+    let mut counterfactual_ranked = 0_u64;
+    let mut episodic_ranked = 0_u64;
     for action in &actions {
         let Some(key) = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)
         else {
             continue;
         };
         let Some(assessment) = world_model.assess_utility(&key, workload) else {
-            if let Some(prior) = world_model.assess_family_prior(&key) {
+            let prior = world_model.assess_family_prior(&key);
+            let episodic = world_model.recall_similar_episodes(&key, workload);
+            if prior.is_some() || episodic.is_some() {
+                let prior_benefit = prior
+                    .map(|prior| prior.lower_bound.max(0.0) * 0.50)
+                    .unwrap_or(0.0);
+                let episodic_benefit = episodic.map_or(0.0, |recall| recall.rank_support);
+                let prior_uncertainty =
+                    prior.map(|prior| (prior.upper_bound - prior.lower_bound).abs());
+                let episodic_uncertainty = episodic.map(|recall| 1.0 - recall.mean_similarity);
+                let uncertainty = match (prior_uncertainty, episodic_uncertainty) {
+                    (Some(prior), Some(episode)) => prior.max(episode),
+                    (Some(prior), None) => prior,
+                    (None, Some(episode)) => episode,
+                    (None, None) => 1.0,
+                }
+                .clamp(0.0, 1.0);
                 context.utility_evidence.insert(
                     key,
                     IntentEvidence {
-                        // Shrink family evidence because the target itself is
-                        // unseen. It influences order only, never admission.
-                        expected_benefit: prior.lower_bound.max(0.0) * 0.50,
-                        uncertainty: (prior.upper_bound - prior.lower_bound)
-                            .abs()
-                            .clamp(0.0, 1.0),
+                        expected_benefit: prior_benefit + episodic_benefit,
+                        uncertainty,
                     },
                 );
+            }
+            if prior.is_some() {
                 family_priors_used = family_priors_used.saturating_add(1);
+            }
+            if episodic.is_some_and(|recall| recall.rank_support.abs() > f64::EPSILON) {
+                episodic_ranked = episodic_ranked.saturating_add(1);
             }
             continue;
         };
         let expected_benefit = match assessment.verdict {
             apollo_engine::engine::world_model::UtilityImagined::ActWins { margin } => {
                 exact_positive_evidence = exact_positive_evidence.saturating_add(1);
-                margin
+                if assessment.counterfactual_observations > 0 {
+                    counterfactual_ranked = counterfactual_ranked.saturating_add(1);
+                }
+                if assessment.episodic_observations > 0 {
+                    episodic_ranked = episodic_ranked.saturating_add(1);
+                }
+                (margin + assessment.counterfactual_support + assessment.episodic_support).max(0.0)
             }
             apollo_engine::engine::world_model::UtilityImagined::DoNothingDominates {
                 predicted_utility,
             } => predicted_utility.min(0.0),
-            apollo_engine::engine::world_model::UtilityImagined::Unknown => 0.0,
+            apollo_engine::engine::world_model::UtilityImagined::Unknown => {
+                if assessment.episodic_observations > 0 {
+                    episodic_ranked = episodic_ranked.saturating_add(1);
+                }
+                assessment.episodic_support
+            }
         };
         context.utility_evidence.insert(
             key,
@@ -404,6 +434,8 @@ pub fn plan_action_intents(
     let (planned, mut report) = plan_actions(actions, &context);
     report.evidence_ranked = exact_positive_evidence;
     report.family_priors_used = family_priors_used;
+    report.counterfactual_ranked = counterfactual_ranked;
+    report.episodic_ranked = episodic_ranked;
     report.temporal_candidates = temporal_plan.candidates;
     report.temporal_rollouts = temporal_plan.sequences_evaluated;
     report.temporal_promotions = temporal_promotions;
@@ -420,6 +452,11 @@ pub fn plan_action_intents(
     report.temporal_authoritative_pressure_delta = temporal_plan.authoritative_pressure_delta;
     report.temporal_authoritative_fluidity_delta = temporal_plan.authoritative_fluidity_delta;
     report.temporal_authoritative_energy_delta = temporal_plan.authoritative_energy_delta;
+    report.dynamics_predictions = temporal_plan.dynamics_predictions;
+    report.dynamics_ranking_predictions = temporal_plan.dynamics_ranking_predictions;
+    report.dynamics_authoritative_predictions = temporal_plan.dynamics_authoritative_predictions;
+    report.dynamics_baseline_used = temporal_plan.dynamics_baseline_used;
+    report.dynamics_mean_uncertainty = temporal_plan.dynamics_mean_uncertainty;
     report.temporal_best_first = temporal_plan.best_first;
     report.temporal_best_second = temporal_plan.best_second;
     report.temporal_authoritative_best_first = temporal_plan.authoritative_best_first;
@@ -877,7 +914,7 @@ mod tests {
         CapabilityReport, LatencyTarget, OptimizationProfile, RuntimeMetrics,
     };
     use apollo_engine::engine::usage_model::UsageModel;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap, VecDeque};
     use std::path::PathBuf;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -1377,6 +1414,12 @@ mod tests {
             installation_id,
             action_models: &action_models,
             action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
+            ),
+            causal_dynamics_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -1446,6 +1489,12 @@ mod tests {
             installation_id,
             action_models: &action_models,
             action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
+            ),
+            causal_dynamics_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -1477,6 +1526,179 @@ mod tests {
             actions[2],
             RootAction::BoostProcess { pid: 100, .. }
         ));
+    }
+
+    #[test]
+    fn exact_control_arm_breaks_accelerator_tie_without_granting_authority() {
+        use apollo_engine::engine::telemetry_medallion::{
+            ActionModelStats, ControlledCounterfactualStats, HardwareRegime,
+            TelemetryContextSummary, TelemetryMedallionMetrics, TrustedTelemetryView,
+        };
+        use apollo_engine::engine::world_model::WorldModel;
+
+        let installation_id = apollo_engine::engine::installation_identity::InstallationId(1);
+        let now_unix = chrono::Utc::now().timestamp();
+        let hardware_regime = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let context = TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            cpu_core_count: 10,
+            p_core_count: 4,
+            e_core_count: 6,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+        let mature = || ActionModelStats {
+            observations: 12,
+            effective_observations: 10,
+            utility_ema: 0.08,
+            evidence_mass: 12.0,
+            utility_variance_ema: 0.0001,
+            quality_ema: 0.95,
+            last_cycle: 100,
+            last_observed_unix: now_unix,
+            hardware_regime,
+            installation_id,
+            ..ActionModelStats::default()
+        };
+        let action_models = BTreeMap::from([
+            ("build|boost:p100".to_string(), mature()),
+            ("build|boost:p200".to_string(), mature()),
+        ]);
+        let controlled_models = BTreeMap::from([(
+            "build|boost:p200".to_string(),
+            ControlledCounterfactualStats {
+                observations: 8,
+                would_have_helped: 7,
+                control_utility_ema: -0.04,
+                quality_ema: 0.95,
+                last_cycle: 100,
+                last_observed_unix: now_unix,
+                hardware_regime,
+                installation_id,
+            },
+        )]);
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id,
+            action_models: &action_models,
+            action_models_revision: 1,
+            controlled_models: &controlled_models,
+            controlled_models_revision: 1,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
+            ),
+            causal_dynamics_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        let (actions, report) = plan_action_intents(
+            vec![boost(100), boost(200)],
+            &model,
+            "build",
+            0.30,
+            false,
+            false,
+        );
+
+        assert_eq!(report.counterfactual_ranked, 1);
+        assert_eq!(report.evidence_ranked, 2);
+        assert!(matches!(
+            actions[0],
+            RootAction::BoostProcess { pid: 200, .. }
+        ));
+    }
+
+    #[test]
+    fn contextual_episodes_rank_accelerators_without_authorizing_new_actions() {
+        use apollo_engine::engine::telemetry_medallion::{
+            ActuatorEpisodeContext, ActuatorFamily, ActuatorObjective, EvidenceTier,
+            HardwareRegime, ResolvedActuatorEvidence, TelemetryContextSummary,
+            TelemetryMedallionMetrics, TrustedTelemetryView, WorldStateDelta,
+        };
+        use apollo_engine::engine::world_model::WorldModel;
+
+        let installation_id = apollo_engine::engine::installation_identity::InstallationId(1);
+        let now_unix = chrono::Utc::now().timestamp();
+        let context = TelemetryContextSummary {
+            cycle: 100,
+            timestamp_unix: now_unix,
+            workload: "build".to_string(),
+            cpu_core_count: 10,
+            p_core_count: 4,
+            e_core_count: 6,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            fluidity_score: 0.82,
+            ..Default::default()
+        };
+        let hardware = HardwareRegime::from_context(&context);
+        let episodes = (1..=2)
+            .map(|id| ResolvedActuatorEvidence {
+                id,
+                family: ActuatorFamily::Boost,
+                objective: ActuatorObjective::Responsiveness,
+                action_key: "boost:p200".to_string(),
+                target: "p200".to_string(),
+                workload: "build".to_string(),
+                issued_cycle: 90 + id,
+                resolved_cycle: 93 + id,
+                resolved_timestamp_unix: now_unix - id as i64,
+                hardware_regime: hardware,
+                installation_id,
+                horizon_cycles: 3,
+                tier: EvidenceTier::Gold,
+                quality: 0.96,
+                raw_utility_delta: 0.08,
+                counterfactual_delta: 0.0,
+                net_utility_delta: 0.08,
+                net_state_delta: WorldStateDelta::default(),
+                context_before: ActuatorEpisodeContext::from_telemetry(&context),
+                effective: true,
+                confounder_count: 0,
+                target_present_after: Some(true),
+            })
+            .collect::<VecDeque<_>>();
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id,
+            action_models: &BTreeMap::new(),
+            action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &episodes,
+            causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
+            ),
+            causal_dynamics_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: 2,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        let (actions, report) = plan_action_intents(
+            vec![boost(100), boost(200)],
+            &model,
+            "build",
+            0.30,
+            false,
+            false,
+        );
+
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            actions[0],
+            RootAction::BoostProcess { pid: 200, .. }
+        ));
+        assert_eq!(report.episodic_ranked, 2);
+        assert_eq!(report.reordered, 2);
     }
 
     #[test]
@@ -1525,6 +1747,12 @@ mod tests {
             installation_id,
             action_models: &action_models,
             action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(
+            ),
+            causal_dynamics_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -1638,6 +1866,12 @@ mod tests {
                 installation_id,
                 action_models: &action_models,
                 action_models_revision: 1,
+                controlled_models: &BTreeMap::new(),
+                controlled_models_revision: 0,
+                episodic_evidence: &VecDeque::new(),
+                causal_dynamics:
+                    &apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default(),
+                causal_dynamics_revision: 0,
                 metrics: TelemetryMedallionMetrics {
                     bronze_total: cycle,
                     gold_total: cycle,

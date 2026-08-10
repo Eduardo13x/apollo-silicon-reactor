@@ -242,12 +242,13 @@ pub fn run_learning_tick<'a>(
                     .unwrap_or(0.0);
                 // Capture swap context for affective salience weighting.
                 // High swap at throttle time → high arousal → stronger NARS belief.
-                lctx.outcome_tracker.record_action_with_swap(
+                lctx.outcome_tracker.record_action_with_context(
                     &name,
                     mem_pressure_now,
                     proc_watts,
                     swap_gb_now,
                     action.action_type,
+                    workload_mode.code(),
                 );
             }
         }
@@ -426,12 +427,7 @@ pub fn run_learning_tick<'a>(
     // Normal: use adaptive params from LearnableParams (outcome_wait_secs,
     // outcome_effective_threshold) instead of hardcoded 30s / 0.01.
     {
-        let wl_id = match workload_mode {
-            WorkloadMode::Build => 1,
-            WorkloadMode::LlmInference => 2,
-            WorkloadMode::Browsing => 3,
-            WorkloadMode::Idle => 0,
-        };
+        let wl_id = workload_mode.code();
         let workload_name = workload_mode.as_str();
         let batch = if snapshot.pressure.memory_pressure > 0.80 {
             lctx.outcome_tracker.urgency_flush_curated(
@@ -487,10 +483,11 @@ pub fn run_learning_tick<'a>(
                         let avg_drop = lctx
                             .outcome_tracker
                             .experience
-                            .query_similar_with_band(
+                            .query_similar_contextual(
                                 name,
                                 snapshot.pressure.memory_pressure,
                                 learnable_params.experience_pressure_band,
+                                workload_mode.code(),
                             )
                             .map(|(drop, _)| drop)
                             .unwrap_or(0.05);
@@ -677,12 +674,7 @@ pub fn run_learning_tick<'a>(
         let effectiveness = lctx.outcome_tracker.overall_effectiveness();
         let pressure = signal_digest.pressure_smooth;
         if lctx.outcome_tracker.total_resolved > 10 {
-            let wl_id = match workload_mode {
-                WorkloadMode::Build => 1,
-                WorkloadMode::LlmInference => 2,
-                WorkloadMode::Browsing => 3,
-                WorkloadMode::Idle => 0,
-            };
+            let wl_id = workload_mode.code();
             lctx.signal_intel
                 .zone_feedback_workload(pressure, effectiveness > 0.50, wl_id);
         }

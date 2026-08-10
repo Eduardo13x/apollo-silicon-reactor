@@ -696,6 +696,48 @@ pub struct RuntimeMetrics {
     pub interaction_qos_active: bool,
     #[serde(default)]
     pub interaction_qos_reason: String,
+    /// Parameter arm used by the current/last interaction lease. The
+    /// medallion records this separately so it can learn whether shorter,
+    /// standard, or longer leases actually caused the observed utility.
+    #[serde(default)]
+    pub interaction_qos_ttl_band: String,
+    #[serde(default)]
+    pub interaction_qos_ttl_ms: u64,
+    #[serde(default)]
+    pub interaction_qos_ttl_exploratory: bool,
+    #[serde(default)]
+    pub interaction_qos_parameter_explorations_total: u64,
+    /// Member-level observability for the bounded acceleration lease broker.
+    /// The legacy interaction counters above remain the actuator-learning
+    /// contract consumed by AIS and the telemetry medallion.
+    #[serde(default)]
+    pub acceleration_lease_members_active: u32,
+    #[serde(default)]
+    pub acceleration_lease_members_applied_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_member_reverts_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_renewals_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_chromium_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_general_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_identity_skips_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_capability_skips_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_nice_fallbacks_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_nice_failures_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_conflict_skips_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_io_promotions_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_family: String,
+    #[serde(default)]
+    pub acceleration_lease_last_family: String,
     pub iokit_snapshots: u64,
     pub iokit_errors: u64,
     pub iokit_p_cluster_temp: Option<f32>,
@@ -740,6 +782,8 @@ pub struct RuntimeMetrics {
     pub energy_session_wh: Option<f64>,
     #[serde(default)]
     pub energy_co2_avoided_g: Option<f64>,
+    #[serde(default)]
+    pub energy_co2_emitted_g: Option<f64>,
     #[serde(default)]
     pub energy_savings_wh: Option<f64>,
     #[serde(default)]
@@ -1260,6 +1304,12 @@ pub struct RuntimeMetrics {
     /// Renderer processes demoted to E-cores this cycle.
     #[serde(default)]
     pub chromium_renderers_ecore: u32,
+    #[serde(default)]
+    pub chromium_ecore_demotions_total: u64,
+    #[serde(default)]
+    pub chromium_purge_hints_total: u64,
+    #[serde(default)]
+    pub chromium_purge_noops_total: u64,
     /// Estimated RAM freed (MB) by frozen renderers.
     #[serde(default)]
     pub chromium_freed_mb: f64,
@@ -1612,6 +1662,43 @@ pub struct RuntimeMetrics {
     pub world_model_sequence_authoritative_fluidity_delta: f64,
     #[serde(default)]
     pub world_model_sequence_authoritative_energy_delta: f64,
+    /// Compact causal latent-dynamics ensemble and MPC observability.
+    #[serde(default)]
+    pub world_model_dynamics_phase: String,
+    #[serde(default)]
+    pub world_model_dynamics_action_models: u64,
+    #[serde(default)]
+    pub world_model_dynamics_ready_models: u64,
+    #[serde(default)]
+    pub world_model_dynamics_ranking_models: u64,
+    #[serde(default)]
+    pub world_model_dynamics_authoritative_models: u64,
+    #[serde(default)]
+    pub world_model_dynamics_baseline_models: u64,
+    #[serde(default)]
+    pub world_model_dynamics_baseline_ready_models: u64,
+    #[serde(default)]
+    pub world_model_dynamics_gold_updates: u64,
+    #[serde(default)]
+    pub world_model_dynamics_no_action_updates: u64,
+    #[serde(default)]
+    pub world_model_dynamics_validation_samples: u64,
+    #[serde(default)]
+    pub world_model_dynamics_validation_mae: f64,
+    #[serde(default)]
+    pub world_model_dynamics_validation_coverage: f64,
+    #[serde(default)]
+    pub world_model_dynamics_publication_revision: u64,
+    #[serde(default)]
+    pub world_model_dynamics_predictions_total: u64,
+    #[serde(default)]
+    pub world_model_dynamics_ranking_predictions_total: u64,
+    #[serde(default)]
+    pub world_model_dynamics_authoritative_predictions_total: u64,
+    #[serde(default)]
+    pub world_model_dynamics_baseline_uses_total: u64,
+    #[serde(default)]
+    pub world_model_dynamics_mean_uncertainty: f64,
     #[serde(default)]
     pub world_model_sequence_best_first: String,
     #[serde(default)]
@@ -1680,6 +1767,34 @@ pub struct RuntimeMetrics {
     pub world_model_counterfactual_would_help_total: u64,
     #[serde(default)]
     pub world_model_counterfactual_control_utility: f64,
+    /// Mature exact-workload control arms used only as a bounded ranking hint.
+    #[serde(default)]
+    pub world_model_counterfactual_rank_uses_total: u64,
+    /// Context-nearest universal actuator episodes used for ranking only.
+    #[serde(default)]
+    pub world_model_episodic_rank_uses_total: u64,
+    #[serde(default)]
+    pub world_model_episodic_memory_samples: u64,
+    #[serde(default)]
+    pub world_model_episodic_memory_families: u64,
+    /// Advisory World Model modulation of already-admitted acceleration
+    /// lanes. These counters never represent newly authorized actions.
+    #[serde(default)]
+    pub world_model_contextual_markov_total: u64,
+    #[serde(default)]
+    pub world_model_contextual_interaction_total: u64,
+    #[serde(default)]
+    pub world_model_contextual_io_total: u64,
+    #[serde(default)]
+    pub world_model_contextual_predictive_total: u64,
+    #[serde(default)]
+    pub world_model_contextual_chromium_total: u64,
+    #[serde(default)]
+    pub world_model_contextual_chromium_suppressed_total: u64,
+    #[serde(default)]
+    pub world_model_contextual_last_action: String,
+    #[serde(default)]
+    pub world_model_contextual_last_bias: f64,
     /// Gold-only world-model telemetry. Unlike process-local medallion totals,
     /// these counters describe the persisted evidence currently available for
     /// action imagination and vetoes.
@@ -2081,6 +2196,21 @@ pub struct RuntimeMetrics {
     pub markov_prewarm_hits: u64,
     #[serde(default)]
     pub markov_prewarm_misses: u64,
+    /// Passive next-app predictions scored without changing kernel or cache
+    /// state. These samples calibrate transition reliability while the real
+    /// accelerator is quarantined, unavailable, or intentionally idle.
+    #[serde(default)]
+    pub markov_shadow_predictions_total: u64,
+    #[serde(default)]
+    pub markov_shadow_resolved_total: u64,
+    #[serde(default)]
+    pub markov_shadow_hits: u64,
+    #[serde(default)]
+    pub markov_shadow_misses: u64,
+    #[serde(default)]
+    pub markov_shadow_active: bool,
+    #[serde(default)]
+    pub markov_shadow_superseded_total: u64,
     #[serde(default)]
     pub markov_prewarm_reverts: u64,
     #[serde(default)]

@@ -365,6 +365,36 @@ pub struct QoSOutcome {
     pub error: Option<String>,
 }
 
+/// A short-lived send right to a process task port.
+///
+/// Acceleration leases keep this handle from elevation through rollback so
+/// the undo path cannot be stranded by a second, independently denied
+/// `task_for_pid` call. Dropping the handle always releases the send right.
+#[derive(Debug)]
+pub struct TaskPolicyLease {
+    pid: u32,
+    #[cfg(target_os = "macos")]
+    port: ffi::MachPortT,
+}
+
+impl TaskPolicyLease {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+impl Drop for TaskPolicyLease {
+    fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            if self.port != mach_sys::MACH_PORT_NULL {
+                ffi::mach_port_deallocate(ffi::mach_task_self(), self.port);
+                self.port = mach_sys::MACH_PORT_NULL;
+            }
+        }
+    }
+}
+
 /// Snapshot of a single thread's state within a process.
 #[derive(Debug, Clone)]
 pub struct ThreadSnapshot {
@@ -423,6 +453,92 @@ impl MachQoSManager {
             prev_thread_cpu: HashMap::new(),
             app_napped: HashSet::new(),
             io_tier_cache: HashMap::new(),
+        }
+    }
+
+    /// Acquire one task port for a bounded policy transaction. Callers that
+    /// mutate through this handle must retain it until every owned policy has
+    /// been restored.
+    #[cfg(target_os = "macos")]
+    pub fn acquire_task_policy_lease(&mut self, pid: u32) -> Option<TaskPolicyLease> {
+        if self.permanently_blocked.contains(&pid) || Self::is_sip_protected(pid) {
+            self.mark_blocked(pid);
+            return None;
+        }
+
+        unsafe {
+            let mut port = mach_sys::MACH_PORT_NULL;
+            let kr = ffi::task_for_pid(ffi::mach_task_self(), pid as i32, &mut port);
+            if kr != mach_sys::KERN_SUCCESS || port == mach_sys::MACH_PORT_NULL {
+                self.mark_blocked(pid);
+                return None;
+            }
+            Some(TaskPolicyLease { pid, port })
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn acquire_task_policy_lease(&mut self, _pid: u32) -> Option<TaskPolicyLease> {
+        None
+    }
+
+    /// Apply task latency and throughput policy through the same task port
+    /// retained for rollback.
+    pub fn set_latency_and_throughput_with_lease(
+        &mut self,
+        lease: &TaskPolicyLease,
+        latency: LatencyTier,
+        throughput: ThroughputTier,
+    ) -> QoSOutcome {
+        #[cfg(target_os = "macos")]
+        unsafe {
+            let latency_tier = match latency {
+                LatencyTier::Interactive => mach_sys::LATENCY_QOS_TIER_0,
+                LatencyTier::Default => mach_sys::LATENCY_QOS_TIER_UNSPECIFIED,
+                LatencyTier::Background => mach_sys::LATENCY_QOS_TIER_5,
+            };
+            let throughput_tier = match throughput {
+                ThroughputTier::High => mach_sys::THROUGHPUT_QOS_TIER_0,
+                ThroughputTier::Default => mach_sys::THROUGHPUT_QOS_TIER_UNSPECIFIED,
+                ThroughputTier::Low => mach_sys::THROUGHPUT_QOS_TIER_5,
+            };
+            let policy = ffi::TaskQosPolicy {
+                task_latency_qos_tier: latency_tier,
+                task_throughput_qos_tier: throughput_tier,
+            };
+            let kr = ffi::task_policy_set(
+                lease.port,
+                mach_sys::TASK_POLICY_QOS,
+                &policy as *const _ as *const std::ffi::c_void,
+                mach_sys::TASK_QOS_POLICY_COUNT,
+            );
+            if kr == mach_sys::KERN_SUCCESS {
+                return QoSOutcome {
+                    pid: lease.pid,
+                    tier: SchedulingTier::Normal,
+                    success: true,
+                    mutated: true,
+                    error: None,
+                };
+            }
+            return QoSOutcome {
+                pid: lease.pid,
+                tier: SchedulingTier::Normal,
+                success: false,
+                mutated: false,
+                error: Some(format!(
+                    "task_policy_set(QOS) via lease failed: kern_return={kr}"
+                )),
+            };
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        QoSOutcome {
+            pid: lease.pid,
+            tier: SchedulingTier::Normal,
+            success: false,
+            mutated: false,
+            error: Some("task policy leases are only available on macOS".into()),
         }
     }
 

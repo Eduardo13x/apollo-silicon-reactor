@@ -109,6 +109,9 @@ pub struct EnergySummary {
     pub estimated_co2_kg: f64,
     /// Estimated energy saved by Apollo's optimizations (Wh).
     pub estimated_savings_wh: f64,
+    /// Estimated CO2 avoided by Apollo's measured energy savings (kg).
+    #[serde(default)]
+    pub estimated_co2_avoided_kg: f64,
     /// Number of processes being tracked.
     pub tracked_processes: usize,
     /// Session duration in seconds.
@@ -325,13 +328,16 @@ impl EnergyTracker {
         let total_wh = self.package_cumulative_wh;
         let total_kwh = total_wh / 1000.0;
         let co2_kg = total_kwh * CO2_KG_PER_KWH;
+        let savings_wh = self.savings_estimate_wh();
+        let avoided_co2_kg = (savings_wh / 1000.0) * CO2_KG_PER_KWH;
 
         EnergySummary {
             total_cpu_wh: self.cpu_cumulative_wh,
             total_gpu_wh: self.gpu_cumulative_wh,
             total_package_wh: self.package_cumulative_wh,
             estimated_co2_kg: co2_kg,
-            estimated_savings_wh: self.savings_estimate_wh(),
+            estimated_savings_wh: savings_wh,
+            estimated_co2_avoided_kg: avoided_co2_kg,
             tracked_processes: self.accumulators.len(),
             session_duration_secs: self.session_start.elapsed().as_secs_f64(),
         }
@@ -926,6 +932,8 @@ mod tests {
             summary.estimated_co2_kg,
             expected_co2
         );
+        assert_eq!(summary.estimated_savings_wh, 0.0);
+        assert_eq!(summary.estimated_co2_avoided_kg, 0.0);
     }
 
     #[test]

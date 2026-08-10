@@ -71,6 +71,7 @@ use apollo_engine::engine::predictive_agent::{
 use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::types::OptimizationProfile;
 use apollo_engine::engine::workload_classifier::WorkloadMode;
+use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 
 /// NARS belief confidence target for monopoly_freeze maturity gate.
 /// At c=0.80 the belief carries enough evidence to act on without
@@ -244,6 +245,58 @@ fn skill_aware_factor(signal: Option<f32>) -> f64 {
     }
 }
 
+fn intervention_action_key(intervention: Intervention) -> Option<&'static str> {
+    match intervention {
+        Intervention::Observe => None,
+        Intervention::TightenThresholds => Some("predictive_threshold:tighten"),
+        Intervention::SuggestAggressive => Some("predictive_profile:aggressive"),
+        Intervention::PreThrottleNoise => Some("predictive_prethrottle:noise"),
+        Intervention::ProactivePurge => Some("predictive_purge:kernel"),
+    }
+}
+
+#[inline]
+fn contextual_vote_factor(bias: ContextualActionBias) -> f64 {
+    (1.0 + bias.score.clamp(-1.0, 1.0) * 0.15).clamp(0.85, 1.15)
+}
+
+fn apply_contextual_world_model_bias(
+    votes: &mut [SpecialistVote],
+    world_model: &WorldModel,
+    workload: &str,
+) -> (u64, Option<(Intervention, f64)>) {
+    let mut cache: [Option<ContextualActionBias>; 4] = [None; 4];
+    let mut modulated = 0_u64;
+    let mut strongest = None::<(Intervention, f64)>;
+    for vote in votes {
+        let Some(key) = intervention_action_key(vote.intervention) else {
+            continue;
+        };
+        let index = match vote.intervention {
+            Intervention::TightenThresholds => 0,
+            Intervention::SuggestAggressive => 1,
+            Intervention::PreThrottleNoise => 2,
+            Intervention::ProactivePurge => 3,
+            Intervention::Observe => continue,
+        };
+        let bias =
+            *cache[index].get_or_insert_with(|| world_model.contextual_action_bias(key, workload));
+        if !bias.is_informative() {
+            continue;
+        }
+        let previous = vote.confidence;
+        vote.confidence = (vote.confidence * contextual_vote_factor(bias)).clamp(0.0, 1.0);
+        if (vote.confidence - previous).abs() <= f64::EPSILON {
+            continue;
+        }
+        modulated = modulated.saturating_add(1);
+        if strongest.is_none_or(|(_, score)| bias.score.abs() > score.abs()) {
+            strongest = Some((vote.intervention, bias.score));
+        }
+    }
+    (modulated, strongest)
+}
+
 /// Super Learner specialist voting + accuracy feedback.
 ///
 /// Runs once per cycle, **after** `PredictiveAgent::select_action_with_confidence`
@@ -278,6 +331,7 @@ pub fn apply_specialist_voting(
     // arousal, used to scale non-Observe vote confidences by the narrowed
     // user-presence multiplier ∈ [0.7, 1.0]. See [`PresenceInputs`].
     presence_inputs: PresenceInputs,
+    world_model: &WorldModel,
     // Phase 4.3.1 — Specialist accuracy purge inhibition (Sprint 8, 2026-05-16).
     // SharedState has no `maintenance` field; the daemon main loop owns the
     // `MaintenanceState` value and threads it down (mirrors learning_tick.rs
@@ -511,6 +565,26 @@ pub fn apply_specialist_voting(
     if presence_modulated > 0 {
         apollo_engine::engine::lse_counters::LSE_COUNTERS
             .add_user_presence_suppressions(presence_modulated);
+    }
+
+    // The World Model may only tilt confidence on interventions specialists
+    // already proposed. It cannot add a vote, choose a new intervention, or
+    // bypass the physical gates below.
+    let (contextual_modulations, strongest_contextual) =
+        apply_contextual_world_model_bias(&mut votes, world_model, workload_mode.as_str());
+    if contextual_modulations > 0 {
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.world_model_contextual_predictive_total = metrics
+            .metrics
+            .world_model_contextual_predictive_total
+            .saturating_add(contextual_modulations);
+        if let Some((intervention, score)) = strongest_contextual {
+            metrics.metrics.world_model_contextual_last_action =
+                intervention_action_key(intervention)
+                    .unwrap_or_default()
+                    .to_string();
+            metrics.metrics.world_model_contextual_last_bias = score;
+        }
     }
 
     let vote_result = tally_votes(&votes);
@@ -773,6 +847,28 @@ mod tests {
     #[test]
     fn habituation_threshold_is_five() {
         assert_eq!(HABITUATION_THRESHOLD, 5);
+    }
+
+    #[test]
+    fn contextual_vote_tilt_is_narrow_and_never_maps_observe_to_an_action() {
+        let positive = ContextualActionBias {
+            score: 1.0,
+            model_observations: 20,
+            ..ContextualActionBias::default()
+        };
+        let negative = ContextualActionBias {
+            score: -1.0,
+            episodic_observations: 8,
+            ..ContextualActionBias::default()
+        };
+        assert_eq!(contextual_vote_factor(positive), 1.15);
+        assert_eq!(contextual_vote_factor(negative), 0.85);
+        assert_eq!(contextual_vote_factor(ContextualActionBias::default()), 1.0);
+        assert_eq!(intervention_action_key(Intervention::Observe), None);
+        assert_eq!(
+            intervention_action_key(Intervention::ProactivePurge),
+            Some("predictive_purge:kernel")
+        );
     }
 
     #[test]

@@ -1559,6 +1559,7 @@ mod tests {
                 fluidity: 0.04,
                 ..WorldStateDelta::default()
             },
+            context_before: Default::default(),
             effective: true,
             confounder_count: 0,
             target_present_after: Some(true),

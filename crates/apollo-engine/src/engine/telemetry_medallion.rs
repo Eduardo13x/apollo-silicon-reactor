@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use serde::{Deserialize, Serialize};
 
 use crate::collector::SystemSnapshot;
+use crate::engine::causal_dynamics::CausalDynamicsModel;
 use crate::engine::execute_actions::ExecuteOutcomes;
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::iokit_sensors::HardwareSnapshot;
@@ -29,6 +30,8 @@ use chrono::Utc;
 
 const MAX_PENDING_ACTIONS: usize = 192;
 const MAX_RECENT_EVIDENCE: usize = 64;
+const MAX_EPISODIC_EVIDENCE: usize = 128;
+const MAX_EPISODES_PER_FAMILY: usize = 12;
 const MAX_ACTION_MODELS: usize = 256;
 const MAX_PENDING_CONTROLLED_HOLDOUTS: usize = 32;
 const MAX_CONTROLLED_MODELS: usize = 256;
@@ -88,15 +91,18 @@ pub enum ActuatorFamily {
     ThreadQos,
     MarkovPrewarm,
     InteractionQos,
+    IoShaping,
     PredictiveThreshold,
     PredictiveProfile,
     PredictivePreThrottle,
     PredictivePurge,
+    ChromiumEcore,
+    ChromiumPurge,
     Coordinated,
 }
 
 impl ActuatorFamily {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::Boost,
         Self::Throttle,
         Self::Freeze,
@@ -108,10 +114,13 @@ impl ActuatorFamily {
         Self::ThreadQos,
         Self::MarkovPrewarm,
         Self::InteractionQos,
+        Self::IoShaping,
         Self::PredictiveThreshold,
         Self::PredictiveProfile,
         Self::PredictivePreThrottle,
         Self::PredictivePurge,
+        Self::ChromiumEcore,
+        Self::ChromiumPurge,
         Self::Coordinated,
     ];
 
@@ -128,10 +137,13 @@ impl ActuatorFamily {
             Self::ThreadQos => "thread_qos",
             Self::MarkovPrewarm => "markov_prewarm",
             Self::InteractionQos => "interaction_qos",
+            Self::IoShaping => "io_shaping",
             Self::PredictiveThreshold => "predictive_threshold",
             Self::PredictiveProfile => "predictive_profile",
             Self::PredictivePreThrottle => "predictive_prethrottle",
             Self::PredictivePurge => "predictive_purge",
+            Self::ChromiumEcore => "chromium_ecore",
+            Self::ChromiumPurge => "chromium_purge",
             Self::Coordinated => "coordinated",
         }
     }
@@ -217,6 +229,12 @@ pub struct ControlledCounterfactualStats {
     pub control_utility_ema: f64,
     pub quality_ema: f64,
     pub last_cycle: u64,
+    #[serde(default)]
+    pub last_observed_unix: i64,
+    #[serde(default)]
+    pub hardware_regime: HardwareRegime,
+    #[serde(default)]
+    pub installation_id: InstallationId,
 }
 
 #[derive(Debug, Clone)]
@@ -389,9 +407,132 @@ pub struct ResolvedActuatorEvidence {
     pub net_utility_delta: f64,
     #[serde(default)]
     pub net_state_delta: WorldStateDelta,
+    /// Compact state at action emission. This preserves enough universal
+    /// context for same-machine episodic recall without persisting the full
+    /// telemetry frame for every outcome.
+    #[serde(default)]
+    pub context_before: ActuatorEpisodeContext,
     pub effective: bool,
     pub confounder_count: u8,
     pub target_present_after: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct ActuatorEpisodeContext {
+    pub valid: bool,
+    pub memory_pressure: f64,
+    pub compressor_pressure: f64,
+    pub thrashing_score: f64,
+    pub cpu_global_usage: f64,
+    pub cpu_max_busy: f64,
+    pub cpu_pegged_fraction: f64,
+    pub stall_fraction: f64,
+    pub used_ram_fraction: f64,
+    pub thermal_score: f64,
+    pub fluidity_score: f64,
+    pub windowserver_cpu_fraction: f64,
+    pub arousal_level: f64,
+    pub markov_prediction_confidence: f64,
+    pub network_retransmit_fraction: f64,
+    pub network_drop_rate: f64,
+    pub package_power_fraction: f64,
+    pub p_cluster_util: f64,
+    pub e_cluster_util: f64,
+    pub ane_util_fraction: f64,
+    pub user_idle_fraction: f64,
+    pub foreground_app_hash: u64,
+    pub effective_profile_hash: u64,
+    pub app_launching: bool,
+    pub window_op_active: bool,
+    pub foreground_idle: bool,
+    pub user_call_in_progress: bool,
+    pub user_audio_active: bool,
+    pub markov_prewarm_active: bool,
+    pub predictive_agent_active: bool,
+}
+
+impl ActuatorEpisodeContext {
+    pub fn from_telemetry(context: &TelemetryContextSummary) -> Self {
+        let mut episode = Self {
+            valid: true,
+            memory_pressure: context.memory_pressure,
+            compressor_pressure: context.compressor_pressure,
+            thrashing_score: context.thrashing_score,
+            cpu_global_usage: context.cpu_global_usage,
+            cpu_max_busy: context.cpu_max_busy,
+            cpu_pegged_fraction: context.cpu_pegged_fraction,
+            stall_fraction: context.stall_fraction,
+            used_ram_fraction: context.used_ram_fraction,
+            thermal_score: context.thermal_score,
+            fluidity_score: context.fluidity_score,
+            windowserver_cpu_fraction: context.windowserver_cpu_fraction,
+            arousal_level: context.arousal_level,
+            markov_prediction_confidence: context.markov_prediction_confidence,
+            network_retransmit_fraction: (context.network_retransmits_per_k / 1_000.0)
+                .clamp(0.0, 1.0),
+            network_drop_rate: context.network_listen_drop_rate.clamp(0.0, 1.0),
+            package_power_fraction: (context.package_watts.unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
+            p_cluster_util: context.p_cluster_util.unwrap_or(context.cpu_global_usage),
+            e_cluster_util: context.e_cluster_util.unwrap_or(context.cpu_global_usage),
+            ane_util_fraction: (context.ane_util_pct.unwrap_or(0.0) / 100.0).clamp(0.0, 1.0),
+            user_idle_fraction: (context.user_idle_secs / 300.0).clamp(0.0, 1.0),
+            foreground_app_hash: stable_episode_tag(context.foreground_app.as_deref()),
+            effective_profile_hash: stable_episode_tag(Some(&context.effective_profile)),
+            app_launching: context.app_launching,
+            window_op_active: context.window_op_active,
+            foreground_idle: context.foreground_idle,
+            user_call_in_progress: context.user_call_in_progress,
+            user_audio_active: context.user_audio_active,
+            markov_prewarm_active: context.markov_prewarm_active,
+            predictive_agent_active: context.predictive_agent_active,
+        };
+        episode.valid = episode.is_finite();
+        episode
+    }
+
+    pub fn is_finite(self) -> bool {
+        [
+            self.memory_pressure,
+            self.compressor_pressure,
+            self.thrashing_score,
+            self.cpu_global_usage,
+            self.cpu_max_busy,
+            self.cpu_pegged_fraction,
+            self.stall_fraction,
+            self.used_ram_fraction,
+            self.thermal_score,
+            self.fluidity_score,
+            self.windowserver_cpu_fraction,
+            self.arousal_level,
+            self.markov_prediction_confidence,
+            self.network_retransmit_fraction,
+            self.network_drop_rate,
+            self.package_power_fraction,
+            self.p_cluster_util,
+            self.e_cluster_util,
+            self.ane_util_fraction,
+            self.user_idle_fraction,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+    }
+}
+
+fn stable_episode_tag(value: Option<&str>) -> u64 {
+    value
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+                (hash ^ byte as u64).wrapping_mul(0x100_0000_01b3)
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn parameter_parent_action_key(action_key: &str) -> Option<&str> {
+    let (parent, arm) = action_key.rsplit_once('@')?;
+    matches!(arm, "short" | "standard" | "long").then_some(parent)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -420,6 +561,9 @@ struct ExternalActuatorCounters {
     markov_misses: u64,
     interaction_qos_activations: u64,
     interaction_qos_reverts: u64,
+    acceleration_io_promotions: u64,
+    chromium_ecore_demotions: u64,
+    chromium_purge_hints: u64,
 }
 
 impl ExternalActuatorCounters {
@@ -430,6 +574,9 @@ impl ExternalActuatorCounters {
             markov_misses: runtime.markov_prewarm_misses,
             interaction_qos_activations: runtime.interaction_qos_activations,
             interaction_qos_reverts: runtime.interaction_qos_reverts,
+            acceleration_io_promotions: runtime.acceleration_lease_io_promotions_total,
+            chromium_ecore_demotions: runtime.chromium_ecore_demotions_total,
+            chromium_purge_hints: runtime.chromium_purge_hints_total,
         }
     }
 }
@@ -441,6 +588,9 @@ struct ExternalDeltas {
     markov_misses: u64,
     interaction_activations: u64,
     interaction_reverts: u64,
+    io_promotions: u64,
+    chromium_ecore_demotions: u64,
+    chromium_purge_hints: u64,
 }
 
 #[derive(Debug)]
@@ -679,6 +829,8 @@ pub struct TelemetryMedallionPersisted {
     #[serde(default)]
     pub recent_evidence: Vec<ResolvedActuatorEvidence>,
     #[serde(default)]
+    pub episodic_evidence: Vec<ResolvedActuatorEvidence>,
+    #[serde(default)]
     external_counters: ExternalActuatorCounters,
     #[serde(default)]
     pub next_action_id: u64,
@@ -714,6 +866,8 @@ pub struct TelemetryMedallionPersisted {
     pub controlled_holdout_rejected_total: u64,
     #[serde(default)]
     pub controlled_holdout_pending_total: u64,
+    #[serde(default)]
+    pub causal_dynamics: CausalDynamicsModel,
 }
 
 #[derive(Debug)]
@@ -739,6 +893,7 @@ pub struct TelemetryMedallion {
     action_models: BTreeMap<String, ActionModelStats>,
     action_models_revision: u64,
     recent_evidence: VecDeque<ResolvedActuatorEvidence>,
+    episodic_evidence: VecDeque<ResolvedActuatorEvidence>,
     new_gold_evidence: VecDeque<ResolvedActuatorEvidence>,
     external_counters: ExternalActuatorCounters,
     next_action_id: u64,
@@ -755,9 +910,11 @@ pub struct TelemetryMedallion {
     no_action_state_delta_ema: WorldStateDelta,
     pending_controlled_holdouts: VecDeque<PendingControlledHoldout>,
     controlled_models: BTreeMap<String, ControlledCounterfactualStats>,
+    controlled_models_revision: u64,
     controlled_holdout_issued_total: u64,
     controlled_holdout_resolved_total: u64,
     controlled_holdout_rejected_total: u64,
+    causal_dynamics: CausalDynamicsModel,
 }
 
 impl Default for TelemetryMedallion {
@@ -784,6 +941,7 @@ impl Default for TelemetryMedallion {
             action_models: BTreeMap::new(),
             action_models_revision: 0,
             recent_evidence: VecDeque::new(),
+            episodic_evidence: VecDeque::new(),
             new_gold_evidence: VecDeque::new(),
             external_counters: ExternalActuatorCounters::default(),
             next_action_id: 0,
@@ -800,9 +958,11 @@ impl Default for TelemetryMedallion {
             no_action_state_delta_ema: WorldStateDelta::default(),
             pending_controlled_holdouts: VecDeque::new(),
             controlled_models: BTreeMap::new(),
+            controlled_models_revision: 0,
             controlled_holdout_issued_total: 0,
             controlled_holdout_resolved_total: 0,
             controlled_holdout_rejected_total: 0,
+            causal_dynamics: CausalDynamicsModel::default(),
         }
     }
 }
@@ -813,6 +973,11 @@ pub struct TrustedTelemetryView<'a> {
     pub installation_id: InstallationId,
     pub action_models: &'a BTreeMap<String, ActionModelStats>,
     pub action_models_revision: u64,
+    pub controlled_models: &'a BTreeMap<String, ControlledCounterfactualStats>,
+    pub controlled_models_revision: u64,
+    pub episodic_evidence: &'a VecDeque<ResolvedActuatorEvidence>,
+    pub causal_dynamics: &'a CausalDynamicsModel,
+    pub causal_dynamics_revision: u64,
     pub metrics: TelemetryMedallionMetrics,
 }
 
@@ -820,6 +985,7 @@ impl TelemetryMedallion {
     pub fn new(installation_id: InstallationId) -> Self {
         Self {
             installation_id,
+            causal_dynamics: CausalDynamicsModel::new(installation_id),
             ..Self::default()
         }
     }
@@ -894,6 +1060,9 @@ impl TelemetryMedallion {
         issued_this_cycle = issued_this_cycle
             .saturating_add(external_deltas.markov_applied)
             .saturating_add(external_deltas.interaction_activations)
+            .saturating_add(external_deltas.io_promotions)
+            .saturating_add(external_deltas.chromium_ecore_demotions)
+            .saturating_add(external_deltas.chromium_purge_hints)
             .saturating_add(u64::from(applied_intervention.is_some()));
 
         if self.consecutive_gold >= 2
@@ -902,6 +1071,12 @@ impl TelemetryMedallion {
             && self.pending_actions.is_empty()
         {
             if let Some(previous) = self.latest.as_ref() {
+                self.causal_dynamics.observe_no_action(
+                    previous,
+                    &summary,
+                    admission.quality,
+                    self.installation_id,
+                );
                 self.no_action_state_delta_ema = self
                     .no_action_state_delta_ema
                     .ema(WorldStateDelta::between(previous, &summary), 0.05)
@@ -916,7 +1091,7 @@ impl TelemetryMedallion {
         }
 
         let cohort_size = issued_this_cycle.min(u16::MAX as u64) as u16;
-        let mut coordinated_members = Vec::with_capacity(root_cohort_size.saturating_add(3));
+        let mut coordinated_members = Vec::with_capacity(root_cohort_size.saturating_add(5));
         for action in applied_root_actions {
             if let Some(spec) = action_spec(action) {
                 coordinated_members.push(spec.action_key.clone());
@@ -949,15 +1124,24 @@ impl TelemetryMedallion {
                 true,
             );
         }
+        let interaction_action_key = match (
+            runtime.interaction_qos_ttl_exploratory,
+            runtime.interaction_qos_ttl_band.as_str(),
+        ) {
+            (true, band @ ("short" | "standard" | "long")) => {
+                format!("interaction_qos:foreground@{band}")
+            }
+            _ => "interaction_qos:foreground".to_string(),
+        };
         if external_deltas.interaction_activations > 0 {
-            coordinated_members.push("interaction_qos:foreground".to_string());
+            coordinated_members.push(interaction_action_key.clone());
         }
         for _ in 0..external_deltas.interaction_activations.min(16) {
             self.issue(
                 ActionSpec::synthetic(
                     ActuatorFamily::InteractionQos,
                     ActuatorObjective::Responsiveness,
-                    "interaction_qos:foreground",
+                    &interaction_action_key,
                     runtime.interaction_qos_reason.as_str(),
                     30,
                 ),
@@ -966,6 +1150,63 @@ impl TelemetryMedallion {
                 cohort_size.max(1),
                 purge_recent,
                 true,
+            );
+        }
+        if external_deltas.io_promotions > 0 {
+            coordinated_members.push("io_shaping:interactive_release".to_string());
+        }
+        for _ in 0..external_deltas.io_promotions.min(16) {
+            self.issue(
+                ActionSpec::synthetic(
+                    ActuatorFamily::IoShaping,
+                    ActuatorObjective::Responsiveness,
+                    "io_shaping:interactive_release",
+                    runtime.acceleration_lease_last_family.as_str(),
+                    30,
+                ),
+                &summary,
+                cycle,
+                cohort_size.max(1),
+                purge_recent,
+                false,
+            );
+        }
+        if external_deltas.chromium_ecore_demotions > 0 {
+            coordinated_members.push("chromium_ecore:background_renderer".to_string());
+        }
+        for _ in 0..external_deltas.chromium_ecore_demotions.min(16) {
+            self.issue(
+                ActionSpec::synthetic(
+                    ActuatorFamily::ChromiumEcore,
+                    ActuatorObjective::Efficiency,
+                    "chromium_ecore:background_renderer",
+                    "background_renderer",
+                    30,
+                ),
+                &summary,
+                cycle,
+                cohort_size.max(1),
+                purge_recent,
+                false,
+            );
+        }
+        if external_deltas.chromium_purge_hints > 0 {
+            coordinated_members.push("chromium_purge:purgeable_renderer".to_string());
+        }
+        for _ in 0..external_deltas.chromium_purge_hints.min(16) {
+            self.issue(
+                ActionSpec::synthetic(
+                    ActuatorFamily::ChromiumPurge,
+                    ActuatorObjective::PressureRelief,
+                    "chromium_purge:purgeable_renderer",
+                    "background_renderer",
+                    12,
+                ),
+                &summary,
+                cycle,
+                cohort_size.max(1),
+                purge_recent,
+                false,
             );
         }
         if let Some(spec) = applied_intervention.and_then(intervention_spec) {
@@ -1158,6 +1399,10 @@ impl TelemetryMedallion {
                 alpha * quality + (1.0 - alpha) * model.quality_ema
             };
             model.last_cycle = cycle;
+            model.last_observed_unix = after.timestamp_unix;
+            model.hardware_regime = HardwareRegime::from_context(after);
+            model.installation_id = self.installation_id;
+            self.controlled_models_revision = self.controlled_models_revision.wrapping_add(1);
             self.controlled_holdout_resolved_total =
                 self.controlled_holdout_resolved_total.saturating_add(1);
         }
@@ -1178,6 +1423,20 @@ impl TelemetryMedallion {
                 runtime.interaction_qos_activations;
             self.external_counters.interaction_qos_reverts = runtime.interaction_qos_reverts;
         }
+        if runtime.acceleration_lease_io_promotions_total
+            < self.external_counters.acceleration_io_promotions
+        {
+            self.external_counters.acceleration_io_promotions =
+                runtime.acceleration_lease_io_promotions_total;
+        }
+        if runtime.chromium_ecore_demotions_total < self.external_counters.chromium_ecore_demotions
+        {
+            self.external_counters.chromium_ecore_demotions =
+                runtime.chromium_ecore_demotions_total;
+        }
+        if runtime.chromium_purge_hints_total < self.external_counters.chromium_purge_hints {
+            self.external_counters.chromium_purge_hints = runtime.chromium_purge_hints_total;
+        }
         ExternalDeltas {
             markov_applied: runtime
                 .markov_prewarm_applied
@@ -1194,6 +1453,15 @@ impl TelemetryMedallion {
             interaction_reverts: runtime
                 .interaction_qos_reverts
                 .saturating_sub(self.external_counters.interaction_qos_reverts),
+            io_promotions: runtime
+                .acceleration_lease_io_promotions_total
+                .saturating_sub(self.external_counters.acceleration_io_promotions),
+            chromium_ecore_demotions: runtime
+                .chromium_ecore_demotions_total
+                .saturating_sub(self.external_counters.chromium_ecore_demotions),
+            chromium_purge_hints: runtime
+                .chromium_purge_hints_total
+                .saturating_sub(self.external_counters.chromium_purge_hints),
         }
     }
 
@@ -1362,6 +1630,22 @@ impl TelemetryMedallion {
             |score| score >= 0.5,
         );
 
+        if tier == EvidenceTier::Gold {
+            self.causal_dynamics.observe_action(
+                &pending.action_key,
+                pending.family.as_str(),
+                &pending.workload,
+                &pending.before,
+                net_state_delta,
+                pending.horizon_cycles,
+                quality,
+                after.timestamp_unix,
+                HardwareRegime::from_context(after),
+                self.installation_id,
+                pending.id,
+            );
+        }
+
         let evidence = ResolvedActuatorEvidence {
             id: pending.id,
             family: pending.family,
@@ -1385,6 +1669,7 @@ impl TelemetryMedallion {
             } else {
                 WorldStateDelta::default()
             },
+            context_before: ActuatorEpisodeContext::from_telemetry(&pending.before),
             effective,
             confounder_count: confounders,
             target_present_after,
@@ -1403,6 +1688,12 @@ impl TelemetryMedallion {
             self.actuator_silver_total = self.actuator_silver_total.saturating_add(1);
         } else {
             self.actuator_rejected_total = self.actuator_rejected_total.saturating_add(1);
+        }
+        if evidence.tier != EvidenceTier::Bronze
+            && evidence.quality >= 0.85
+            && evidence.context_before.valid
+        {
+            self.admit_episode(evidence.clone());
         }
         if evidence.tier == EvidenceTier::Gold {
             self.actuator_gold_total = self.actuator_gold_total.saturating_add(1);
@@ -1435,12 +1726,47 @@ impl TelemetryMedallion {
         self.recent_evidence.push_back(evidence);
     }
 
+    fn admit_episode(&mut self, evidence: ResolvedActuatorEvidence) {
+        let family_count = self
+            .episodic_evidence
+            .iter()
+            .filter(|existing| existing.family == evidence.family)
+            .count();
+        let eviction = if family_count >= MAX_EPISODES_PER_FAMILY {
+            self.episodic_evidence
+                .iter()
+                .position(|existing| existing.family == evidence.family)
+        } else if self.episodic_evidence.len() >= MAX_EPISODIC_EVIDENCE {
+            let mut family_counts = BTreeMap::new();
+            for existing in &self.episodic_evidence {
+                *family_counts.entry(existing.family).or_insert(0_usize) += 1;
+            }
+            let largest = family_counts.values().copied().max().unwrap_or(0);
+            self.episodic_evidence.iter().position(|existing| {
+                family_counts.get(&existing.family).copied().unwrap_or(0) == largest
+            })
+        } else {
+            None
+        };
+        if let Some(index) = eviction {
+            self.episodic_evidence.remove(index);
+        }
+        self.episodic_evidence.push_back(evidence);
+    }
+
     fn update_action_model(&mut self, evidence: &ResolvedActuatorEvidence) {
-        let keys = [
-            evidence.action_key.clone(),
-            format!("{}|{}", evidence.workload, evidence.action_key),
-            format!("{}:*", evidence.family.as_str()),
-        ];
+        let mut keys = Vec::with_capacity(5);
+        keys.push(evidence.action_key.clone());
+        keys.push(format!("{}|{}", evidence.workload, evidence.action_key));
+        // Parameterized arms remain independently learnable while also
+        // updating the legacy parent model. This avoids splitting all prior
+        // interaction evidence at upgrade time and prevents a short/long arm
+        // from making the aggregate action disappear from the planner.
+        if let Some(parent) = parameter_parent_action_key(&evidence.action_key) {
+            keys.push(parent.to_string());
+            keys.push(format!("{}|{}", evidence.workload, parent));
+        }
+        keys.push(format!("{}:*", evidence.family.as_str()));
         for key in keys {
             if !self.action_models.contains_key(&key)
                 && self.action_models.len() >= MAX_ACTION_MODELS
@@ -1629,6 +1955,11 @@ impl TelemetryMedallion {
             installation_id: self.installation_id,
             action_models: &self.action_models,
             action_models_revision: self.action_models_revision,
+            controlled_models: &self.controlled_models,
+            controlled_models_revision: self.controlled_models_revision,
+            episodic_evidence: &self.episodic_evidence,
+            causal_dynamics: &self.causal_dynamics,
+            causal_dynamics_revision: self.causal_dynamics.publication_revision(),
             metrics: self.metrics(),
         }
     }
@@ -1647,6 +1978,10 @@ impl TelemetryMedallion {
 
     pub fn recent_actuator_evidence(&self) -> &VecDeque<ResolvedActuatorEvidence> {
         &self.recent_evidence
+    }
+
+    pub fn causal_dynamics(&self) -> &CausalDynamicsModel {
+        &self.causal_dynamics
     }
 
     /// Drain only Gold outcomes resolved since the previous call. This queue
@@ -1673,6 +2008,7 @@ impl TelemetryMedallion {
             family_stats: self.family_stats.clone(),
             action_models: self.action_models.clone(),
             recent_evidence: self.recent_evidence.iter().cloned().collect(),
+            episodic_evidence: self.episodic_evidence.iter().cloned().collect(),
             external_counters: self.external_counters.clone(),
             next_action_id: self.next_action_id,
             actuator_issued_total: self.actuator_issued_total,
@@ -1691,6 +2027,7 @@ impl TelemetryMedallion {
             controlled_holdout_resolved_total: self.controlled_holdout_resolved_total,
             controlled_holdout_rejected_total: self.controlled_holdout_rejected_total,
             controlled_holdout_pending_total: self.pending_controlled_holdouts.len() as u64,
+            causal_dynamics: self.causal_dynamics.clone(),
         }
     }
 
@@ -1773,9 +2110,28 @@ impl TelemetryMedallion {
                     && evidence.raw_utility_delta.is_finite()
                     && evidence.counterfactual_delta.is_finite()
                     && evidence.net_utility_delta.is_finite()
+                    && (!evidence.context_before.valid || evidence.context_before.is_finite())
             })
             .take(MAX_RECENT_EVIDENCE)
             .collect();
+        self.episodic_evidence.clear();
+        for evidence in state
+            .episodic_evidence
+            .into_iter()
+            .filter(|evidence| {
+                evidence.tier != EvidenceTier::Bronze
+                    && evidence.action_key.len() <= 320
+                    && evidence.target.len() <= 256
+                    && evidence.workload.len() <= 64
+                    && evidence.quality.is_finite()
+                    && evidence.net_utility_delta.is_finite()
+                    && evidence.context_before.valid
+                    && evidence.context_before.is_finite()
+            })
+            .take(MAX_EPISODIC_EVIDENCE)
+        {
+            self.admit_episode(evidence);
+        }
         self.external_counters = ExternalActuatorCounters::default();
         self.next_action_id = state.next_action_id;
         self.actuator_issued_total = state.actuator_issued_total;
@@ -1828,6 +2184,10 @@ impl TelemetryMedallion {
                     stats.control_utility_ema = stats.control_utility_ema.clamp(-1.0, 1.0);
                     stats.quality_ema = stats.quality_ema.clamp(0.0, 1.0);
                     stats.would_have_helped = stats.would_have_helped.min(stats.observations);
+                    if stats.last_observed_unix <= 0 {
+                        stats.hardware_regime = HardwareRegime::default();
+                        stats.installation_id = InstallationId::UNKNOWN;
+                    }
                     Some((key, stats))
                 })
                 .take(MAX_CONTROLLED_MODELS)
@@ -1846,16 +2206,21 @@ impl TelemetryMedallion {
             self.controlled_holdout_resolved_total = 0;
             self.controlled_holdout_rejected_total = 0;
         }
+        self.causal_dynamics = state
+            .causal_dynamics
+            .sanitized_for_restore(self.installation_id, same_origin);
         if !same_origin {
             for evidence in &mut self.recent_evidence {
                 evidence.installation_id = state.installation_id;
             }
+            self.episodic_evidence.clear();
         }
         if reset_actuator_evidence {
             self.pending_actions.clear();
             self.family_stats.clear();
             self.action_models.clear();
             self.recent_evidence.clear();
+            self.episodic_evidence.clear();
             self.new_gold_evidence.clear();
             self.external_counters = ExternalActuatorCounters::default();
             self.next_action_id = 0;
@@ -1875,8 +2240,10 @@ impl TelemetryMedallion {
             self.controlled_holdout_issued_total = 0;
             self.controlled_holdout_resolved_total = 0;
             self.controlled_holdout_rejected_total = 0;
+            self.causal_dynamics = CausalDynamicsModel::new(self.installation_id);
         }
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
+        self.controlled_models_revision = self.controlled_models_revision.wrapping_add(1);
     }
 }
 
@@ -2534,6 +2901,7 @@ mod tests {
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
             net_state_delta: WorldStateDelta::default(),
+            context_before: ActuatorEpisodeContext::default(),
             effective: utility > 0.0,
             confounder_count: 0,
             target_present_after: None,
@@ -2590,6 +2958,142 @@ mod tests {
         let foreign_model = foreign_restore.action_models().get("boost:Editor").unwrap();
         assert_eq!(foreign_model.state_evidence_mass, 0.0);
         assert_eq!(foreign_model.effective_state_evidence_at(now_unix + 4), 0.0);
+    }
+
+    #[test]
+    fn parameterized_interaction_evidence_updates_arm_and_parent_models() {
+        let now_unix = Utc::now().timestamp();
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let mut evidence = gold_evidence(
+            "interaction_qos:foreground@long",
+            0.04,
+            now_unix,
+            HardwareRegime {
+                p_core_count: 4,
+                e_core_count: 6,
+                ram_gib: 16,
+            },
+        );
+        evidence.family = ActuatorFamily::InteractionQos;
+        medallion.update_action_model(&evidence);
+
+        assert_eq!(
+            medallion
+                .action_models()
+                .get("interaction_qos:foreground@long")
+                .unwrap()
+                .observations,
+            1
+        );
+        assert_eq!(
+            medallion
+                .action_models()
+                .get("interaction_qos:foreground")
+                .unwrap()
+                .observations,
+            1
+        );
+        assert!(medallion
+            .action_models()
+            .contains_key("build|interaction_qos:foreground@long"));
+        assert!(medallion
+            .action_models()
+            .contains_key("build|interaction_qos:foreground"));
+        assert_eq!(
+            parameter_parent_action_key("interaction_qos:foreground@unknown"),
+            None
+        );
+    }
+
+    #[test]
+    fn episodic_reservoir_prevents_one_family_from_erasing_others() {
+        let now_unix = Utc::now().timestamp();
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let mut next_id = 1_u64;
+        for family in [
+            ActuatorFamily::PredictiveThreshold,
+            ActuatorFamily::InteractionQos,
+            ActuatorFamily::PredictiveThreshold,
+        ] {
+            let count = if family == ActuatorFamily::InteractionQos {
+                2
+            } else {
+                40
+            };
+            for _ in 0..count {
+                let mut evidence = gold_evidence(
+                    if family == ActuatorFamily::InteractionQos {
+                        "interaction_qos:foreground"
+                    } else {
+                        "predictive_threshold:tighten"
+                    },
+                    0.04,
+                    now_unix + next_id as i64,
+                    hardware,
+                );
+                evidence.id = next_id;
+                evidence.family = family;
+                evidence.context_before.valid = true;
+                medallion.admit_resolved(evidence);
+                next_id += 1;
+            }
+        }
+
+        let predictive = medallion
+            .episodic_evidence
+            .iter()
+            .filter(|evidence| evidence.family == ActuatorFamily::PredictiveThreshold)
+            .count();
+        let qos = medallion
+            .episodic_evidence
+            .iter()
+            .filter(|evidence| evidence.family == ActuatorFamily::InteractionQos)
+            .count();
+        assert_eq!(predictive, MAX_EPISODES_PER_FAMILY);
+        assert_eq!(qos, 2);
+        assert_eq!(medallion.episodic_evidence.len(), 14);
+    }
+
+    #[test]
+    fn episodic_context_round_trips_only_for_the_same_installation() {
+        let now_unix = Utc::now().timestamp();
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let mut evidence = gold_evidence("interaction_qos:foreground", 0.05, now_unix, hardware);
+        evidence.family = ActuatorFamily::InteractionQos;
+        evidence.context_before = ActuatorEpisodeContext {
+            valid: true,
+            fluidity_score: 0.82,
+            foreground_app_hash: 42,
+            ..ActuatorEpisodeContext::default()
+        };
+        medallion.admit_resolved(evidence);
+
+        let encoded = serde_json::to_vec(&medallion.snapshot()).expect("serialize medallion");
+        let persisted: TelemetryMedallionPersisted =
+            serde_json::from_slice(&encoded).expect("deserialize medallion");
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(persisted.clone());
+        assert_eq!(restored.episodic_evidence.len(), 1);
+        assert_eq!(
+            restored.episodic_evidence[0]
+                .context_before
+                .foreground_app_hash,
+            42
+        );
+
+        let mut foreign = TelemetryMedallion::new(InstallationId(99));
+        foreign.restore(persisted);
+        assert!(foreign.episodic_evidence.is_empty());
     }
 
     #[test]
@@ -2652,6 +3156,13 @@ mod tests {
         assert!(medallion
             .controlled_models
             .contains_key("build|boost:Editor"));
+        let controlled = medallion
+            .controlled_models
+            .get("build|boost:Editor")
+            .expect("resolved control model");
+        assert!(controlled.last_observed_unix > 0);
+        assert_eq!(controlled.installation_id, LOCAL_ID);
+        assert!(controlled.hardware_regime.is_known());
     }
 
     #[test]
@@ -3017,6 +3528,22 @@ mod tests {
         assert_eq!(metrics.actuator_silver_total, 1);
         assert_eq!(metrics.actuator_gold_total, 1);
         assert_eq!(medallion.recent_actuator_evidence().len(), 1);
+        let dynamics = medallion.causal_dynamics().metrics(medallion.latest());
+        assert_eq!(dynamics.gold_action_updates, 1);
+        assert_eq!(dynamics.action_models, 3);
+    }
+
+    #[test]
+    fn uncontaminated_no_action_windows_train_causal_baseline() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        for cycle in 1..=8 {
+            observe(&mut medallion, cycle, &ExecuteOutcomes::default(), &runtime);
+        }
+        let dynamics = medallion.causal_dynamics().metrics(medallion.latest());
+        assert!(dynamics.no_action_updates >= 4);
+        assert!(dynamics.baseline_models >= 1);
+        assert!(dynamics.baseline_ready_models >= 1);
     }
 
     #[test]
@@ -3043,6 +3570,91 @@ mod tests {
         assert_eq!(evidence.net_utility_delta, 1.0);
         assert_eq!(medallion.drain_new_gold_evidence().len(), 1);
         assert!(medallion.drain_new_gold_evidence().is_empty());
+    }
+
+    #[test]
+    fn io_promotion_gets_its_own_horizon_resolved_causal_evidence() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = RuntimeMetrics {
+            acceleration_lease_io_promotions_total: 1,
+            acceleration_lease_last_family: "chromium".to_string(),
+            ..healthy_runtime()
+        };
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        assert_eq!(medallion.metrics().actuator_pending_total, 1);
+
+        for cycle in 2..=31 {
+            observe(&mut medallion, cycle, &ExecuteOutcomes::default(), &runtime);
+        }
+        let evidence = medallion
+            .recent_actuator_evidence()
+            .back()
+            .expect("resolved I/O evidence");
+        assert_eq!(evidence.family, ActuatorFamily::IoShaping);
+        assert_eq!(evidence.target, "chromium");
+        assert_eq!(medallion.metrics().actuator_bronze_total, 1);
+    }
+
+    #[test]
+    fn interaction_activation_records_the_actual_ttl_arm() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = RuntimeMetrics {
+            interaction_qos_activations: 1,
+            interaction_qos_reason: "input".to_string(),
+            interaction_qos_ttl_band: "long".to_string(),
+            interaction_qos_ttl_ms: 1_760,
+            interaction_qos_ttl_exploratory: true,
+            ..healthy_runtime()
+        };
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+
+        assert!(medallion.pending_actions.iter().any(|pending| {
+            pending.family == ActuatorFamily::InteractionQos
+                && pending.action_key == "interaction_qos:foreground@long"
+        }));
+    }
+
+    #[test]
+    fn policy_selected_interaction_keeps_parameter_models_causally_clean() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = RuntimeMetrics {
+            interaction_qos_activations: 1,
+            interaction_qos_reason: "input".to_string(),
+            interaction_qos_ttl_band: "long".to_string(),
+            interaction_qos_ttl_ms: 1_760,
+            interaction_qos_ttl_exploratory: false,
+            ..healthy_runtime()
+        };
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+
+        assert!(medallion.pending_actions.iter().any(|pending| {
+            pending.family == ActuatorFamily::InteractionQos
+                && pending.action_key == "interaction_qos:foreground"
+        }));
+        assert!(!medallion
+            .pending_actions
+            .iter()
+            .any(|pending| pending.action_key.contains('@')));
+    }
+
+    #[test]
+    fn confirmed_chromium_soft_actions_enter_the_universal_medallion() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = RuntimeMetrics {
+            chromium_ecore_demotions_total: 1,
+            chromium_purge_hints_total: 1,
+            ..healthy_runtime()
+        };
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+
+        assert!(medallion.pending_actions.iter().any(|pending| {
+            pending.family == ActuatorFamily::ChromiumEcore
+                && pending.action_key == "chromium_ecore:background_renderer"
+        }));
+        assert!(medallion.pending_actions.iter().any(|pending| {
+            pending.family == ActuatorFamily::ChromiumPurge
+                && pending.action_key == "chromium_purge:purgeable_renderer"
+        }));
     }
 
     #[test]
@@ -3295,6 +3907,7 @@ mod tests {
                 counterfactual_delta: 0.0,
                 net_utility_delta: 0.08,
                 net_state_delta: WorldStateDelta::default(),
+                context_before: ActuatorEpisodeContext::default(),
                 effective: true,
                 confounder_count: 0,
                 target_present_after: None,
@@ -3321,6 +3934,7 @@ mod tests {
             counterfactual_delta: 0.0,
             net_utility_delta: 1.0,
             net_state_delta: WorldStateDelta::default(),
+            context_before: ActuatorEpisodeContext::default(),
             effective: true,
             confounder_count: 0,
             target_present_after: None,
@@ -3456,5 +4070,50 @@ mod tests {
         let runtime = healthy_runtime();
         observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
         assert_eq!(medallion.metrics().actuator_ready_models, 1);
+    }
+
+    #[test]
+    fn causal_dynamics_persists_only_for_the_same_installation() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        for sample in 1..=8 {
+            let before = TelemetryContextSummary {
+                cycle: sample,
+                timestamp_unix: 1_800_000_000 + sample as i64,
+                workload: "coding".to_string(),
+                memory_pressure: 0.4,
+                fluidity_score: 0.8,
+                package_watts: Some(8.0),
+                cpu_max_busy: 0.4,
+                total_ram_bytes: 16 * 1024 * 1024 * 1024,
+                p_core_count: 4,
+                e_core_count: 6,
+                ..TelemetryContextSummary::default()
+            };
+            medallion.causal_dynamics.observe_action(
+                "boost:Editor",
+                "boost",
+                "coding",
+                &before,
+                WorldStateDelta {
+                    pressure: -0.02,
+                    fluidity: 0.03,
+                    ..WorldStateDelta::default()
+                },
+                4,
+                0.98,
+                before.timestamp_unix + 4,
+                HardwareRegime::from_context(&before),
+                LOCAL_ID,
+                sample,
+            );
+        }
+        let persisted = medallion.snapshot();
+        let mut local = TelemetryMedallion::new(LOCAL_ID);
+        local.restore(persisted.clone());
+        assert!(local.causal_dynamics.metrics(None).action_models > 0);
+
+        let mut foreign = TelemetryMedallion::new(InstallationId(99));
+        foreign.restore(persisted);
+        assert_eq!(foreign.causal_dynamics.metrics(None).action_models, 0);
     }
 }

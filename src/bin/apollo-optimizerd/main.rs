@@ -1097,9 +1097,10 @@ fn main() -> anyhow::Result<()> {
             // foreground transition or a wall-clock deadline, never the next
             // daemon cycle alone.
             let mut last_markov_prethaw: Option<daemon_markov_tick::MarkovPrewarmLease> = None;
+            let mut markov_shadow = daemon_markov_tick::MarkovShadowTracker::default();
             let mut markov_hit_count: u32 = 0;
             let mut markov_miss_count: u32 = 0;
-            let mut interaction_qos = daemon_cycle_tail::InteractionQoSController::default();
+            let mut acceleration_lease = daemon_cycle_tail::AccelerationLeaseBroker::default();
             // Restored pending trial skill from the previous run (if daemon crashed mid-trial).
             let mut restored_trial_skill: Option<(String, f64)> = None;
             // Restored arousal state — applied after arousal_state is declared below.
@@ -2115,6 +2116,7 @@ fn main() -> anyhow::Result<()> {
                     &mut focus_markov,
                     &mut temporal_predictor,
                     &mut last_markov_prethaw,
+                    &mut markov_shadow,
                     &mut markov_hit_count,
                     &mut markov_miss_count,
                     &state,
@@ -2123,6 +2125,7 @@ fn main() -> anyhow::Result<()> {
                     &coalition_tracker,
                     &mut cache_warmer,
                     &frozen_state_path,
+                    &world_model,
                 );
                 temporal_hour = markov_temporal_hour;
                 temporal_weekday = markov_temporal_weekday;
@@ -2755,6 +2758,8 @@ fn main() -> anyhow::Result<()> {
                     let energy_summary = lctx.energy_tracker.session_summary();
                     metrics.metrics.energy_savings_wh = Some(energy_summary.estimated_savings_wh);
                     metrics.metrics.energy_co2_avoided_g =
+                        Some(energy_summary.estimated_co2_avoided_kg * 1000.0);
+                    metrics.metrics.energy_co2_emitted_g =
                         Some(energy_summary.estimated_co2_kg * 1000.0);
                     metrics.metrics.energy_package_wh = Some(energy_summary.total_package_wh);
                     metrics.metrics.energy_session_wh =
@@ -3186,17 +3191,10 @@ fn main() -> anyhow::Result<()> {
                 let raw_workload_onset = workload_mode == WorkloadMode::Build
                     && prev_workload_mode != WorkloadMode::Build;
 
-                // Work-session hysteresis (ADDITIVE — can only turn workload_onset
-                // ON, never off). "is_dev_active" reuses signals already computed
-                // this cycle (no new process scans): the workload classifier sees
-                // a Build, OR dev_session_active (critical_background_processes =
-                // dev-runtime + infra patterns: cargo/rustc/node/...), OR the
-                // foreground app is a known dev tool. note_activity refreshes the
-                // grace window; is_active reports whether we are still within it.
-                // battery_low forces is_active=false inside WorkSession (survival
-                // of the battery beats feel). We modulate ONLY the governor's
-                // workload_onset input — NOT the WorkloadMode enum that other
-                // consumers read. See profile_governor.rs:272.
+                // Work-session hysteresis keeps a BalancedRoot floor after recent
+                // development activity, but only the true Build transition edge may
+                // trigger AggressiveRoot. Reusing the full grace window as an onset
+                // pulse kept re-escalating an otherwise calm machine for five minutes.
                 let fg_is_dev_tool = foreground_app
                     .as_deref()
                     .map(is_dev_tool_name)
@@ -3207,7 +3205,7 @@ fn main() -> anyhow::Result<()> {
                 work_session.note_activity(is_dev_active, now_instant);
                 let work_session_active =
                     work_session.is_active(power_mgr.is_on_battery(), battery_low, now_instant);
-                let workload_onset = raw_workload_onset || work_session_active;
+                let workload_onset = raw_workload_onset;
 
                 let governor_decision = {
                     let mut pg = state.policy.lock_recover();
@@ -3220,9 +3218,10 @@ fn main() -> anyhow::Result<()> {
                             snapshot.pressure.thermal_level.as_str(),
                             "serious" | "critical"
                         ) || gpu_thermal_throttled,
-                        dev_session_active,
+                        dev_session_active: dev_session_active || work_session_active,
                         interactive_heavy,
                         context_switch_burst,
+                        arousal_level: arousal_state.level as f64,
                         workload_mode: Some(workload_mode),
                         workload_onset,
                         swap_used_bytes: snapshot.pressure.swap_used_bytes,
@@ -3560,6 +3559,7 @@ fn main() -> anyhow::Result<()> {
                         ode_t_sat_urgency,
                         workload_mode,
                         presence_inputs,
+                        &world_model,
                         &maintenance_state,
                     );
                     last_specialist_votes = voting_out.disagreement_record;
@@ -4294,6 +4294,7 @@ fn main() -> anyhow::Result<()> {
                     &lctx.outcome_tracker.experience,
                     learnable_params.experience_pressure_band,
                     snapshot.pressure.memory_pressure,
+                    workload_mode.code(),
                     (hw_ram_gb * 1024.0 * 1024.0 * 1024.0) as u64,
                     &recently_applied,
                     &apple_platform_pids,
@@ -5017,6 +5018,8 @@ fn main() -> anyhow::Result<()> {
                         call_active_chromium,
                         llm_active_chromium,
                         external_4k_attached,
+                        &world_model,
+                        workload_mode.as_str(),
                     );
                     lf_metrics.record_stage(
                         apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
@@ -5511,6 +5514,14 @@ fn main() -> anyhow::Result<()> {
                         .metrics
                         .world_model_family_prior_uses_total
                         .saturating_add(plan_report.family_priors_used);
+                    metrics.metrics.world_model_counterfactual_rank_uses_total = metrics
+                        .metrics
+                        .world_model_counterfactual_rank_uses_total
+                        .saturating_add(plan_report.counterfactual_ranked);
+                    metrics.metrics.world_model_episodic_rank_uses_total = metrics
+                        .metrics
+                        .world_model_episodic_rank_uses_total
+                        .saturating_add(plan_report.episodic_ranked);
                     metrics.metrics.world_model_temporal_memory_samples =
                         plan_report.temporal_memory_samples;
                     metrics.metrics.world_model_sequence_candidates_total = metrics
@@ -5537,6 +5548,28 @@ fn main() -> anyhow::Result<()> {
                         .saturating_add(plan_report.temporal_authoritative_rollouts);
                     metrics.metrics.world_model_sequence_authoritative =
                         plan_report.temporal_authoritative;
+                    metrics.metrics.world_model_dynamics_predictions_total = metrics
+                        .metrics
+                        .world_model_dynamics_predictions_total
+                        .saturating_add(plan_report.dynamics_predictions);
+                    metrics
+                        .metrics
+                        .world_model_dynamics_ranking_predictions_total = metrics
+                        .metrics
+                        .world_model_dynamics_ranking_predictions_total
+                        .saturating_add(plan_report.dynamics_ranking_predictions);
+                    metrics
+                        .metrics
+                        .world_model_dynamics_authoritative_predictions_total = metrics
+                        .metrics
+                        .world_model_dynamics_authoritative_predictions_total
+                        .saturating_add(plan_report.dynamics_authoritative_predictions);
+                    metrics.metrics.world_model_dynamics_baseline_uses_total = metrics
+                        .metrics
+                        .world_model_dynamics_baseline_uses_total
+                        .saturating_add(u64::from(plan_report.dynamics_baseline_used));
+                    metrics.metrics.world_model_dynamics_mean_uncertainty =
+                        plan_report.dynamics_mean_uncertainty;
                     metrics.metrics.world_model_sequence_expected_gain =
                         plan_report.temporal_expected_gain;
                     metrics.metrics.world_model_sequence_uncertainty =
@@ -6104,14 +6137,19 @@ fn main() -> anyhow::Result<()> {
 
                 // ── Fluidity QoS elevation ───────────────────────────────────
                 // Extracted to daemon_cycle_tail::apply_fluidity_qos (Wave 10).
-                daemon_cycle_tail::update_interaction_qos(
+                daemon_cycle_tail::update_acceleration_lease(
                     &state,
-                    &mut interaction_qos,
+                    &mut acceleration_lease,
                     &fluidity_state,
                     &thermal_action,
                     foreground_pid,
                     build_tracker.phase,
                     user_context.idle_secs,
+                    &process_tree,
+                    &proc_snaps,
+                    &mut io_shaper,
+                    &world_model,
+                    workload_mode.as_str(),
                 );
 
                 metrics_reporter::merge_cycle_metrics(
@@ -6457,7 +6495,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(lease) = last_markov_prethaw.take() {
                 daemon_markov_tick::release_markov_prewarm(lease, &state);
             }
-            daemon_cycle_tail::release_interaction_qos(&mut interaction_qos, &state);
+            daemon_cycle_tail::release_acceleration_lease(&mut acceleration_lease, &state);
             // Persist Markov chain + Holt-Winters + SignalIntelligence state on shutdown.
             focus_markov.persist();
             holt_winters.persist(&hw_path);

@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::engine::causal_dynamics::{CausalDynamicsModel, DynamicsState};
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::telemetry_medallion::{
     ActionModelStats, HardwareRegime, TelemetryContextSummary, WorldStateDelta,
@@ -57,79 +58,24 @@ pub struct TemporalSequencePlan {
     pub authoritative_pressure_delta: f64,
     pub authoritative_fluidity_delta: f64,
     pub authoritative_energy_delta: f64,
+    pub dynamics_predictions: u64,
+    pub dynamics_ranking_predictions: u64,
+    pub dynamics_authoritative_predictions: u64,
+    pub dynamics_baseline_used: bool,
+    pub dynamics_mean_uncertainty: f64,
     pub abstention_reason: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct JointState {
-    pressure: f64,
-    fluidity: f64,
-    energy: f64,
-    cpu: f64,
-    thermal: f64,
-    thrashing: f64,
-    stall: f64,
-}
-
-impl JointState {
-    fn from_context(context: &TelemetryContextSummary) -> Self {
-        Self {
-            pressure: context.memory_pressure.clamp(0.0, 1.0),
-            fluidity: context.fluidity_score.clamp(0.0, 1.0),
-            energy: (context.package_watts.unwrap_or(0.0) / 50.0).clamp(0.0, 1.0),
-            cpu: context.cpu_max_busy.clamp(0.0, 1.0),
-            thermal: context.thermal_score.clamp(0.0, 1.0),
-            thrashing: (context.thrashing_score / 50_000.0).clamp(0.0, 1.0),
-            stall: context.stall_fraction.clamp(0.0, 1.0),
-        }
-    }
-
-    fn apply(self, delta: WorldStateDelta) -> Self {
-        Self {
-            pressure: (self.pressure + delta.pressure).clamp(0.0, 1.0),
-            fluidity: (self.fluidity + delta.fluidity).clamp(0.0, 1.0),
-            energy: (self.energy + delta.energy).clamp(0.0, 1.0),
-            cpu: (self.cpu + delta.cpu).clamp(0.0, 1.0),
-            thermal: (self.thermal + delta.thermal).clamp(0.0, 1.0),
-            thrashing: (self.thrashing + delta.thrashing).clamp(0.0, 1.0),
-            stall: (self.stall + delta.stall).clamp(0.0, 1.0),
-        }
-    }
-
-    fn delta_from(self, baseline: Self) -> WorldStateDelta {
-        WorldStateDelta {
-            pressure: self.pressure - baseline.pressure,
-            fluidity: self.fluidity - baseline.fluidity,
-            energy: self.energy - baseline.energy,
-            cpu: self.cpu - baseline.cpu,
-            thermal: self.thermal - baseline.thermal,
-            thrashing: self.thrashing - baseline.thrashing,
-            stall: self.stall - baseline.stall,
-        }
-    }
-
-    fn utility(self) -> f64 {
-        (0.24 * (1.0 - self.pressure)
-            + 0.25 * self.fluidity
-            + 0.12 * (1.0 - self.energy)
-            + 0.08 * (1.0 - self.cpu)
-            + 0.11 * (1.0 - self.thermal)
-            + 0.10 * (1.0 - self.thrashing)
-            + 0.10 * (1.0 - self.stall))
-            .clamp(0.0, 1.0)
-    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct TemporalMemory {
-    states: VecDeque<(u64, i64, JointState)>,
+    states: VecDeque<(u64, i64, DynamicsState)>,
     dynamics_per_cycle: WorldStateDelta,
     variance_per_cycle: WorldStateDelta,
 }
 
 impl TemporalMemory {
     pub fn observe(&mut self, context: &TelemetryContextSummary) {
-        let state = JointState::from_context(context);
+        let state = DynamicsState::from_context(context);
         if let Some((last_cycle, last_timestamp, last_state)) = self.states.back().copied() {
             if context.cycle == last_cycle {
                 return;
@@ -172,7 +118,7 @@ impl TemporalMemory {
         self.states.len()
     }
 
-    fn current(&self) -> Option<JointState> {
+    fn current(&self) -> Option<DynamicsState> {
         self.states.back().map(|(_, _, state)| *state)
     }
 }
@@ -180,11 +126,18 @@ impl TemporalMemory {
 #[derive(Clone)]
 struct Candidate {
     key: String,
+    legacy_effect: WorldStateDelta,
     effect: WorldStateDelta,
     utility: f64,
+    legacy_uncertainty: f64,
     uncertainty: f64,
     exact: bool,
     authoritative: bool,
+    legacy_authoritative: bool,
+    dynamics_weight: f64,
+    dynamics: bool,
+    dynamics_ranking_eligible: bool,
+    dynamics_authoritative: bool,
     dispatchable: bool,
 }
 
@@ -194,8 +147,16 @@ struct Trajectory {
     second: Option<usize>,
     score: f64,
     uncertainty: f64,
-    final_state: JointState,
+    final_state: DynamicsState,
     authoritative: bool,
+}
+
+struct CandidateEvidence<'a> {
+    models: &'a HashMap<String, ActionModelStats>,
+    dynamics: Option<&'a CausalDynamicsModel>,
+    workload: &'a str,
+    context: &'a TelemetryContextSummary,
+    installation_id: InstallationId,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -205,6 +166,29 @@ pub fn plan_temporal_sequence(
     installation_id: InstallationId,
     authority_trusted: bool,
     action_models: &HashMap<String, ActionModelStats>,
+    action_keys: &[String],
+    workload: &str,
+) -> TemporalSequencePlan {
+    plan_temporal_sequence_with_dynamics(
+        memory,
+        context,
+        installation_id,
+        authority_trusted,
+        action_models,
+        None,
+        action_keys,
+        workload,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn plan_temporal_sequence_with_dynamics(
+    memory: &TemporalMemory,
+    context: Option<&TelemetryContextSummary>,
+    installation_id: InstallationId,
+    authority_trusted: bool,
+    action_models: &HashMap<String, ActionModelStats>,
+    dynamics: Option<&CausalDynamicsModel>,
     action_keys: &[String],
     workload: &str,
 ) -> TemporalSequencePlan {
@@ -229,13 +213,19 @@ pub fn plan_temporal_sequence(
         return plan;
     }
 
+    let evidence = CandidateEvidence {
+        models: action_models,
+        dynamics,
+        workload,
+        context,
+        installation_id,
+    };
+
     let mut seen = HashSet::new();
     let mut candidates = Vec::new();
     for key in action_keys.iter().take(MAX_DISPATCHABLE) {
         if seen.insert(key.clone()) {
-            if let Some(candidate) =
-                candidate_for_key(key, true, action_models, workload, context, installation_id)
-            {
+            if let Some(candidate) = candidate_for_key(key, true, &evidence, current) {
                 candidates.push(candidate);
             }
         }
@@ -243,27 +233,57 @@ pub fn plan_temporal_sequence(
     let ambient = ambient_followups(context);
     for key in ambient.iter().take(MAX_AMBIENT_FOLLOWUPS) {
         if seen.insert((*key).to_string()) {
-            if let Some(candidate) = candidate_for_key(
-                key,
-                false,
-                action_models,
-                workload,
-                context,
-                installation_id,
-            ) {
+            if let Some(candidate) = candidate_for_key(key, false, &evidence, current) {
                 candidates.push(candidate);
             }
         }
     }
     plan.candidates = candidates.len() as u64;
+    plan.dynamics_predictions = candidates
+        .iter()
+        .filter(|candidate| candidate.dynamics)
+        .count() as u64;
+    plan.dynamics_authoritative_predictions = candidates
+        .iter()
+        .filter(|candidate| candidate.dynamics_authoritative)
+        .count() as u64;
+    plan.dynamics_ranking_predictions = candidates
+        .iter()
+        .filter(|candidate| candidate.dynamics_ranking_eligible)
+        .count() as u64;
+    if plan.dynamics_predictions > 0 {
+        plan.dynamics_mean_uncertainty = candidates
+            .iter()
+            .filter(|candidate| candidate.dynamics)
+            .map(|candidate| candidate.uncertainty)
+            .sum::<f64>()
+            / plan.dynamics_predictions as f64;
+    }
     if !candidates.iter().any(|candidate| candidate.dispatchable) {
         plan.abstention_reason = Some("transition_evidence");
         return plan;
     }
 
-    let drift = memory.dynamics_per_cycle.scaled(STEP_CYCLES);
-    let baseline_one = current.apply(drift);
-    let baseline_two = baseline_one.apply(drift);
+    let fallback_drift = memory.dynamics_per_cycle.scaled(STEP_CYCLES);
+    let (drift_one, learned_baseline_one) = baseline_drift(
+        dynamics,
+        workload,
+        context,
+        current,
+        installation_id,
+        fallback_drift,
+    );
+    let baseline_one = current.apply(drift_one);
+    let (drift_two, learned_baseline_two) = baseline_drift(
+        dynamics,
+        workload,
+        context,
+        baseline_one,
+        installation_id,
+        fallback_drift,
+    );
+    let baseline_two = baseline_one.apply(drift_two);
+    plan.dynamics_baseline_used = learned_baseline_one || learned_baseline_two;
     let mut one_step_trajectories = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         if !candidate.dispatchable {
@@ -274,6 +294,11 @@ pub fn plan_temporal_sequence(
             state.utility() - baseline_one.utility(),
             candidate.utility,
             action_cost(&candidate.key),
+            if candidate.dynamics_weight > 0.0 {
+                0.05 * candidate.uncertainty
+            } else {
+                0.0
+            },
         );
         plan.sequences_evaluated = plan.sequences_evaluated.saturating_add(1);
         plan.action_scores.insert(
@@ -320,24 +345,39 @@ pub fn plan_temporal_sequence(
                 continue;
             }
             let first = &candidates[beam.first];
-            let mut final_state = beam.final_state.apply(drift).apply(second.effect);
+            let (second_effect, second_uncertainty, second_authoritative) = effect_at_state(
+                second,
+                dynamics,
+                workload,
+                context,
+                beam.final_state,
+                installation_id,
+            );
+            let (second_drift, learned_second_baseline) = baseline_drift(
+                dynamics,
+                workload,
+                context,
+                beam.final_state,
+                installation_id,
+                fallback_drift,
+            );
+            plan.dynamics_baseline_used |= learned_second_baseline;
+            let mut final_state = beam.final_state.apply(second_drift).apply(second_effect);
             let mut learned_utility = first.utility + 0.90 * second.utility;
             let mut exact = first.exact && second.exact;
+            let endpoints_authoritative = first.authoritative && second_authoritative;
+            // A two-action sequence needs a mature coordinated model. Exact
+            // endpoint models alone do not prove the interaction is safe.
             let mut authoritative = false;
-            let mut uncertainty = (first.uncertainty + second.uncertainty) * 0.5;
-            if let Some(synergy) = coordinated_effect(
-                &first.key,
-                &second.key,
-                action_models,
-                context,
-                installation_id,
-            ) {
+            let mut uncertainty = (first.uncertainty + second_uncertainty) * 0.5;
+            if let Some(synergy) =
+                coordinated_effect(&first.key, &second.key, &evidence, beam.final_state)
+            {
                 final_state = final_state.apply(synergy.effect);
                 learned_utility += 0.50 * synergy.utility;
                 uncertainty = (uncertainty + synergy.uncertainty) * 0.5;
                 exact &= synergy.exact;
-                authoritative =
-                    first.authoritative && second.authoritative && synergy.authoritative;
+                authoritative = endpoints_authoritative && synergy.authoritative;
             }
             let state_gain = 0.45 * (beam.final_state.utility() - baseline_one.utility())
                 + 0.55 * (final_state.utility() - baseline_two.utility());
@@ -345,6 +385,11 @@ pub fn plan_temporal_sequence(
                 state_gain,
                 learned_utility,
                 action_cost(&first.key) + 0.90 * action_cost(&second.key),
+                if first.dynamics_weight > 0.0 || second.dynamics_weight > 0.0 {
+                    0.05 * uncertainty
+                } else {
+                    0.0
+                },
             );
             plan.sequences_evaluated = plan.sequences_evaluated.saturating_add(1);
             let entry = plan.action_scores.entry(first.key.clone()).or_default();
@@ -436,37 +481,36 @@ pub fn plan_temporal_sequence(
     plan
 }
 
-fn sequence_score(state_gain: f64, learned_utility: f64, cost: f64) -> f64 {
-    (0.65 * state_gain + 0.35 * learned_utility - cost).clamp(-1.0, 1.0)
+fn sequence_score(state_gain: f64, learned_utility: f64, cost: f64, risk_penalty: f64) -> f64 {
+    (0.65 * state_gain + 0.35 * learned_utility - cost - risk_penalty.clamp(0.0, 0.05))
+        .clamp(-1.0, 1.0)
 }
 
 fn candidate_for_key(
     key: &str,
     dispatchable: bool,
-    models: &HashMap<String, ActionModelStats>,
-    workload: &str,
-    context: &TelemetryContextSummary,
-    installation_id: InstallationId,
+    evidence: &CandidateEvidence<'_>,
+    state: DynamicsState,
 ) -> Option<Candidate> {
-    let workload_key = format!("{workload}|{key}");
+    let workload_key = format!("{}|{key}", evidence.workload);
     let family_key = key.split_once(':').map(|(family, _)| format!("{family}:*"));
     let mut options = Vec::with_capacity(3);
     for (model, exact, contextual) in [
-        (models.get(&workload_key), true, true),
-        (models.get(key), true, false),
+        (evidence.models.get(&workload_key), true, true),
+        (evidence.models.get(key), true, false),
         (
-            family_key.as_ref().and_then(|key| models.get(key)),
+            family_key.as_ref().and_then(|key| evidence.models.get(key)),
             false,
             false,
         ),
     ] {
-        let Some(model) =
-            model.filter(|model| transition_model_ready(model, context, installation_id))
-        else {
+        let Some(model) = model.filter(|model| {
+            transition_model_ready(model, evidence.context, evidence.installation_id)
+        }) else {
             continue;
         };
         let evidence = model
-            .effective_state_evidence_at(context.timestamp_unix)
+            .effective_state_evidence_at(evidence.context.timestamp_unix)
             .max(1.0);
         let uncertainty = model_uncertainty(model, evidence, exact);
         let authoritative = exact
@@ -492,13 +536,58 @@ fn candidate_for_key(
                 .then_with(|| left.3.total_cmp(&right.3))
         })?;
     let prior_scale = if exact { 1.0 } else { 0.50 };
+    let legacy_effect = model.state_delta_ema.scaled(prior_scale);
+    let legacy_uncertainty = uncertainty;
+    let legacy_authoritative = authoritative;
+    let forecast = evidence.dynamics.and_then(|dynamics| {
+        dynamics.predict_action_from_state(
+            key,
+            evidence.workload,
+            evidence.context,
+            state,
+            evidence.installation_id,
+        )
+    });
+    let dynamics_weight = forecast.map_or(0.0, |forecast| {
+        if forecast.authoritative {
+            0.70
+        } else if forecast.ranking_eligible {
+            (forecast.effective_evidence / (forecast.effective_evidence + 24.0) * 0.35)
+                .clamp(0.05, 0.35)
+        } else {
+            0.0
+        }
+    });
+    let effect = forecast.map_or(legacy_effect, |forecast| {
+        legacy_effect
+            .scaled(1.0 - dynamics_weight)
+            .plus(forecast.mean_delta.scaled(dynamics_weight))
+    });
+    let uncertainty = forecast.map_or(uncertainty, |forecast| {
+        ((1.0 - dynamics_weight) * uncertainty + dynamics_weight * forecast.uncertainty)
+            .clamp(0.0, 1.0)
+    });
+    let authoritative = forecast.map_or(authoritative, |forecast| {
+        if forecast.ranking_eligible {
+            authoritative && forecast.authoritative
+        } else {
+            authoritative
+        }
+    });
     Some(Candidate {
         key: key.to_string(),
-        effect: model.state_delta_ema.scaled(prior_scale),
+        legacy_effect,
+        effect,
         utility: model.utility_ema * prior_scale,
+        legacy_uncertainty,
         uncertainty,
         exact,
         authoritative,
+        legacy_authoritative,
+        dynamics_weight,
+        dynamics: forecast.is_some(),
+        dynamics_ranking_eligible: forecast.is_some_and(|forecast| forecast.ranking_eligible),
+        dynamics_authoritative: forecast.is_some_and(|forecast| forecast.authoritative),
         dispatchable,
     })
 }
@@ -512,20 +601,77 @@ fn model_uncertainty(model: &ActionModelStats, evidence: f64, exact: bool) -> f6
 fn coordinated_effect(
     first: &str,
     second: &str,
-    models: &HashMap<String, ActionModelStats>,
-    context: &TelemetryContextSummary,
-    installation_id: InstallationId,
+    evidence: &CandidateEvidence<'_>,
+    state: DynamicsState,
 ) -> Option<Candidate> {
     let mut families = [first.split_once(':')?.0, second.split_once(':')?.0];
     families.sort_unstable();
     let key = format!("coordinated:{}+{}", families[0], families[1]);
-    candidate_for_key(
-        &key,
-        false,
-        models,
-        &context.workload,
-        context,
-        installation_id,
+    candidate_for_key(&key, false, evidence, state)
+}
+
+fn effect_at_state(
+    candidate: &Candidate,
+    dynamics: Option<&CausalDynamicsModel>,
+    workload: &str,
+    context: &TelemetryContextSummary,
+    state: DynamicsState,
+    installation_id: InstallationId,
+) -> (WorldStateDelta, f64, bool) {
+    let Some(forecast) = dynamics.and_then(|dynamics| {
+        dynamics.predict_action_from_state(
+            &candidate.key,
+            workload,
+            context,
+            state,
+            installation_id,
+        )
+    }) else {
+        return (
+            candidate.effect,
+            candidate.uncertainty,
+            candidate.authoritative,
+        );
+    };
+    let effect = candidate
+        .legacy_effect
+        .scaled(1.0 - candidate.dynamics_weight)
+        .plus(forecast.mean_delta.scaled(candidate.dynamics_weight));
+    let uncertainty = ((1.0 - candidate.dynamics_weight) * candidate.legacy_uncertainty
+        + candidate.dynamics_weight * forecast.uncertainty)
+        .clamp(0.0, 1.0);
+    (
+        effect,
+        uncertainty,
+        candidate.legacy_authoritative && forecast.authoritative,
+    )
+}
+
+fn baseline_drift(
+    dynamics: Option<&CausalDynamicsModel>,
+    workload: &str,
+    context: &TelemetryContextSummary,
+    state: DynamicsState,
+    installation_id: InstallationId,
+    fallback: WorldStateDelta,
+) -> (WorldStateDelta, bool) {
+    let Some(forecast) = dynamics.and_then(|dynamics| {
+        dynamics.predict_baseline_from_state(workload, context, state, installation_id)
+    }) else {
+        return (fallback, false);
+    };
+    let learned = forecast.mean_delta.scaled(STEP_CYCLES);
+    if !forecast.ranking_eligible {
+        return (fallback, false);
+    }
+    let maturity = forecast.effective_evidence / (forecast.effective_evidence + 24.0);
+    let confidence = (1.0 - forecast.uncertainty).clamp(0.0, 1.0) * maturity * 0.70;
+    (
+        fallback
+            .scaled(1.0 - confidence)
+            .plus(learned.scaled(confidence))
+            .clamped(-0.20, 0.20),
+        true,
     )
 }
 
@@ -564,6 +710,7 @@ fn ambient_followups(context: &TelemetryContextSummary) -> Vec<&'static str> {
 fn action_cost(key: &str) -> f64 {
     match key.split_once(':').map(|(family, _)| family) {
         Some("unfreeze") => 0.001,
+        Some("io_shaping") => 0.002,
         Some("boost" | "thread_qos" | "interaction_qos") => 0.003,
         Some("markov_prewarm") => 0.004,
         Some("throttle" | "memorystatus") => 0.006,
@@ -697,6 +844,135 @@ mod tests {
                 <= (MAX_DISPATCHABLE + BEAM_WIDTH * (MAX_DISPATCHABLE + MAX_AMBIENT_FOLLOWUPS))
                     as u64
         );
+    }
+
+    #[test]
+    fn causal_dynamics_re_ranks_only_existing_specialist_actions() {
+        let mut dynamics = CausalDynamicsModel::new(LOCAL_ID);
+        for sample in 1..=40 {
+            let before = context(sample);
+            let hardware = HardwareRegime::from_context(&before);
+            dynamics.observe_action(
+                "boost:Editor",
+                "boost",
+                "coding",
+                &before,
+                WorldStateDelta {
+                    fluidity: 0.06,
+                    pressure: -0.01,
+                    ..WorldStateDelta::default()
+                },
+                4,
+                0.98,
+                before.timestamp_unix + 4,
+                hardware,
+                LOCAL_ID,
+                sample,
+            );
+            dynamics.observe_action(
+                "boost:Browser",
+                "boost",
+                "coding",
+                &before,
+                WorldStateDelta {
+                    fluidity: -0.04,
+                    pressure: 0.01,
+                    ..WorldStateDelta::default()
+                },
+                4,
+                0.98,
+                before.timestamp_unix + 4,
+                hardware,
+                LOCAL_ID,
+                1_000 + sample,
+            );
+        }
+        let mut memory = TemporalMemory::default();
+        let mut latest = context(100);
+        for cycle in 95..=100 {
+            latest = context(cycle);
+            memory.observe(&latest);
+        }
+        let models = HashMap::from([
+            ("boost:Editor".to_string(), model(&latest, 0.02, 0.01)),
+            ("boost:Browser".to_string(), model(&latest, 0.02, 0.01)),
+        ]);
+        let proposed = ["boost:Editor".to_string(), "boost:Browser".to_string()];
+        let plan = plan_temporal_sequence_with_dynamics(
+            &memory,
+            Some(&latest),
+            LOCAL_ID,
+            true,
+            &models,
+            Some(&dynamics),
+            &proposed,
+            "coding",
+        );
+
+        assert_eq!(plan.dynamics_predictions, 2);
+        assert_eq!(plan.dynamics_ranking_predictions, 2);
+        assert_eq!(plan.best_first.as_deref(), Some("boost:Editor"));
+        assert!(plan.action_scores.keys().all(|key| proposed.contains(key)));
+        assert!(plan.dynamics_mean_uncertainty.is_finite());
+    }
+
+    #[test]
+    fn unvalidated_dynamics_is_observed_but_has_zero_planner_influence() {
+        let mut dynamics = CausalDynamicsModel::new(LOCAL_ID);
+        for sample in 1..=6 {
+            let before = context(sample);
+            dynamics.observe_action(
+                "boost:Editor",
+                "boost",
+                "coding",
+                &before,
+                WorldStateDelta {
+                    pressure: 0.50,
+                    fluidity: -0.50,
+                    ..WorldStateDelta::default()
+                },
+                4,
+                0.98,
+                before.timestamp_unix + 4,
+                HardwareRegime::from_context(&before),
+                LOCAL_ID,
+                sample,
+            );
+        }
+        let mut memory = TemporalMemory::default();
+        let mut latest = context(100);
+        for cycle in 95..=100 {
+            latest = context(cycle);
+            memory.observe(&latest);
+        }
+        let models = HashMap::from([("boost:Editor".to_string(), model(&latest, 0.04, 0.04))]);
+        let actions = ["boost:Editor".to_string()];
+        let legacy = plan_temporal_sequence(
+            &memory,
+            Some(&latest),
+            LOCAL_ID,
+            true,
+            &models,
+            &actions,
+            "coding",
+        );
+        let shadow = plan_temporal_sequence_with_dynamics(
+            &memory,
+            Some(&latest),
+            LOCAL_ID,
+            true,
+            &models,
+            Some(&dynamics),
+            &actions,
+            "coding",
+        );
+
+        assert_eq!(shadow.dynamics_predictions, 1);
+        assert_eq!(shadow.dynamics_ranking_predictions, 0);
+        assert_eq!(shadow.dynamics_authoritative_predictions, 0);
+        assert!(!shadow.dynamics_baseline_used);
+        assert!((shadow.expected_gain - legacy.expected_gain).abs() < 1e-12);
+        assert_eq!(shadow.authoritative, legacy.authoritative);
     }
 
     #[test]

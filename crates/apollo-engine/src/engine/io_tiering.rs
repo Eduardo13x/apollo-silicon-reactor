@@ -296,6 +296,62 @@ impl IoShaper {
         changes
     }
 
+    /// Immediately release Apollo's Darwin-background assignment for a small
+    /// foreground family. This is the conservative acceleration path for
+    /// Chromium/Electron: it hands scheduling back to macOS without applying
+    /// explicit task QoS, affinity, jetsam, or signals.
+    pub fn promote_interactive(
+        &mut self,
+        pids: &[u32],
+        mut qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
+    ) -> u32 {
+        let now = Instant::now();
+        let mut changes = 0u32;
+        for &pid in pids {
+            // Only undo a demotion this shaper can prove it owns. Unknown
+            // processes are already under macOS/RunningBoard control, so a
+            // blind clear would be an unmeasurable no-op reported as success.
+            if !self
+                .assignments
+                .get(&pid)
+                .is_some_and(|existing| existing.tier != IOTier::Interactive)
+            {
+                continue;
+            }
+
+            let success = if let Some(ref mut manager) = { qos_mgr.as_deref_mut() } {
+                manager.set_io_tier(pid, IOTier::Interactive as i32)
+                    || apply_io_tier(pid, IOTier::Interactive)
+            } else {
+                apply_io_tier(pid, IOTier::Interactive)
+            };
+            if !success {
+                continue;
+            }
+
+            if self.assignments.len() >= MAX_TRACKED_PIDS && !self.assignments.contains_key(&pid) {
+                if let Some(&oldest_pid) = self
+                    .assignments
+                    .iter()
+                    .min_by_key(|(_, assignment)| assignment.applied_at)
+                    .map(|(tracked_pid, _)| tracked_pid)
+                {
+                    self.assignments.remove(&oldest_pid);
+                }
+            }
+            self.assignments.insert(
+                pid,
+                TierAssignment {
+                    tier: IOTier::Interactive,
+                    applied_at: now,
+                },
+            );
+            self.total_changes = self.total_changes.saturating_add(1);
+            changes = changes.saturating_add(1);
+        }
+        changes
+    }
+
     /// Clean up entries for PIDs that no longer exist.
     pub fn gc(&mut self) {
         let now = Instant::now();
@@ -338,6 +394,23 @@ mod tests {
     fn shaper_new() {
         let shaper = IoShaper::new();
         assert_eq!(shaper.tracked_pids(), 0);
+        assert_eq!(shaper.total_changes, 0);
+    }
+
+    #[test]
+    fn recent_interactive_assignment_does_not_need_reapply() {
+        let mut shaper = IoShaper::new();
+        shaper.assignments.insert(
+            42,
+            TierAssignment {
+                tier: IOTier::Interactive,
+                applied_at: Instant::now(),
+            },
+        );
+
+        assert_eq!(shaper.promote_interactive(&[42], None), 0);
+        assert_eq!(shaper.total_changes, 0);
+        assert_eq!(shaper.promote_interactive(&[43], None), 0);
         assert_eq!(shaper.total_changes, 0);
     }
 

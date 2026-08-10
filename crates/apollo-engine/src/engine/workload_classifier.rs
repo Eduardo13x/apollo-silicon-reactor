@@ -440,6 +440,16 @@ impl WorkloadMode {
         }
     }
 
+    /// Stable compact code used by persisted contextual learning records.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Idle => 0,
+            Self::Build => 1,
+            Self::LlmInference => 2,
+            Self::Browsing => 3,
+        }
+    }
+
     /// Threshold bonus for overflow_guard. Negative = more conservative.
     pub fn threshold_bonus(&self) -> f64 {
         match self {

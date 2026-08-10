@@ -98,6 +98,7 @@ pub fn is_protected_action_candidate(
 /// - `experience` — ExperienceMemory for Cable 2 throttle outcome gate
 /// - `experience_pressure_band` — learnable_params band for query_similar_with_band
 /// - `current_pressure` — raw memory pressure (snapshot.pressure.memory_pressure)
+/// - `current_workload` — workload code captured for contextual episode replay
 #[allow(clippy::too_many_arguments)]
 pub fn run_heuristic_pass(
     proc_snaps: &[ProcessSnapshot],
@@ -116,6 +117,7 @@ pub fn run_heuristic_pass(
     experience: &ExperienceMemory,
     experience_pressure_band: f64,
     current_pressure: f64,
+    current_workload: u8,
     total_ram_bytes: u64,
     recently_applied: &RecentlyApplied,
     apple_platform_pids: &HashSet<u32>,
@@ -311,10 +313,11 @@ pub fn run_heuristic_pass(
         .into_iter()
         .filter(|a| {
             if let RootAction::ThrottleProcess { ref name, .. } = a {
-                if let Some((avg_drop, confidence)) = experience.query_similar_with_band(
+                if let Some((avg_drop, confidence)) = experience.query_similar_contextual(
                     name,
                     current_pressure,
                     experience_pressure_band,
+                    current_workload,
                 ) {
                     if confidence >= 0.5 && avg_drop <= 0.0 {
                         return false;

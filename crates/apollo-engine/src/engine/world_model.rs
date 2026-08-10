@@ -26,18 +26,20 @@
 //! - [Camacho 2007] MPC — act only when the predicted trajectory under
 //!   action improves on the free response.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::engine::causal_dynamics::{CausalDynamicsMetrics, CausalDynamicsModel};
 use crate::engine::causal_graph::CausalGraph;
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::outcome_tracker::OutcomeTracker;
 use crate::engine::telemetry_medallion::{
-    ActionModelStats, TelemetryContextSummary, TrustedTelemetryView,
+    ActionModelStats, ActuatorEpisodeContext, ControlledCounterfactualStats, EvidenceTier,
+    ResolvedActuatorEvidence, TelemetryContextSummary, TrustedTelemetryView,
 };
 use crate::engine::world_model_sequence::{
-    plan_temporal_sequence, TemporalMemory, TemporalSequencePlan,
+    plan_temporal_sequence_with_dynamics, TemporalMemory, TemporalSequencePlan,
 };
 
 /// Minimum causal-edge evidence before a prediction is trusted enough to
@@ -61,6 +63,15 @@ const MIN_UTILITY_DATA_QUALITY: f64 = 0.85;
 const UTILITY_CONFIDENCE_Z: f64 = 1.96;
 const UTILITY_VARIANCE_FLOOR: f64 = 0.0001;
 const UTILITY_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
+const MIN_COUNTERFACTUAL_EVIDENCE: u32 = 3;
+const MIN_COUNTERFACTUAL_QUALITY: f64 = 0.85;
+const COUNTERFACTUAL_MAX_RANK_SUPPORT: f64 = 0.01;
+const EPISODIC_MAX_AGE_SECS: i64 = 14 * 24 * 60 * 60;
+const EPISODIC_MIN_QUALITY: f64 = 0.85;
+const EPISODIC_MIN_SIMILARITY: f64 = 0.55;
+const EPISODIC_NEIGHBORS: usize = 8;
+const EPISODIC_MAX_RANK_SUPPORT: f64 = 0.012;
+type EpisodicNeighbor = (f64, f64, f64, bool, f64);
 
 /// The model's verdict for a candidate action.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,6 +129,43 @@ pub struct UtilityAssessment {
     pub upper_bound: f64,
     pub effective_evidence: f64,
     pub quality: f64,
+    /// Bounded ranking-only support from an exact same-workload control arm.
+    /// It never changes the authoritative utility verdict.
+    pub counterfactual_support: f64,
+    pub counterfactual_observations: u32,
+    /// Context-nearest outcomes from any universal actuator family. This is a
+    /// ranking hint only and never changes the authoritative utility verdict.
+    pub episodic_support: f64,
+    pub episodic_observations: u32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EpisodicRecall {
+    pub expected_utility: f64,
+    pub rank_support: f64,
+    pub observations: u32,
+    pub exact_observations: u32,
+    pub mean_similarity: f64,
+}
+
+/// Bounded, context-sensitive preference for an action already proposed by a
+/// specialist. The score is deliberately unitless and capped to `[-1, 1]` so
+/// external actuator lanes can map it into their own narrow parameter bands.
+/// It never authorizes an action or bypasses a specialist gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ContextualActionBias {
+    pub score: f64,
+    pub model_observations: u32,
+    pub episodic_observations: u32,
+    /// True only when a mature exact/workload utility model contributed.
+    pub authoritative: bool,
+}
+
+impl ContextualActionBias {
+    pub fn is_informative(self) -> bool {
+        self.score.abs() > f64::EPSILON
+            && (self.model_observations > 0 || self.episodic_observations > 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -215,15 +263,22 @@ pub struct WorldModel {
     /// Action key -> (counterfactual-adjusted utility EMA, data quality,
     /// Gold observations). Populated from the universal actuator medallion.
     utility_predicted: HashMap<String, ActionModelStats>,
+    controlled_predicted: HashMap<String, ControlledCounterfactualStats>,
+    episodic_evidence: Vec<ResolvedActuatorEvidence>,
+    episodic_revision: Option<(usize, u64)>,
+    episodic_families: usize,
     causal_revision: Option<u64>,
     causal_workload: String,
     causal_debias_bits: u32,
     utility_revision: Option<u64>,
+    controlled_revision: Option<u64>,
     causal_refreshes: u64,
     causal_cache_hits: u64,
     utility_refreshes: u64,
     utility_cache_hits: u64,
     temporal_memory: TemporalMemory,
+    causal_dynamics: CausalDynamicsModel,
+    causal_dynamics_revision: Option<u64>,
 }
 
 impl WorldModel {
@@ -388,6 +443,9 @@ impl WorldModel {
             && self.current_installation_id != view.installation_id
         {
             self.temporal_memory.clear();
+            self.episodic_evidence.clear();
+            self.episodic_revision = None;
+            self.causal_dynamics_revision = None;
         }
         self.context_bronze = view.metrics.bronze_total;
         self.context_silver = view.metrics.silver_total;
@@ -397,6 +455,10 @@ impl WorldModel {
         self.current_installation_id = view.installation_id;
         if let Some(context) = view.current {
             self.temporal_memory.observe(context);
+        }
+        if self.causal_dynamics_revision != Some(view.causal_dynamics_revision) {
+            self.causal_dynamics = view.causal_dynamics.clone();
+            self.causal_dynamics_revision = Some(view.causal_dynamics_revision);
         }
         if self.utility_revision == Some(view.action_models_revision) {
             self.utility_cache_hits = self.utility_cache_hits.saturating_add(1);
@@ -409,6 +471,37 @@ impl WorldModel {
             );
             self.utility_revision = Some(view.action_models_revision);
             self.utility_refreshes = self.utility_refreshes.saturating_add(1);
+        }
+        let episodic_revision = (
+            view.episodic_evidence.len(),
+            view.episodic_evidence
+                .back()
+                .map_or(0, |evidence| evidence.id),
+        );
+        if self.episodic_revision != Some(episodic_revision) {
+            self.episodic_evidence.clear();
+            self.episodic_evidence.extend(
+                view.episodic_evidence
+                    .iter()
+                    .filter(|evidence| evidence.tier != EvidenceTier::Bronze)
+                    .cloned(),
+            );
+            self.episodic_families = self
+                .episodic_evidence
+                .iter()
+                .map(|evidence| evidence.family)
+                .collect::<HashSet<_>>()
+                .len();
+            self.episodic_revision = Some(episodic_revision);
+        }
+        if self.controlled_revision != Some(view.controlled_models_revision) {
+            self.controlled_predicted.clear();
+            self.controlled_predicted.extend(
+                view.controlled_models
+                    .iter()
+                    .map(|(key, stats)| (key.clone(), stats.clone())),
+            );
+            self.controlled_revision = Some(view.controlled_models_revision);
         }
         self.authority_phase = if self.latest_context.is_none() {
             if local_gold_total == 0 {
@@ -522,6 +615,12 @@ impl WorldModel {
         } else {
             UtilityImagined::Unknown
         };
+        let (counterfactual_support, counterfactual_observations) = self
+            .counterfactual_rank_support(action_key, workload, now_unix)
+            .unwrap_or((0.0, 0));
+        let episodic = self
+            .recall_similar_episodes(action_key, workload)
+            .unwrap_or_default();
         UtilityAssessmentResult::Assessed(UtilityAssessment {
             verdict,
             scope,
@@ -530,7 +629,228 @@ impl WorldModel {
             upper_bound: upper,
             effective_evidence,
             quality: stats.quality_ema,
+            counterfactual_support,
+            counterfactual_observations,
+            episodic_support: episodic.rank_support,
+            episodic_observations: episodic.observations,
         })
+    }
+
+    /// Recall bounded, same-machine outcomes from contexts closest to the
+    /// current one. Exact action episodes dominate; same-family episodes are
+    /// deliberately shrunk and can only influence planner ordering.
+    pub fn recall_similar_episodes(
+        &self,
+        action_key: &str,
+        workload: &str,
+    ) -> Option<EpisodicRecall> {
+        let current = self.latest_context.as_ref()?;
+        let current_episode = ActuatorEpisodeContext::from_telemetry(current);
+        if !current_episode.valid || !self.current_installation_id.is_known() {
+            return None;
+        }
+        let family = action_key.split_once(':')?.0;
+        let now_unix = current.timestamp_unix;
+        let mut neighbors: [Option<EpisodicNeighbor>; EPISODIC_NEIGHBORS] =
+            [None; EPISODIC_NEIGHBORS];
+        let mut neighbor_len = 0_usize;
+        for evidence in &self.episodic_evidence {
+            if evidence.tier == EvidenceTier::Bronze
+                || evidence.quality < EPISODIC_MIN_QUALITY
+                || evidence.confounder_count > 2
+                || !evidence.net_utility_delta.is_finite()
+                || !evidence.context_before.valid
+                || evidence.installation_id != self.current_installation_id
+                || !evidence.hardware_regime.matches_context(current)
+                || evidence.resolved_timestamp_unix <= 0
+                || now_unix < evidence.resolved_timestamp_unix
+                || now_unix - evidence.resolved_timestamp_unix > EPISODIC_MAX_AGE_SECS
+            {
+                continue;
+            }
+            let exact = evidence.action_key == action_key;
+            if !exact && evidence.family.as_str() != family {
+                continue;
+            }
+            let similarity = episode_similarity(current_episode, evidence.context_before);
+            if similarity < EPISODIC_MIN_SIMILARITY {
+                continue;
+            }
+            let scope_weight = if exact { 1.0 } else { 0.30 };
+            let tier_weight = if evidence.tier == EvidenceTier::Gold {
+                1.0
+            } else {
+                0.35
+            };
+            let workload_weight = if evidence.workload == workload {
+                1.0
+            } else {
+                0.55
+            };
+            let age_secs = (now_unix - evidence.resolved_timestamp_unix).max(0) as f64;
+            let recency = 0.5_f64.powf(age_secs / (7.0 * 24.0 * 60.0 * 60.0));
+            let weight = similarity.powi(2)
+                * evidence.quality
+                * scope_weight
+                * tier_weight
+                * workload_weight
+                * recency;
+            let candidate = (
+                similarity,
+                weight,
+                evidence.net_utility_delta,
+                exact,
+                tier_weight,
+            );
+            let index = (0..neighbor_len)
+                .find(|&index| neighbors[index].is_some_and(|neighbor| neighbor.1 < weight))
+                .unwrap_or(neighbor_len);
+            if index < EPISODIC_NEIGHBORS {
+                let new_len = neighbor_len.saturating_add(1).min(EPISODIC_NEIGHBORS);
+                for destination in (index + 1..new_len).rev() {
+                    neighbors[destination] = neighbors[destination - 1];
+                }
+                neighbors[index] = Some(candidate);
+                neighbor_len = new_len;
+            }
+        }
+        if neighbor_len < 2 {
+            return None;
+        }
+        let weight_sum = neighbors
+            .iter()
+            .take(neighbor_len)
+            .flatten()
+            .map(|(_, weight, _, _, _)| weight)
+            .sum::<f64>();
+        if weight_sum <= f64::EPSILON {
+            return None;
+        }
+        let expected_utility = neighbors
+            .iter()
+            .take(neighbor_len)
+            .flatten()
+            .map(|(_, weight, utility, _, _)| weight * utility)
+            .sum::<f64>()
+            / weight_sum;
+        let mean_similarity = neighbors
+            .iter()
+            .take(neighbor_len)
+            .flatten()
+            .map(|(similarity, weight, _, _, _)| similarity * weight)
+            .sum::<f64>()
+            / weight_sum;
+        let maturity = neighbor_len as f64 / (neighbor_len as f64 + 3.0);
+        let exact_observations = neighbors
+            .iter()
+            .take(neighbor_len)
+            .flatten()
+            .filter(|(_, _, _, exact, _)| *exact)
+            .count() as u32;
+        let exact_fraction = exact_observations as f64 / neighbor_len as f64;
+        let scope_strength = 0.30 + 0.70 * exact_fraction;
+        let tier_strength = neighbors
+            .iter()
+            .take(neighbor_len)
+            .flatten()
+            .map(|(_, weight, _, _, tier)| weight * tier)
+            .sum::<f64>()
+            / weight_sum;
+        let rank_support =
+            (expected_utility * mean_similarity * maturity * scope_strength * tier_strength)
+                .clamp(-EPISODIC_MAX_RANK_SUPPORT, EPISODIC_MAX_RANK_SUPPORT);
+        Some(EpisodicRecall {
+            expected_utility,
+            rank_support,
+            observations: neighbor_len as u32,
+            exact_observations,
+            mean_similarity,
+        })
+    }
+
+    /// Combine mature utility evidence with local context-nearest episodes
+    /// into a small advisory signal. Callers may tune an action they already
+    /// admitted, but must retain their physical, safety, and capability gates.
+    pub fn contextual_action_bias(&self, action_key: &str, workload: &str) -> ContextualActionBias {
+        if let Some(assessment) = self.assess_utility(action_key, workload) {
+            let model_signal = match assessment.verdict {
+                UtilityImagined::ActWins { margin } => (margin / 0.03).clamp(0.0, 1.0),
+                UtilityImagined::DoNothingDominates { predicted_utility } => {
+                    (predicted_utility / 0.03).clamp(-1.0, 0.0)
+                }
+                UtilityImagined::Unknown => 0.0,
+            };
+            let model_weight = if assessment.verdict == UtilityImagined::Unknown {
+                0.0
+            } else {
+                (assessment.effective_evidence / (assessment.effective_evidence + 10.0))
+                    * assessment.quality.clamp(0.0, 1.0)
+            };
+            let episode_signal =
+                (assessment.episodic_support / EPISODIC_MAX_RANK_SUPPORT).clamp(-1.0, 1.0);
+            let episode_weight = if assessment.episodic_observations > 0 {
+                let observations = f64::from(assessment.episodic_observations);
+                0.35 * observations / (observations + 3.0)
+            } else {
+                0.0
+            };
+            let total_weight = model_weight + episode_weight;
+            let score = if total_weight > f64::EPSILON {
+                (model_signal * model_weight + episode_signal * episode_weight) / total_weight
+            } else {
+                0.0
+            };
+            return ContextualActionBias {
+                score: score.clamp(-1.0, 1.0),
+                model_observations: assessment
+                    .effective_evidence
+                    .round()
+                    .clamp(0.0, f64::from(u32::MAX)) as u32,
+                episodic_observations: assessment.episodic_observations,
+                authoritative: assessment.verdict != UtilityImagined::Unknown,
+            };
+        }
+
+        let Some(episodic) = self.recall_similar_episodes(action_key, workload) else {
+            return ContextualActionBias::default();
+        };
+        ContextualActionBias {
+            score: (episodic.rank_support / EPISODIC_MAX_RANK_SUPPORT).clamp(-1.0, 1.0),
+            model_observations: 0,
+            episodic_observations: episodic.observations,
+            authoritative: false,
+        }
+    }
+
+    fn counterfactual_rank_support(
+        &self,
+        action_key: &str,
+        workload: &str,
+        now_unix: i64,
+    ) -> Option<(f64, u32)> {
+        let context = self.latest_context.as_ref()?;
+        let stats = self
+            .controlled_predicted
+            .get(&format!("{workload}|{action_key}"))?;
+        if stats.observations < MIN_COUNTERFACTUAL_EVIDENCE
+            || stats.quality_ema < MIN_COUNTERFACTUAL_QUALITY
+            || stats.last_observed_unix <= 0
+            || now_unix < stats.last_observed_unix
+            || now_unix - stats.last_observed_unix > UTILITY_MAX_AGE_SECS
+            || !self.current_installation_id.is_known()
+            || stats.installation_id != self.current_installation_id
+            || !stats.hardware_regime.matches_context(context)
+        {
+            return None;
+        }
+        let maturity = stats.observations as f64 / (stats.observations as f64 + 4.0);
+        let help_rate = stats.would_have_helped as f64 / stats.observations as f64;
+        let directional = (help_rate * 2.0 - 1.0) * DOMINANCE_MARGIN;
+        let support = ((-stats.control_utility_ema * 0.80 + directional * 0.20) * maturity).clamp(
+            -COUNTERFACTUAL_MAX_RANK_SUPPORT,
+            COUNTERFACTUAL_MAX_RANK_SUPPORT,
+        );
+        Some((support, stats.observations))
     }
 
     /// Return a same-installation, same-hardware family prior for ranking.
@@ -641,12 +961,13 @@ impl WorldModel {
         action_keys: &[String],
         workload: &str,
     ) -> TemporalSequencePlan {
-        plan_temporal_sequence(
+        plan_temporal_sequence_with_dynamics(
             &self.temporal_memory,
             self.latest_context.as_ref(),
             self.current_installation_id,
             self.authority_phase == ModelAuthorityPhase::Trusted,
             &self.utility_predicted,
+            Some(&self.causal_dynamics),
             action_keys,
             workload,
         )
@@ -654,6 +975,18 @@ impl WorldModel {
 
     pub fn temporal_memory_samples(&self) -> usize {
         self.temporal_memory.samples()
+    }
+
+    pub fn episodic_memory_samples(&self) -> usize {
+        self.episodic_evidence.len()
+    }
+
+    pub fn episodic_memory_families(&self) -> usize {
+        self.episodic_families
+    }
+
+    pub fn causal_dynamics_metrics(&self) -> CausalDynamicsMetrics {
+        self.causal_dynamics.metrics(self.latest_context.as_ref())
     }
 
     pub fn authority_phase(&self) -> ModelAuthorityPhase {
@@ -689,6 +1022,94 @@ fn utility_model_ready(
     installation_id: InstallationId,
 ) -> bool {
     utility_model_status(stats, now_unix, context, installation_id, true).is_ok()
+}
+
+fn episode_similarity(left: ActuatorEpisodeContext, right: ActuatorEpisodeContext) -> f64 {
+    if !left.valid || !right.valid || !left.is_finite() || !right.is_finite() {
+        return 0.0;
+    }
+    let scalar_distance = [
+        (left.memory_pressure, right.memory_pressure, 2.0),
+        (left.compressor_pressure, right.compressor_pressure, 1.25),
+        (left.thrashing_score, right.thrashing_score, 1.5),
+        (left.cpu_global_usage, right.cpu_global_usage, 1.0),
+        (left.cpu_max_busy, right.cpu_max_busy, 1.0),
+        (left.cpu_pegged_fraction, right.cpu_pegged_fraction, 1.25),
+        (left.stall_fraction, right.stall_fraction, 1.25),
+        (left.used_ram_fraction, right.used_ram_fraction, 0.75),
+        (left.thermal_score, right.thermal_score, 1.0),
+        (left.fluidity_score, right.fluidity_score, 2.0),
+        (
+            left.windowserver_cpu_fraction,
+            right.windowserver_cpu_fraction,
+            1.5,
+        ),
+        (left.arousal_level, right.arousal_level, 0.75),
+        (
+            left.markov_prediction_confidence,
+            right.markov_prediction_confidence,
+            0.75,
+        ),
+        (
+            left.network_retransmit_fraction,
+            right.network_retransmit_fraction,
+            0.75,
+        ),
+        (left.network_drop_rate, right.network_drop_rate, 0.75),
+        (
+            left.package_power_fraction,
+            right.package_power_fraction,
+            0.75,
+        ),
+        (left.p_cluster_util, right.p_cluster_util, 0.75),
+        (left.e_cluster_util, right.e_cluster_util, 0.75),
+        (left.ane_util_fraction, right.ane_util_fraction, 0.50),
+        (left.user_idle_fraction, right.user_idle_fraction, 0.75),
+    ];
+    let mut distance = 0.0;
+    let mut weight = 0.0;
+    for (a, b, dimension_weight) in scalar_distance {
+        distance += (a - b).abs().min(1.0) * dimension_weight;
+        weight += dimension_weight;
+    }
+    for (a, b, dimension_weight) in [
+        (left.app_launching, right.app_launching, 0.75),
+        (left.window_op_active, right.window_op_active, 0.75),
+        (left.foreground_idle, right.foreground_idle, 0.50),
+        (
+            left.user_call_in_progress,
+            right.user_call_in_progress,
+            0.75,
+        ),
+        (left.user_audio_active, right.user_audio_active, 0.50),
+        (
+            left.markov_prewarm_active,
+            right.markov_prewarm_active,
+            0.50,
+        ),
+        (
+            left.predictive_agent_active,
+            right.predictive_agent_active,
+            0.50,
+        ),
+    ] {
+        distance += f64::from(a != b) * dimension_weight;
+        weight += dimension_weight;
+    }
+    for (a, b, dimension_weight) in [
+        (left.foreground_app_hash, right.foreground_app_hash, 1.25),
+        (
+            left.effective_profile_hash,
+            right.effective_profile_hash,
+            0.75,
+        ),
+    ] {
+        if a != 0 && b != 0 {
+            distance += f64::from(a != b) * dimension_weight;
+            weight += dimension_weight;
+        }
+    }
+    (1.0 - distance / weight.max(f64::EPSILON)).clamp(0.0, 1.0)
 }
 
 fn utility_model_status(
@@ -738,10 +1159,11 @@ mod tests {
     use super::*;
     use crate::engine::installation_identity::InstallationId;
     use crate::engine::telemetry_medallion::{
-        HardwareRegime, TelemetryMedallion, TelemetryMedallionMetrics, TrustedTelemetryView,
+        ActuatorFamily, ActuatorObjective, HardwareRegime, TelemetryMedallion,
+        TelemetryMedallionMetrics, TrustedTelemetryView,
     };
     use chrono::Utc;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::time::{Duration, Instant};
 
     const LOCAL_ID: InstallationId = InstallationId(0x1020_3040_5060_7080);
@@ -783,6 +1205,40 @@ mod tests {
         }
     }
 
+    fn episode(
+        id: u64,
+        family: ActuatorFamily,
+        action_key: &str,
+        utility: f64,
+        context: &TelemetryContextSummary,
+        installation_id: InstallationId,
+    ) -> ResolvedActuatorEvidence {
+        ResolvedActuatorEvidence {
+            id,
+            family,
+            objective: ActuatorObjective::Responsiveness,
+            action_key: action_key.to_string(),
+            target: action_key.to_string(),
+            workload: context.workload.clone(),
+            issued_cycle: context.cycle.saturating_sub(3),
+            resolved_cycle: context.cycle,
+            resolved_timestamp_unix: context.timestamp_unix.saturating_sub(1),
+            hardware_regime: HardwareRegime::from_context(context),
+            installation_id,
+            horizon_cycles: 3,
+            tier: EvidenceTier::Gold,
+            quality: 0.96,
+            raw_utility_delta: utility,
+            counterfactual_delta: 0.0,
+            net_utility_delta: utility,
+            net_state_delta: Default::default(),
+            context_before: ActuatorEpisodeContext::from_telemetry(context),
+            effective: utility > 0.0,
+            confounder_count: 0,
+            target_present_after: Some(true),
+        }
+    }
+
     fn attach_view(
         model: &mut WorldModel,
         context: Option<&TelemetryContextSummary>,
@@ -794,6 +1250,11 @@ mod tests {
             installation_id: LOCAL_ID,
             action_models: models,
             action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: local_gold_total,
                 gold_total: local_gold_total,
@@ -835,6 +1296,11 @@ mod tests {
             installation_id: LOCAL_ID,
             action_models: &models,
             action_models_revision: 2,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 bronze_total: 1,
                 gold_total: 1,
@@ -843,6 +1309,235 @@ mod tests {
             },
         });
         assert_eq!(model.authority_phase(), ModelAuthorityPhase::Trusted);
+    }
+
+    #[test]
+    fn episodic_recall_is_contextual_and_universal_across_actuator_families() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let mut episodes = VecDeque::from([
+            episode(
+                1,
+                ActuatorFamily::InteractionQos,
+                "interaction_qos:foreground",
+                0.04,
+                &context,
+                LOCAL_ID,
+            ),
+            episode(
+                2,
+                ActuatorFamily::InteractionQos,
+                "interaction_qos:foreground",
+                0.06,
+                &context,
+                LOCAL_ID,
+            ),
+            episode(
+                3,
+                ActuatorFamily::InteractionQos,
+                "interaction_qos:other",
+                0.03,
+                &context,
+                LOCAL_ID,
+            ),
+            episode(
+                4,
+                ActuatorFamily::MarkovPrewarm,
+                "markov_prewarm:predicted_app",
+                -0.08,
+                &context,
+                LOCAL_ID,
+            ),
+            episode(
+                5,
+                ActuatorFamily::MarkovPrewarm,
+                "markov_prewarm:predicted_app",
+                -0.06,
+                &context,
+                LOCAL_ID,
+            ),
+        ]);
+        for id in 6..=7 {
+            let mut io = episode(
+                id,
+                ActuatorFamily::IoShaping,
+                "io_shaping:foreground",
+                0.04,
+                &context,
+                LOCAL_ID,
+            );
+            io.tier = EvidenceTier::Silver;
+            io.confounder_count = 1;
+            episodes.push_back(io);
+        }
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id: LOCAL_ID,
+            action_models: &BTreeMap::new(),
+            action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &episodes,
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: episodes.len() as u64,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        let qos = model
+            .recall_similar_episodes("interaction_qos:foreground", "build")
+            .expect("QoS episodes");
+        assert_eq!(qos.observations, 3);
+        assert_eq!(qos.exact_observations, 2);
+        assert!(qos.expected_utility > 0.0);
+        assert!(qos.rank_support > 0.0);
+        assert!(qos.rank_support <= EPISODIC_MAX_RANK_SUPPORT);
+
+        let prewarm = model
+            .recall_similar_episodes("markov_prewarm:predicted_app", "build")
+            .expect("prewarm episodes");
+        assert_eq!(prewarm.observations, 2);
+        assert!(prewarm.expected_utility < 0.0);
+        assert!(prewarm.rank_support < 0.0);
+
+        let io = model
+            .recall_similar_episodes("io_shaping:foreground", "build")
+            .expect("high-quality Silver I/O episodes");
+        assert_eq!(io.observations, 2);
+        assert!(io.rank_support > 0.0);
+        assert!(io.rank_support < qos.rank_support);
+    }
+
+    #[test]
+    fn contextual_bias_combines_mature_models_and_episode_only_advice() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let mut negative = mature_model(now, LOCAL_ID);
+        negative.utility_ema = -0.08;
+        let models = BTreeMap::from([
+            (
+                "interaction_qos:foreground".to_string(),
+                mature_model(now, LOCAL_ID),
+            ),
+            ("markov_prewarm:predicted_app".to_string(), negative),
+        ]);
+        let episodes = VecDeque::from([
+            episode(
+                1,
+                ActuatorFamily::IoShaping,
+                "io_shaping:interactive_release",
+                0.04,
+                &context,
+                LOCAL_ID,
+            ),
+            episode(
+                2,
+                ActuatorFamily::IoShaping,
+                "io_shaping:interactive_release",
+                0.05,
+                &context,
+                LOCAL_ID,
+            ),
+        ]);
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id: LOCAL_ID,
+            action_models: &models,
+            action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &episodes,
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: 22,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        let qos = model.contextual_action_bias("interaction_qos:foreground", "build");
+        assert!(qos.authoritative);
+        assert!(qos.model_observations >= 10);
+        assert!(qos.score > 0.0);
+
+        let markov = model.contextual_action_bias("markov_prewarm:predicted_app", "build");
+        assert!(markov.authoritative);
+        assert!(markov.score < 0.0);
+
+        let io = model.contextual_action_bias("io_shaping:interactive_release", "build");
+        assert!(!io.authoritative);
+        assert_eq!(io.model_observations, 0);
+        assert_eq!(io.episodic_observations, 2);
+        assert!(io.score > 0.0);
+
+        assert_eq!(
+            model.contextual_action_bias("predictive_profile:aggressive", "build"),
+            ContextualActionBias::default()
+        );
+    }
+
+    #[test]
+    fn episodic_recall_rejects_foreign_and_dissimilar_state() {
+        let now = Utc::now().timestamp();
+        let stored = m4_context(now);
+        let mut current = m4_context(now);
+        current.memory_pressure = 1.0;
+        current.compressor_pressure = 1.0;
+        current.thrashing_score = 1.0;
+        current.cpu_global_usage = 1.0;
+        current.cpu_max_busy = 1.0;
+        current.cpu_pegged_fraction = 1.0;
+        current.stall_fraction = 1.0;
+        current.used_ram_fraction = 1.0;
+        current.thermal_score = 1.0;
+        current.fluidity_score = 1.0;
+        current.windowserver_cpu_fraction = 1.0;
+        current.arousal_level = 1.0;
+        current.markov_prediction_confidence = 1.0;
+        current.app_launching = true;
+        current.window_op_active = true;
+        let episodes = VecDeque::from([
+            episode(
+                1,
+                ActuatorFamily::IoShaping,
+                "io_shaping:foreground",
+                1.0,
+                &stored,
+                LOCAL_ID,
+            ),
+            episode(
+                2,
+                ActuatorFamily::IoShaping,
+                "io_shaping:foreground",
+                1.0,
+                &stored,
+                InstallationId(99),
+            ),
+        ]);
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&current),
+            installation_id: LOCAL_ID,
+            action_models: &BTreeMap::new(),
+            action_models_revision: 1,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &episodes,
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: 2,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        assert!(model
+            .recall_similar_episodes("io_shaping:foreground", "build")
+            .is_none());
     }
 
     #[test]
@@ -1268,6 +1963,11 @@ mod tests {
             installation_id: LOCAL_ID,
             action_models: &models,
             action_models_revision: 2,
+            controlled_models: &BTreeMap::new(),
+            controlled_models_revision: 0,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
             metrics: TelemetryMedallionMetrics {
                 local_gold_total: 1,
                 ..TelemetryMedallionMetrics::default()
@@ -1280,6 +1980,109 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn local_control_arm_adds_bounded_ranking_support_without_changing_verdict() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let models = BTreeMap::from([(
+            "build|boost:Editor".to_string(),
+            mature_model(now, LOCAL_ID),
+        )]);
+        let controls = BTreeMap::from([(
+            "build|boost:Editor".to_string(),
+            ControlledCounterfactualStats {
+                observations: 8,
+                would_have_helped: 6,
+                control_utility_ema: -0.04,
+                quality_ema: 0.95,
+                last_cycle: 100,
+                last_observed_unix: now,
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+                installation_id: LOCAL_ID,
+            },
+        )]);
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id: LOCAL_ID,
+            action_models: &models,
+            action_models_revision: 1,
+            controlled_models: &controls,
+            controlled_models_revision: 1,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        let assessment = model
+            .assess_utility("boost:Editor", "build")
+            .expect("mature treatment model");
+        assert!(matches!(
+            assessment.verdict,
+            UtilityImagined::ActWins { .. }
+        ));
+        assert_eq!(assessment.counterfactual_observations, 8);
+        assert!(assessment.counterfactual_support > 0.0);
+        assert!(assessment.counterfactual_support <= COUNTERFACTUAL_MAX_RANK_SUPPORT);
+    }
+
+    #[test]
+    fn foreign_control_arm_never_influences_local_ranking() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let models = BTreeMap::from([(
+            "build|boost:Editor".to_string(),
+            mature_model(now, LOCAL_ID),
+        )]);
+        let controls = BTreeMap::from([(
+            "build|boost:Editor".to_string(),
+            ControlledCounterfactualStats {
+                observations: 20,
+                would_have_helped: 20,
+                control_utility_ema: -1.0,
+                quality_ema: 1.0,
+                last_cycle: 100,
+                last_observed_unix: now,
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+                installation_id: InstallationId(99),
+            },
+        )]);
+        let mut model = WorldModel::default();
+        model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id: LOCAL_ID,
+            action_models: &models,
+            action_models_revision: 1,
+            controlled_models: &controls,
+            controlled_models_revision: 1,
+            episodic_evidence: &VecDeque::new(),
+            causal_dynamics: &CausalDynamicsModel::default(),
+            causal_dynamics_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+
+        let assessment = model
+            .assess_utility("boost:Editor", "build")
+            .expect("mature treatment model");
+        assert_eq!(assessment.counterfactual_observations, 0);
+        assert_eq!(assessment.counterfactual_support, 0.0);
     }
 
     #[test]

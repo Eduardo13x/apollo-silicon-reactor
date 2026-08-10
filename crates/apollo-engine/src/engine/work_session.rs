@@ -1,22 +1,19 @@
 //! Work-session hysteresis — keeps "work mode" latched through a dev session.
 //!
 //! ## Problem
-//! Apollo enters an aggressive "work mode" (boost dev cluster, freeze background
-//! noise, AggressiveRoot profile) when it detects a dev session via
-//! `workload_onset`. But the instant the user closes Claude Code / stops
-//! compiling, the raw workload classifier snaps back to `Idle`, the governor
-//! relaxes, background noise returns — "the zen mode deflates instantly."
+//! Apollo enters a work mode when it detects development activity. Without a
+//! grace window, the instant a build stops the classifier can snap back to Idle
+//! and drop below the profile appropriate for an ongoing development session.
 //!
 //! ## Design
 //! [`WorkSession`] is a tiny, pure hysteresis latch. It records the timestamp of
 //! the last observed dev activity and reports "active" for a grace window after
-//! that — so the profile governor stays aggressive through the whole session and
-//! decays gracefully instead of snapping to Idle.
+//! that. The daemon uses this as a BalancedRoot floor; only a real workload-onset
+//! edge may promote to AggressiveRoot. Calm machines can therefore decay from
+//! aggressive to balanced during the grace period.
 //!
-//! It is purely *additive*: the only lever it touches is the governor's
-//! `workload_onset` input, and it can only ever turn that input ON (latch
-//! aggression), never off. When the latch is inactive, behaviour is identical to
-//! before this module existed.
+//! It is purely *additive*: it extends the governor's dev-session signal and
+//! cannot force a profile below BalancedRoot or create a new aggressive onset.
 //!
 //! ## Battery safety
 //! `battery_low` ALWAYS wins → the latch is forced inactive. We never hold zen

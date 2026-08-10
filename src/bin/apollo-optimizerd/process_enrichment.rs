@@ -832,6 +832,22 @@ mod tests {
     }
 
     #[test]
+    fn global_input_monitor_never_emits_heuristic_throttle() {
+        let cache = RecentlyApplied::new();
+        let decisions = vec![make_decision(
+            972,
+            "bare-modifier-monitor",
+            GovernorDecision::Throttle,
+        )];
+
+        let (actions, stats) =
+            convert_and_merge_heuristic_decisions(&decisions, &[], &HashSet::new(), &cache);
+
+        assert!(actions.is_empty());
+        assert_eq!(stats.throttles, 0);
+    }
+
+    #[test]
     fn actionable_zombie_suspect_remains_in_stability_signal() {
         let cache = RecentlyApplied::new();
         let decisions = vec![make_zombie_decision(12_345, "unprotected-orphan")];

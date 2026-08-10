@@ -26,6 +26,9 @@ pub struct GovernorInput {
     pub interactive_heavy: bool,
     /// Usuario cambió de app 3+ veces en los últimos 5 min → modo burst de cambio de contexto.
     pub context_switch_burst: bool,
+    /// Live arousal estimate (0.0..1.0). Context-switch bursts only justify
+    /// AggressiveRoot while the user is actually active.
+    pub arousal_level: f64,
     /// Workload mode from Phase 3 feature-based classifier (None for backward compat).
     pub workload_mode: Option<WorkloadMode>,
     /// True when workload just transitioned INTO Build mode (cargo/rustc/swift detected).
@@ -301,6 +304,7 @@ impl ProfileGovernor {
         // y ante presión de RAM alta (>70%): con muchas ventanas y RAM alta, subir a
         // aggressive causaría más freezes/throttles justo cuando el sistema más lo necesita.
         if input.context_switch_burst
+            && input.arousal_level >= 0.25
             && !input.thermal_constrained
             && input.ram_pressure < 0.70
             && self.balanced_lock_until.is_none_or(|t| t <= now)
@@ -308,6 +312,14 @@ impl ProfileGovernor {
         {
             target = OptimizationProfile::AggressiveRoot;
             reason = "context-switch-burst".to_string();
+        } else if input.context_switch_burst
+            && input.arousal_level < 0.25
+            && !input.thermal_constrained
+            && input.ram_pressure < 0.70
+            && self.balanced_lock_until.is_none_or(|t| t <= now)
+            && target != OptimizationProfile::AggressiveRoot
+        {
+            reason = "context-switch-burst-suppressed-calm".to_string();
         }
 
         let transition = if target != current {
@@ -346,6 +358,7 @@ impl ProfileGovernor {
             }
         } else {
             self.state.effective_profile = current;
+            self.transition_reason = reason.clone();
             None
         };
 
@@ -487,6 +500,7 @@ mod tests {
             dev_session_active: false,
             interactive_heavy: false,
             context_switch_burst: false,
+            arousal_level: 0.0,
             workload_mode: None,
             workload_onset,
             swap_used_bytes: 0,
@@ -554,6 +568,96 @@ mod tests {
     }
 
     #[test]
+    fn calm_context_switch_burst_does_not_escalate() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        let mut input = low_pressure_input(false);
+        input.context_switch_burst = true;
+        input.arousal_level = 0.15;
+
+        let decision = gov.evaluate(input);
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::BalancedRoot
+        );
+        assert_eq!(
+            decision.transition_reason,
+            "context-switch-burst-suppressed-calm"
+        );
+    }
+
+    #[test]
+    fn active_context_switch_burst_escalates() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        let mut input = low_pressure_input(false);
+        input.context_switch_burst = true;
+        input.arousal_level = 0.60;
+
+        let decision = gov.evaluate(input);
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::AggressiveRoot
+        );
+        assert_eq!(decision.transition_reason, "context-switch-burst");
+    }
+
+    #[test]
+    fn calm_burst_releases_aggressive_after_low_pressure_hysteresis() {
+        let mut gov = make_governor(OptimizationProfile::AggressiveRoot);
+        let mut input = low_pressure_input(false);
+        input.context_switch_burst = true;
+        input.arousal_level = 0.15;
+
+        let mut decision = gov.evaluate(input.clone());
+        for _ in 1..6 {
+            decision = gov.evaluate(input.clone());
+        }
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::BalancedRoot
+        );
+        assert_eq!(
+            decision.transition_reason,
+            "context-switch-burst-suppressed-calm"
+        );
+    }
+
+    #[test]
+    fn calm_burst_does_not_hide_build_onset_reason() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        let mut input = low_pressure_input(true);
+        input.context_switch_burst = true;
+        input.arousal_level = 0.15;
+
+        let decision = gov.evaluate(input);
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::AggressiveRoot
+        );
+        assert_eq!(decision.transition_reason, "build-onset-proactive");
+    }
+
+    #[test]
+    fn calm_burst_does_not_hide_thermal_release_reason() {
+        let mut gov = make_governor(OptimizationProfile::AggressiveRoot);
+        let mut input = low_pressure_input(false);
+        input.context_switch_burst = true;
+        input.arousal_level = 0.15;
+        input.thermal_constrained = true;
+
+        let decision = gov.evaluate(input);
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::BalancedRoot
+        );
+        assert_eq!(decision.transition_reason, "thermal-cap-immediate");
+    }
+
+    #[test]
     fn memory_thrash_crisis_score_clears_aggressive_threshold() {
         // ram=0.67, swap=2.5 GB (8 GB machine thrashing) — score must reach >= 0.72
         let input = GovernorInput {
@@ -565,6 +669,7 @@ mod tests {
             dev_session_active: false,
             interactive_heavy: false,
             context_switch_burst: false,
+            arousal_level: 0.0,
             workload_mode: None,
             workload_onset: false,
             swap_used_bytes: (2.5 * 1024.0 * 1024.0 * 1024.0) as u64,
@@ -594,6 +699,7 @@ mod tests {
             dev_session_active: false,
             interactive_heavy: false,
             context_switch_burst: false,
+            arousal_level: 0.0,
             workload_mode: None,
             workload_onset: false,
             swap_used_bytes: (2.5 * 1024.0 * 1024.0 * 1024.0) as u64,

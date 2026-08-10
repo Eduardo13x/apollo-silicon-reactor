@@ -159,6 +159,10 @@ pub fn protected_processes() -> HashSet<&'static str> {
         // Karabiner keyboard remapper — throttle = key remapping stops mid-session.
         // 36 throttles in prod. User loses custom shortcuts silently.
         "Karabiner-DriverKit-VirtualHIDDevice",
+        // ChatGPT global shortcut monitor. It owns the Double Command trigger and
+        // has no window of its own, so generic background heuristics otherwise
+        // misclassify it as idle work. Throttling can drop the user's hotkey.
+        "bare-modifier-monitor",
         // Code signing integrity daemon — throttle = app launches hang at signature check.
         // 10 throttles in prod. amfid is on the critical path for every app launch.
         "amfid",
@@ -891,6 +895,16 @@ pub fn allowlisted_sysctls_with_ranges() -> Vec<SysctlRange> {
             max: 1000,
         },
         SysctlRange {
+            key: "vm.compressor_eval_period_in_msecs",
+            min: 100,
+            max: 500,
+        },
+        SysctlRange {
+            key: "vm.compressor_sample_min_in_msecs",
+            min: 250,
+            max: 1000,
+        },
+        SysctlRange {
             key: "vm.compressor_sample_min",
             min: 0,
             max: 1000,
@@ -1413,6 +1427,22 @@ mod tests {
     use super::*;
 
     const RAM_8GB: u64 = 8 * 1024 * 1024 * 1024;
+
+    #[test]
+    fn macos_compressor_governor_keys_are_allowlisted_with_narrow_ranges() {
+        let ranges = allowlisted_sysctls_with_ranges();
+        let eval = ranges
+            .iter()
+            .find(|range| range.key == "vm.compressor_eval_period_in_msecs")
+            .expect("governor eval-period key must reach the executor allowlist");
+        let sample = ranges
+            .iter()
+            .find(|range| range.key == "vm.compressor_sample_min_in_msecs")
+            .expect("governor sample-min key must reach the executor allowlist");
+
+        assert_eq!((eval.min, eval.max), (100, 500));
+        assert_eq!((sample.min, sample.max), (250, 1000));
+    }
 
     // ── is_infrastructure_path coverage tests (2026-05-16 adversarial review) ─
 
@@ -2068,6 +2098,14 @@ mod tests {
                 name
             );
         }
+    }
+
+    #[test]
+    fn is_protected_name_covers_global_input_monitors() {
+        assert!(
+            is_protected_name("bare-modifier-monitor"),
+            "global shortcut monitors must never enter throttle or freeze paths"
+        );
     }
 
     /// Tier 2: Infrastructure services must be protected via substring match.

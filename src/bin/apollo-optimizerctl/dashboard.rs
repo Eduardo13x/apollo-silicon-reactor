@@ -187,14 +187,22 @@ fn profile_emoji(p: OptimizationProfile) -> &'static str {
 }
 
 /// Short, current explanation for a profile that differs from its configured
-/// base. `transition_reason` is historical state, so it can be stale after an
-/// override expires; the dashboard should describe live signals instead.
+/// base. The governor refreshes `transition_reason` on every evaluation, so it
+/// takes precedence over raw signals that may have been deliberately gated.
 fn profile_activity_reason(status: &DaemonStatus) -> &'static str {
     if status.override_active {
         "Override manual"
     } else if status.effective_profile == status.base_profile {
         "Base estable"
-    } else if status.metrics.context_switch_burst {
+    } else if status.effective_profile == OptimizationProfile::SafeRoot
+        && status.transition_reason == "steady"
+    {
+        "Auto: ahorro en reposo"
+    } else if status.transition_reason == "context-switch-burst-suppressed-calm" {
+        "Auto: liberando por calma"
+    } else if status.transition_reason == "context-switch-burst"
+        || (status.metrics.context_switch_burst && status.metrics.arousal_level >= 0.25)
+    {
         "Auto: cambios de app"
     } else if status.metrics.dev_session_active {
         "Auto: desarrollo"
@@ -435,6 +443,44 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             ));
         }
     }
+    if m.acceleration_lease_members_applied_total > 0
+        || m.acceleration_lease_io_promotions_total > 0
+    {
+        let family = if m.acceleration_lease_family.is_empty() {
+            m.acceleration_lease_last_family.as_str()
+        } else {
+            m.acceleration_lease_family.as_str()
+        };
+        let family = if family.is_empty() { "idle" } else { family };
+        lines.push(format!(
+            "Lease  {} M{} A{}/R{} I{}",
+            family,
+            m.acceleration_lease_members_active,
+            format_number(m.acceleration_lease_members_applied_total),
+            format_number(m.acceleration_lease_member_reverts_total),
+            format_number(m.acceleration_lease_io_promotions_total),
+        ));
+        lines.push(format!(
+            "       C{} G{} N{} renew{}",
+            format_number(m.acceleration_lease_chromium_total),
+            format_number(m.acceleration_lease_general_total),
+            format_number(m.acceleration_lease_nice_fallbacks_total),
+            format_number(m.acceleration_lease_renewals_total),
+        ));
+        if !m.interaction_qos_ttl_band.is_empty() {
+            lines.push(format!(
+                "       ttl {} {}ms {} exp{}",
+                m.interaction_qos_ttl_band,
+                m.interaction_qos_ttl_ms,
+                if m.interaction_qos_ttl_exploratory {
+                    "probe"
+                } else {
+                    "policy"
+                },
+                format_number(m.interaction_qos_parameter_explorations_total),
+            ));
+        }
+    }
     let authority_phase = match m.world_model_context_authority_phase.as_str() {
         "calibrating" => "calibrating",
         "trusted" => "trusted",
@@ -456,6 +502,60 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             "WM-U+  V{} P{}",
             format_number(m.world_model_utility_vetoes_total),
             format_number(m.world_model_utility_promotions_total)
+        ));
+    }
+    if m.world_model_counterfactual_issued_total > 0
+        || m.world_model_counterfactual_rank_uses_total > 0
+    {
+        lines.push(format!(
+            "CF     R{}/{} H{} rank{}",
+            format_number(m.world_model_counterfactual_resolved_total),
+            format_number(m.world_model_counterfactual_issued_total),
+            format_number(m.world_model_counterfactual_would_help_total),
+            format_number(m.world_model_counterfactual_rank_uses_total)
+        ));
+    }
+    if m.world_model_episodic_memory_samples > 0 || m.world_model_episodic_rank_uses_total > 0 {
+        lines.push(format!(
+            "WM-E   M{} F{} rank{}",
+            format_number(m.world_model_episodic_memory_samples),
+            format_number(m.world_model_episodic_memory_families),
+            format_number(m.world_model_episodic_rank_uses_total)
+        ));
+    }
+    if m.world_model_contextual_markov_total > 0
+        || m.world_model_contextual_interaction_total > 0
+        || m.world_model_contextual_io_total > 0
+        || m.world_model_contextual_predictive_total > 0
+        || m.world_model_contextual_chromium_total > 0
+    {
+        lines.push(format!(
+            "WM-X   K{} Q{} O{} P{} C{}",
+            format_number(m.world_model_contextual_markov_total),
+            format_number(m.world_model_contextual_interaction_total),
+            format_number(m.world_model_contextual_io_total),
+            format_number(m.world_model_contextual_predictive_total),
+            format_number(m.world_model_contextual_chromium_total),
+        ));
+        let family = m.world_model_contextual_last_action.split_once(':').map_or(
+            m.world_model_contextual_last_action.as_str(),
+            |(family, _)| family,
+        );
+        let family = match family {
+            "markov_prewarm" => "markov",
+            "interaction_qos" => "interact",
+            "io_shaping" => "io",
+            "predictive_threshold" => "pred-thresh",
+            "predictive_profile" => "pred-profile",
+            "predictive_prethrottle" => "pred-throttle",
+            "predictive_purge" => "pred-purge",
+            "chromium_ecore" => "chrom-ecore",
+            "chromium_purge" => "chrom-purge",
+            other => other,
+        };
+        lines.push(format!(
+            "       last {} b{:+.2}",
+            family, m.world_model_contextual_last_bias
         ));
     }
     if m.world_model_family_known_models > 0 {
@@ -547,6 +647,35 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             ));
         }
     }
+    if m.world_model_dynamics_action_models > 0 || m.world_model_dynamics_no_action_updates > 0 {
+        let phase = match m.world_model_dynamics_phase.as_str() {
+            "trusted" => "trusted",
+            "shadow" => "shadow",
+            "calibrating" => "calibrating",
+            _ => "protected",
+        };
+        lines.push(format!(
+            "WM-D   {} A{} R{}/{} V{} e{:.1}%",
+            phase,
+            format_number(m.world_model_dynamics_authoritative_models),
+            format_number(m.world_model_dynamics_ranking_models),
+            format_number(m.world_model_dynamics_ready_models),
+            format_number(m.world_model_dynamics_validation_samples),
+            m.world_model_dynamics_validation_mae * 100.0
+        ));
+        if m.world_model_dynamics_predictions_total > 0
+            || m.world_model_dynamics_baseline_uses_total > 0
+        {
+            lines.push(format!(
+                "MPC-D  P{} R{} A{} B{} u{:.1}%",
+                format_number(m.world_model_dynamics_predictions_total),
+                format_number(m.world_model_dynamics_ranking_predictions_total),
+                format_number(m.world_model_dynamics_authoritative_predictions_total),
+                format_number(m.world_model_dynamics_baseline_uses_total),
+                m.world_model_dynamics_mean_uncertainty * 100.0
+            ));
+        }
+    }
     lines.push(format!(
         // This is the pressure-causal imagination model, not the universal
         // actuator-learning stream shown above as `Act` / `Act+`.
@@ -592,6 +721,19 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         "Workload {}",
         m.current_workload.chars().take(20).collect::<String>()
     ));
+    if m.markov_shadow_predictions_total > 0 {
+        lines.push(format!(
+            "Mk-S   H{}/{} P{}{}",
+            format_number(m.markov_shadow_hits),
+            format_number(m.markov_shadow_resolved_total),
+            format_number(m.markov_shadow_predictions_total),
+            if m.markov_shadow_active {
+                " active"
+            } else {
+                ""
+            }
+        ));
+    }
 
     lines
 }
@@ -742,6 +884,11 @@ fn render_act_q(status: &DaemonStatus) -> Vec<String> {
 
     let pkg_w = m.energy_package_watts.unwrap_or(0.0);
     lines.push(format!("Energy {:.2}W", pkg_w));
+    lines.push(format!(
+        "Used   {:.2}Wh {:.2}gCO₂",
+        m.energy_package_wh.unwrap_or(0.0),
+        m.energy_co2_emitted_g.unwrap_or(0.0)
+    ));
     lines.push(format!(
         "Saved  {:.2}Wh {:.2}gCO₂",
         m.energy_savings_wh.unwrap_or(0.0),
@@ -1065,6 +1212,7 @@ mod tests {
         let mut status = dashboard_status();
         status.effective_profile = OptimizationProfile::AggressiveRoot;
         status.metrics.context_switch_burst = true;
+        status.metrics.arousal_level = 0.60;
         status.transition_reason = "manual-override-cleared".to_string();
 
         assert_eq!(profile_activity_reason(&status), "Auto: cambios de app");
@@ -1082,6 +1230,32 @@ mod tests {
         let header = render_header_v2(&status);
         assert!(header[0].contains("activo ⚡ aggressive-root"));
         assert!(header.iter().all(|line| display_width(line) <= CW));
+    }
+
+    #[test]
+    fn dashboard_reports_calm_release_instead_of_raw_context_switch_burst() {
+        let mut status = dashboard_status();
+        status.effective_profile = OptimizationProfile::AggressiveRoot;
+        status.metrics.context_switch_burst = true;
+        status.metrics.arousal_level = 0.15;
+        status.transition_reason = "context-switch-burst-suppressed-calm".to_string();
+
+        assert_eq!(
+            profile_activity_reason(&status),
+            "Auto: liberando por calma"
+        );
+        assert!(render_decide_q(&status)
+            .iter()
+            .any(|line| line == "Motivo  Auto: liberando por calma"));
+    }
+
+    #[test]
+    fn dashboard_explains_safe_root_at_rest() {
+        let mut status = dashboard_status();
+        status.effective_profile = OptimizationProfile::SafeRoot;
+        status.transition_reason = "steady".to_string();
+
+        assert_eq!(profile_activity_reason(&status), "Auto: ahorro en reposo");
     }
 
     #[test]
@@ -1125,6 +1299,24 @@ mod tests {
         status.metrics.world_model_actuator_quality = 0.94;
         status.metrics.world_model_actuator_known_models = 7;
         status.metrics.world_model_actuator_ready_models = 2;
+        status.metrics.world_model_counterfactual_issued_total = 4;
+        status.metrics.world_model_counterfactual_resolved_total = 3;
+        status.metrics.world_model_counterfactual_would_help_total = 2;
+        status.metrics.world_model_counterfactual_rank_uses_total = 7;
+        status.metrics.world_model_episodic_memory_samples = 23;
+        status.metrics.world_model_episodic_memory_families = 6;
+        status.metrics.world_model_episodic_rank_uses_total = 9;
+        status.metrics.world_model_contextual_markov_total = 12;
+        status.metrics.world_model_contextual_interaction_total = 8;
+        status.metrics.world_model_contextual_io_total = 5;
+        status.metrics.world_model_contextual_predictive_total = 42;
+        status.metrics.world_model_contextual_chromium_total = 4;
+        status.metrics.world_model_contextual_last_action =
+            "predictive_threshold:tighten".to_string();
+        status.metrics.world_model_contextual_last_bias = 0.35;
+        status.metrics.markov_shadow_predictions_total = 5;
+        status.metrics.markov_shadow_resolved_total = 4;
+        status.metrics.markov_shadow_hits = 3;
         status.metrics.world_model_causal_actuator_gold_total = 42;
         status.metrics.world_model_temporal_memory_samples = 32;
         status.metrics.world_model_sequence_rollouts_total = 123;
@@ -1132,6 +1324,21 @@ mod tests {
         status.metrics.world_model_sequence_best_first = "boost:Editor".to_string();
         status.metrics.world_model_sequence_best_second =
             "markov_prewarm:predicted_app".to_string();
+        status.metrics.world_model_dynamics_phase = "shadow".to_string();
+        status.metrics.world_model_dynamics_action_models = 9;
+        status.metrics.world_model_dynamics_ready_models = 6;
+        status.metrics.world_model_dynamics_ranking_models = 4;
+        status.metrics.world_model_dynamics_validation_samples = 42;
+        status.metrics.world_model_dynamics_validation_mae = 0.032;
+        status.metrics.world_model_dynamics_predictions_total = 17;
+        status
+            .metrics
+            .world_model_dynamics_ranking_predictions_total = 9;
+        status
+            .metrics
+            .world_model_dynamics_authoritative_predictions_total = 3;
+        status.metrics.world_model_dynamics_baseline_uses_total = 8;
+        status.metrics.world_model_dynamics_mean_uncertainty = 0.071;
         status.metrics.world_model_actuator_families =
             vec![apollo_engine::engine::types::ActuatorEvidenceStatus {
                 family: "boost".to_string(),
@@ -1160,10 +1367,21 @@ mod tests {
         assert!(think.iter().any(|line| line == "       eff 4/6 u+3%"));
         assert!(think.iter().any(|line| line == "WM-U   calibrating 2/7"));
         assert!(think.iter().any(|line| line == "WM-U+  V0 P3"));
+        assert!(think.iter().any(|line| line == "CF     R3/4 H2 rank7"));
+        assert!(think.iter().any(|line| line == "WM-E   M23 F6 rank9"));
+        assert!(think.iter().any(|line| line == "WM-X   K12 Q8 O5 P42 C4"));
+        assert!(think
+            .iter()
+            .any(|line| line == "       last pred-thresh b+0.35"));
+        assert!(think.iter().any(|line| line == "Mk-S   H3/4 P5"));
         assert!(think.iter().any(|line| line == "WM-T   M32 R123 G+2.1%"));
         assert!(think
             .iter()
             .any(|line| line == "Seq-E  boost>markov_prewarm"));
+        assert!(think
+            .iter()
+            .any(|line| line == "WM-D   shadow A0 R4/6 V42 e3.2%"));
+        assert!(think.iter().any(|line| line == "MPC-D  P17 R9 A3 B8 u7.1%"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -1311,5 +1529,19 @@ mod tests {
             total_line.contains("B505") && total_line.contains("F4") && total_line.contains("U1"),
             "cumulative action totals must stay visible: {total_line}"
         );
+    }
+
+    #[test]
+    fn act_quadrant_separates_consumed_and_avoided_co2() {
+        let mut status = dashboard_status();
+        status.metrics.energy_package_wh = Some(8.46);
+        status.metrics.energy_co2_emitted_g = Some(3.30);
+        status.metrics.energy_savings_wh = Some(0.0);
+        status.metrics.energy_co2_avoided_g = Some(0.0);
+
+        let lines = render_act_q(&status);
+
+        assert!(lines.iter().any(|line| line == "Used   8.46Wh 3.30gCO₂"));
+        assert!(lines.iter().any(|line| line == "Saved  0.00Wh 0.00gCO₂"));
     }
 }
