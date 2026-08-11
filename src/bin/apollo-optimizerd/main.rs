@@ -37,6 +37,7 @@ mod daemon_proc_scan_tick;
 mod daemon_process_collector;
 mod daemon_reactor;
 mod daemon_reactor_tick;
+mod daemon_resource_interrupt_tick;
 mod daemon_rusage_tick;
 mod daemon_sensor_tick;
 mod daemon_signal_tick;
@@ -126,8 +127,8 @@ use apollo_engine::engine::sysctl_governor::{
     SysctlGovernor, SysctlGovernorInput, SysctlGovernorStatus,
 };
 use apollo_engine::engine::thermal_interrupt::{
-    resource_interrupt_decision_channel, spawn_resource_sentinel_with_decisions,
-    ResourceInterruptState, SentinelConfig,
+    resource_interrupt_proposal_channel, spawn_resource_sentinel_with_proposals,
+    ResourceInterruptActuationWindow, ResourceInterruptState, SentinelConfig,
 };
 use apollo_engine::engine::types::{
     EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry, FrozenPidEntry,
@@ -1059,11 +1060,12 @@ fn main() -> anyhow::Result<()> {
                 .with_calibration_log(calibration_pb)
                 .spawn();
             }
-            // Resource sentinel: sub-100ms interrupt handler for thermal/memory/power emergencies.
-            // Shares the fg_detector so the sentinel never freezes the active foreground app.
-            let (resource_interrupt_decision_tx, resource_interrupt_decision_rx) =
-                resource_interrupt_decision_channel();
-            let mut resource_sentinel_shutdown = spawn_resource_sentinel_with_decisions(
+            // Resource sentinel: low-latency observer for thermal/memory/power emergencies.
+            // It shares the foreground detector and wakes the loop with bounded proposals.
+            let (resource_interrupt_proposal_tx, resource_interrupt_proposal_rx) =
+                resource_interrupt_proposal_channel(Some(state.cycle_condvar.clone()));
+            let mut resource_interrupt_window = ResourceInterruptActuationWindow::open();
+            let mut resource_sentinel_shutdown = spawn_resource_sentinel_with_proposals(
                 smc_reader.cache_arc(),
                 pressure_collector.cache_arc(),
                 state.resource_interrupt.clone(),
@@ -1073,7 +1075,7 @@ fn main() -> anyhow::Result<()> {
                 fg_detector.clone(),
                 Some(state.mach_qos.clone()),
                 frozen_state_path.clone(),
-                resource_interrupt_decision_tx,
+                resource_interrupt_proposal_tx,
             );
             // Overflow guard: aprende de eventos OOM y ajusta thresholds adaptativamente.
             // SleepNotifier: IOKit pre-sleep callback — fires kIOMessageSystemWillSleep
@@ -1740,7 +1742,23 @@ fn main() -> anyhow::Result<()> {
                 lf_metrics.inc_cycles();
                 let mut cycle_decision_events =
                     apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
-                resource_interrupt_decision_rx.drain_into(cycle_count, &mut cycle_decision_events);
+                {
+                    let pressure = pressure_collector.latest().memory_pressure;
+                    let mut executor = daemon_resource_interrupt_tick::ResourceInterruptExecutor {
+                        state: &state,
+                        caps: &caps,
+                        journal_path: &journal_path,
+                        frozen_state_path: &frozen_state_path,
+                        dry_run,
+                        cycle: cycle_count,
+                        memory_pressure: pressure,
+                    };
+                    let events = executor.execute_batch(
+                        &resource_interrupt_window,
+                        resource_interrupt_proposal_rx.drain(),
+                    );
+                    cycle_decision_events.extend_buffer(&events);
+                }
                 let async_completion_stats =
                     async_commands.drain_decision_events(cycle_count, &mut cycle_decision_events);
                 if async_completion_stats.maintenance_purges_applied > 0
@@ -6713,6 +6731,27 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
+                // Catch proposals emitted while this cycle was running. The
+                // sentinel wakes the existing condvar, so an observation that
+                // arrives after this point starts the next cycle immediately.
+                {
+                    let pressure = pressure_collector.latest().memory_pressure;
+                    let mut executor = daemon_resource_interrupt_tick::ResourceInterruptExecutor {
+                        state: &state,
+                        caps: &caps,
+                        journal_path: &journal_path,
+                        frozen_state_path: &frozen_state_path,
+                        dry_run,
+                        cycle: cycle_count,
+                        memory_pressure: pressure,
+                    };
+                    let events = executor.execute_batch(
+                        &resource_interrupt_window,
+                        resource_interrupt_proposal_rx.drain(),
+                    );
+                    cycle_decision_events.extend_buffer(&events);
+                }
+
                 if let Some(coordinated) =
                     apollo_engine::engine::decision_ledger::coordinated_action_event(
                         &cycle_decision_events,
@@ -6927,16 +6966,28 @@ fn main() -> anyhow::Result<()> {
                 }
             }
 
+            // Structurally close sentinel actuation before shutdown. The
+            // observer can no longer enqueue accepted proposals, and the
+            // loop-owned window can never invoke an executor after this point.
+            resource_interrupt_proposal_rx.close();
+            resource_interrupt_window.close();
+            resource_sentinel_shutdown.request_stop();
+
             // Release speculative kernel state before persisting on shutdown.
             let mut shutdown_decision_events =
                 apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
             let resource_sentinel_quiesced =
                 resource_sentinel_shutdown.quiesce(Duration::from_millis(750));
-            resource_interrupt_decision_rx.drain_into(cycle_count, &mut shutdown_decision_events);
+            let expired_proposals = resource_interrupt_window.resolve(
+                resource_interrupt_proposal_rx.drain(),
+                cycle_count,
+                |_| unreachable!("closed resource-interrupt window invoked executor"),
+            );
+            shutdown_decision_events.extend_buffer(&expired_proposals);
             if !resource_sentinel_quiesced {
                 tracing::warn!(
                     worker_finished = resource_sentinel_shutdown.worker_finished(),
-                    "resource-sentinel: bounded quiescence wait expired; direct-effect authority remains revoked"
+                    "resource-sentinel: bounded observer quiescence wait expired; no background effector exists"
                 );
             }
             if let Some(lease) = last_markov_prethaw.take() {
@@ -7061,8 +7112,6 @@ fn main() -> anyhow::Result<()> {
                     &outcome,
                 ));
             }
-
-            resource_interrupt_decision_rx.drain_into(cycle_count, &mut shutdown_decision_events);
 
             let shutdown_completion_stats =
                 async_commands.finalize_shutdown(cycle_count, &mut shutdown_decision_events);
