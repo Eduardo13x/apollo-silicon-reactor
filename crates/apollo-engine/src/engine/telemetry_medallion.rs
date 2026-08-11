@@ -28,9 +28,10 @@ use crate::engine::installation_identity::InstallationId;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::learning_hierarchy::{HierarchyContext, HierarchyPath, ResolvedLearningDetails};
 use crate::engine::model_calibration::{
-    CalibrationObservation, CalibrationProvenance, CalibrationUpdate, ForegroundContext,
-    ModelCalibrationMetrics, ModelCalibrationPersisted, ModelCalibrationStore,
-    ModelCalibrationSummary, PressureBand, ProcessClass, SeparabilityState, ThermalBand,
+    valid_forecast_deltas, CalibrationActionScope, CalibrationKey, CalibrationObservation,
+    CalibrationProvenance, CalibrationUpdate, ForegroundContext, ModelCalibrationMetrics,
+    ModelCalibrationPersisted, ModelCalibrationStore, ModelCalibrationSummary, PressureBand,
+    ProcessClass, ProducerId, SeparabilityState, ThermalBand, TrustState,
 };
 use crate::engine::predictive_agent::Intervention;
 use crate::engine::signal_intelligence::SignalDigest;
@@ -1238,6 +1239,7 @@ where
 #[derive(Debug)]
 pub struct TelemetryMedallion {
     installation_id: InstallationId,
+    live_hardware_regime: HardwareRegime,
     decision_id_high_water: u64,
     current_tier: ContextTier,
     last_admitted_live: Option<TelemetryContextSummary>,
@@ -1302,6 +1304,7 @@ impl Default for TelemetryMedallion {
     fn default() -> Self {
         Self {
             installation_id: InstallationId::UNKNOWN,
+            live_hardware_regime: HardwareRegime::default(),
             decision_id_high_water: 0,
             current_tier: ContextTier::Rejected,
             last_admitted_live: None,
@@ -1389,6 +1392,10 @@ impl TelemetryMedallion {
             model_calibration: ModelCalibrationStore::new(installation_id),
             ..Self::default()
         }
+    }
+
+    pub fn bind_live_hardware(&mut self, hardware_regime: HardwareRegime) {
+        self.live_hardware_regime = hardware_regime;
     }
 
     /// Admit compact GPU forecasts as Bronze evidence. The Monte Carlo sample
@@ -1968,6 +1975,7 @@ impl TelemetryMedallion {
         }
         self.external_counters = ExternalActuatorCounters::from_runtime(runtime, intervention);
 
+        self.live_hardware_regime = HardwareRegime::from_context(&summary);
         self.latest = Some(summary.clone());
         self.last_admitted_live = Some(summary);
         self.staged_attributions.clear();
@@ -3188,16 +3196,33 @@ impl TelemetryMedallion {
         let persisted_actuator_schema = state.actuator_evidence_schema_version;
         if persisted_actuator_schema > ACTUATOR_EVIDENCE_SCHEMA_VERSION {
             let installation_id = self.installation_id;
+            let live_hardware_regime = self.live_hardware_regime;
             *self = Self::new(installation_id);
+            self.live_hardware_regime = live_hardware_regime;
             self.quarantined_future_state = Some(Box::new(state));
             return;
         }
         self.quarantined_future_state = None;
-        let current_hardware = state
+        let observed_live_hardware = self
             .latest
             .as_ref()
             .map(HardwareRegime::from_context)
             .unwrap_or_default();
+        let live_hardware = if self.live_hardware_regime.is_known() {
+            self.live_hardware_regime
+        } else {
+            observed_live_hardware
+        };
+        let persisted_hardware = state
+            .latest
+            .as_ref()
+            .map(HardwareRegime::from_context)
+            .unwrap_or_default();
+        let current_hardware = if live_hardware.is_known() {
+            live_hardware
+        } else {
+            persisted_hardware
+        };
         let model_calibration = state.model_calibration.take();
         let same_installation =
             state.installation_id.is_known() && state.installation_id == self.installation_id;
@@ -3310,7 +3335,7 @@ impl TelemetryMedallion {
             .into_iter()
             .filter_map(|mut evidence| {
                 evidence.calibration_provenance = evidence.calibration_provenance.bounded();
-                if !valid_learning_details(&evidence, installation_id) {
+                if !valid_learning_details(&evidence, installation_id, live_hardware) {
                     evidence.learning_details = None;
                 }
                 (evidence.tier != EvidenceTier::Bronze
@@ -3382,6 +3407,7 @@ impl TelemetryMedallion {
                     .restore(model_calibration, current_hardware);
             }
         }
+        strip_invalid_restored_trust_chains(&mut self.episodic_evidence, &self.model_calibration);
         self.staged_attributions.clear();
         self.staged_decision_episodes.clear();
         self.no_action_delta_ema = if same_origin {
@@ -3746,9 +3772,10 @@ fn learning_details_for_evidence(
     details.is_authoritative().then_some(details)
 }
 
-fn valid_learning_details(
+pub(crate) fn valid_learning_details(
     evidence: &ResolvedActuatorEvidence,
     installation_id: InstallationId,
+    live_hardware: HardwareRegime,
 ) -> bool {
     let Some(details) = evidence.learning_details.as_ref() else {
         return true;
@@ -3774,6 +3801,8 @@ fn valid_learning_details(
         }
         && details.installation_id == installation_id
         && details.installation_id == evidence.installation_id
+        && live_hardware.is_known()
+        && details.hardware_regime == live_hardware
         && details.hardware_regime == evidence.hardware_regime
         && details.resolved_cycle == evidence.resolved_cycle
         && details.resolved_timestamp_unix == evidence.resolved_timestamp_unix
@@ -3793,6 +3822,56 @@ fn valid_learning_details(
         && (details.quality - evidence.quality).abs() <= f64::EPSILON
         && (details.causal_quality - evidence.quality).abs() <= f64::EPSILON
         && details.confounder_count == evidence.confounder_count
+        && valid_forecast_deltas(
+            &calibration_observation(evidence),
+            &details.calibration_deltas,
+        )
+}
+
+fn strip_invalid_restored_trust_chains(
+    evidence: &mut VecDeque<ResolvedActuatorEvidence>,
+    calibration: &ModelCalibrationStore,
+) {
+    let mut chains: BTreeMap<
+        (ProducerId, CalibrationActionScope),
+        Vec<(DecisionId, TrustState, TrustState, CalibrationKey)>,
+    > = BTreeMap::new();
+    for episode in evidence.iter() {
+        let Some(details) = episode.learning_details.as_ref() else {
+            continue;
+        };
+        for delta in &details.calibration_deltas {
+            chains
+                .entry((delta.key.producer, delta.key.action.clone()))
+                .or_default()
+                .push((
+                    details.decision_id,
+                    delta.trust_before,
+                    delta.trust_after,
+                    delta.key.clone(),
+                ));
+        }
+    }
+
+    let mut invalid = BTreeSet::new();
+    for chain in chains.values() {
+        let continuous = chain.windows(2).all(|pair| pair[0].2 == pair[1].1);
+        let anchored = chain.last().is_some_and(|(_, _, trust_after, key)| {
+            calibration.record(key).is_some() && calibration.trust_for(key) == *trust_after
+        });
+        if !continuous || !anchored {
+            invalid.extend(chain.iter().map(|(decision_id, ..)| *decision_id));
+        }
+    }
+    for episode in evidence {
+        if episode
+            .learning_details
+            .as_ref()
+            .is_some_and(|details| invalid.contains(&details.decision_id))
+        {
+            episode.learning_details = None;
+        }
+    }
 }
 
 fn calibration_observation(evidence: &ResolvedActuatorEvidence) -> CalibrationObservation<'_> {
@@ -4725,6 +4804,84 @@ mod tests {
             .expect("resolved ledger episode")
     }
 
+    fn rich_restore_snapshot() -> TelemetryMedallionPersisted {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        let event = ActuatorDecisionEvent::local(
+            "predictive_threshold:tighten",
+            "predictive_threshold:tighten",
+            1,
+            ActuatorDecisionOutcome::Applied,
+            "predictive-agent",
+            "Task 4 restore review fixture",
+        )
+        .with_prediction(PredictionRecord {
+            source: "world-model".to_string(),
+            expected_utility: 0.03,
+            uncertainty: 0.25,
+            horizon_cycles: 10,
+            positive_probability: Some(0.6),
+            binary_target: Some(BinaryPredictionTarget::Effective),
+        });
+        let mut events = CycleDecisionEvents::default();
+        events.push(event);
+        let episodes = DecisionLedger::new().ingest_cycle_events(&mut events);
+        medallion.stage_decision_episodes(&episodes);
+        for cycle in 2..=11 {
+            observe(&mut medallion, cycle, &ExecuteOutcomes::default(), &runtime);
+        }
+        let snapshot = medallion.snapshot();
+        assert!(snapshot.episodic_evidence.iter().any(|evidence| {
+            evidence
+                .learning_details
+                .as_ref()
+                .is_some_and(ResolvedLearningDetails::is_authoritative)
+        }));
+        snapshot
+    }
+
+    #[test]
+    fn task4_review_forged_calibration_delta_is_stripped_on_restore() {
+        let mut persisted = rich_restore_snapshot();
+        let evidence = persisted
+            .episodic_evidence
+            .iter_mut()
+            .find(|evidence| evidence.learning_details.is_some())
+            .expect("rich evidence");
+        let delta = evidence
+            .learning_details
+            .as_mut()
+            .and_then(|details| details.calibration_deltas.first_mut())
+            .expect("calibration delta");
+        delta.uncertainty_covered = !delta.uncertainty_covered;
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.latest = persisted.latest.clone();
+        restored.restore(persisted);
+
+        assert!(restored
+            .episodic_evidence
+            .iter()
+            .all(|evidence| evidence.learning_details.is_none()));
+    }
+
+    #[test]
+    fn task4_review_live_hardware_mismatch_strips_restored_rich_details() {
+        let persisted = rich_restore_snapshot();
+        let mut live_context = persisted.latest.clone().expect("persisted context");
+        live_context.p_core_count = live_context.p_core_count.saturating_add(2);
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.latest = Some(live_context);
+        restored.restore(persisted);
+
+        assert!(restored
+            .episodic_evidence
+            .iter()
+            .all(|evidence| evidence.learning_details.is_none()));
+    }
+
     #[test]
     fn local_root_episode_attaches_decision_id_to_existing_medallion_episode() {
         let action = RootAction::BoostProcess {
@@ -4931,7 +5088,9 @@ mod tests {
             .and_then(|episode| episode.learning_details.as_ref())
             .is_none());
 
+        let live_context = snapshot.latest.clone();
         let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.latest = live_context;
         restored.restore(snapshot);
         assert_eq!(restored.model_calibration_metrics().record_count, 8);
         assert!(restored.drain_new_gold_evidence().is_empty());

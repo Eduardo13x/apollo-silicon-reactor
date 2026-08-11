@@ -14,8 +14,8 @@ use crate::engine::decision_ledger::{
 };
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::model_calibration::{
-    canonical_action_class, CalibrationActionScope, ForecastCalibrationDelta, PressureBand,
-    ProducerId, SeparabilityState, ThermalBand, TrustState,
+    canonical_action_class, CalibrationActionScope, CalibrationHorizon, ForecastCalibrationDelta,
+    ForegroundContext, PressureBand, ProducerId, SeparabilityState, ThermalBand, TrustState,
 };
 use crate::engine::telemetry_medallion::{ActuatorEpisodeContext, ActuatorFamily, HardwareRegime};
 
@@ -1061,29 +1061,69 @@ fn valid_advisers(advisers: &[AdviserContribution]) -> bool {
 
 fn valid_deltas(details: &ResolvedLearningDetails) -> bool {
     let mut seen = BTreeSet::new();
-    details.calibration_deltas.iter().all(|delta| {
+    let mut accepted = 0_usize;
+    for prediction in details.predictions.iter().take(8) {
+        let producer = ProducerId::canonical(&prediction.source);
+        if producer == ProducerId::Other
+            || !seen.insert(producer)
+            || !prediction.expected_utility.is_finite()
+            || !(-1.0..=1.0).contains(&prediction.expected_utility)
+            || !prediction.uncertainty.is_finite()
+            || prediction.uncertainty <= 0.0
+        {
+            continue;
+        }
+        let Some(delta) = details.calibration_deltas.get(accepted) else {
+            return false;
+        };
         let action_matches = match &delta.key.action {
             CalibrationActionScope::Exact(action) => action == &details.hierarchy.action,
             CalibrationActionScope::Family(family) => *family == details.hierarchy.family,
         };
         let expected_error = delta.actual_utility - delta.predicted_utility;
-        delta.key.producer != ProducerId::Other
+        let coverage = details.actual_utility
+            >= prediction.expected_utility - prediction.uncertainty
+            && details.actual_utility <= prediction.expected_utility + prediction.uncertainty;
+        let foreground_matches = match details.context.foreground {
+            ForegroundBand::Foreground => matches!(
+                delta.key.foreground,
+                ForegroundContext::Active | ForegroundContext::Launching
+            ),
+            ForegroundBand::Background => matches!(
+                delta.key.foreground,
+                ForegroundContext::Idle | ForegroundContext::Unknown
+            ),
+        };
+        let brier_matches = match (prediction.binary_target, prediction.positive_probability) {
+            (Some(crate::engine::decision_ledger::BinaryPredictionTarget::Effective), Some(p))
+                if p.is_finite() && (0.0..=1.0).contains(&p) =>
+            {
+                delta.brier.is_some_and(|brier| {
+                    (brier - p.powi(2)).abs() <= 1.0e-12
+                        || (brier - (p - 1.0).powi(2)).abs() <= 1.0e-12
+                })
+            }
+            _ => delta.brier.is_none(),
+        };
+        if !(delta.key.producer == producer
             && action_matches
-            && delta.predicted_utility.is_finite()
-            && (-1.0..=1.0).contains(&delta.predicted_utility)
-            && delta.actual_utility.is_finite()
+            && delta.key.workload == details.context.workload.as_str()
+            && delta.key.horizon == CalibrationHorizon::from_cycles(prediction.horizon_cycles)
+            && delta.key.pressure == details.context.pressure
+            && delta.key.thermal == details.context.thermal
+            && foreground_matches
+            && (delta.predicted_utility - prediction.expected_utility).abs() <= f64::EPSILON
             && (delta.actual_utility - details.actual_utility).abs() <= f64::EPSILON
-            && delta.signed_error.is_finite()
-            && (-2.0..=2.0).contains(&delta.signed_error)
             && (delta.signed_error - expected_error).abs() <= 1.0e-12
-            && delta.normalized_absolute_error.is_finite()
-            && (0.0..=1.0).contains(&delta.normalized_absolute_error)
             && (delta.normalized_absolute_error - expected_error.abs() / 2.0).abs() <= 1.0e-12
-            && delta
-                .brier
-                .is_none_or(|value| value.is_finite() && (0.0..=1.0).contains(&value))
-            && seen.insert(delta.key.producer)
-    })
+            && delta.uncertainty_covered == coverage
+            && brier_matches)
+        {
+            return false;
+        }
+        accepted += 1;
+    }
+    accepted == details.calibration_deltas.len()
 }
 
 fn representative_cmp(left: &RepresentativeAction, right: &RepresentativeAction) -> Ordering {
@@ -1364,7 +1404,14 @@ mod tests {
                 key: CalibrationKey {
                     producer: ProducerId::WorldModel,
                     action: CalibrationActionScope::Family(family),
+                    workload: hierarchy_context.workload.as_str().to_string(),
                     horizon: CalibrationHorizon::Sec5,
+                    pressure: hierarchy_context.pressure,
+                    thermal: hierarchy_context.thermal,
+                    foreground: match hierarchy_context.foreground {
+                        ForegroundBand::Foreground => ForegroundContext::Active,
+                        ForegroundBand::Background => ForegroundContext::Unknown,
+                    },
                     ..CalibrationKey::default()
                 },
                 predicted_utility: 0.0,
@@ -1698,5 +1745,46 @@ mod tests {
         .unwrap();
         hostile["hierarchy"]["action"] = serde_json::Value::String("x".repeat(321));
         assert!(serde_json::from_value::<ResolvedLearningDetails>(hostile).is_err());
+    }
+
+    #[test]
+    fn task4_review_hostile_oversized_rich_strings_fail_serde() {
+        let mut item = details(
+            3,
+            ActuatorFamily::Boost,
+            context(0),
+            0.02,
+            "boost:editor",
+            1_700_000_000,
+        );
+        item.alternatives.push(CandidateAlternative {
+            action_key: "boost:editor".to_string(),
+            target: "Editor".to_string(),
+            expected_utility: 0.02,
+            uncertainty: 0.2,
+        });
+
+        let mut hostile = serde_json::to_value(&item).unwrap();
+        hostile["alternatives"][0]["action_key"] =
+            serde_json::Value::String("x".repeat(MAX_ACTION_KEY_CHARS + 1));
+        assert!(serde_json::from_value::<ResolvedLearningDetails>(hostile).is_err());
+
+        let mut hostile = serde_json::to_value(&item).unwrap();
+        hostile["alternatives"][0]["target"] =
+            serde_json::Value::String("x".repeat(MAX_TARGET_CHARS + 1));
+        assert!(serde_json::from_value::<ResolvedLearningDetails>(hostile).is_err());
+
+        let mut hostile = serde_json::to_value(&item).unwrap();
+        hostile["calibration_deltas"][0]["key"]["action"] =
+            serde_json::json!({ "exact": "x".repeat(MAX_ACTION_KEY_CHARS + 1) });
+        assert!(serde_json::from_value::<ResolvedLearningDetails>(hostile).is_err());
+
+        let mut hostile = serde_json::to_value(&item).unwrap();
+        hostile["calibration_deltas"][0]["key"]["workload"] =
+            serde_json::Value::String("x".repeat(65));
+        assert!(serde_json::from_value::<ResolvedLearningDetails>(hostile).is_err());
+
+        item.alternatives[0].target = "x".repeat(MAX_TARGET_CHARS + 1);
+        assert!(serde_json::to_vec(&item).is_err());
     }
 }

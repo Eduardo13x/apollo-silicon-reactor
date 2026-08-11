@@ -12,15 +12,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::learning_hierarchy::{
-    HierarchyConsolidationOutcome, HierarchyContext, HierarchyPath, LearningHierarchy,
-    ResolvedLearningDetails,
+    HierarchyConsolidationOutcome, LearningHierarchy, ResolvedLearningDetails,
 };
 use crate::engine::nars_belief::{ArousalState, DriftDetector, Salience};
 use crate::engine::telemetry_medallion::{
-    ActuatorFamily, EvidenceTier, HardwareRegime, ResolvedActuatorEvidence,
+    valid_learning_details, ActuatorFamily, HardwareRegime, ResolvedActuatorEvidence,
 };
 
-const MIN_GOLD_QUALITY: f64 = 0.85;
 const FAMILY_EMA_ALPHA: f64 = 0.20;
 const MAX_FAMILY_EVIDENCE: u32 = 256;
 const MAX_BELIEF_KEY_CHARS: usize = 192;
@@ -323,56 +321,7 @@ fn authoritative_details(
     hardware_regime: HardwareRegime,
 ) -> Option<&ResolvedLearningDetails> {
     let details = evidence.learning_details.as_ref()?;
-    let expected_utility = evidence
-        .calibration_provenance
-        .predictions
-        .iter()
-        .find(|prediction| prediction.source == evidence.calibration_provenance.proposer)
-        .or_else(|| evidence.calibration_provenance.predictions.first())?
-        .expected_utility;
-    (evidence.tier == EvidenceTier::Gold
-        && evidence.calibration_provenance.local_authority_eligible
-        && match evidence.family {
-            ActuatorFamily::Coordinated => {
-                evidence.calibration_provenance.cohort_size > 0
-                    && evidence.calibration_provenance.separability
-                        == crate::engine::model_calibration::SeparabilityState::CoordinatedComposite
-            }
-            _ => evidence.calibration_provenance.cohort_size == 1,
-        }
-        && evidence.quality.is_finite()
-        && evidence.quality >= MIN_GOLD_QUALITY
-        && evidence.utility.apollo_utility.is_finite()
-        && evidence.context_before.valid
-        && installation_id.is_known()
-        && hardware_regime.is_known()
-        && evidence.installation_id == installation_id
-        && evidence.hardware_regime == hardware_regime
-        && !evidence.action_key.is_empty()
-        && evidence.action_key.len() <= 320
-        && evidence.workload.len() <= 96
-        && details.is_authoritative()
-        && evidence.decision_id == Some(details.decision_id)
-        && details.installation_id == installation_id
-        && details.hardware_regime == hardware_regime
-        && details.resolved_cycle == evidence.resolved_cycle
-        && details.resolved_timestamp_unix == evidence.resolved_timestamp_unix
-        && HierarchyPath::classify(evidence.family, &evidence.action_key)
-            .is_some_and(|path| path == details.hierarchy)
-        && HierarchyContext::classify(&evidence.workload, &evidence.context_before)
-            .is_some_and(|context| context == details.context)
-        && details.alternatives == evidence.calibration_provenance.alternatives
-        && details.predictions == evidence.calibration_provenance.predictions
-        && details.adviser_contributions == evidence.calibration_provenance.adviser_contributions
-        && details.separability == evidence.calibration_provenance.separability
-        && (details.expected_utility - expected_utility).abs() <= f64::EPSILON
-        && (details.actual_utility - evidence.utility.apollo_utility).abs() <= f64::EPSILON
-        && (details.raw_utility_delta - evidence.raw_utility_delta).abs() <= f64::EPSILON
-        && (details.counterfactual_delta - evidence.counterfactual_delta).abs() <= f64::EPSILON
-        && (details.quality - evidence.quality).abs() <= f64::EPSILON
-        && (details.causal_quality - evidence.quality).abs() <= f64::EPSILON
-        && details.confounder_count == evidence.confounder_count)
-        .then_some(details)
+    valid_learning_details(evidence, installation_id, hardware_regime).then_some(details)
 }
 
 fn local_salience(
@@ -409,11 +358,12 @@ mod tests {
         HierarchyContext, HierarchyPath, ResolvedLearningDetails,
     };
     use crate::engine::model_calibration::{
-        CalibrationActionScope, CalibrationKey, CalibrationProvenance, ForecastCalibrationDelta,
-        ProducerId, SeparabilityState, TrustState,
+        project_forecast_delta, CalibrationActionScope, CalibrationHorizon, CalibrationKey,
+        CalibrationProvenance, ForegroundContext, PressureBand, ProcessClass, ProducerId,
+        SeparabilityState, ThermalBand, TrustState,
     };
     use crate::engine::telemetry_medallion::{
-        ActuatorEpisodeContext, ActuatorObjective, HardwareRegime, WorldStateDelta,
+        ActuatorEpisodeContext, ActuatorObjective, EvidenceTier, HardwareRegime, WorldStateDelta,
     };
 
     fn gold(
@@ -497,6 +447,42 @@ mod tests {
 
     fn sync_learning_details(evidence: &mut ResolvedActuatorEvidence) {
         let decision_id = evidence.decision_id.expect("fixture decision id");
+        let prediction = evidence.calibration_provenance.predictions[0].clone();
+        let foreground = if evidence.context_before.app_launching {
+            ForegroundContext::Launching
+        } else if evidence.context_before.foreground_idle {
+            ForegroundContext::Idle
+        } else if evidence.context_before.foreground_app_hash != 0 {
+            ForegroundContext::Active
+        } else {
+            ForegroundContext::Unknown
+        };
+        let process_class = ProcessClass::from_target(
+            evidence.family,
+            &evidence.target,
+            matches!(
+                foreground,
+                ForegroundContext::Active | ForegroundContext::Launching
+            ),
+        );
+        let delta = project_forecast_delta(
+            CalibrationKey {
+                producer: ProducerId::WorldModel,
+                action: CalibrationActionScope::Family(evidence.family),
+                workload: evidence.workload.clone(),
+                process_class,
+                horizon: CalibrationHorizon::from_cycles(prediction.horizon_cycles),
+                pressure: PressureBand::from_fraction(evidence.context_before.memory_pressure)
+                    .unwrap(),
+                thermal: ThermalBand::from_fraction(evidence.context_before.thermal_score).unwrap(),
+                foreground,
+            },
+            &prediction,
+            evidence.utility.apollo_utility,
+            evidence.effective,
+            TrustState::Immature,
+            TrustState::Immature,
+        );
         evidence.learning_details = Some(ResolvedLearningDetails {
             decision_id,
             lifecycle: DecisionLifecycle::Applied,
@@ -514,21 +500,7 @@ mod tests {
             causal_quality: evidence.quality,
             confounder_count: evidence.confounder_count,
             separability: evidence.calibration_provenance.separability,
-            calibration_deltas: vec![ForecastCalibrationDelta {
-                key: CalibrationKey {
-                    producer: ProducerId::WorldModel,
-                    action: CalibrationActionScope::Family(evidence.family),
-                    ..CalibrationKey::default()
-                },
-                predicted_utility: 0.02,
-                actual_utility: evidence.utility.apollo_utility,
-                signed_error: evidence.utility.apollo_utility - 0.02,
-                normalized_absolute_error: (evidence.utility.apollo_utility - 0.02).abs() / 2.0,
-                uncertainty_covered: true,
-                brier: None,
-                trust_before: TrustState::Immature,
-                trust_after: TrustState::Immature,
-            }],
+            calibration_deltas: vec![delta],
             installation_id: evidence.installation_id,
             hardware_regime: evidence.hardware_regime,
             resolved_cycle: evidence.resolved_cycle,

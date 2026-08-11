@@ -4,7 +4,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use serde::de::{IgnoredAny, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub use crate::engine::decision_ledger::BinaryPredictionTarget;
 use crate::engine::decision_ledger::{
@@ -21,6 +21,7 @@ pub const MAX_CALIBRATION_STATE_BYTES: usize = 1_048_576;
 
 const MAX_PRODUCER_CHARS: usize = 48;
 const MAX_ACTION_CLASS_CHARS: usize = 96;
+const MAX_CALIBRATION_ACTION_CHARS: usize = 320;
 const MAX_WORKLOAD_CHARS: usize = 64;
 const EMA_ALPHA: f64 = 0.10;
 const FLOAT_BOUNDARY_EPSILON: f64 = 1e-12;
@@ -48,7 +49,7 @@ pub enum ProducerId {
 }
 
 impl ProducerId {
-    fn canonical(source: &str) -> Self {
+    pub(crate) fn canonical(source: &str) -> Self {
         let source = source.trim().to_ascii_lowercase();
         match source.as_str() {
             "actuator" | "root-actuator" | "test-actuator" => Self::Actuator,
@@ -72,7 +73,13 @@ impl ProducerId {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum CalibrationActionScope {
-    Exact(String),
+    Exact(
+        #[serde(
+            deserialize_with = "deserialize_calibration_action",
+            serialize_with = "serialize_calibration_action"
+        )]
+        String,
+    ),
     Family(ActuatorFamily),
 }
 
@@ -238,6 +245,11 @@ pub enum ForegroundContext {
 pub struct CalibrationKey {
     pub producer: ProducerId,
     pub action: CalibrationActionScope,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_calibration_workload",
+        serialize_with = "serialize_calibration_workload"
+    )]
     pub workload: String,
     pub process_class: ProcessClass,
     pub horizon: CalibrationHorizon,
@@ -472,6 +484,116 @@ where
     D: Deserializer<'de>,
 {
     deserialize_bounded_text(deserializer, MAX_PRODUCER_CHARS)
+}
+
+fn deserialize_calibration_action<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_checked_text(
+        deserializer,
+        MAX_CALIBRATION_ACTION_CHARS,
+        "calibration action",
+    )
+}
+
+fn deserialize_calibration_workload<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_checked_text(deserializer, MAX_WORKLOAD_CHARS, "calibration workload")
+}
+
+fn deserialize_checked_text<'de, D>(
+    deserializer: D,
+    max_chars: usize,
+    description: &'static str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CheckedTextVisitor {
+        max_chars: usize,
+        description: &'static str,
+    }
+
+    impl Visitor<'_> for CheckedTextVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "{} of at most {} characters",
+                self.description, self.max_chars
+            )
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.chars().nth(self.max_chars).is_some() {
+                return Err(E::invalid_length(self.max_chars + 1, &self));
+            }
+            Ok(value.to_string())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.chars().nth(self.max_chars).is_some() {
+                return Err(E::invalid_length(self.max_chars + 1, &self));
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_str(CheckedTextVisitor {
+        max_chars,
+        description,
+    })
+}
+
+fn serialize_calibration_action<S>(value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serialize_checked_text(
+        value,
+        serializer,
+        MAX_CALIBRATION_ACTION_CHARS,
+        "calibration action",
+    )
+}
+
+fn serialize_calibration_workload<S>(value: &String, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serialize_checked_text(
+        value,
+        serializer,
+        MAX_WORKLOAD_CHARS,
+        "calibration workload",
+    )
+}
+
+fn serialize_checked_text<S>(
+    value: &str,
+    serializer: S,
+    max_chars: usize,
+    description: &'static str,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.chars().nth(max_chars).is_some() {
+        return Err(serde::ser::Error::custom(format_args!(
+            "{description} exceeds {max_chars} characters"
+        )));
+    }
+    serializer.serialize_str(value)
 }
 
 fn deserialize_bounded_text<'de, D>(deserializer: D, max_chars: usize) -> Result<String, D::Error>
@@ -877,6 +999,104 @@ pub enum CalibrationUpdate {
     Ignored(IgnoreReason),
 }
 
+pub(crate) fn project_forecast_delta(
+    key: CalibrationKey,
+    prediction: &PredictionRecord,
+    actual_utility: f64,
+    effective: bool,
+    trust_before: TrustState,
+    trust_after: TrustState,
+) -> ForecastCalibrationDelta {
+    let signed_error = (actual_utility - prediction.expected_utility).clamp(-2.0, 2.0);
+    let normalized_absolute_error = (signed_error.abs() / 2.0).clamp(0.0, 1.0);
+    let uncertainty_covered = actual_utility
+        >= prediction.expected_utility - prediction.uncertainty
+        && actual_utility <= prediction.expected_utility + prediction.uncertainty;
+    let brier = if prediction.binary_target == Some(BinaryPredictionTarget::Effective) {
+        prediction
+            .positive_probability
+            .filter(|probability| probability.is_finite() && (0.0..=1.0).contains(probability))
+            .map(|probability| (probability - f64::from(effective)).powi(2))
+    } else {
+        None
+    };
+    ForecastCalibrationDelta {
+        key,
+        predicted_utility: prediction.expected_utility,
+        actual_utility,
+        signed_error,
+        normalized_absolute_error,
+        uncertainty_covered,
+        brier,
+        trust_before,
+        trust_after,
+    }
+}
+
+pub(crate) fn valid_forecast_deltas(
+    observation: &CalibrationObservation<'_>,
+    deltas: &[ForecastCalibrationDelta],
+) -> bool {
+    if deltas.is_empty() || deltas.len() > 8 {
+        return false;
+    }
+    let exact_action = canonical_action_class(observation.family, &observation.action_key);
+    let workload = canonical_workload(&observation.workload);
+    let mut seen = BTreeSet::new();
+    let mut accepted = 0_usize;
+
+    for prediction in observation.provenance.predictions.iter().take(8) {
+        let producer = ProducerId::canonical(&prediction.source);
+        if producer == ProducerId::Other
+            || !seen.insert(producer)
+            || !prediction.expected_utility.is_finite()
+            || !(-1.0..=1.0).contains(&prediction.expected_utility)
+            || !prediction.uncertainty.is_finite()
+            || prediction.uncertainty <= 0.0
+        {
+            continue;
+        }
+        let Some(delta) = deltas.get(accepted) else {
+            return false;
+        };
+        let action = match &delta.key.action {
+            CalibrationActionScope::Exact(action)
+                if exact_action.as_deref() == Some(action.as_str()) =>
+            {
+                CalibrationActionScope::Exact(action.clone())
+            }
+            CalibrationActionScope::Family(family) if *family == observation.family => {
+                CalibrationActionScope::Family(*family)
+            }
+            _ => return false,
+        };
+        let key = CalibrationKey {
+            producer,
+            action,
+            workload: workload.clone(),
+            process_class: observation.process_class,
+            horizon: CalibrationHorizon::from_cycles(prediction.horizon_cycles),
+            pressure: observation.pressure,
+            thermal: observation.thermal,
+            foreground: observation.foreground,
+        };
+        if project_forecast_delta(
+            key,
+            prediction,
+            observation.actual_utility,
+            observation.effective,
+            delta.trust_before,
+            delta.trust_after,
+        ) != *delta
+        {
+            return false;
+        }
+        accepted += 1;
+    }
+
+    accepted == deltas.len()
+}
+
 #[derive(Debug)]
 pub struct ModelCalibrationStore {
     installation_id: InstallationId,
@@ -1085,34 +1305,14 @@ impl ModelCalibrationStore {
                 .models
                 .get(&model_key)
                 .map_or(TrustState::Immature, |model| model.trust);
-            let signed_error =
-                (observation.actual_utility - prediction.expected_utility).clamp(-2.0, 2.0);
-            let normalized_absolute_error = (signed_error.abs() / 2.0).clamp(0.0, 1.0);
-            let uncertainty_covered = observation.actual_utility
-                >= prediction.expected_utility - prediction.uncertainty
-                && observation.actual_utility
-                    <= prediction.expected_utility + prediction.uncertainty;
-            let brier = if prediction.binary_target == Some(BinaryPredictionTarget::Effective) {
-                prediction
-                    .positive_probability
-                    .filter(|probability| {
-                        probability.is_finite() && (0.0..=1.0).contains(probability)
-                    })
-                    .map(|probability| (probability - f64::from(observation.effective)).powi(2))
-            } else {
-                None
-            };
-            deltas.push(ForecastCalibrationDelta {
+            deltas.push(project_forecast_delta(
                 key,
-                predicted_utility: prediction.expected_utility,
-                actual_utility: observation.actual_utility,
-                signed_error,
-                normalized_absolute_error,
-                uncertainty_covered,
-                brier,
+                prediction,
+                observation.actual_utility,
+                observation.effective,
                 trust_before,
                 trust_after,
-            });
+            ));
             accepted = accepted.saturating_add(1);
         }
 

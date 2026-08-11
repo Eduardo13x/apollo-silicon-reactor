@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDequ
 use std::fmt;
 
 use serde::de::Visitor;
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 pub const MAX_PENDING_DECISIONS: usize = 192;
 pub const MAX_RECENT_DECISIONS: usize = 64;
@@ -65,7 +65,17 @@ impl DecisionLifecycle {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct CandidateAlternative {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_action_key",
+        serialize_with = "serialize_action_key"
+    )]
     pub action_key: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_target",
+        serialize_with = "serialize_target"
+    )]
     pub target: String,
     pub expected_utility: f64,
     pub uncertainty: f64,
@@ -1076,6 +1086,107 @@ where
     }
 
     deserializer.deserialize_string(BoundedSourceVisitor)
+}
+
+fn deserialize_action_key<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_checked_text(deserializer, MAX_ACTION_KEY_CHARS, "candidate action key")
+}
+
+fn deserialize_target<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_checked_text(deserializer, MAX_TARGET_CHARS, "candidate target")
+}
+
+fn deserialize_checked_text<'de, D>(
+    deserializer: D,
+    max_chars: usize,
+    description: &'static str,
+) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CheckedTextVisitor {
+        max_chars: usize,
+        description: &'static str,
+    }
+
+    impl Visitor<'_> for CheckedTextVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "{} of at most {} characters",
+                self.description, self.max_chars
+            )
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.chars().nth(self.max_chars).is_some() {
+                return Err(E::invalid_length(self.max_chars + 1, &self));
+            }
+            Ok(value.to_string())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            if value.chars().nth(self.max_chars).is_some() {
+                return Err(E::invalid_length(self.max_chars + 1, &self));
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_str(CheckedTextVisitor {
+        max_chars,
+        description,
+    })
+}
+
+fn serialize_action_key<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serialize_checked_text(
+        value,
+        serializer,
+        MAX_ACTION_KEY_CHARS,
+        "candidate action key",
+    )
+}
+
+fn serialize_target<S>(value: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    serialize_checked_text(value, serializer, MAX_TARGET_CHARS, "candidate target")
+}
+
+fn serialize_checked_text<S>(
+    value: &str,
+    serializer: S,
+    max_chars: usize,
+    description: &'static str,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    if value.chars().nth(max_chars).is_some() {
+        return Err(serde::ser::Error::custom(format_args!(
+            "{description} exceeds {max_chars} characters"
+        )));
+    }
+    serializer.serialize_str(value)
 }
 
 fn finite_unit(value: f64) -> f64 {
