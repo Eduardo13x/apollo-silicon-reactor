@@ -2086,6 +2086,7 @@ mod tests {
                 counterfactual_delta: 0.0,
                 net_utility_delta: 0.08,
                 attribution: Default::default(),
+                calibration_provenance: Default::default(),
                 utility: Default::default(),
                 perceptual_latency_improvement: 0.0,
                 net_state_delta: WorldStateDelta::default(),

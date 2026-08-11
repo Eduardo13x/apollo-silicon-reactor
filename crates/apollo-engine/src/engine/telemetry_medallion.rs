@@ -23,6 +23,11 @@ use crate::engine::execute_actions::ExecuteOutcomes;
 use crate::engine::gpu_imagination::GpuImaginationResult;
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::iokit_sensors::HardwareSnapshot;
+use crate::engine::model_calibration::{
+    CalibrationObservation, CalibrationProvenance, ForegroundContext, ModelCalibrationMetrics,
+    ModelCalibrationPersisted, ModelCalibrationStore, ModelCalibrationSummary, PressureBand,
+    ProcessClass, SeparabilityState, ThermalBand,
+};
 use crate::engine::predictive_agent::Intervention;
 use crate::engine::signal_intelligence::SignalDigest;
 use crate::engine::telemetry_context_admission::{
@@ -51,7 +56,7 @@ const ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS: f64 = 7.0 * 24.0 * 60.0 * 60.0;
 const ACTION_MODEL_EVIDENCE_CAP: f64 = 64.0;
 // Version 1 enrolled predictive recommendations before confirming that their
 // operating-system side effect occurred. Do not carry that bias forward.
-const ACTUATOR_EVIDENCE_SCHEMA_VERSION: u32 = 2;
+const ACTUATOR_EVIDENCE_SCHEMA_VERSION: u32 = 3;
 const TELEMETRY_CONTEXT_SCHEMA_VERSION: u32 = 3;
 const GPU_PREDICTION_SCHEMA_VERSION: u32 = 1;
 
@@ -512,6 +517,11 @@ pub struct ResolvedActuatorEvidence {
     /// dispatcher. Legacy evidence deserializes as unknown provenance.
     #[serde(default)]
     pub attribution: DecisionAttribution,
+    /// Full bounded decision-time forecast provenance. This is separate from
+    /// the compatibility attribution projection so delayed Gold resolution
+    /// cannot collapse to the first prediction.
+    #[serde(default)]
+    pub calibration_provenance: CalibrationProvenance,
     /// Objective-independent utility used as Apollo's top-level score.
     #[serde(default)]
     pub utility: UtilityDecomposition,
@@ -777,6 +787,8 @@ struct PendingActuatorEvidence {
     gpu_prediction_generation: Option<u64>,
     #[serde(default)]
     attribution: DecisionAttribution,
+    #[serde(default)]
+    calibration_provenance: CalibrationProvenance,
     before: TelemetryContextSummary,
 }
 
@@ -1136,6 +1148,8 @@ pub struct TelemetryMedallionPersisted {
     #[serde(default)]
     pub decision_source_stats: BTreeMap<String, DecisionSourceStats>,
     #[serde(default)]
+    pub model_calibration: Option<ModelCalibrationPersisted>,
+    #[serde(default)]
     pub no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
     #[serde(default)]
     pub no_action_state_delta_ema: WorldStateDelta,
@@ -1207,6 +1221,7 @@ pub struct TelemetryMedallion {
     apollo_utility_ema: f64,
     apollo_utility_observations: u64,
     decision_source_stats: BTreeMap<String, DecisionSourceStats>,
+    model_calibration: ModelCalibrationStore,
     staged_attributions: BTreeMap<String, VecDeque<DecisionAttribution>>,
     staged_decision_episodes: VecDeque<StagedDecisionEpisode>,
     no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
@@ -1269,6 +1284,7 @@ impl Default for TelemetryMedallion {
             apollo_utility_ema: 0.0,
             apollo_utility_observations: 0,
             decision_source_stats: BTreeMap::new(),
+            model_calibration: ModelCalibrationStore::new(InstallationId::UNKNOWN),
             staged_attributions: BTreeMap::new(),
             staged_decision_episodes: VecDeque::new(),
             no_action_delta_ema: BTreeMap::new(),
@@ -1314,6 +1330,7 @@ impl TelemetryMedallion {
             installation_id,
             decision_id_high_water: 0,
             causal_dynamics: CausalDynamicsModel::new(installation_id),
+            model_calibration: ModelCalibrationStore::new(installation_id),
             ..Self::default()
         }
     }
@@ -1609,6 +1626,8 @@ impl TelemetryMedallion {
     pub fn observe(&mut self, observation: TelemetryObservation<'_>) -> ContextAdmission {
         self.expire_unused_gpu_predictions(observation.cycle);
         let summary = summarize(&observation);
+        self.model_calibration
+            .validate_hardware(HardwareRegime::from_context(&summary));
         let TelemetryObservation {
             snapshot,
             runtime,
@@ -2132,6 +2151,7 @@ impl TelemetryMedallion {
             purge_recent,
             event_resolved,
             None,
+            None,
         );
     }
 
@@ -2145,6 +2165,7 @@ impl TelemetryMedallion {
         purge_recent: bool,
         event_resolved: bool,
         decision_id: Option<DecisionId>,
+        calibration_provenance: Option<CalibrationProvenance>,
     ) {
         if self.pending_actions.len() >= MAX_PENDING_ACTIONS {
             if let Some(evicted) = self.pending_actions.pop_front() {
@@ -2196,6 +2217,7 @@ impl TelemetryMedallion {
             event_resolved,
             gpu_prediction_generation,
             attribution,
+            calibration_provenance: calibration_provenance.unwrap_or_default().bounded(),
             before: before.clone(),
         });
     }
@@ -2368,6 +2390,7 @@ impl TelemetryMedallion {
             counterfactual_delta: finite_or_zero(counterfactual),
             net_utility_delta: finite_or_zero(net_delta),
             attribution: pending.attribution,
+            calibration_provenance: pending.calibration_provenance,
             utility,
             perceptual_latency_improvement: finite_or_zero(perceptual_latency_improvement),
             net_state_delta: if net_state_delta.is_finite() {
@@ -2416,6 +2439,8 @@ impl TelemetryMedallion {
             self.actuator_gold_total = self.actuator_gold_total.saturating_add(1);
             self.update_action_model(&evidence);
             self.update_decision_source_credit(&evidence);
+            let observation = calibration_observation(&evidence);
+            self.model_calibration.observe_local_gold(&observation);
             if self.new_gold_evidence.len() >= MAX_RECENT_EVIDENCE {
                 self.new_gold_evidence.pop_front();
             }
@@ -2466,11 +2491,9 @@ impl TelemetryMedallion {
                 .cloned()
                 .map(|source| (source, -1.0, false)),
         );
-        directed_sources.sort_by(|left, right| left.0.cmp(&right.0));
-        directed_sources.dedup_by(|left, right| left.0 == right.0);
-
+        let mut seen_sources = BTreeSet::new();
         for (source, direction, supported) in directed_sources {
-            if source.is_empty() {
+            if source.is_empty() || !seen_sources.insert(source.clone()) {
                 continue;
             }
             if self.decision_source_stats.len() >= MAX_DECISION_SOURCES
@@ -2493,19 +2516,19 @@ impl TelemetryMedallion {
             } else {
                 stats.vetoes = stats.vetoes.saturating_add(1);
             }
-            let signed_credit = (direction * evidence.utility.apollo_utility).clamp(-1.0, 1.0);
-            if signed_credit > 0.005 {
+            let measured_direction = if evidence.utility.apollo_utility > 0.005 {
+                1.0
+            } else if evidence.utility.apollo_utility < -0.005 {
+                -1.0
+            } else {
+                0.0
+            };
+            let directional_agreement = direction * measured_direction;
+            if directional_agreement > 0.0 {
                 stats.correct = stats.correct.saturating_add(1);
             }
-            stats.credit_ema = alpha * signed_credit + (1.0 - alpha) * stats.credit_ema;
-            let expected = if supported {
-                attribution.predicted_gain
-            } else {
-                -attribution.predicted_gain
-            };
-            let absolute_error = (expected - direction * evidence.utility.apollo_utility)
-                .abs()
-                .clamp(0.0, 2.0);
+            stats.credit_ema = alpha * directional_agreement + (1.0 - alpha) * stats.credit_ema;
+            let absolute_error = ((1.0 - directional_agreement) / 2.0).clamp(0.0, 1.0);
             stats.absolute_error_ema =
                 alpha * absolute_error + (1.0 - alpha) * stats.absolute_error_ema;
             stats.last_cycle = evidence.resolved_cycle;
@@ -2882,6 +2905,7 @@ impl TelemetryMedallion {
                     .unwrap_or(1)
                     .max(1)
             };
+            let calibration_provenance = calibration_provenance_for_episode(episode, cohort_size);
 
             let pending_index = if episode.envelope.action_key.starts_with("coordinated:") {
                 coordinated_pending
@@ -2904,6 +2928,7 @@ impl TelemetryMedallion {
                 pending.target_pid = target_pid_from_decision_target(&episode.envelope.target);
                 pending.cohort_size = pending.cohort_size.max(cohort_size);
                 pending.attribution = attribution;
+                pending.calibration_provenance = calibration_provenance;
                 continue;
             }
 
@@ -2977,6 +3002,10 @@ impl TelemetryMedallion {
                     ActuatorFamily::MarkovPrewarm | ActuatorFamily::InteractionQos
                 ),
                 Some(episode.id),
+                Some(calibration_provenance_for_episode(
+                    &episode,
+                    staged.cohort_size,
+                )),
             );
             external_deltas.suppress(family);
             issued = issued.saturating_add(1);
@@ -2986,6 +3015,18 @@ impl TelemetryMedallion {
 
     pub fn decision_source_stats(&self) -> &BTreeMap<String, DecisionSourceStats> {
         &self.decision_source_stats
+    }
+
+    pub fn model_calibration_metrics(&self) -> ModelCalibrationMetrics {
+        self.model_calibration.metrics()
+    }
+
+    pub fn model_calibration(&self) -> &ModelCalibrationStore {
+        &self.model_calibration
+    }
+
+    pub fn model_calibration_summary(&self) -> ModelCalibrationSummary {
+        self.model_calibration.summary()
     }
 
     pub fn decision_id_high_water(&self) -> u64 {
@@ -3052,6 +3093,7 @@ impl TelemetryMedallion {
             apollo_utility_ema: self.apollo_utility_ema,
             apollo_utility_observations: self.apollo_utility_observations,
             decision_source_stats: self.decision_source_stats.clone(),
+            model_calibration: Some(self.model_calibration.snapshot()),
             no_action_delta_ema: self.no_action_delta_ema.clone(),
             no_action_state_delta_ema: self.no_action_state_delta_ema,
             controlled_models: self.controlled_models.clone(),
@@ -3070,7 +3112,14 @@ impl TelemetryMedallion {
         }
     }
 
-    pub fn restore(&mut self, state: TelemetryMedallionPersisted) {
+    pub fn restore(&mut self, mut state: TelemetryMedallionPersisted) {
+        let persisted_actuator_schema = state.actuator_evidence_schema_version;
+        let current_hardware = state
+            .latest
+            .as_ref()
+            .map(HardwareRegime::from_context)
+            .unwrap_or_default();
+        let model_calibration = state.model_calibration.take();
         let same_installation =
             state.installation_id.is_known() && state.installation_id == self.installation_id;
         let evidence_high_water = state
@@ -3089,8 +3138,8 @@ impl TelemetryMedallion {
         let same_origin = state.context_schema_version == TELEMETRY_CONTEXT_SCHEMA_VERSION
             && state.installation_id.is_known()
             && state.installation_id == self.installation_id;
-        let reset_actuator_evidence =
-            state.actuator_evidence_schema_version < ACTUATOR_EVIDENCE_SCHEMA_VERSION;
+        let reset_actuator_evidence = persisted_actuator_schema < 2;
+        let reset_model_calibration = persisted_actuator_schema < ACTUATOR_EVIDENCE_SCHEMA_VERSION;
 
         self.bronze_total = state.bronze_total;
         self.gold_total = state.gold_total.min(self.bronze_total);
@@ -3238,6 +3287,13 @@ impl TelemetryMedallion {
         } else {
             BTreeMap::new()
         };
+        self.model_calibration = ModelCalibrationStore::new(self.installation_id);
+        if same_origin && !reset_model_calibration {
+            if let Some(model_calibration) = model_calibration {
+                self.model_calibration
+                    .restore(model_calibration, current_hardware);
+            }
+        }
         self.staged_attributions.clear();
         self.staged_decision_episodes.clear();
         self.no_action_delta_ema = if same_origin {
@@ -3409,6 +3465,7 @@ impl TelemetryMedallion {
             self.apollo_utility_ema = 0.0;
             self.apollo_utility_observations = 0;
             self.decision_source_stats.clear();
+            self.model_calibration = ModelCalibrationStore::new(self.installation_id);
             self.staged_attributions.clear();
             self.no_action_delta_ema.clear();
             self.no_action_state_delta_ema = WorldStateDelta::default();
@@ -3495,6 +3552,105 @@ fn decision_episode_attribution(episode: &ResolvedDecisionEpisode) -> Option<Dec
         }
     }
     Some(attribution.bounded())
+}
+
+fn calibration_provenance_for_episode(
+    episode: &ResolvedDecisionEpisode,
+    cohort_size: u16,
+) -> CalibrationProvenance {
+    let proposer = episode
+        .envelope
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.attribution.as_ref())
+        .or(episode.envelope.terminal_attribution.as_ref())
+        .and_then(|attribution| match attribution {
+            ReceiptAttribution::Local { source } if !source.is_empty() => Some(source.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let mut prediction_sources = BTreeSet::new();
+    let predictions = episode
+        .envelope
+        .predictions
+        .iter()
+        .filter(|prediction| {
+            !prediction.source.is_empty() && prediction_sources.insert(prediction.source.clone())
+        })
+        .take(8)
+        .cloned()
+        .collect();
+    let mut advisers = BTreeSet::new();
+    let adviser_contributions = episode
+        .envelope
+        .adviser_contributions
+        .iter()
+        .filter(|adviser| !adviser.adviser.is_empty() && advisers.insert(adviser.adviser.clone()))
+        .take(8)
+        .cloned()
+        .collect();
+    let separability = if episode.envelope.action_key.starts_with("coordinated:") {
+        SeparabilityState::CoordinatedComposite
+    } else if cohort_size > 1 {
+        SeparabilityState::Confounded
+    } else {
+        SeparabilityState::Individual
+    };
+    CalibrationProvenance {
+        local_authority_eligible: episode.authority_eligible
+            && episode.envelope.lifecycle == DecisionLifecycle::Applied,
+        proposer,
+        predictions,
+        adviser_contributions,
+        hierarchy: episode.envelope.hierarchy,
+        cohort_size,
+        separability,
+    }
+    .bounded()
+}
+
+fn calibration_observation(evidence: &ResolvedActuatorEvidence) -> CalibrationObservation<'_> {
+    let pressure = PressureBand::from_fraction(evidence.context_before.memory_pressure);
+    let thermal = ThermalBand::from_fraction(evidence.context_before.thermal_score);
+    let context_valid = evidence.context_before.valid
+        && evidence.context_before.is_finite()
+        && pressure.is_some()
+        && thermal.is_some();
+    let foreground = if evidence.context_before.app_launching {
+        ForegroundContext::Launching
+    } else if evidence.context_before.foreground_idle {
+        ForegroundContext::Idle
+    } else if evidence.context_before.foreground_app_hash != 0 {
+        ForegroundContext::Active
+    } else {
+        ForegroundContext::Unknown
+    };
+    let process_class = ProcessClass::from_target(
+        evidence.family,
+        &evidence.target,
+        matches!(
+            foreground,
+            ForegroundContext::Active | ForegroundContext::Launching
+        ),
+    );
+    CalibrationObservation {
+        decision_id: evidence.decision_id,
+        tier: evidence.tier,
+        installation_id: evidence.installation_id,
+        hardware_regime: evidence.hardware_regime,
+        family: evidence.family,
+        action_key: evidence.action_key.clone(),
+        workload: evidence.workload.clone(),
+        process_class,
+        pressure: pressure.unwrap_or_default(),
+        thermal: thermal.unwrap_or_default(),
+        foreground,
+        context_valid,
+        quality: evidence.quality,
+        actual_utility: evidence.utility.apollo_utility,
+        effective: evidence.effective,
+        provenance: &evidence.calibration_provenance,
+    }
 }
 
 fn target_pid_from_decision_target(target: &str) -> Option<u32> {
@@ -4205,8 +4361,9 @@ mod tests {
     use crate::collector::{CpuStats, MemoryStats, PressureStats, ProcessStats};
     use crate::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
     use crate::engine::decision_ledger::{
-        ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents, DecisionId,
-        DecisionLedger,
+        ActuatorDecisionEvent, ActuatorDecisionOutcome, AdviserContribution,
+        BinaryPredictionTarget, CycleDecisionEvents, DecisionId, DecisionLedger,
+        HierarchyCoordinates, PredictionRecord,
     };
     use crate::engine::lotka_volterra::StabilityRegime;
     use chrono::Utc;
@@ -4426,6 +4583,264 @@ mod tests {
     }
 
     #[test]
+    fn all_predictions_survive_delayed_resolution_and_calibrate_once_at_gold_admission() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &ExecuteOutcomes::default(), &runtime);
+        let sources = [
+            "world-model",
+            "gpu-model",
+            "markov",
+            "causal-graph",
+            "mpc",
+            "nars",
+            "policy-scorer",
+            "predictive-agent",
+        ];
+        let mut event = ActuatorDecisionEvent::local(
+            "predictive_threshold:tighten",
+            "predictive_threshold:tighten",
+            1,
+            ActuatorDecisionOutcome::Applied,
+            "predictive-agent",
+            "delayed calibration fixture",
+        )
+        .with_hierarchy(HierarchyCoordinates {
+            level: 2,
+            parent: Some(DecisionId(77)),
+            cohort: 0,
+        });
+        event.proposal.adviser_contributions = vec![
+            AdviserContribution {
+                adviser: "gpu-model".to_string(),
+                support: 0.7,
+                uncertainty: 0.2,
+            },
+            AdviserContribution {
+                adviser: "causal-graph".to_string(),
+                support: -0.4,
+                uncertainty: 0.3,
+            },
+        ];
+        for (index, source) in sources.into_iter().enumerate() {
+            event = event.with_prediction(PredictionRecord {
+                source: source.to_string(),
+                expected_utility: index as f64 / 100.0,
+                uncertainty: 0.25,
+                horizon_cycles: 10,
+                positive_probability: Some(0.6),
+                binary_target: Some(BinaryPredictionTarget::Effective),
+            });
+        }
+        let mut events = CycleDecisionEvents::default();
+        events.push(event);
+        let episodes = DecisionLedger::new().ingest_cycle_events(&mut events);
+        medallion.stage_decision_episodes(&episodes);
+
+        for cycle in 2..=11 {
+            observe(&mut medallion, cycle, &ExecuteOutcomes::default(), &runtime);
+        }
+
+        let evidence = medallion
+            .recent_actuator_evidence()
+            .back()
+            .expect("resolved evidence");
+        assert_eq!(evidence.calibration_provenance.predictions.len(), 8);
+        assert!(evidence.calibration_provenance.local_authority_eligible);
+        assert_eq!(evidence.calibration_provenance.proposer, "predictive-agent");
+        assert_eq!(
+            evidence.calibration_provenance.adviser_contributions.len(),
+            2
+        );
+        assert_eq!(evidence.calibration_provenance.hierarchy.level, 2);
+        assert_eq!(
+            evidence.calibration_provenance.hierarchy.parent,
+            Some(DecisionId(77))
+        );
+        assert_eq!(evidence.calibration_provenance.cohort_size, 1);
+        assert_eq!(
+            evidence.calibration_provenance.separability,
+            SeparabilityState::Individual
+        );
+        assert_eq!(
+            medallion
+                .model_calibration_metrics()
+                .accepted_forecasts_total,
+            8
+        );
+        assert_eq!(medallion.model_calibration_metrics().record_count, 8);
+        assert!(medallion.gpu_calibration_models.is_empty());
+
+        let snapshot = medallion.snapshot();
+        let calibration_bytes = serde_json::to_vec(
+            snapshot
+                .model_calibration
+                .as_ref()
+                .expect("nested calibration snapshot"),
+        )
+        .unwrap()
+        .len();
+        let mut without_calibration = snapshot.clone();
+        without_calibration.model_calibration = None;
+        let full_growth = serde_json::to_vec(&snapshot).unwrap().len()
+            - serde_json::to_vec(&without_calibration).unwrap().len();
+        assert!(calibration_bytes <= crate::engine::model_calibration::MAX_CALIBRATION_STATE_BYTES);
+        assert!(full_growth <= 2 * 1024 * 1024);
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(snapshot);
+        assert_eq!(restored.model_calibration_metrics().record_count, 8);
+        assert!(restored.drain_new_gold_evidence().is_empty());
+    }
+
+    #[test]
+    fn decision_source_credit_tracks_direction_not_duplicated_treatment_utility() {
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut evidence = gold_evidence("boost:Editor", 0.4, 20_000_000, hardware);
+        evidence.decision_id = Some(DecisionId(1));
+        evidence.utility.apollo_utility = 0.4;
+        evidence.context_before = ActuatorEpisodeContext {
+            valid: true,
+            memory_pressure: 0.4,
+            thermal_score: 0.2,
+            foreground_app_hash: 1,
+            ..ActuatorEpisodeContext::default()
+        };
+        evidence.attribution = DecisionAttribution {
+            action_key: "boost:Editor".to_string(),
+            proposer: "world-model".to_string(),
+            supporters: vec!["gpu-model".to_string(), "markov".to_string()],
+            vetoes: vec!["causal-graph".to_string()],
+            predicted_gain: 0.2,
+            uncertainty: 0.3,
+        };
+        evidence.calibration_provenance = CalibrationProvenance {
+            local_authority_eligible: true,
+            proposer: "world-model".to_string(),
+            predictions: vec![
+                PredictionRecord {
+                    source: "gpu-model".to_string(),
+                    expected_utility: -0.4,
+                    uncertainty: 0.2,
+                    horizon_cycles: 10,
+                    positive_probability: None,
+                    binary_target: None,
+                },
+                PredictionRecord {
+                    source: "causal-graph".to_string(),
+                    expected_utility: -0.4,
+                    uncertainty: 0.2,
+                    horizon_cycles: 10,
+                    positive_probability: None,
+                    binary_target: None,
+                },
+            ],
+            adviser_contributions: vec![
+                AdviserContribution {
+                    adviser: "gpu-model".to_string(),
+                    support: 0.7,
+                    uncertainty: 0.2,
+                },
+                AdviserContribution {
+                    adviser: "causal-graph".to_string(),
+                    support: -0.4,
+                    uncertainty: 0.3,
+                },
+            ],
+            cohort_size: 1,
+            ..CalibrationProvenance::default()
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.admit_resolved(evidence);
+
+        assert!((medallion.actuator_utility_sum - 0.4).abs() < 1e-12);
+        assert_eq!(medallion.action_models["boost:Editor"].observations, 1);
+        assert_eq!(
+            medallion.decision_source_stats["world-model"].credit_ema,
+            1.0
+        );
+        assert_eq!(medallion.decision_source_stats["gpu-model"].credit_ema, 1.0);
+        assert_eq!(medallion.decision_source_stats["markov"].credit_ema, 1.0);
+        assert_eq!(
+            medallion.decision_source_stats["causal-graph"].credit_ema,
+            -1.0
+        );
+        assert_eq!(
+            medallion
+                .model_calibration_metrics()
+                .accepted_forecasts_total,
+            2
+        );
+        assert!(medallion.model_calibration().records().all(|record| {
+            (record.signed_error_ema - 0.8).abs() < 1e-12
+                && (record.normalized_mae_ema - 0.4).abs() < 1e-12
+        }));
+    }
+
+    #[test]
+    fn actuator_schema_v2_keeps_specialists_but_starts_calibration_cold() {
+        let now_unix = 20_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut persisted = TelemetryMedallionPersisted {
+            actuator_evidence_schema_version: 2,
+            context_schema_version: TELEMETRY_CONTEXT_SCHEMA_VERSION,
+            installation_id: LOCAL_ID,
+            latest: Some(TelemetryContextSummary {
+                timestamp_unix: now_unix,
+                p_core_count: 4,
+                e_core_count: 6,
+                total_ram_bytes: 16 * 1024 * 1024 * 1024,
+                ..TelemetryContextSummary::default()
+            }),
+            model_calibration: Some(
+                crate::engine::model_calibration::ModelCalibrationPersisted {
+                    installation_id: LOCAL_ID,
+                    hardware_regime: hardware,
+                    records: vec![crate::engine::model_calibration::CalibrationRecord {
+                        authority_gold_count: 500,
+                        lifetime_forecast_count: 500,
+                        trust: crate::engine::model_calibration::TrustState::Trusted,
+                        ..crate::engine::model_calibration::CalibrationRecord::default()
+                    }],
+                    ..crate::engine::model_calibration::ModelCalibrationPersisted::default()
+                },
+            ),
+            ..TelemetryMedallionPersisted::default()
+        };
+        persisted.action_models.insert(
+            "boost:Editor".to_string(),
+            ActionModelStats {
+                observations: 20,
+                utility_ema: 0.1,
+                evidence_mass: 20.0,
+                quality_ema: 0.95,
+                last_observed_unix: now_unix,
+                hardware_regime: hardware,
+                installation_id: LOCAL_ID,
+                ..ActionModelStats::default()
+            },
+        );
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(persisted);
+
+        assert!(restored.action_models().contains_key("boost:Editor"));
+        assert_eq!(restored.model_calibration_metrics().record_count, 0);
+        assert_eq!(
+            restored.snapshot().actuator_evidence_schema_version,
+            ACTUATOR_EVIDENCE_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
     fn exact_side_episode_suppresses_duplicate_counter_fallback() {
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         observe(
@@ -4575,6 +4990,7 @@ mod tests {
 
         assert!(medallion.pending_actions.is_empty());
         assert_eq!(medallion.metrics().actuator_issued_total, 0);
+        assert_eq!(medallion.model_calibration_metrics().record_count, 0);
     }
 
     fn gold_evidence(
@@ -4603,6 +5019,7 @@ mod tests {
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
             attribution: DecisionAttribution::default(),
+            calibration_provenance: CalibrationProvenance::default(),
             utility: UtilityDecomposition::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
@@ -4869,6 +5286,7 @@ mod tests {
         assert!(controlled.last_observed_unix > 0);
         assert_eq!(controlled.installation_id, LOCAL_ID);
         assert!(controlled.hardware_regime.is_known());
+        assert_eq!(medallion.model_calibration_metrics().record_count, 0);
     }
 
     #[test]
@@ -5755,6 +6173,7 @@ mod tests {
                 counterfactual_delta: 0.0,
                 net_utility_delta: 0.08,
                 attribution: DecisionAttribution::default(),
+                calibration_provenance: CalibrationProvenance::default(),
                 utility: UtilityDecomposition::default(),
                 perceptual_latency_improvement: 0.0,
                 net_state_delta: WorldStateDelta::default(),
@@ -5786,6 +6205,7 @@ mod tests {
             counterfactual_delta: 0.0,
             net_utility_delta: 1.0,
             attribution: DecisionAttribution::default(),
+            calibration_provenance: CalibrationProvenance::default(),
             utility: UtilityDecomposition::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
@@ -5896,6 +6316,7 @@ mod tests {
             event_resolved: false,
             gpu_prediction_generation: None,
             attribution: DecisionAttribution::default(),
+            calibration_provenance: CalibrationProvenance::default(),
             before: TelemetryContextSummary::default(),
         });
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);

@@ -84,6 +84,16 @@ pub struct PredictionRecord {
     pub expected_utility: f64,
     pub uncertainty: f64,
     pub horizon_cycles: u64,
+    /// Optional probability for a declared binary target. Missing or invalid
+    /// probabilities never synthesize a Brier sample.
+    pub positive_probability: Option<f64>,
+    pub binary_target: Option<BinaryPredictionTarget>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum BinaryPredictionTarget {
+    Effective,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -928,8 +938,19 @@ impl CandidateAlternative {
 impl PredictionRecord {
     fn bounded(mut self) -> Self {
         self.source = bounded_text(&self.source, MAX_SOURCE_CHARS);
+        let calibration_valid = self.expected_utility.is_finite()
+            && (-1.0..=1.0).contains(&self.expected_utility)
+            && self.uncertainty.is_finite()
+            && self.uncertainty > 0.0;
         self.expected_utility = finite_unit(self.expected_utility);
-        self.uncertainty = finite_unit(self.uncertainty).max(0.0);
+        self.uncertainty = if calibration_valid {
+            finite_unit(self.uncertainty).max(0.0)
+        } else {
+            0.0
+        };
+        self.positive_probability = self
+            .positive_probability
+            .filter(|probability| probability.is_finite() && (0.0..=1.0).contains(probability));
         self
     }
 }
@@ -1109,11 +1130,12 @@ fn episode_authority_eligible(envelope: &DecisionEnvelope) -> bool {
 mod tests {
     use super::{
         coordinated_action_event, select_reconstructed_pending, ActuatorDecisionEvent,
-        ActuatorDecisionOutcome, AdviserContribution, CandidateAlternative, CycleDecisionEvents,
-        DecisionEnvelope, DecisionId, DecisionLedger, DecisionLifecycle, DecisionProposal,
-        ExecutionDisposition, ExecutionReceipt, ReceiptAttribution, ResolvedDecisionEpisode,
-        MAX_ADVISER_CONTRIBUTIONS, MAX_CANDIDATE_ALTERNATIVES, MAX_CYCLE_DECISION_EVENTS,
-        MAX_PENDING_DECISIONS,
+        ActuatorDecisionOutcome, AdviserContribution, BinaryPredictionTarget, CandidateAlternative,
+        CycleDecisionEvents, DecisionEnvelope, DecisionId, DecisionLedger, DecisionLifecycle,
+        DecisionProposal, ExecutionDisposition, ExecutionReceipt, PredictionRecord,
+        ReceiptAttribution, ResolvedDecisionEpisode, MAX_ADVISER_CONTRIBUTIONS,
+        MAX_CANDIDATE_ALTERNATIVES, MAX_CYCLE_DECISION_EVENTS, MAX_PENDING_DECISIONS,
+        MAX_PREDICTIONS,
     };
 
     #[test]
@@ -1445,6 +1467,16 @@ mod tests {
                     ..AdviserContribution::default()
                 })
                 .collect(),
+            predictions: (0..=MAX_PREDICTIONS)
+                .map(|index| PredictionRecord {
+                    source: format!("source-{index}"),
+                    expected_utility: if index == 0 { f64::NAN } else { 0.1 },
+                    uncertainty: 0.2,
+                    horizon_cycles: 10,
+                    positive_probability: Some(if index == 0 { 1.5 } else { 0.6 }),
+                    binary_target: Some(BinaryPredictionTarget::Effective),
+                })
+                .collect(),
             ..DecisionProposal::default()
         });
 
@@ -1453,6 +1485,13 @@ mod tests {
         assert_eq!(
             envelope.adviser_contributions.len(),
             MAX_ADVISER_CONTRIBUTIONS
+        );
+        assert_eq!(envelope.predictions.len(), MAX_PREDICTIONS);
+        assert_eq!(envelope.predictions[0].positive_probability, None);
+        assert_eq!(envelope.predictions[0].uncertainty, 0.0);
+        assert_eq!(
+            envelope.predictions[1].binary_target,
+            Some(BinaryPredictionTarget::Effective)
         );
     }
 

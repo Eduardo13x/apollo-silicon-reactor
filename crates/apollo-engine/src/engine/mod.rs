@@ -87,6 +87,7 @@ pub mod mediator;
 pub mod memory_analyzer;
 pub mod memory_budget;
 pub mod meta_cognition;
+pub mod model_calibration;
 pub mod mpc_horizon;
 pub mod nars_belief;
 pub mod neon_ema;
