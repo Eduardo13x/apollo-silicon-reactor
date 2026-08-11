@@ -101,7 +101,9 @@ use apollo_engine::engine::learned_state::{LearnableParams, LearnedState, Restor
 use apollo_engine::engine::local_consolidation::{LocalConsolidationVerdict, LocalConsolidator};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
-use apollo_engine::engine::mach_qos::{MachQoSManager, SchedulingTier};
+use apollo_engine::engine::mach_qos::{
+    MachQoSManager, QoSAuditDisposition, QoSOutcome, SchedulingTier,
+};
 use apollo_engine::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_engine::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
@@ -124,7 +126,8 @@ use apollo_engine::engine::sysctl_governor::{
     SysctlGovernor, SysctlGovernorInput, SysctlGovernorStatus,
 };
 use apollo_engine::engine::thermal_interrupt::{
-    spawn_resource_sentinel, ResourceInterruptState, SentinelConfig,
+    resource_interrupt_decision_channel, spawn_resource_sentinel_with_decisions,
+    ResourceInterruptState, SentinelConfig,
 };
 use apollo_engine::engine::types::{
     EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry, FrozenPidEntry,
@@ -269,6 +272,51 @@ fn swap_reclaim_bypass_active(swap_used_bytes: u64, swap_total_bytes: u64, p_oom
         swap_used_bytes,
         swap_total_bytes,
     ) || p_oom_30s >= 0.95
+}
+
+fn contention_mach_tier_event(
+    cycle: u64,
+    pid: u32,
+    tier: SchedulingTier,
+    outcome: &QoSOutcome,
+    audit_disposition: QoSAuditDisposition,
+) -> apollo_engine::engine::decision_ledger::ActuatorDecisionEvent {
+    use apollo_engine::engine::decision_ledger::{ActuatorDecisionEvent, ActuatorDecisionOutcome};
+
+    let (disposition, detail) = match audit_disposition {
+        QoSAuditDisposition::Applied => (
+            ActuatorDecisionOutcome::Applied,
+            "Mach tier applied".to_string(),
+        ),
+        QoSAuditDisposition::NoOp => (
+            ActuatorDecisionOutcome::NoOp,
+            "requested Mach tier already active".to_string(),
+        ),
+        QoSAuditDisposition::Blocked => (
+            ActuatorDecisionOutcome::Blocked,
+            "Mach tier unavailable or protected".to_string(),
+        ),
+        QoSAuditDisposition::Failed => (
+            ActuatorDecisionOutcome::Failed,
+            outcome
+                .error
+                .clone()
+                .unwrap_or_else(|| "Mach tier syscall failed".to_string()),
+        ),
+    };
+    let tier_name = match tier {
+        SchedulingTier::Foreground => "foreground",
+        SchedulingTier::Normal => "normal",
+        SchedulingTier::Background => "background",
+    };
+    ActuatorDecisionEvent::local(
+        format!("contention:mach_tier:{tier_name}"),
+        format!("pid:{pid}"),
+        cycle,
+        disposition,
+        "contention-separation",
+        detail,
+    )
 }
 
 /// Sprint 12 perf-fix (2026-05-30). Single-slot cache for the
@@ -1013,7 +1061,9 @@ fn main() -> anyhow::Result<()> {
             }
             // Resource sentinel: sub-100ms interrupt handler for thermal/memory/power emergencies.
             // Shares the fg_detector so the sentinel never freezes the active foreground app.
-            spawn_resource_sentinel(
+            let (resource_interrupt_decision_tx, resource_interrupt_decision_rx) =
+                resource_interrupt_decision_channel();
+            spawn_resource_sentinel_with_decisions(
                 smc_reader.cache_arc(),
                 pressure_collector.cache_arc(),
                 state.resource_interrupt.clone(),
@@ -1023,6 +1073,7 @@ fn main() -> anyhow::Result<()> {
                 fg_detector.clone(),
                 Some(state.mach_qos.clone()),
                 frozen_state_path.clone(),
+                resource_interrupt_decision_tx,
             );
             // Overflow guard: aprende de eventos OOM y ajusta thresholds adaptativamente.
             // SleepNotifier: IOKit pre-sleep callback — fires kIOMessageSystemWillSleep
@@ -1689,6 +1740,7 @@ fn main() -> anyhow::Result<()> {
                 lf_metrics.inc_cycles();
                 let mut cycle_decision_events =
                     apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
+                resource_interrupt_decision_rx.drain_into(cycle_count, &mut cycle_decision_events);
                 let async_completion_stats =
                     async_commands.drain_decision_events(cycle_count, &mut cycle_decision_events);
                 if async_completion_stats.maintenance_purges_applied > 0
@@ -2139,14 +2191,16 @@ fn main() -> anyhow::Result<()> {
 
                 // Context-switch burst detector + reactive unfreeze.
                 // Extracted to daemon_ctx_switch_tick::run_ctx_switch_tick (Wave 31).
-                daemon_ctx_switch_tick::run_ctx_switch_tick(
+                let ctx_switch_decision_events = daemon_ctx_switch_tick::run_ctx_switch_tick(
                     foreground_app.clone(),
                     foreground_pid,
                     &mut last_fg_name,
                     &mut ctx_switch_times,
                     &state,
                     &frozen_state_path,
+                    cycle_count,
                 );
+                cycle_decision_events.extend_buffer(&ctx_switch_decision_events);
 
                 // Build enriched process data using foreground detector + process tree.
                 // A process is considered foreground if it IS the foreground app or a
@@ -2947,12 +3001,48 @@ fn main() -> anyhow::Result<()> {
                                         })
                                 };
                                 if protected(&pair.heavy_name) || protected(&pair.light_name) {
+                                    for (pid, tier) in [
+                                        (pair.heavy_pid, SchedulingTier::Foreground),
+                                        (pair.light_pid, SchedulingTier::Background),
+                                    ] {
+                                        let tier_name = match tier {
+                                            SchedulingTier::Foreground => "foreground",
+                                            SchedulingTier::Normal => "normal",
+                                            SchedulingTier::Background => "background",
+                                        };
+                                        cycle_decision_events.push(
+                                            apollo_engine::engine::decision_ledger::ActuatorDecisionEvent::local(
+                                                format!("contention:mach_tier:{tier_name}"),
+                                                format!("pid:{pid}"),
+                                                cycle_count,
+                                                apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                                "contention-separation",
+                                                "protected by contention safety gate",
+                                            ),
+                                        );
+                                    }
                                     continue;
                                 }
                                 // heavy → P-cores (Foreground tier)
-                                qos.set_tier(pair.heavy_pid, SchedulingTier::Foreground);
+                                let (heavy_outcome, heavy_disposition) = qos
+                                    .set_tier_audited(pair.heavy_pid, SchedulingTier::Foreground);
+                                cycle_decision_events.push(contention_mach_tier_event(
+                                    cycle_count,
+                                    pair.heavy_pid,
+                                    SchedulingTier::Foreground,
+                                    &heavy_outcome,
+                                    heavy_disposition,
+                                ));
                                 // light → E-cores (Background tier)
-                                qos.set_tier(pair.light_pid, SchedulingTier::Background);
+                                let (light_outcome, light_disposition) = qos
+                                    .set_tier_audited(pair.light_pid, SchedulingTier::Background);
+                                cycle_decision_events.push(contention_mach_tier_event(
+                                    cycle_count,
+                                    pair.light_pid,
+                                    SchedulingTier::Background,
+                                    &light_outcome,
+                                    light_disposition,
+                                ));
                             }
                         }
 
@@ -6840,18 +6930,6 @@ fn main() -> anyhow::Result<()> {
             // Release speculative kernel state before persisting on shutdown.
             let mut shutdown_decision_events =
                 apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
-            let shutdown_completion_stats =
-                async_commands.drain_decision_events(cycle_count, &mut shutdown_decision_events);
-            if shutdown_completion_stats.maintenance_purges_applied > 0
-                || shutdown_completion_stats.cli_purges_applied > 0
-            {
-                lf_metrics.maintenance_purge_total.fetch_add(
-                    shutdown_completion_stats
-                        .maintenance_purges_applied
-                        .saturating_add(shutdown_completion_stats.cli_purges_applied),
-                    Ordering::Relaxed,
-                );
-            }
             if let Some(lease) = last_markov_prethaw.take() {
                 let report = daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
                 shutdown_decision_events.extend_buffer(&report.decision_events);
@@ -6975,6 +7053,21 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
 
+            resource_interrupt_decision_rx.drain_into(cycle_count, &mut shutdown_decision_events);
+
+            let shutdown_completion_stats =
+                async_commands.finalize_shutdown(cycle_count, &mut shutdown_decision_events);
+            if shutdown_completion_stats.maintenance_purges_applied > 0
+                || shutdown_completion_stats.cli_purges_applied > 0
+            {
+                lf_metrics.maintenance_purge_total.fetch_add(
+                    shutdown_completion_stats
+                        .maintenance_purges_applied
+                        .saturating_add(shutdown_completion_stats.cli_purges_applied),
+                    Ordering::Relaxed,
+                );
+            }
+
             let shutdown_overflow_summary =
                 shutdown_decision_events.seal_overflow_summary(cycle_count);
             let shutdown_dropped = shutdown_decision_events.dropped_total();
@@ -7075,11 +7168,80 @@ mod tests {
     //! call count `< 30` (one per fg-burst or graph mutation).
 
     use super::{
-        fingerprint_top_processes, is_dev_tool_name, swap_reclaim_bypass_active, CompanionFgCache,
+        contention_mach_tier_event, fingerprint_top_processes, is_dev_tool_name,
+        swap_reclaim_bypass_active, CompanionFgCache,
     };
     use apollo_engine::collector::ProcessStats;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
+    use apollo_engine::engine::mach_qos::{QoSAuditDisposition, QoSOutcome, SchedulingTier};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn contention_mach_receipt_classifies_exact_effector_disposition() {
+        let applied = contention_mach_tier_event(
+            5,
+            101,
+            SchedulingTier::Foreground,
+            &QoSOutcome {
+                pid: 101,
+                tier: SchedulingTier::Foreground,
+                success: true,
+                mutated: true,
+                error: None,
+            },
+            QoSAuditDisposition::Applied,
+        );
+        let no_op = contention_mach_tier_event(
+            5,
+            102,
+            SchedulingTier::Background,
+            &QoSOutcome {
+                pid: 102,
+                tier: SchedulingTier::Background,
+                success: true,
+                mutated: false,
+                error: None,
+            },
+            QoSAuditDisposition::NoOp,
+        );
+        let blocked = contention_mach_tier_event(
+            5,
+            103,
+            SchedulingTier::Background,
+            &QoSOutcome {
+                pid: 103,
+                tier: SchedulingTier::Background,
+                success: true,
+                mutated: false,
+                error: None,
+            },
+            QoSAuditDisposition::Blocked,
+        );
+        let failed = contention_mach_tier_event(
+            5,
+            104,
+            SchedulingTier::Foreground,
+            &QoSOutcome {
+                pid: 104,
+                tier: SchedulingTier::Foreground,
+                success: false,
+                mutated: false,
+                error: Some("task_policy_set failed".to_string()),
+            },
+            QoSAuditDisposition::Failed,
+        );
+
+        assert_eq!(applied.outcome, ActuatorDecisionOutcome::Applied);
+        assert_eq!(no_op.outcome, ActuatorDecisionOutcome::NoOp);
+        assert_eq!(blocked.outcome, ActuatorDecisionOutcome::Blocked);
+        assert_eq!(failed.outcome, ActuatorDecisionOutcome::Failed);
+        assert_eq!(failed.proposal.target, "pid:104");
+        assert_eq!(
+            failed.proposal.action_key,
+            "contention:mach_tier:foreground"
+        );
+    }
 
     #[test]
     fn dev_tool_name_matches_known_tools_case_insensitively() {

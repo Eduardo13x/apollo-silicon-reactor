@@ -365,6 +365,17 @@ pub struct QoSOutcome {
     pub error: Option<String>,
 }
 
+/// Exact audit disposition for a tier request. The legacy `QoSOutcome`
+/// intentionally masks protected and first-failure paths as successful skips;
+/// direct actuator owners use this companion value for honest receipts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QoSAuditDisposition {
+    Applied,
+    NoOp,
+    Blocked,
+    Failed,
+}
+
 /// A short-lived send right to a process task port.
 ///
 /// Acceleration leases keep this handle from elevation through rollback so
@@ -555,15 +566,36 @@ impl MachQoSManager {
     /// Apply `tier` to `pid`.  Skips the syscall if already at that tier
     /// or if the PID is permanently blocked.
     pub fn set_tier(&mut self, pid: u32, tier: SchedulingTier) -> QoSOutcome {
+        let (mut outcome, disposition) = self.set_tier_audited(pid, tier);
+        if disposition == QoSAuditDisposition::Failed {
+            // Preserve the historical public contract: task-policy failures
+            // become permanently blocked silent skips for legacy callers.
+            outcome.success = true;
+            outcome.mutated = false;
+            outcome.error = None;
+        }
+        outcome
+    }
+
+    /// Apply `tier` while retaining the exact distinction between cache no-op,
+    /// policy block, successful mutation, and syscall failure.
+    pub fn set_tier_audited(
+        &mut self,
+        pid: u32,
+        tier: SchedulingTier,
+    ) -> (QoSOutcome, QoSAuditDisposition) {
         // Permanently blocked PIDs (SIP-protected) — never retry.
         if self.permanently_blocked.contains(&pid) {
-            return QoSOutcome {
-                pid,
-                tier,
-                success: true,
-                mutated: false,
-                error: None,
-            };
+            return (
+                QoSOutcome {
+                    pid,
+                    tier,
+                    success: true,
+                    mutated: false,
+                    error: None,
+                },
+                QoSAuditDisposition::Blocked,
+            );
         }
 
         // Check cache FIRST: any pid already in current_tier has been
@@ -578,13 +610,16 @@ impl MachQoSManager {
         // the common case during unfreeze is a pid already classified.
         if let Some(&(cached, stamped_at)) = self.current_tier.get(&pid) {
             if cached == tier && stamped_at.elapsed() < CURRENT_TIER_TTL {
-                return QoSOutcome {
-                    pid,
-                    tier,
-                    success: true,
-                    mutated: false,
-                    error: None,
-                };
+                return (
+                    QoSOutcome {
+                        pid,
+                        tier,
+                        success: true,
+                        mutated: false,
+                        error: None,
+                    },
+                    QoSAuditDisposition::NoOp,
+                );
             }
             // Same tier but stale stamp: fall through to a real re-apply —
             // external writers may have changed the live policy underneath us.
@@ -594,18 +629,17 @@ impl MachQoSManager {
             if result.success {
                 self.current_tier
                     .insert(pid, (tier, std::time::Instant::now()));
+                let disposition = if result.mutated {
+                    QoSAuditDisposition::Applied
+                } else {
+                    QoSAuditDisposition::NoOp
+                };
+                return (result, disposition);
             } else {
                 self.mark_blocked(pid);
                 self.current_tier.remove(&pid);
-                return QoSOutcome {
-                    pid,
-                    tier,
-                    success: true,
-                    mutated: false,
-                    error: None,
-                };
+                return (result, QoSAuditDisposition::Failed);
             }
-            return result;
         }
 
         // First encounter with this pid — pay the SIP classification cost.
@@ -613,13 +647,16 @@ impl MachQoSManager {
         // proc_pidpath fails, block permanently without attempting task_for_pid.
         if Self::is_sip_protected(pid) {
             self.mark_blocked(pid);
-            return QoSOutcome {
-                pid,
-                tier,
-                success: true,
-                mutated: false,
-                error: None,
-            };
+            return (
+                QoSOutcome {
+                    pid,
+                    tier,
+                    success: true,
+                    mutated: false,
+                    error: None,
+                },
+                QoSAuditDisposition::Blocked,
+            );
         }
 
         let result = self.apply_task_policy(pid, tier);
@@ -627,20 +664,19 @@ impl MachQoSManager {
         if result.success {
             self.current_tier
                 .insert(pid, (tier, std::time::Instant::now()));
+            let disposition = if result.mutated {
+                QoSAuditDisposition::Applied
+            } else {
+                QoSAuditDisposition::NoOp
+            };
+            (result, disposition)
         } else {
-            // task_for_pid failed — block permanently and report as silent skip.
+            // task_for_pid failed — block permanently, but retain the exact
+            // failure for audited direct-actuator callers.
             self.mark_blocked(pid);
             self.current_tier.remove(&pid);
-            return QoSOutcome {
-                pid,
-                tier,
-                success: true,
-                mutated: false,
-                error: None,
-            };
+            (result, QoSAuditDisposition::Failed)
         }
-
-        result
     }
 
     /// Purge dead PIDs from all tracking maps.
@@ -1873,6 +1909,22 @@ mod tests {
             !mgr.current_tier.contains_key(&pid),
             "stale hit must fall through to a real apply (observable via              the unprivileged-failure cleanup path)"
         );
+    }
+
+    #[test]
+    fn audited_set_tier_distinguishes_noop_from_policy_block() {
+        let pid = std::process::id();
+        let mut cached = MachQoSManager::new();
+        cached
+            .current_tier
+            .insert(pid, (SchedulingTier::Background, std::time::Instant::now()));
+        let (_, cached_disposition) = cached.set_tier_audited(pid, SchedulingTier::Background);
+        assert_eq!(cached_disposition, QoSAuditDisposition::NoOp);
+
+        let mut blocked = MachQoSManager::new();
+        blocked.mark_blocked(pid);
+        let (_, blocked_disposition) = blocked.set_tier_audited(pid, SchedulingTier::Background);
+        assert_eq!(blocked_disposition, QoSAuditDisposition::Blocked);
     }
 
     use super::*;

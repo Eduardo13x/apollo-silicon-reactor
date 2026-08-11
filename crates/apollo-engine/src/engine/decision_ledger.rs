@@ -390,6 +390,12 @@ impl CycleDecisionEvents {
         self.dropped_total
     }
 
+    /// Carry bounded producer/channel loss into the loop-owned overflow
+    /// accounting without manufacturing synthetic per-effect receipts.
+    pub fn record_dropped(&mut self, count: u64) {
+        self.dropped_total = self.dropped_total.saturating_add(count);
+    }
+
     fn drain(&mut self) -> impl Iterator<Item = ActuatorDecisionEvent> + '_ {
         self.events.drain(..)
     }

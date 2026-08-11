@@ -17,8 +17,11 @@ use std::collections::VecDeque;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{
+    unfreeze_outcome_events, unfreeze_pids_verified_outcome, write_frozen_state, UnfreezeOutcome,
+};
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::CycleDecisionEvents;
 use apollo_engine::engine::lock_ext::LockRecover;
 
 /// Run context-switch burst detector and reactive foreground unfreeze.
@@ -37,7 +40,9 @@ pub fn run_ctx_switch_tick(
     ctx_switch_times: &mut VecDeque<Instant>,
     state: &SharedState,
     frozen_state_path: &Path,
-) {
+    cycle: u64,
+) -> CycleDecisionEvents {
+    let mut decision_events = CycleDecisionEvents::default();
     let fg_changed =
         foreground_app.is_some() && last_fg_name.is_some() && foreground_app != *last_fg_name;
 
@@ -56,10 +61,55 @@ pub fn run_ctx_switch_tick(
             write_frozen_state(frozen_state_path, &frozen_guard);
             drop(frozen_guard);
             state.metrics.lock_recover().metrics.unfreezes_applied += outcome.applied_count();
+            decision_events.extend_buffer(&foreground_unfreeze_events(cycle, &outcome));
         }
     }
 
     *last_fg_name = foreground_app;
     let cutoff = Instant::now() - Duration::from_secs(300);
     ctx_switch_times.retain(|t| *t > cutoff);
+    decision_events
+}
+
+fn foreground_unfreeze_events(cycle: u64, outcome: &UnfreezeOutcome) -> CycleDecisionEvents {
+    unfreeze_outcome_events(
+        "unfreeze:foreground_switch",
+        "context-switch-recovery",
+        cycle,
+        outcome,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
+
+    #[test]
+    fn foreground_sigcont_receipts_preserve_exact_dispositions() {
+        let outcome = UnfreezeOutcome {
+            applied_pids: vec![41],
+            stale_pids: vec![42],
+            failed_pids: vec![43],
+        };
+
+        let events = foreground_unfreeze_events(12, &outcome);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events.as_slice()[0].proposal.target, "pid:41");
+        assert_eq!(
+            events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Reverted
+        );
+        assert_eq!(events.as_slice()[1].proposal.target, "pid:42");
+        assert_eq!(
+            events.as_slice()[1].outcome,
+            ActuatorDecisionOutcome::Blocked
+        );
+        assert_eq!(events.as_slice()[2].proposal.target, "pid:43");
+        assert_eq!(
+            events.as_slice()[2].outcome,
+            ActuatorDecisionOutcome::Failed
+        );
+    }
 }

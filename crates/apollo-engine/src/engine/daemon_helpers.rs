@@ -3,6 +3,7 @@
 //! These helpers have no dependency on SharedState and can be tested independently.
 //! Includes: path resolution, persistence I/O, freeze logic, policy seeding.
 
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -31,6 +32,7 @@ use crate::engine::types::{
 
 pub const FREEZE_TTL_SECS: i64 = 3 * 60;
 pub const ASYNC_COMMAND_QUEUE_CAPACITY: usize = 32;
+const ASYNC_COMMAND_PENDING_CAPACITY: usize = ASYNC_COMMAND_QUEUE_CAPACITY * 2 + 1;
 
 /// Seed policy embedded at compile time — guarantees Brave, Claude, Warp, etc.
 /// are always in interactive_patterns even on fresh installs or corrupt disk policy.
@@ -937,10 +939,31 @@ impl AsyncCommandSubmission {
 pub struct AsyncCommandCompletionStats {
     pub completed: u64,
     pub failed: u64,
+    pub expired: u64,
     pub maintenance_purges_applied: u64,
     pub survival_purges_applied: u64,
     pub cli_purges_applied: u64,
     pub spotlight_applied: u64,
+}
+
+impl AsyncCommandCompletionStats {
+    fn merge(&mut self, other: Self) {
+        self.completed = self.completed.saturating_add(other.completed);
+        self.failed = self.failed.saturating_add(other.failed);
+        self.expired = self.expired.saturating_add(other.expired);
+        self.maintenance_purges_applied = self
+            .maintenance_purges_applied
+            .saturating_add(other.maintenance_purges_applied);
+        self.survival_purges_applied = self
+            .survival_purges_applied
+            .saturating_add(other.survival_purges_applied);
+        self.cli_purges_applied = self
+            .cli_purges_applied
+            .saturating_add(other.cli_purges_applied);
+        self.spotlight_applied = self
+            .spotlight_applied
+            .saturating_add(other.spotlight_applied);
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -963,6 +986,8 @@ enum AsyncCommandKind {
     Spotlight(bool),
     #[cfg(test)]
     TestProgram(String),
+    #[cfg(test)]
+    TestDelay(Duration, bool),
 }
 
 struct AsyncCommandJob {
@@ -984,6 +1009,8 @@ pub struct AsyncCommandQueue {
     jobs: SyncSender<AsyncCommandJob>,
     completions: Receiver<AsyncCommandCompletion>,
     next_correlation_id: AtomicU64,
+    pending: RefCell<Vec<AsyncCommandSubmission>>,
+    shutdown_finalized: Cell<bool>,
 }
 
 impl Default for AsyncCommandQueue {
@@ -1004,6 +1031,8 @@ impl AsyncCommandQueue {
             jobs: job_tx,
             completions: completion_rx,
             next_correlation_id: AtomicU64::new(1),
+            pending: RefCell::new(Vec::with_capacity(ASYNC_COMMAND_PENDING_CAPACITY)),
+            shutdown_finalized: Cell::new(false),
         }
     }
 
@@ -1048,6 +1077,24 @@ impl AsyncCommandQueue {
         )
     }
 
+    #[cfg(test)]
+    fn submit_test_delay(
+        &self,
+        delay: Duration,
+        success: bool,
+        action_key: &str,
+        target: &str,
+        source: &str,
+    ) -> Result<AsyncCommandSubmission, AsyncCommandSubmitError> {
+        self.submit(
+            AsyncCommandKind::TestDelay(delay, success),
+            action_key,
+            target,
+            source,
+            AsyncCommandMetric::Test,
+        )
+    }
+
     fn submit(
         &self,
         kind: AsyncCommandKind,
@@ -1056,6 +1103,12 @@ impl AsyncCommandQueue {
         source: &str,
         metric: AsyncCommandMetric,
     ) -> Result<AsyncCommandSubmission, AsyncCommandSubmitError> {
+        if self.shutdown_finalized.get() {
+            return Err(AsyncCommandSubmitError::WorkerUnavailable);
+        }
+        if self.pending.borrow().len() >= ASYNC_COMMAND_PENDING_CAPACITY {
+            return Err(AsyncCommandSubmitError::Full);
+        }
         let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
         let submission = AsyncCommandSubmission {
             correlation_id: correlation_id.max(1),
@@ -1068,7 +1121,10 @@ impl AsyncCommandQueue {
             kind,
             submission: submission.clone(),
         }) {
-            Ok(()) => Ok(submission),
+            Ok(()) => {
+                self.pending.borrow_mut().push(submission.clone());
+                Ok(submission)
+            }
             Err(TrySendError::Full(_)) => Err(AsyncCommandSubmitError::Full),
             Err(TrySendError::Disconnected(_)) => Err(AsyncCommandSubmitError::WorkerUnavailable),
         }
@@ -1085,6 +1141,15 @@ impl AsyncCommandQueue {
                 Ok(completion) => completion,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
+            let Some(pending_index) =
+                self.pending.borrow().iter().position(|pending| {
+                    pending.correlation_id == completion.submission.correlation_id
+                })
+            else {
+                // Shutdown already terminally expired this identity.
+                continue;
+            };
+            self.pending.borrow_mut().swap_remove(pending_index);
             stats.completed = stats.completed.saturating_add(1);
             stats.failed = stats.failed.saturating_add(u64::from(!completion.success));
             if completion.success {
@@ -1124,6 +1189,41 @@ impl AsyncCommandQueue {
         }
         stats
     }
+
+    /// Terminally account for every admitted command without waiting for an
+    /// external process. Ready completions retain their exact exit status;
+    /// every other correlation expires once and any later worker result is
+    /// ignored because it no longer exists in the loop-owned pending set.
+    pub fn finalize_shutdown(
+        &self,
+        cycle: u64,
+        events: &mut CycleDecisionEvents,
+    ) -> AsyncCommandCompletionStats {
+        self.shutdown_finalized.set(true);
+        let mut stats = AsyncCommandCompletionStats::default();
+        // Three non-blocking drains cover the fixed 65-command admission
+        // envelope even when the worker refills the 32-slot completion queue
+        // while shutdown is consuming it.
+        for _ in 0..3 {
+            stats.merge(self.drain_decision_events(cycle, events));
+        }
+        let pending = self.pending.take();
+        for submission in pending {
+            stats.expired = stats.expired.saturating_add(1);
+            events.push(
+                ActuatorDecisionEvent::local(
+                    submission.action_key,
+                    submission.target,
+                    cycle,
+                    ActuatorDecisionOutcome::Expired,
+                    submission.source,
+                    "command unresolved at graceful shutdown; authority cancelled",
+                )
+                .with_correlation(submission.correlation_id),
+            );
+        }
+        stats
+    }
 }
 
 fn async_command_worker(
@@ -1131,32 +1231,32 @@ fn async_command_worker(
     completions: SyncSender<AsyncCommandCompletion>,
 ) {
     while let Ok(job) = jobs.recv() {
-        let result = match job.kind {
-            AsyncCommandKind::Purge => std::process::Command::new("purge")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
-            AsyncCommandKind::Spotlight(enabled) => std::process::Command::new("/usr/bin/mdutil")
-                .args(["-a", "-i", if enabled { "on" } else { "off" }])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
-            #[cfg(test)]
-            AsyncCommandKind::TestProgram(program) => std::process::Command::new(program)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status(),
-        };
-        let (success, detail) = match result {
-            Ok(status) => (
-                status.success(),
-                format!(
-                    "exit_status={:?},success={}",
-                    status.code(),
-                    status.success()
-                ),
+        let (success, detail) = match job.kind {
+            AsyncCommandKind::Purge => async_command_result(
+                std::process::Command::new("purge")
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status(),
             ),
-            Err(error) => (false, format!("spawn_error={error}")),
+            AsyncCommandKind::Spotlight(enabled) => async_command_result(
+                std::process::Command::new("/usr/bin/mdutil")
+                    .args(["-a", "-i", if enabled { "on" } else { "off" }])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status(),
+            ),
+            #[cfg(test)]
+            AsyncCommandKind::TestProgram(program) => async_command_result(
+                std::process::Command::new(program)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status(),
+            ),
+            #[cfg(test)]
+            AsyncCommandKind::TestDelay(delay, success) => {
+                std::thread::sleep(delay);
+                (success, format!("test_delay_success={success}"))
+            }
         };
         if completions
             .send(AsyncCommandCompletion {
@@ -1168,6 +1268,20 @@ fn async_command_worker(
         {
             break;
         }
+    }
+}
+
+fn async_command_result(result: std::io::Result<std::process::ExitStatus>) -> (bool, String) {
+    match result {
+        Ok(status) => (
+            status.success(),
+            format!(
+                "exit_status={:?},success={}",
+                status.code(),
+                status.success()
+            ),
+        ),
+        Err(error) => (false, format!("spawn_error={error}")),
     }
 }
 
@@ -1335,6 +1449,62 @@ mod tests {
         assert_eq!(completion.correlation_id, pending.correlation_id);
         assert_eq!(completion.proposal.action_key, pending.proposal.action_key);
         assert_eq!(completion.proposal.target, pending.proposal.target);
+        assert!(completion.detail.contains("exit"));
+    }
+
+    #[test]
+    fn shutdown_expires_inflight_command_and_ignores_late_completion() {
+        let commands = AsyncCommandQueue::new();
+        let submission = commands
+            .submit_test_delay(
+                Duration::from_millis(75),
+                true,
+                "predictive_purge:test",
+                "host",
+                "test-async-command",
+            )
+            .expect("bounded queue accepts delayed test command");
+
+        let mut shutdown_events = CycleDecisionEvents::default();
+        let stats = commands.finalize_shutdown(9, &mut shutdown_events);
+        assert_eq!(stats.completed, 0);
+        assert_eq!(stats.expired, 1);
+        assert_eq!(shutdown_events.len(), 1);
+        let expiry = &shutdown_events.as_slice()[0];
+        assert_eq!(expiry.outcome, ActuatorDecisionOutcome::Expired);
+        assert_eq!(expiry.correlation_id, Some(submission.correlation_id));
+        assert_eq!(expiry.proposal.action_key, submission.action_key);
+        assert_eq!(expiry.proposal.target, submission.target);
+
+        std::thread::sleep(Duration::from_millis(125));
+        let mut late_events = CycleDecisionEvents::default();
+        let late_stats = commands.drain_decision_events(10, &mut late_events);
+        assert_eq!(late_stats.completed, 0);
+        assert!(late_events.is_empty());
+    }
+
+    #[test]
+    fn shutdown_prefers_ready_exact_completion_over_expiry() {
+        let commands = AsyncCommandQueue::new();
+        let submission = commands
+            .submit_test_program(
+                "/usr/bin/false",
+                "predictive_purge:test",
+                "host",
+                "test-async-command",
+            )
+            .expect("bounded queue accepts one test command");
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut shutdown_events = CycleDecisionEvents::default();
+        let stats = commands.finalize_shutdown(10, &mut shutdown_events);
+        assert_eq!(stats.completed, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.expired, 0);
+        assert_eq!(shutdown_events.len(), 1);
+        let completion = &shutdown_events.as_slice()[0];
+        assert_eq!(completion.outcome, ActuatorDecisionOutcome::Failed);
+        assert_eq!(completion.correlation_id, Some(submission.correlation_id));
         assert!(completion.detail.contains("exit"));
     }
 

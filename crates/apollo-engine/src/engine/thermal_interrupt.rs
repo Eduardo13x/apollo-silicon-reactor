@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,12 +20,16 @@ use std::time::{Duration, Instant};
 use crate::engine::activity_sensor::active_pids;
 use crate::engine::background_collectors::PressureData;
 use crate::engine::daemon_helpers::{
-    unfreeze_pids_outcome, unfreeze_pids_verified_outcome, write_frozen_state,
+    unfreeze_outcome_events, unfreeze_pids_outcome, unfreeze_pids_verified_outcome,
+    write_frozen_state,
+};
+use crate::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
 };
 use crate::engine::foreground::ForegroundDetector;
 use crate::engine::iokit_sensors::HardwareSnapshot;
 use crate::engine::lock_ext::LockRecover;
-use crate::engine::mach_qos::{MachQoSManager, SchedulingTier};
+use crate::engine::mach_qos::{MachQoSManager, QoSAuditDisposition, SchedulingTier};
 use crate::engine::process_identity::ProcessIdentity;
 use crate::engine::types::{FreezeSource, FrozenEntry};
 use chrono::Utc;
@@ -123,6 +128,88 @@ impl ResourceInterruptState {
 impl Default for ResourceInterruptState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+const RESOURCE_INTERRUPT_DECISION_CAPACITY: usize = 128;
+
+/// Non-blocking producer retained by the background sentinel. Channel loss is
+/// counted atomically and propagated into the loop's bounded overflow receipt.
+#[derive(Clone)]
+pub struct ResourceInterruptDecisionSender {
+    sender: SyncSender<ActuatorDecisionEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl ResourceInterruptDecisionSender {
+    fn emit(&self, event: ActuatorDecisionEvent) -> bool {
+        match self.sender.try_send(event) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+        }
+    }
+}
+
+/// Loop-owned consumer for exact sentinel actuator outcomes.
+pub struct ResourceInterruptDecisionReceiver {
+    receiver: Receiver<ActuatorDecisionEvent>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl ResourceInterruptDecisionReceiver {
+    pub fn drain_into(&self, cycle: u64, events: &mut CycleDecisionEvents) {
+        for _ in 0..RESOURCE_INTERRUPT_DECISION_CAPACITY {
+            let mut event = match self.receiver.try_recv() {
+                Ok(event) => event,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            event.set_cycle(cycle);
+            events.push(event);
+        }
+        events.record_dropped(self.dropped.swap(0, Ordering::AcqRel));
+    }
+}
+
+pub fn resource_interrupt_decision_channel() -> (
+    ResourceInterruptDecisionSender,
+    ResourceInterruptDecisionReceiver,
+) {
+    let (sender, receiver) = mpsc::sync_channel(RESOURCE_INTERRUPT_DECISION_CAPACITY);
+    let dropped = Arc::new(AtomicU64::new(0));
+    (
+        ResourceInterruptDecisionSender {
+            sender,
+            dropped: dropped.clone(),
+        },
+        ResourceInterruptDecisionReceiver { receiver, dropped },
+    )
+}
+
+fn interrupt_effect_event(
+    action_key: &str,
+    pid: u32,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        action_key,
+        format!("pid:{pid}"),
+        0,
+        outcome,
+        "resource-interrupt-sentinel",
+        detail,
+    )
+}
+
+fn emit_interrupt_event(
+    decisions: Option<&ResourceInterruptDecisionSender>,
+    event: ActuatorDecisionEvent,
+) {
+    if let Some(decisions) = decisions {
+        decisions.emit(event);
     }
 }
 
@@ -396,6 +483,60 @@ pub fn spawn_resource_sentinel(
     qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
     frozen_state_path: PathBuf,
 ) {
+    spawn_resource_sentinel_inner(
+        hw_cache,
+        pressure_cache,
+        interrupt_state,
+        main_frozen,
+        stop,
+        config,
+        fg_detector,
+        qos_mgr,
+        frozen_state_path,
+        None,
+    );
+}
+
+/// Spawn the live sentinel with a bounded decision-event handoff owned by the
+/// daemon loop. This does not alter the sentinel's existing safety authority.
+pub fn spawn_resource_sentinel_with_decisions(
+    hw_cache: Arc<Mutex<Option<HardwareSnapshot>>>,
+    pressure_cache: Arc<Mutex<PressureData>>,
+    interrupt_state: Arc<ResourceInterruptState>,
+    main_frozen: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
+    stop: Arc<AtomicBool>,
+    config: SentinelConfig,
+    fg_detector: Arc<ForegroundDetector>,
+    qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
+    frozen_state_path: PathBuf,
+    decisions: ResourceInterruptDecisionSender,
+) {
+    spawn_resource_sentinel_inner(
+        hw_cache,
+        pressure_cache,
+        interrupt_state,
+        main_frozen,
+        stop,
+        config,
+        fg_detector,
+        qos_mgr,
+        frozen_state_path,
+        Some(decisions),
+    );
+}
+
+fn spawn_resource_sentinel_inner(
+    hw_cache: Arc<Mutex<Option<HardwareSnapshot>>>,
+    pressure_cache: Arc<Mutex<PressureData>>,
+    interrupt_state: Arc<ResourceInterruptState>,
+    main_frozen: Arc<Mutex<HashMap<u32, FrozenEntry>>>,
+    stop: Arc<AtomicBool>,
+    config: SentinelConfig,
+    fg_detector: Arc<ForegroundDetector>,
+    qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
+    frozen_state_path: PathBuf,
+    decisions: Option<ResourceInterruptDecisionSender>,
+) {
     if let Err(e) = thread::Builder::new()
         .name("resource-sentinel".into())
         .spawn(move || {
@@ -413,6 +554,7 @@ pub fn spawn_resource_sentinel(
                 fg_detector,
                 qos_mgr,
                 frozen_state_path,
+                decisions,
             );
         })
     {
@@ -447,6 +589,7 @@ fn sentinel_loop(
     fg_detector: Arc<ForegroundDetector>,
     qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
     frozen_state_path: PathBuf,
+    decisions: Option<ResourceInterruptDecisionSender>,
 ) {
     let mut bufs = SentinelBuffers::new(fg_detector);
     let mut last_escalation = Instant::now() - config.debounce;
@@ -564,6 +707,7 @@ fn sentinel_loop(
                     &frozen_state_path,
                     &mut bufs,
                     &qos_mgr,
+                    decisions.as_ref(),
                 );
             } else {
                 // De-escalation → recovery.
@@ -574,6 +718,7 @@ fn sentinel_loop(
                         &frozen_state_path,
                         &mut bufs,
                         &qos_mgr,
+                        decisions.as_ref(),
                     );
                     state.active.store(false, Ordering::Release);
                 }
@@ -608,6 +753,15 @@ fn sentinel_loop(
                     } else {
                         unfreeze_pids_outcome(std::iter::once(pid))
                     };
+                    let outcome_events = unfreeze_outcome_events(
+                        "thermal_interrupt:foreground_sigcont",
+                        "resource-interrupt-sentinel",
+                        0,
+                        &outcome,
+                    );
+                    for event in outcome_events.as_slice() {
+                        emit_interrupt_event(decisions.as_ref(), event.clone());
+                    }
                     let forgettable: Vec<u32> = outcome.forgettable_pids().collect();
                     let mut persisted_changed = false;
                     if let Ok(mut mf) = main_frozen.try_lock() {
@@ -700,22 +854,23 @@ fn respond_to_phase(
     frozen_state_path: &Path,
     bufs: &mut SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
+    decisions: Option<&ResourceInterruptDecisionSender>,
 ) {
     match phase {
         InterruptPhase::Moderate => {
             // Migrate non-protected to E-cores via direct Mach syscall.
-            migrate_to_ecores(state, main_frozen, bufs, qos_mgr);
+            migrate_to_ecores(state, main_frozen, bufs, qos_mgr, decisions);
         }
         InterruptPhase::Emergency => {
             // SIGSTOP non-critical + E-core migration + memory pressure hint.
-            freeze_non_critical(state, main_frozen, frozen_state_path, bufs);
-            migrate_to_ecores(state, main_frozen, bufs, qos_mgr);
+            freeze_non_critical(state, main_frozen, frozen_state_path, bufs, decisions);
+            migrate_to_ecores(state, main_frozen, bufs, qos_mgr, decisions);
             send_memory_pressure_hint();
         }
         InterruptPhase::SuperEmergency => {
             // Everything above + I/O throttle.
-            freeze_non_critical(state, main_frozen, frozen_state_path, bufs);
-            migrate_to_ecores(state, main_frozen, bufs, qos_mgr);
+            freeze_non_critical(state, main_frozen, frozen_state_path, bufs, decisions);
+            migrate_to_ecores(state, main_frozen, bufs, qos_mgr, decisions);
             send_memory_pressure_hint();
             enable_io_throttle();
         }
@@ -729,6 +884,7 @@ fn migrate_to_ecores(
     main_frozen: &Arc<Mutex<HashMap<u32, FrozenEntry>>>,
     bufs: &SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
+    decisions: Option<&ResourceInterruptDecisionSender>,
 ) {
     let main_frozen_pids: HashSet<u32> = main_frozen
         .try_lock()
@@ -779,18 +935,62 @@ fn migrate_to_ecores(
             continue;
         }
         // Phase 2: direct Mach syscall for E-core migration.
-        let applied_effect = if let Some(ref mut mgr) = qos_guard {
-            mgr.set_tier(pid_u32, SchedulingTier::Background)
-                .mutated
-                .then_some(crate::engine::effect_ledger::AppliedEffect::MachTier { pid: pid_u32 })
+        let (action_key, applied_effect, outcome, detail) = if let Some(ref mut mgr) = qos_guard {
+            let (qos_outcome, audit_disposition) =
+                mgr.set_tier_audited(pid_u32, SchedulingTier::Background);
+            match audit_disposition {
+                QoSAuditDisposition::Applied => (
+                    "thermal_interrupt:mach_tier_background",
+                    Some(crate::engine::effect_ledger::AppliedEffect::MachTier { pid: pid_u32 }),
+                    ActuatorDecisionOutcome::Applied,
+                    "Mach background tier applied".to_string(),
+                ),
+                QoSAuditDisposition::NoOp => (
+                    "thermal_interrupt:mach_tier_background",
+                    None,
+                    ActuatorDecisionOutcome::NoOp,
+                    "Mach background tier already active".to_string(),
+                ),
+                QoSAuditDisposition::Blocked => (
+                    "thermal_interrupt:mach_tier_background",
+                    None,
+                    ActuatorDecisionOutcome::Blocked,
+                    "Mach background tier unavailable or protected".to_string(),
+                ),
+                QoSAuditDisposition::Failed => (
+                    "thermal_interrupt:mach_tier_background",
+                    None,
+                    ActuatorDecisionOutcome::Failed,
+                    qos_outcome
+                        .error
+                        .unwrap_or_else(|| "Mach background tier syscall failed".to_string()),
+                ),
+            }
         } else {
             // Fallback: PRIO_DARWIN_BG (turnstile-compatible background QoS).
             // Do NOT use PRIO_PROCESS+nice=20 — that breaks the Mach
             // priority-inheritance chain and causes WindowServer IPC hangs.
             const PRIO_DARWIN_BG: libc::c_int = 0x1000;
-            ((unsafe { libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1) }) == 0)
-                .then_some(crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: pid_u32 })
+            if unsafe { libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1) } == 0 {
+                (
+                    "thermal_interrupt:darwin_bg_enable",
+                    Some(crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: pid_u32 }),
+                    ActuatorDecisionOutcome::Applied,
+                    "Darwin background priority applied".to_string(),
+                )
+            } else {
+                (
+                    "thermal_interrupt:darwin_bg_enable",
+                    None,
+                    ActuatorDecisionOutcome::Failed,
+                    format!("setpriority failed: {}", std::io::Error::last_os_error()),
+                )
+            }
         };
+        emit_interrupt_event(
+            decisions,
+            interrupt_effect_event(action_key, pid_u32, outcome, detail),
+        );
         let Some(applied_effect) = applied_effect else {
             continue;
         };
@@ -821,6 +1021,7 @@ fn freeze_non_critical(
     main_frozen: &Arc<Mutex<HashMap<u32, FrozenEntry>>>,
     frozen_state_path: &Path,
     bufs: &SentinelBuffers,
+    decisions: Option<&ResourceInterruptDecisionSender>,
 ) {
     let main_frozen_pids: HashSet<u32> = main_frozen
         .try_lock()
@@ -910,22 +1111,59 @@ fn freeze_non_critical(
         );
         for (pid_u32, expected_name) in &newly_frozen {
             let pid_key = sysinfo::Pid::from_u32(*pid_u32);
-            let name_matches = verify_sys
-                .process(pid_key)
-                .map(|p| p.name() == expected_name.as_str())
-                .unwrap_or(false); // process no longer exists → do not signal
-            if !name_matches {
-                // PID recycled or process exited between snapshot and now.
-                continue;
+            match verify_sys.process(pid_key) {
+                None => {
+                    emit_interrupt_event(
+                        decisions,
+                        interrupt_effect_event(
+                            "thermal_interrupt:freeze",
+                            *pid_u32,
+                            ActuatorDecisionOutcome::NoOp,
+                            "process exited before SIGSTOP",
+                        ),
+                    );
+                    continue;
+                }
+                Some(process) if process.name() != expected_name.as_str() => {
+                    emit_interrupt_event(
+                        decisions,
+                        interrupt_effect_event(
+                            "thermal_interrupt:freeze",
+                            *pid_u32,
+                            ActuatorDecisionOutcome::Blocked,
+                            "PID identity changed before SIGSTOP",
+                        ),
+                    );
+                    continue;
+                }
+                Some(_) => {}
             }
             // Re-check safety against the freshly verified name (names can change
             // between snapshots) — central source of truth, not the local lists.
             if crate::engine::safety::is_protected_name(expected_name) {
+                emit_interrupt_event(
+                    decisions,
+                    interrupt_effect_event(
+                        "thermal_interrupt:freeze",
+                        *pid_u32,
+                        ActuatorDecisionOutcome::Blocked,
+                        "protected by central safety policy",
+                    ),
+                );
                 continue;
             }
             // Apple platform check: skip CS_PLATFORM_BINARY processes even in
             // thermal emergency — freezing WindowServer helpers causes display hangs.
             if crate::engine::process_identity::is_apple_platform_process(*pid_u32) {
+                emit_interrupt_event(
+                    decisions,
+                    interrupt_effect_event(
+                        "thermal_interrupt:freeze",
+                        *pid_u32,
+                        ActuatorDecisionOutcome::Blocked,
+                        "Apple platform process",
+                    ),
+                );
                 continue;
             }
             if unsafe { libc::kill(*pid_u32 as i32, libc::SIGSTOP) } == 0 {
@@ -933,6 +1171,25 @@ fn freeze_non_critical(
                     .map(|identity| identity.start_sec)
                     .unwrap_or(0);
                 confirmed_frozen.push((*pid_u32, expected_name.clone(), start_sec));
+                emit_interrupt_event(
+                    decisions,
+                    interrupt_effect_event(
+                        "thermal_interrupt:freeze",
+                        *pid_u32,
+                        ActuatorDecisionOutcome::Applied,
+                        "SIGSTOP applied",
+                    ),
+                );
+            } else {
+                emit_interrupt_event(
+                    decisions,
+                    interrupt_effect_event(
+                        "thermal_interrupt:freeze",
+                        *pid_u32,
+                        ActuatorDecisionOutcome::Failed,
+                        format!("SIGSTOP failed: {}", std::io::Error::last_os_error()),
+                    ),
+                );
             }
         }
     }
@@ -1003,6 +1260,7 @@ fn recover(
     frozen_state_path: &Path,
     _bufs: &mut SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
+    decisions: Option<&ResourceInterruptDecisionSender>,
 ) {
     // Disable I/O throttle if it was enabled during SuperEmergency.
     disable_io_throttle();
@@ -1033,18 +1291,96 @@ fn recover(
                 let darwin_owned =
                     crate::engine::effect_ledger::is_global_owner(&darwin_effect, OWNER);
 
-                let restored = if mach_owned {
-                    qos_guard.as_mut().is_some_and(|mgr| {
-                        let outcome = mgr.set_tier(*pid, SchedulingTier::Normal);
-                        outcome.mutated || mgr.current_tier(*pid) == Some(SchedulingTier::Normal)
-                    })
+                let (action_key, outcome, detail, restored) = if mach_owned {
+                    if let Some(mgr) = qos_guard.as_mut() {
+                        let (qos_outcome, audit_disposition) =
+                            mgr.set_tier_audited(*pid, SchedulingTier::Normal);
+                        match audit_disposition {
+                            QoSAuditDisposition::Applied => (
+                                "thermal_interrupt:mach_tier_restore",
+                                ActuatorDecisionOutcome::Reverted,
+                                "Mach tier restored to normal".to_string(),
+                                true,
+                            ),
+                            QoSAuditDisposition::NoOp => (
+                                "thermal_interrupt:mach_tier_restore",
+                                ActuatorDecisionOutcome::NoOp,
+                                "Mach tier already normal".to_string(),
+                                true,
+                            ),
+                            QoSAuditDisposition::Blocked => (
+                                "thermal_interrupt:mach_tier_restore",
+                                ActuatorDecisionOutcome::Blocked,
+                                "Mach normal-tier restoration blocked".to_string(),
+                                false,
+                            ),
+                            QoSAuditDisposition::Failed => (
+                                "thermal_interrupt:mach_tier_restore",
+                                ActuatorDecisionOutcome::Failed,
+                                qos_outcome.error.unwrap_or_else(|| {
+                                    "Mach normal-tier restoration failed".to_string()
+                                }),
+                                false,
+                            ),
+                        }
+                    } else {
+                        (
+                            "thermal_interrupt:mach_tier_restore",
+                            ActuatorDecisionOutcome::Blocked,
+                            "Mach QoS manager busy during recovery".to_string(),
+                            false,
+                        )
+                    }
                 } else if darwin_owned {
-                    (unsafe { libc::setpriority(PRIO_DARWIN_BG, *pid, 0) }) == 0
+                    if unsafe { libc::setpriority(PRIO_DARWIN_BG, *pid, 0) } == 0 {
+                        (
+                            "thermal_interrupt:darwin_bg_restore",
+                            ActuatorDecisionOutcome::Reverted,
+                            "Darwin background priority cleared".to_string(),
+                            true,
+                        )
+                    } else {
+                        (
+                            "thermal_interrupt:darwin_bg_restore",
+                            ActuatorDecisionOutcome::Failed,
+                            format!(
+                                "setpriority restore failed: {}",
+                                std::io::Error::last_os_error()
+                            ),
+                            false,
+                        )
+                    }
                 } else {
                     // The TTL ledger already resolved it, or a newer producer
                     // owns the same effect kind. Do not undo the newer owner.
-                    true
+                    let mach_transferred =
+                        crate::engine::effect_ledger::is_global_tracked(&mach_effect);
+                    let darwin_transferred =
+                        crate::engine::effect_ledger::is_global_tracked(&darwin_effect);
+                    if mach_transferred || darwin_transferred {
+                        (
+                            if mach_transferred {
+                                "thermal_interrupt:mach_tier_restore"
+                            } else {
+                                "thermal_interrupt:darwin_bg_restore"
+                            },
+                            ActuatorDecisionOutcome::Blocked,
+                            "migration ownership transferred; restore suppressed".to_string(),
+                            true,
+                        )
+                    } else {
+                        (
+                            "thermal_interrupt:qos_restore",
+                            ActuatorDecisionOutcome::NoOp,
+                            "migration already resolved by TTL reconciliation".to_string(),
+                            true,
+                        )
+                    }
                 };
+                emit_interrupt_event(
+                    decisions,
+                    interrupt_effect_event(action_key, *pid, outcome, detail),
+                );
                 if !restored {
                     continue;
                 }
@@ -1110,6 +1446,28 @@ fn recover(
 
     let verified_outcome = unfreeze_pids_verified_outcome(&verified_entries);
     let missing_outcome = unfreeze_pids_outcome(missing_entries.into_iter());
+    for outcome in [&verified_outcome, &missing_outcome] {
+        let outcome_events = unfreeze_outcome_events(
+            "thermal_interrupt:sigcont_recovery",
+            "resource-interrupt-sentinel",
+            0,
+            outcome,
+        );
+        for event in outcome_events.as_slice() {
+            emit_interrupt_event(decisions, event.clone());
+        }
+    }
+    for pid in &transferred {
+        emit_interrupt_event(
+            decisions,
+            interrupt_effect_event(
+                "thermal_interrupt:sigcont_recovery",
+                *pid,
+                ActuatorDecisionOutcome::Blocked,
+                "freeze ownership transferred; SIGCONT suppressed",
+            ),
+        );
+    }
     let forgettable: HashSet<u32> = verified_outcome
         .forgettable_pids()
         .chain(missing_outcome.forgettable_pids())
@@ -1160,6 +1518,63 @@ impl Ord for InterruptPhase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::decision_ledger::{ActuatorDecisionOutcome, CycleDecisionEvents};
+
+    #[test]
+    fn bounded_interrupt_handoff_preserves_pid_effect_and_all_dispositions() {
+        let (sender, receiver) = resource_interrupt_decision_channel();
+        let outcomes = [
+            ActuatorDecisionOutcome::Applied,
+            ActuatorDecisionOutcome::Blocked,
+            ActuatorDecisionOutcome::Failed,
+            ActuatorDecisionOutcome::NoOp,
+            ActuatorDecisionOutcome::Reverted,
+        ];
+
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            assert!(sender.emit(interrupt_effect_event(
+                "thermal_interrupt:mach_tier",
+                4100 + index as u32,
+                outcome,
+                "test disposition",
+            )));
+        }
+
+        let mut events = CycleDecisionEvents::default();
+        receiver.drain_into(77, &mut events);
+        assert_eq!(events.len(), outcomes.len());
+        for (index, event) in events.as_slice().iter().enumerate() {
+            assert_eq!(event.proposal.target, format!("pid:{}", 4100 + index));
+            assert_eq!(event.proposal.action_key, "thermal_interrupt:mach_tier");
+            assert_eq!(event.proposal.proposed_cycle, 77);
+            assert_eq!(event.observed_cycle, 77);
+            assert_eq!(event.outcome, outcomes[index]);
+        }
+    }
+
+    #[test]
+    fn interrupt_handoff_propagates_bounded_channel_overflow() {
+        let (sender, receiver) = resource_interrupt_decision_channel();
+        for pid in 1..=RESOURCE_INTERRUPT_DECISION_CAPACITY as u32 {
+            assert!(sender.emit(interrupt_effect_event(
+                "thermal_interrupt:freeze",
+                pid,
+                ActuatorDecisionOutcome::Applied,
+                "SIGSTOP applied",
+            )));
+        }
+        assert!(!sender.emit(interrupt_effect_event(
+            "thermal_interrupt:freeze",
+            9999,
+            ActuatorDecisionOutcome::Applied,
+            "SIGSTOP applied",
+        )));
+
+        let mut events = CycleDecisionEvents::default();
+        receiver.drain_into(8, &mut events);
+        assert_eq!(events.len(), RESOURCE_INTERRUPT_DECISION_CAPACITY);
+        assert_eq!(events.dropped_total(), 1);
+    }
 
     #[test]
     fn migrated_set_records_and_drains() {
