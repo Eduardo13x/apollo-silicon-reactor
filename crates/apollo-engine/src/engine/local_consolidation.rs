@@ -367,6 +367,7 @@ mod tests {
     ) -> ResolvedActuatorEvidence {
         ResolvedActuatorEvidence {
             id,
+            decision_id: None,
             family,
             objective: ActuatorObjective::BalancedUtility,
             action_key: format!("{}:Editor", family.as_str()),

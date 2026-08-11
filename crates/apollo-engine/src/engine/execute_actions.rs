@@ -7,6 +7,9 @@ use crate::engine::active_coalition_envelope::CoalitionGuard;
 use crate::engine::activity_sensor::pids_with_assertions;
 use crate::engine::amx_detector;
 use crate::engine::audit_types::{BlockReason, PolicyDecisionTrace};
+use crate::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use crate::engine::io_tiering::{apply_io_tier, io_tier_for_throttle};
 // Switch-3: jetsam_control imports retired — production path now routes
 // through mediator::JetsamEffector. Direct apply_apollo_policy/JetsamClass
@@ -272,6 +275,8 @@ pub struct ExecuteOutcomes {
     pub last_skip: Option<String>,
     /// Audit traces for all intended actions.
     pub audit_traces: Vec<PolicyDecisionTrace>,
+    /// Exact bounded proposal/receipt records for this execution batch.
+    pub decision_events: CycleDecisionEvents,
 }
 
 impl ExecuteOutcomes {
@@ -282,6 +287,79 @@ impl ExecuteOutcomes {
             self.top_skipped.push(what);
         }
     }
+}
+
+fn root_action_target(action: &RootAction) -> String {
+    match action {
+        RootAction::BoostProcess { pid, name, .. }
+        | RootAction::ThrottleProcess { pid, name, .. }
+        | RootAction::FreezeProcess { pid, name, .. }
+        | RootAction::UnfreezeProcess { pid, name, .. }
+        | RootAction::SetThreadQoS { pid, name, .. } => format!("{name}:pid:{pid}"),
+        RootAction::SetMemorystatus { pid, priority, .. } => {
+            format!("pid:{pid}:priority:{priority}")
+        }
+        RootAction::SetSysctl(action) => format!("{}={}", action.key(), action.value()),
+        RootAction::ToggleSpotlight { enabled, .. } => {
+            if *enabled {
+                "enabled".to_string()
+            } else {
+                "disabled".to_string()
+            }
+        }
+        RootAction::QuarantineDaemon { daemon, active, .. } => {
+            format!("{daemon}:{}", if *active { "active" } else { "released" })
+        }
+    }
+}
+
+fn root_action_outcome(
+    applied: bool,
+    result: &anyhow::Result<()>,
+    block_reason: Option<BlockReason>,
+    skip: Option<&str>,
+) -> ActuatorDecisionOutcome {
+    if applied {
+        return ActuatorDecisionOutcome::Applied;
+    }
+    if result.is_err() {
+        return ActuatorDecisionOutcome::Failed;
+    }
+    if block_reason == Some(BlockReason::NoMutation)
+        || skip.is_some_and(|detail| detail.contains("noop") || detail.contains("no-mutation"))
+    {
+        return ActuatorDecisionOutcome::NoOp;
+    }
+    if block_reason.is_some() || skip.is_some() {
+        return ActuatorDecisionOutcome::Blocked;
+    }
+    ActuatorDecisionOutcome::NoOp
+}
+
+pub fn decision_event_for_root_action(
+    action: &RootAction,
+    outcome: ActuatorDecisionOutcome,
+    detail: String,
+) -> ActuatorDecisionEvent {
+    decision_event_for_root_action_from(action, outcome, "actuation-broker", detail)
+}
+
+pub fn decision_event_for_root_action_from(
+    action: &RootAction,
+    outcome: ActuatorDecisionOutcome,
+    source: &str,
+    detail: String,
+) -> ActuatorDecisionEvent {
+    let action_key = crate::engine::telemetry_medallion::actuator_action_key(action)
+        .unwrap_or_else(|| format!("root:{}", action.action_class()));
+    ActuatorDecisionEvent::local(
+        action_key,
+        root_action_target(action),
+        0,
+        outcome,
+        source,
+        detail,
+    )
 }
 
 #[derive(Debug)]
@@ -1487,6 +1565,25 @@ pub fn execute_actions(
         // cross-cycle suppression require a confirmed system mutation.
         let success = result.is_ok() && out.last_skip.is_none() && (dry_run || action_applied);
 
+        let decision_outcome = root_action_outcome(
+            action_applied,
+            &result,
+            block_reason,
+            out.last_skip.as_deref(),
+        );
+        let decision_detail = result
+            .as_ref()
+            .err()
+            .map(ToString::to_string)
+            .or_else(|| out.last_skip.clone())
+            .or_else(|| block_reason.map(|reason| format!("{reason:?}")))
+            .unwrap_or_else(|| reason.clone());
+        out.decision_events.push(decision_event_for_root_action(
+            &action,
+            decision_outcome,
+            decision_detail,
+        ));
+
         out.audit_traces.push(PolicyDecisionTrace {
             t: Utc::now(),
             cycle: 0, // Filled by caller
@@ -1734,6 +1831,11 @@ mod tests {
                 .any(|reason| reason.starts_with("memorystatus-send-unsupported:")),
             "unsupported channel must be visible as a blocked action"
         );
+        assert_eq!(outcomes.decision_events.as_slice().len(), 1);
+        assert_eq!(
+            outcomes.decision_events.as_slice()[0].outcome,
+            crate::engine::decision_ledger::ActuatorDecisionOutcome::Blocked
+        );
     }
 
     #[test]
@@ -1761,6 +1863,10 @@ mod tests {
                 ..
             }]
         ));
+        assert_eq!(
+            outcomes.decision_events.as_slice()[0].outcome,
+            crate::engine::decision_ledger::ActuatorDecisionOutcome::Blocked
+        );
     }
 
     #[test]
@@ -1803,6 +1909,10 @@ mod tests {
             ),
             "unexpected traces: {:#?}",
             outcomes.audit_traces
+        );
+        assert_eq!(
+            outcomes.decision_events.as_slice()[0].outcome,
+            crate::engine::decision_ledger::ActuatorDecisionOutcome::NoOp
         );
         let entries = crate::engine::journal::read_journal(&journal).expect("read journal");
         assert!(

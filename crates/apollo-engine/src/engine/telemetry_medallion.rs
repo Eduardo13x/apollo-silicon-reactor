@@ -10,12 +10,15 @@
 //! Context Gold remains descriptive. Actuator Gold requires an applied action,
 //! a later observation, coherent telemetry, and low-confounding context.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
 use crate::collector::SystemSnapshot;
 use crate::engine::causal_dynamics::CausalDynamicsModel;
+use crate::engine::decision_ledger::{
+    DecisionId, DecisionLifecycle, ReceiptAttribution, ResolvedDecisionEpisode,
+};
 use crate::engine::execute_actions::ExecuteOutcomes;
 use crate::engine::gpu_imagination::GpuImaginationResult;
 use crate::engine::installation_identity::InstallationId;
@@ -40,6 +43,7 @@ const MAX_GPU_PREDICTIONS: usize = 256;
 const MAX_GPU_CALIBRATION_MODELS: usize = 256;
 const MAX_DECISION_SOURCES: usize = 48;
 const MAX_STAGED_ATTRIBUTIONS: usize = 64;
+const MAX_STAGED_DECISION_EPISODES: usize = 640;
 const GPU_PREDICTION_MATCH_MAX_AGE_CYCLES: u64 = 30;
 const CONTROLLED_HOLDOUT_HORIZON_CYCLES: u64 = 30;
 const ACTION_MODEL_EMA_ALPHA: f64 = 0.20;
@@ -481,6 +485,10 @@ impl WorldStateDelta {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedActuatorEvidence {
     pub id: u64,
+    /// Universal identity assigned by `DecisionLedger`. Aggregate fallback
+    /// evidence and legacy state have no decision identity.
+    #[serde(default)]
+    pub decision_id: Option<DecisionId>,
     pub family: ActuatorFamily,
     pub objective: ActuatorObjective,
     pub action_key: String,
@@ -751,6 +759,8 @@ fn parameter_parent_action_key(action_key: &str) -> Option<&str> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct PendingActuatorEvidence {
     id: u64,
+    #[serde(default)]
+    decision_id: Option<DecisionId>,
     family: ActuatorFamily,
     objective: ActuatorObjective,
     action_key: String,
@@ -768,6 +778,12 @@ struct PendingActuatorEvidence {
     #[serde(default)]
     attribution: DecisionAttribution,
     before: TelemetryContextSummary,
+}
+
+#[derive(Debug, Clone)]
+struct StagedDecisionEpisode {
+    episode: ResolvedDecisionEpisode,
+    cohort_size: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -811,6 +827,21 @@ struct ExternalDeltas {
     chromium_ecore_demotions: u64,
     chromium_purge_hints: u64,
     chromium_jetsam_demotions: u64,
+}
+
+impl ExternalDeltas {
+    fn suppress(&mut self, family: ActuatorFamily) {
+        let counter = match family {
+            ActuatorFamily::MarkovPrewarm => &mut self.markov_applied,
+            ActuatorFamily::InteractionQos => &mut self.interaction_activations,
+            ActuatorFamily::IoShaping => &mut self.io_promotions,
+            ActuatorFamily::ChromiumEcore => &mut self.chromium_ecore_demotions,
+            ActuatorFamily::ChromiumPurge => &mut self.chromium_purge_hints,
+            ActuatorFamily::ChromiumJetsam => &mut self.chromium_jetsam_demotions,
+            _ => return,
+        };
+        *counter = counter.saturating_sub(1);
+    }
 }
 
 #[derive(Debug)]
@@ -1172,6 +1203,7 @@ pub struct TelemetryMedallion {
     apollo_utility_observations: u64,
     decision_source_stats: BTreeMap<String, DecisionSourceStats>,
     staged_attributions: BTreeMap<String, VecDeque<DecisionAttribution>>,
+    staged_decision_episodes: VecDeque<StagedDecisionEpisode>,
     no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
     no_action_state_delta_ema: WorldStateDelta,
     pending_controlled_holdouts: VecDeque<PendingControlledHoldout>,
@@ -1232,6 +1264,7 @@ impl Default for TelemetryMedallion {
             apollo_utility_observations: 0,
             decision_source_stats: BTreeMap::new(),
             staged_attributions: BTreeMap::new(),
+            staged_decision_episodes: VecDeque::new(),
             no_action_delta_ema: BTreeMap::new(),
             no_action_state_delta_ema: WorldStateDelta::default(),
             pending_controlled_holdouts: VecDeque::new(),
@@ -1596,6 +1629,7 @@ impl TelemetryMedallion {
                 self.last_admitted_live = Some(summary);
             }
             self.staged_attributions.clear();
+            self.staged_decision_episodes.clear();
             return admission;
         }
 
@@ -1621,7 +1655,10 @@ impl TelemetryMedallion {
             &applied_families,
             admission.quality,
         );
-        let external_deltas = self.external_deltas(runtime);
+        let mut external_deltas = self.external_deltas(runtime);
+        let staged_before = self.latest.clone().unwrap_or_else(|| summary.clone());
+        let staged_issued =
+            self.issue_staged_decisions(&staged_before, cycle, purge_recent, &mut external_deltas);
         let resolved_this_cycle = self.resolve_pending(
             &summary,
             snapshot,
@@ -1632,7 +1669,7 @@ impl TelemetryMedallion {
         );
 
         let root_cohort_size = applied_root_actions.len();
-        let mut issued_this_cycle = root_cohort_size as u64;
+        let mut issued_this_cycle = (root_cohort_size as u64).saturating_add(staged_issued);
         issued_this_cycle = issued_this_cycle
             .saturating_add(external_deltas.markov_applied)
             .saturating_add(external_deltas.interaction_activations)
@@ -2080,6 +2117,28 @@ impl TelemetryMedallion {
         purge_recent: bool,
         event_resolved: bool,
     ) {
+        self.issue_with_decision_id(
+            spec,
+            before,
+            cycle,
+            cohort_size,
+            purge_recent,
+            event_resolved,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue_with_decision_id(
+        &mut self,
+        spec: ActionSpec,
+        before: &TelemetryContextSummary,
+        cycle: u64,
+        cohort_size: u16,
+        purge_recent: bool,
+        event_resolved: bool,
+        decision_id: Option<DecisionId>,
+    ) {
         if self.pending_actions.len() >= MAX_PENDING_ACTIONS {
             if let Some(evicted) = self.pending_actions.pop_front() {
                 self.expire_unresolved(evicted.family);
@@ -2115,6 +2174,7 @@ impl TelemetryMedallion {
         family_stats.issued_total = family_stats.issued_total.saturating_add(1);
         self.pending_actions.push_back(PendingActuatorEvidence {
             id: self.next_action_id,
+            decision_id,
             family: spec.family,
             objective: spec.objective,
             action_key: spec.action_key,
@@ -2283,6 +2343,7 @@ impl TelemetryMedallion {
 
         let evidence = ResolvedActuatorEvidence {
             id: pending.id,
+            decision_id: pending.decision_id,
             family: pending.family,
             objective: pending.objective,
             action_key: pending.action_key,
@@ -2756,6 +2817,105 @@ impl TelemetryMedallion {
         self.action_models_revision
     }
 
+    /// Accept the ledger's bounded terminal batch. All locally attributed
+    /// outcomes cross this interface, but only locally applied episodes may
+    /// open actuator evidence. Existing counter/audit fallback episodes are
+    /// matched in place so one kernel action cannot create two medallion
+    /// episodes.
+    pub fn stage_decision_episodes(&mut self, episodes: &[ResolvedDecisionEpisode]) {
+        let mut cohort_sizes = BTreeMap::<u64, u16>::new();
+        for episode in episodes {
+            if episode.envelope.lifecycle == DecisionLifecycle::Applied
+                && episode.authority_eligible
+                && decision_episode_attribution(episode).is_some()
+                && !episode.envelope.action_key.starts_with("coordinated:")
+            {
+                let count = cohort_sizes
+                    .entry(episode.envelope.proposed_cycle)
+                    .or_default();
+                *count = count.saturating_add(1);
+            }
+        }
+        let mut exact_pending = HashMap::<(u64, String), VecDeque<usize>>::new();
+        let mut coordinated_pending = HashMap::<u64, VecDeque<usize>>::new();
+        for (index, pending) in self.pending_actions.iter().enumerate() {
+            if pending.decision_id.is_some() {
+                continue;
+            }
+            if pending.family == ActuatorFamily::Coordinated {
+                coordinated_pending
+                    .entry(pending.issued_cycle)
+                    .or_default()
+                    .push_back(index);
+            } else {
+                exact_pending
+                    .entry((pending.issued_cycle, pending.action_key.clone()))
+                    .or_default()
+                    .push_back(index);
+            }
+        }
+        for episode in episodes {
+            let Some(attribution) = decision_episode_attribution(episode) else {
+                continue;
+            };
+            if episode.envelope.lifecycle != DecisionLifecycle::Applied
+                || !episode.authority_eligible
+            {
+                continue;
+            }
+            let cohort_size = if episode.envelope.action_key.starts_with("coordinated:") {
+                1
+            } else {
+                cohort_sizes
+                    .get(&episode.envelope.proposed_cycle)
+                    .copied()
+                    .unwrap_or(1)
+                    .max(1)
+            };
+
+            let pending_index = if episode.envelope.action_key.starts_with("coordinated:") {
+                coordinated_pending
+                    .get_mut(&episode.envelope.proposed_cycle)
+                    .and_then(VecDeque::pop_front)
+            } else {
+                exact_pending
+                    .get_mut(&(
+                        episode.envelope.proposed_cycle,
+                        episode.envelope.action_key.clone(),
+                    ))
+                    .and_then(VecDeque::pop_front)
+            };
+            if let Some(pending) =
+                pending_index.and_then(|index| self.pending_actions.get_mut(index))
+            {
+                pending.decision_id = Some(episode.id);
+                pending.action_key = bounded_text(&episode.envelope.action_key, 320);
+                pending.target = bounded_text(&episode.envelope.target, 256);
+                pending.target_pid = target_pid_from_decision_target(&episode.envelope.target);
+                pending.cohort_size = pending.cohort_size.max(cohort_size);
+                pending.attribution = attribution;
+                continue;
+            }
+
+            // A non-Gold source context cannot later become authoritative by
+            // waiting for a healthier cycle. Exact events from the latest Gold
+            // cycle are retained for the next observation only.
+            if self.current_tier != ContextTier::Gold
+                || self.last_cycle != episode.envelope.proposed_cycle
+            {
+                continue;
+            }
+            if self.staged_decision_episodes.len() >= MAX_STAGED_DECISION_EPISODES {
+                self.staged_decision_episodes.pop_front();
+            }
+            self.staged_decision_episodes
+                .push_back(StagedDecisionEpisode {
+                    episode: episode.clone(),
+                    cohort_size,
+                });
+        }
+    }
+
     pub fn stage_decision_attribution(&mut self, attribution: DecisionAttribution) {
         let attribution = attribution.bounded();
         if attribution.action_key.is_empty() {
@@ -2769,6 +2929,49 @@ impl TelemetryMedallion {
             .entry(attribution.action_key.clone())
             .or_default()
             .push_back(attribution);
+    }
+
+    fn issue_staged_decisions(
+        &mut self,
+        before: &TelemetryContextSummary,
+        cycle: u64,
+        purge_recent: bool,
+        external_deltas: &mut ExternalDeltas,
+    ) -> u64 {
+        let mut issued = 0_u64;
+        while let Some(staged) = self.staged_decision_episodes.pop_front() {
+            let episode = staged.episode;
+            if episode.envelope.proposed_cycle >= cycle {
+                self.staged_decision_episodes
+                    .push_front(StagedDecisionEpisode {
+                        episode,
+                        cohort_size: staged.cohort_size,
+                    });
+                break;
+            }
+            let Some(spec) = decision_episode_spec(&episode) else {
+                continue;
+            };
+            let family = spec.family;
+            if let Some(attribution) = decision_episode_attribution(&episode) {
+                self.stage_decision_attribution(attribution);
+            }
+            self.issue_with_decision_id(
+                spec,
+                before,
+                episode.envelope.proposed_cycle,
+                staged.cohort_size,
+                purge_recent,
+                matches!(
+                    family,
+                    ActuatorFamily::MarkovPrewarm | ActuatorFamily::InteractionQos
+                ),
+                Some(episode.id),
+            );
+            external_deltas.suppress(family);
+            issued = issued.saturating_add(1);
+        }
+        issued
     }
 
     pub fn decision_source_stats(&self) -> &BTreeMap<String, DecisionSourceStats> {
@@ -2886,6 +3089,7 @@ impl TelemetryMedallion {
         self.consecutive_gold = 0;
         self.local_gold_total = 0;
         self.pending_actions.clear();
+        self.staged_decision_episodes.clear();
         self.family_stats = state.family_stats;
         self.action_models = state
             .action_models
@@ -3005,6 +3209,7 @@ impl TelemetryMedallion {
             BTreeMap::new()
         };
         self.staged_attributions.clear();
+        self.staged_decision_episodes.clear();
         self.no_action_delta_ema = if same_origin {
             state
                 .no_action_delta_ema
@@ -3225,6 +3430,158 @@ fn gpu_action_matches(predicted: &str, observed: &str) -> bool {
         || (predicted == "predictive_prethrottle:noise"
             && observed.starts_with("predictive_prethrottle:"))
         || (predicted == "predictive_purge:kernel" && observed.starts_with("predictive_purge:"))
+}
+
+fn decision_episode_attribution(episode: &ResolvedDecisionEpisode) -> Option<DecisionAttribution> {
+    let receipt_attribution = episode
+        .envelope
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.attribution.as_ref())
+        .or(episode.envelope.terminal_attribution.as_ref());
+    let ReceiptAttribution::Local { source } = receipt_attribution? else {
+        return None;
+    };
+    if source.is_empty() {
+        return None;
+    }
+    let mut attribution = DecisionAttribution {
+        action_key: episode.envelope.action_key.clone(),
+        proposer: source.clone(),
+        ..DecisionAttribution::default()
+    };
+    for adviser in &episode.envelope.adviser_contributions {
+        if adviser.support < 0.0 {
+            attribution.vetoes.push(adviser.adviser.clone());
+        } else {
+            attribution.supporters.push(adviser.adviser.clone());
+        }
+    }
+    if let Some(prediction) = episode.envelope.predictions.first() {
+        attribution.predicted_gain = prediction.expected_utility;
+        attribution.uncertainty = prediction.uncertainty;
+        if prediction.source != *source {
+            attribution.supporters.push(prediction.source.clone());
+        }
+    }
+    Some(attribution.bounded())
+}
+
+fn target_pid_from_decision_target(target: &str) -> Option<u32> {
+    target
+        .rsplit_once(":pid:")
+        .and_then(|(_, pid)| pid.parse().ok())
+        .or_else(|| target.strip_prefix("pid:").and_then(|pid| pid.parse().ok()))
+}
+
+fn decision_episode_spec(episode: &ResolvedDecisionEpisode) -> Option<ActionSpec> {
+    if episode.envelope.lifecycle != DecisionLifecycle::Applied || !episode.authority_eligible {
+        return None;
+    }
+    let key = episode.envelope.action_key.as_str();
+    let family_name = key.split_once(':').map_or(key, |(family, _)| family);
+    let (family, objective, horizon_cycles) = match family_name {
+        "boost" => (ActuatorFamily::Boost, ActuatorObjective::Responsiveness, 3),
+        "throttle" => (
+            ActuatorFamily::Throttle,
+            ActuatorObjective::PressureRelief,
+            5,
+        ),
+        "freeze" => (ActuatorFamily::Freeze, ActuatorObjective::PressureRelief, 5),
+        "unfreeze" => (ActuatorFamily::Unfreeze, ActuatorObjective::Recovery, 3),
+        "memorystatus" => (
+            ActuatorFamily::Memorystatus,
+            ActuatorObjective::PressureRelief,
+            8,
+        ),
+        "sysctl" => (ActuatorFamily::Sysctl, ActuatorObjective::NetworkHealth, 15),
+        "spotlight" => (
+            ActuatorFamily::Spotlight,
+            ActuatorObjective::Availability,
+            15,
+        ),
+        "quarantine" => (
+            ActuatorFamily::Quarantine,
+            ActuatorObjective::Efficiency,
+            10,
+        ),
+        "thread_qos" => (
+            ActuatorFamily::ThreadQos,
+            ActuatorObjective::Responsiveness,
+            3,
+        ),
+        "markov_prewarm" => (
+            ActuatorFamily::MarkovPrewarm,
+            ActuatorObjective::Prediction,
+            120,
+        ),
+        "interaction_qos" => (
+            ActuatorFamily::InteractionQos,
+            ActuatorObjective::Responsiveness,
+            30,
+        ),
+        "io_shaping" => (
+            ActuatorFamily::IoShaping,
+            ActuatorObjective::Responsiveness,
+            30,
+        ),
+        "predictive_threshold" => (
+            ActuatorFamily::PredictiveThreshold,
+            ActuatorObjective::Prediction,
+            12,
+        ),
+        "predictive_profile" => (
+            ActuatorFamily::PredictiveProfile,
+            ActuatorObjective::Prediction,
+            12,
+        ),
+        "predictive_prethrottle" => (
+            ActuatorFamily::PredictivePreThrottle,
+            ActuatorObjective::PressureRelief,
+            5,
+        ),
+        "predictive_purge" => (
+            ActuatorFamily::PredictivePurge,
+            ActuatorObjective::PressureRelief,
+            8,
+        ),
+        "chromium_ecore" => (
+            ActuatorFamily::ChromiumEcore,
+            ActuatorObjective::Efficiency,
+            30,
+        ),
+        "chromium_purge" => (
+            ActuatorFamily::ChromiumPurge,
+            ActuatorObjective::PressureRelief,
+            12,
+        ),
+        "chromium_jetsam" => (
+            ActuatorFamily::ChromiumJetsam,
+            ActuatorObjective::Efficiency,
+            30,
+        ),
+        "coordinated" => (
+            ActuatorFamily::Coordinated,
+            ActuatorObjective::BalancedUtility,
+            8,
+        ),
+        _ => return None,
+    };
+    let horizon_cycles = episode
+        .envelope
+        .predictions
+        .first()
+        .map_or(horizon_cycles, |prediction| {
+            prediction.horizon_cycles.max(1)
+        });
+    Some(ActionSpec {
+        family,
+        objective,
+        action_key: bounded_text(key, 320),
+        target: bounded_text(&episode.envelope.target, 256),
+        target_pid: target_pid_from_decision_target(&episode.envelope.target),
+        horizon_cycles,
+    })
 }
 
 fn action_spec(action: &RootAction) -> Option<ActionSpec> {
@@ -3817,6 +4174,10 @@ mod tests {
     use super::*;
     use crate::collector::{CpuStats, MemoryStats, PressureStats, ProcessStats};
     use crate::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
+    use crate::engine::decision_ledger::{
+        ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents, DecisionId,
+        DecisionLedger,
+    };
     use crate::engine::lotka_volterra::StabilityRegime;
     use chrono::Utc;
 
@@ -3966,6 +4327,193 @@ mod tests {
         })
     }
 
+    fn local_episode(
+        action_key: &str,
+        target: &str,
+        cycle: u64,
+        outcome: ActuatorDecisionOutcome,
+    ) -> crate::engine::decision_ledger::ResolvedDecisionEpisode {
+        let mut events = CycleDecisionEvents::default();
+        events.push(ActuatorDecisionEvent::local(
+            action_key,
+            target,
+            cycle,
+            outcome,
+            "test-actuator",
+            "focused medallion handoff test",
+        ));
+        DecisionLedger::new()
+            .ingest_cycle_events(&mut events)
+            .pop()
+            .expect("resolved ledger episode")
+    }
+
+    #[test]
+    fn local_root_episode_attaches_decision_id_to_existing_medallion_episode() {
+        let action = RootAction::BoostProcess {
+            pid: 300,
+            name: "Editor".to_string(),
+            reason: "fixture".to_string(),
+            decision_reason: DecisionReason::InteractiveFocus,
+            start_sec: 12_345,
+            start_usec: 678,
+        };
+        let action_key = actuator_action_key(&action).expect("root action key");
+        let outcomes = ExecuteOutcomes {
+            audit_traces: vec![trace(action, true)],
+            ..ExecuteOutcomes::default()
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        observe(&mut medallion, 1, &outcomes, &healthy_runtime());
+
+        medallion.stage_decision_episodes(&[local_episode(
+            &action_key,
+            "Editor:pid:300",
+            1,
+            ActuatorDecisionOutcome::Applied,
+        )]);
+
+        assert_eq!(medallion.pending_actions.len(), 1);
+        assert_eq!(
+            medallion.pending_actions[0].decision_id,
+            Some(DecisionId(1))
+        );
+        for cycle in 2..=4 {
+            observe(
+                &mut medallion,
+                cycle,
+                &ExecuteOutcomes::default(),
+                &healthy_runtime(),
+            );
+        }
+        assert_eq!(
+            medallion
+                .recent_actuator_evidence()
+                .back()
+                .and_then(|evidence| evidence.decision_id),
+            Some(DecisionId(1))
+        );
+    }
+
+    #[test]
+    fn exact_side_episode_suppresses_duplicate_counter_fallback() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        observe(
+            &mut medallion,
+            1,
+            &ExecuteOutcomes::default(),
+            &healthy_runtime(),
+        );
+        medallion.stage_decision_episodes(&[local_episode(
+            "interaction_qos:foreground",
+            "pid:300",
+            1,
+            ActuatorDecisionOutcome::Applied,
+        )]);
+        let runtime = RuntimeMetrics {
+            interaction_qos_activations: 1,
+            interaction_qos_reason: "input".to_string(),
+            ..healthy_runtime()
+        };
+
+        observe(&mut medallion, 2, &ExecuteOutcomes::default(), &runtime);
+
+        assert_eq!(medallion.pending_actions.len(), 1);
+        assert_eq!(medallion.metrics().actuator_issued_total, 1);
+        assert_eq!(
+            medallion.pending_actions[0].decision_id,
+            Some(DecisionId(1))
+        );
+        assert_eq!(medallion.pending_actions[0].target, "pid:300");
+    }
+
+    #[test]
+    fn exact_concurrent_side_episodes_keep_members_confounded_and_cohort_separate() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        observe(
+            &mut medallion,
+            1,
+            &ExecuteOutcomes::default(),
+            &healthy_runtime(),
+        );
+        let mut events = CycleDecisionEvents::default();
+        events.push(ActuatorDecisionEvent::local(
+            "markov_prewarm:predicted_app",
+            "Editor",
+            1,
+            ActuatorDecisionOutcome::Applied,
+            "markov",
+            "applied",
+        ));
+        events.push(ActuatorDecisionEvent::local(
+            "predictive_purge:maintenance",
+            "host",
+            1,
+            ActuatorDecisionOutcome::Applied,
+            "maintenance",
+            "applied",
+        ));
+        let coordinated = crate::engine::decision_ledger::coordinated_action_event(&events, 1)
+            .expect("coordinated event");
+        events.push(coordinated);
+        let episodes = DecisionLedger::new().ingest_cycle_events(&mut events);
+        medallion.stage_decision_episodes(&episodes);
+
+        observe(
+            &mut medallion,
+            2,
+            &ExecuteOutcomes::default(),
+            &healthy_runtime(),
+        );
+
+        assert_eq!(medallion.pending_actions.len(), 3);
+        assert!(medallion.pending_actions.iter().all(|pending| {
+            if pending.family == ActuatorFamily::Coordinated {
+                pending.cohort_size == 1
+            } else {
+                pending.cohort_size == 2
+            }
+        }));
+    }
+
+    #[test]
+    fn imported_and_non_applied_ledger_episodes_cannot_open_medallion_evidence() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        observe(
+            &mut medallion,
+            1,
+            &ExecuteOutcomes::default(),
+            &healthy_runtime(),
+        );
+        let mut imported_events = CycleDecisionEvents::default();
+        imported_events.push(ActuatorDecisionEvent::imported(
+            "markov_prewarm:predicted_app",
+            "Editor",
+            1,
+            ActuatorDecisionOutcome::Applied,
+            "foreign evidence",
+        ));
+        let mut ledger = DecisionLedger::new();
+        let mut episodes = ledger.ingest_cycle_events(&mut imported_events);
+        episodes.push(local_episode(
+            "freeze:background",
+            "pid:44",
+            1,
+            ActuatorDecisionOutcome::Blocked,
+        ));
+
+        medallion.stage_decision_episodes(&episodes);
+        observe(
+            &mut medallion,
+            2,
+            &ExecuteOutcomes::default(),
+            &healthy_runtime(),
+        );
+
+        assert!(medallion.pending_actions.is_empty());
+        assert_eq!(medallion.metrics().actuator_issued_total, 0);
+    }
+
     fn gold_evidence(
         action_key: &str,
         utility: f64,
@@ -3974,6 +4522,7 @@ mod tests {
     ) -> ResolvedActuatorEvidence {
         ResolvedActuatorEvidence {
             id: 1,
+            decision_id: None,
             family: ActuatorFamily::Boost,
             objective: ActuatorObjective::Responsiveness,
             action_key: action_key.to_string(),
@@ -5125,6 +5674,7 @@ mod tests {
         for id in 1..=11 {
             persisted.recent_evidence.push(ResolvedActuatorEvidence {
                 id,
+                decision_id: None,
                 family: ActuatorFamily::Boost,
                 objective: ActuatorObjective::Responsiveness,
                 action_key: "boost:Editor".to_string(),
@@ -5155,6 +5705,7 @@ mod tests {
         // and must not enter the rebuilt M4 model.
         persisted.recent_evidence.push(ResolvedActuatorEvidence {
             id: 99,
+            decision_id: None,
             family: ActuatorFamily::Boost,
             objective: ActuatorObjective::Responsiveness,
             action_key: "boost:ImportedM1".to_string(),
@@ -5267,6 +5818,7 @@ mod tests {
         let mut persisted = persisted_with_ready_model(LOCAL_ID);
         persisted.pending_actions.push(PendingActuatorEvidence {
             id: 1,
+            decision_id: None,
             family: ActuatorFamily::Boost,
             objective: ActuatorObjective::Responsiveness,
             action_key: "boost:Editor".to_string(),

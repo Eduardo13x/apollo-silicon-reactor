@@ -22,6 +22,9 @@ use apollo_engine::engine::daemon_helpers::{
     apply_reversible_background_jetsam, spawn_reaped_purge, ReversibleJetsamOutcome,
 };
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::learned_state::LearnableParams;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
@@ -39,7 +42,26 @@ static SURVIVAL_LOCAL_COOLDOWN: Mutex<Option<Instant>> = Mutex::new(None);
 const SURVIVAL_JETSAM_OWNER: &str = "survival: chromium jetsam BACKGROUND";
 const SURVIVAL_JETSAM_TTL: Duration = Duration::from_secs(90);
 
-fn apply_survival_jetsam_demotions(chromium_mgr: &ChromiumManager) -> u64 {
+#[derive(Debug, Default)]
+pub struct SurvivalTickOutput {
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn survival_event(
+    action_key: &str,
+    target: impl Into<String>,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(action_key, target, cycle, outcome, "survival-mode", detail)
+}
+
+fn apply_survival_jetsam_demotions(
+    chromium_mgr: &ChromiumManager,
+    cycle: u64,
+    decision_events: &mut CycleDecisionEvents,
+) -> u64 {
     let mut applied = 0u64;
     for (pid, name) in chromium_mgr.survival_jetsam_candidates() {
         match apply_reversible_background_jetsam(
@@ -50,18 +72,47 @@ fn apply_survival_jetsam_demotions(chromium_mgr: &ChromiumManager) -> u64 {
         ) {
             Ok(ReversibleJetsamOutcome::Applied) => {
                 applied = applied.saturating_add(1);
+                decision_events.push(survival_event(
+                    "chromium_jetsam:background_renderer",
+                    format!("{name}:pid:{pid}"),
+                    cycle,
+                    ActuatorDecisionOutcome::Applied,
+                    "temporary survival jetsam demotion applied",
+                ));
             }
-            Ok(
-                ReversibleJetsamOutcome::Refreshed
-                | ReversibleJetsamOutcome::Unchanged
-                | ReversibleJetsamOutcome::Stale,
-            ) => {}
-            Err(error) => tracing::debug!(
-                pid,
-                process = name.as_str(),
-                error = error.as_str(),
-                "survival: reversible Chromium Jetsam demotion skipped"
-            ),
+            Ok(ReversibleJetsamOutcome::Refreshed | ReversibleJetsamOutcome::Unchanged) => {
+                decision_events.push(survival_event(
+                    "chromium_jetsam:background_renderer",
+                    format!("{name}:pid:{pid}"),
+                    cycle,
+                    ActuatorDecisionOutcome::NoOp,
+                    "existing survival jetsam lease retained",
+                ));
+            }
+            Ok(ReversibleJetsamOutcome::Stale) => {
+                decision_events.push(survival_event(
+                    "chromium_jetsam:background_renderer",
+                    format!("{name}:pid:{pid}"),
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    "stale process identity",
+                ));
+            }
+            Err(error) => {
+                decision_events.push(survival_event(
+                    "chromium_jetsam:background_renderer",
+                    format!("{name}:pid:{pid}"),
+                    cycle,
+                    ActuatorDecisionOutcome::Failed,
+                    error.clone(),
+                ));
+                tracing::debug!(
+                    pid,
+                    process = name.as_str(),
+                    error = error.as_str(),
+                    "survival: reversible Chromium Jetsam demotion skipped"
+                );
+            }
         }
     }
     applied
@@ -96,7 +147,8 @@ pub fn run_survival_tick(
     state: &SharedState,
     chromium_mgr: &mut ChromiumManager,
     maintenance_state: &mut MaintenanceState,
-) {
+) -> SurvivalTickOutput {
+    let mut output = SurvivalTickOutput::default();
     let p_oom_escalation = cycle_count > 5
         && signal_digest.p_oom_30s > 0.80
         && snapshot.pressure.memory_pressure >= 0.70;
@@ -173,7 +225,8 @@ pub fn run_survival_tick(
         // Jetsam demotion: mark non-foreground Chromium renderers as BACKGROUND
         // with an exact-prior ledger entry. The 90s lease is refreshed while
         // survival remains active and automatically restores afterward.
-        let demoted = apply_survival_jetsam_demotions(chromium_mgr);
+        let demoted =
+            apply_survival_jetsam_demotions(chromium_mgr, cycle_count, &mut output.decision_events);
         if demoted > 0 {
             state
                 .metrics
@@ -194,13 +247,38 @@ pub fn run_survival_tick(
             let can_purge = local
                 .map(|t: Instant| t.elapsed() >= Duration::from_secs(600))
                 .unwrap_or(true);
-            if can_purge && spawn_reaped_purge() {
-                *local = Some(Instant::now());
-                // Write shared timestamp so maintenance_tick yields.
-                // Survival itself does NOT read this field — asymmetric.
-                maintenance_state.mark_purged();
-                maintenance_state
-                    .mark_compressor_flushing(snapshot.pressure.swap_delta_bytes_per_sec < 0.0);
+            if can_purge {
+                if spawn_reaped_purge() {
+                    *local = Some(Instant::now());
+                    // Write shared timestamp so maintenance_tick yields.
+                    // Survival itself does NOT read this field — asymmetric.
+                    maintenance_state.mark_purged();
+                    maintenance_state
+                        .mark_compressor_flushing(snapshot.pressure.swap_delta_bytes_per_sec < 0.0);
+                    output.decision_events.push(survival_event(
+                        "predictive_purge:survival",
+                        "host",
+                        cycle_count,
+                        ActuatorDecisionOutcome::Applied,
+                        "survival purge spawned",
+                    ));
+                } else {
+                    output.decision_events.push(survival_event(
+                        "predictive_purge:survival",
+                        "host",
+                        cycle_count,
+                        ActuatorDecisionOutcome::Failed,
+                        "survival purge spawn failed",
+                    ));
+                }
+            } else {
+                output.decision_events.push(survival_event(
+                    "predictive_purge:survival",
+                    "host",
+                    cycle_count,
+                    ActuatorDecisionOutcome::Blocked,
+                    "survival purge cooldown",
+                ));
             }
         }
     }
@@ -212,4 +290,36 @@ pub fn run_survival_tick(
         &learnable_params.rl_pressure_bands,
         &learnable_params.rl_compressor_bands,
     );
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
+
+    #[test]
+    fn survival_actions_use_existing_pressure_relief_families() {
+        let purge = survival_event(
+            "predictive_purge:survival",
+            "host",
+            9,
+            ActuatorDecisionOutcome::Applied,
+            "purge spawned",
+        );
+        let jetsam = survival_event(
+            "chromium_jetsam:background_renderer",
+            "Renderer:pid:42",
+            9,
+            ActuatorDecisionOutcome::NoOp,
+            "already demoted",
+        );
+
+        assert_eq!(purge.proposal.action_key, "predictive_purge:survival");
+        assert_eq!(
+            jetsam.proposal.action_key,
+            "chromium_jetsam:background_renderer"
+        );
+        assert_eq!(purge.proposal.proposed_cycle, 9);
+    }
 }

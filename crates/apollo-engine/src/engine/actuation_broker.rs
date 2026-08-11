@@ -9,7 +9,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::engine::active_coalition_envelope::CoalitionGuard;
-use crate::engine::execute_actions::{execute_actions, ExecuteOutcomes};
+use crate::engine::decision_ledger::ActuatorDecisionOutcome;
+use crate::engine::execute_actions::{
+    decision_event_for_root_action, execute_actions, ExecuteOutcomes,
+};
 use crate::engine::mach_qos::MachQoSManager;
 use crate::engine::types::{CapabilityReport, RootAction};
 
@@ -93,12 +96,22 @@ impl ActuationBroker {
             } else {
                 "actuation broker denied: batch exceeds 512 actions"
             };
+            let mut outcomes = ExecuteOutcomes {
+                failures: requests,
+                last_error: Some(reason.to_string()),
+                ..ExecuteOutcomes::default()
+            };
+            for action in &request.actions {
+                outcomes
+                    .decision_events
+                    .push(decision_event_for_root_action(
+                        action,
+                        ActuatorDecisionOutcome::Rejected,
+                        reason.to_string(),
+                    ));
+            }
             return BrokerExecution {
-                outcomes: ExecuteOutcomes {
-                    failures: requests,
-                    last_error: Some(reason.to_string()),
-                    ..ExecuteOutcomes::default()
-                },
+                outcomes,
                 requests,
                 rejected: requests,
                 mode: BrokerMode::Denied,
@@ -131,6 +144,8 @@ impl ActuationBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::audit_types::DecisionReason;
+    use crate::engine::decision_ledger::ActuatorDecisionOutcome;
 
     fn caps(is_root: bool) -> CapabilityReport {
         CapabilityReport {
@@ -162,6 +177,44 @@ mod tests {
         assert_eq!(
             ActuationBroker::from_runtime(&caps(false), true).mode(),
             BrokerMode::DryRun
+        );
+    }
+
+    #[test]
+    fn denied_batch_returns_one_rejected_event_per_root_action() {
+        let mut frozen = HashSet::new();
+        let capabilities = caps(false);
+        let journal = std::env::temp_dir().join("apollo-broker-rejected-events.jsonl");
+        let actions = vec![RootAction::BoostProcess {
+            pid: 42,
+            name: "Example".to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::InteractiveFocus,
+            start_sec: 1,
+            start_usec: 0,
+        }];
+
+        let execution = ActuationBroker {
+            mode: BrokerMode::Denied,
+        }
+        .execute(ActuationRequest {
+            actions,
+            caps: &capabilities,
+            journal_path: &journal,
+            frozen: &mut frozen,
+            learned_protected: &[],
+            learned_interactive: &[],
+            qos_mgr: None,
+            memory_pressure: 0.5,
+            thrashing_score: 0.0,
+            coalition_guard: None,
+            cpu_pegged_fraction: 0.0,
+        });
+
+        assert_eq!(execution.outcomes.decision_events.len(), 1);
+        assert_eq!(
+            execution.outcomes.decision_events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Rejected
         );
     }
 }

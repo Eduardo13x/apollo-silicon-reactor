@@ -910,6 +910,7 @@ fn main() -> anyhow::Result<()> {
                 apollo_engine::engine::telemetry_medallion::TelemetryMedallion::new(
                     installation_id,
                 );
+            let mut decision_ledger = apollo_engine::engine::decision_ledger::DecisionLedger::new();
             {
                 let mut m_guard = state.metrics.lock_recover();
                 m_guard.metrics.recently_applied_restore_status =
@@ -1683,6 +1684,8 @@ fn main() -> anyhow::Result<()> {
                 wake_thaw_pids.clear();
                 cycle_count += 1;
                 lf_metrics.inc_cycles();
+                let mut cycle_decision_events =
+                    apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
 
                 // Decrement freeze cooldown counters once per cycle.
                 // [Nygard 2018] §8.5 circuit-breaker hold-down decay.
@@ -1909,12 +1912,20 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_wake_unfreeze::run_wake_unfreeze (Wave 25).
                 // [Nygard 2018] bulkhead: spread SIGCONT across cycles; shrink under
                 // thermal/swap-velocity stress to avoid 1-3GB decompression spike.
-                daemon_wake_unfreeze::run_wake_unfreeze(
+                let wake_unfreeze_output = daemon_wake_unfreeze::run_wake_unfreeze(
                     &mut wake_unfreeze_queue,
                     &mut wake_thaw_pids,
                     &state,
                     &pressure_collector,
                     &frozen_state_path,
+                    cycle_count,
+                );
+                cycle_decision_events.extend(
+                    wake_unfreeze_output
+                        .decision_events
+                        .as_slice()
+                        .iter()
+                        .cloned(),
                 );
 
                 // Mark reactor as stalled only if the reactor thread has sent
@@ -2091,6 +2102,7 @@ fn main() -> anyhow::Result<()> {
                 let daemon_markov_tick::MarkovTickOutput {
                     temporal_hour: markov_temporal_hour,
                     temporal_weekday: markov_temporal_weekday,
+                    decision_events: markov_decision_events,
                 } = daemon_markov_tick::run_markov_tick(
                     foreground_app.as_deref(),
                     foreground_pid,
@@ -2110,6 +2122,7 @@ fn main() -> anyhow::Result<()> {
                     &frozen_state_path,
                     &world_model,
                 );
+                cycle_decision_events.extend(markov_decision_events.as_slice().iter().cloned());
                 temporal_hour = markov_temporal_hour;
                 temporal_weekday = markov_temporal_weekday;
 
@@ -4509,6 +4522,29 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         &state.mach_qos,
                     );
+                    for receipt in &reconcile.receipts {
+                        let outcome = match receipt.disposition {
+                            apollo_engine::engine::effect_ledger::ReconcileDisposition::Reverted => {
+                                apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Reverted
+                            }
+                            apollo_engine::engine::effect_ledger::ReconcileDisposition::Failed => {
+                                apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Failed
+                            }
+                            apollo_engine::engine::effect_ledger::ReconcileDisposition::NoOp => {
+                                apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::NoOp
+                            }
+                        };
+                        cycle_decision_events.push(
+                            apollo_engine::engine::decision_ledger::ActuatorDecisionEvent::local(
+                                receipt.action_key(),
+                                receipt.target(),
+                                cycle_count,
+                                outcome,
+                                "effect-ledger-reconcile",
+                                format!("expired effect reconciliation: {:?}", receipt.effect),
+                            ),
+                        );
+                    }
                     if reconcile.reverted > 0 || reconcile.failed > 0 {
                         tracing::info!(
                             reverted = reconcile.reverted,
@@ -4526,7 +4562,7 @@ fn main() -> anyhow::Result<()> {
                 // Survival mode: overflow recording, swap streak, purge, threshold decay.
                 // Extracted to daemon_survival_tick::run_survival_tick (Wave 27).
                 // [Fowler 2004] Strangler Fig — pure move.
-                daemon_survival_tick::run_survival_tick(
+                let survival_output = daemon_survival_tick::run_survival_tick(
                     &snapshot,
                     &signal_digest,
                     cycle_count,
@@ -4538,6 +4574,8 @@ fn main() -> anyhow::Result<()> {
                     &mut chromium_mgr,
                     &mut maintenance_state,
                 );
+                cycle_decision_events
+                    .extend(survival_output.decision_events.as_slice().iter().cloned());
 
                 // Maintenance Purge Gate (2026-05-10) — opportunistic non-crisis purge
                 // between survival_tick and dispatch_tick. Asymmetric cooldown: survival
@@ -4608,13 +4646,23 @@ fn main() -> anyhow::Result<()> {
                     .unwrap_or(0.0);
                 let bus_saturated =
                     dram_bw_pct > 80.0 || (dram_bw_pct == 0.0 && prev_entropy_anomaly > 2.0);
-                let maintenance_fired = daemon_maintenance_tick::run_maintenance_tick(
-                    &snapshot,
-                    &user_context,
-                    &mut maintenance_state,
-                    lf_metrics,
-                    build_tracker.build_active,
-                    bus_saturated,
+                let maintenance_output =
+                    daemon_maintenance_tick::run_maintenance_tick_with_decisions(
+                        &snapshot,
+                        &user_context,
+                        &mut maintenance_state,
+                        lf_metrics,
+                        build_tracker.build_active,
+                        bus_saturated,
+                        cycle_count,
+                    );
+                let maintenance_fired = maintenance_output.fired;
+                cycle_decision_events.extend(
+                    maintenance_output
+                        .decision_events
+                        .as_slice()
+                        .iter()
+                        .cloned(),
                 );
                 if maintenance_fired {
                     // Record cause for observational outcome tracking via CausalGraph.
@@ -5022,7 +5070,7 @@ fn main() -> anyhow::Result<()> {
                         DISPLAY_STATE_CACHE
                     };
                     let external_4k_attached = display_state_now.external_4k_attached;
-                    daemon_chromium_tick::run_chromium_tick(
+                    let chromium_output = daemon_chromium_tick::run_chromium_tick(
                         &mut chromium_mgr,
                         &focus_markov,
                         foreground_app.as_deref(),
@@ -5046,6 +5094,8 @@ fn main() -> anyhow::Result<()> {
                         &world_model,
                         workload_mode.as_str(),
                     );
+                    cycle_decision_events
+                        .extend(chromium_output.decision_events.as_slice().iter().cloned());
                     lf_metrics.record_stage(
                         apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
                         _t_chrom_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -5411,6 +5461,13 @@ fn main() -> anyhow::Result<()> {
                         let outcome = apollo_engine::engine::daemon_helpers::unfreeze_pids_outcome(
                             stuck_pids.iter().copied(),
                         );
+                        let recovery_events = daemon_wake_unfreeze::recovery_unfreeze_events(
+                            &outcome,
+                            cycle_count,
+                            "unfreeze:deadlock_recovery",
+                            "deadlock-recovery",
+                        );
+                        cycle_decision_events.extend(recovery_events.as_slice().iter().cloned());
                         let mut frozen_map = state.frozen_state.lock_recover();
                         for pid in outcome.forgettable_pids() {
                             frozen_map.remove(&pid);
@@ -5835,6 +5892,8 @@ fn main() -> anyhow::Result<()> {
                     )
                 };
                 causal_qos_upgrades_cycle += causal_qos_upgrades;
+                cycle_decision_events
+                    .extend_at_cycle(exec_outcomes.decision_events.as_slice(), cycle_count);
 
                 for holdout in &counterfactual_holdouts {
                     if telemetry_medallion.issue_controlled_holdout(
@@ -6328,7 +6387,7 @@ fn main() -> anyhow::Result<()> {
 
                 // ── Fluidity QoS elevation ───────────────────────────────────
                 // Extracted to daemon_cycle_tail::apply_fluidity_qos (Wave 10).
-                daemon_cycle_tail::update_acceleration_lease(
+                let acceleration_output = daemon_cycle_tail::update_acceleration_lease(
                     &state,
                     &mut acceleration_lease,
                     &fluidity_state,
@@ -6341,8 +6400,15 @@ fn main() -> anyhow::Result<()> {
                     &mut io_shaper,
                     &world_model,
                     workload_mode.as_str(),
+                    cycle_count,
                 );
-
+                cycle_decision_events.extend(
+                    acceleration_output
+                        .decision_events
+                        .as_slice()
+                        .iter()
+                        .cloned(),
+                );
                 metrics_reporter::merge_cycle_metrics(
                     &state,
                     &exec_outcomes,
@@ -6457,46 +6523,97 @@ fn main() -> anyhow::Result<()> {
                 while let Ok(msg) = main_loop_rx.try_recv() {
                     match msg {
                         main_loop_msg::MainLoopMsg::CliPurge { response_tx } => {
-                            let resp = if maintenance_state.secs_since_cli_purge() < 300 {
+                            let (resp, decision_outcome, detail) = if maintenance_state
+                                .secs_since_cli_purge()
+                                < 300
+                            {
                                 let wait = 300 - maintenance_state.secs_since_cli_purge();
-                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
-                                    fired: false,
-                                    reason: format!("rate_limited — wait {}s", wait),
-                                }
+                                (
+                                    apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                        fired: false,
+                                        reason: format!("rate_limited — wait {}s", wait),
+                                    },
+                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                    format!("rate-limited:{wait}s"),
+                                )
                             } else if maintenance_state.secs_since_any_purge() < 60 {
-                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
-                                    fired: false,
-                                    reason: "rate_limited — auto-purge fired recently".into(),
-                                }
+                                (
+                                    apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                        fired: false,
+                                        reason: "rate_limited — auto-purge fired recently".into(),
+                                    },
+                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                    "recent-auto-purge".to_string(),
+                                )
                             } else if user_context.audio_active
                                 || user_context.call_in_progress
                                 || user_context.has_sleep_assertion
                             {
                                 // Audio/video/conferencing active → page-cache invalidation
                                 // would cause stutter. User can `sudo purge` directly to bypass.
-                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
-                                    fired: false,
-                                    reason: "media_active — audio/video/call running; pause media or use `sudo purge` to bypass".into(),
-                                }
+                                (
+                                    apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                        fired: false,
+                                        reason: "media_active — audio/video/call running; pause media or use `sudo purge` to bypass".into(),
+                                    },
+                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                    "media-active".to_string(),
+                                )
                             } else if spawn_reaped_purge() {
                                 maintenance_state.mark_cli_purged();
                                 lf_metrics
                                     .maintenance_purge_total
                                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
-                                    fired: true,
-                                    reason: "ok".into(),
-                                }
+                                (
+                                    apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                        fired: true,
+                                        reason: "ok".into(),
+                                    },
+                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Applied,
+                                    "purge applied".to_string(),
+                                )
                             } else {
-                                apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
-                                    fired: false,
-                                    reason: "purge spawn failed".into(),
-                                }
+                                (
+                                    apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                        fired: false,
+                                        reason: "purge spawn failed".into(),
+                                    },
+                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Failed,
+                                    "purge spawn failed".to_string(),
+                                )
                             };
+                            cycle_decision_events.push(
+                                apollo_engine::engine::decision_ledger::ActuatorDecisionEvent::local(
+                                    "predictive_purge:cli",
+                                    "host",
+                                    cycle_count,
+                                    decision_outcome,
+                                    "cli-maintenance-purge",
+                                    detail,
+                                ),
+                            );
                             let _ = response_tx.send(resp);
                         }
                     }
                 }
+
+                if let Some(coordinated) =
+                    apollo_engine::engine::decision_ledger::coordinated_action_event(
+                        &cycle_decision_events,
+                        cycle_count,
+                    )
+                {
+                    cycle_decision_events.push(coordinated);
+                }
+                if cycle_decision_events.dropped_total() > 0 {
+                    tracing::warn!(
+                        dropped = cycle_decision_events.dropped_total(),
+                        "decision event cycle buffer reached its bounded capacity"
+                    );
+                }
+                let resolved_decisions =
+                    decision_ledger.ingest_cycle_events(&mut cycle_decision_events);
+                telemetry_medallion.stage_decision_episodes(&resolved_decisions);
 
                 // Push estado a suscriptores activos (menubar, etc.)
                 socket_handler::broadcast_current_status(&state);

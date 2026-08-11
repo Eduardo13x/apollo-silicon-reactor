@@ -71,6 +71,9 @@ pub struct FilterOutcome {
     pub op_mode: OperationMode,
     /// Count of FreezeProcess actions rewritten to ThrottleProcess this cycle.
     pub causal_qos_upgrades: u32,
+    /// Root proposals suppressed before dispatch, retained for exact blocked
+    /// or no-op decision receipts.
+    pub blocked_actions: Vec<(RootAction, &'static str)>,
 }
 
 /// Previous-cycle throttled PIDs (dedup across cycles).
@@ -122,20 +125,54 @@ fn upgrade_causal_qos_actions(
 fn dedup_throttle_actions(
     actions: Vec<RootAction>,
     previous: &HashSet<u32>,
-) -> (Vec<RootAction>, HashSet<u32>) {
+) -> (Vec<RootAction>, HashSet<u32>, Vec<RootAction>) {
     let mut this_cycle = HashSet::new();
-    let actions = actions
-        .into_iter()
-        .filter(|action| {
-            if let RootAction::ThrottleProcess { pid, .. } = action {
-                this_cycle.insert(*pid);
-                !previous.contains(pid)
-            } else {
-                true
+    let mut allowed = Vec::with_capacity(actions.len());
+    let mut blocked = Vec::new();
+    for action in actions {
+        if let RootAction::ThrottleProcess { pid, .. } = &action {
+            this_cycle.insert(*pid);
+            if previous.contains(pid) {
+                blocked.push(action);
+                continue;
             }
-        })
-        .collect();
-    (actions, this_cycle)
+        }
+        allowed.push(action);
+    }
+    (allowed, this_cycle, blocked)
+}
+
+fn filter_actions_for_mode(
+    actions: Vec<RootAction>,
+    op_mode: OperationMode,
+) -> (Vec<RootAction>, Vec<(RootAction, &'static str)>) {
+    let reason = match op_mode {
+        OperationMode::Emergency => "operation-mode-emergency",
+        OperationMode::Observe => "operation-mode-observe",
+        OperationMode::Conservative => "operation-mode-conservative",
+        OperationMode::Full => return (actions, Vec::new()),
+    };
+    let mut allowed = Vec::with_capacity(actions.len());
+    let mut blocked = Vec::new();
+    for action in actions {
+        let admitted = match op_mode {
+            OperationMode::Emergency => matches!(action, RootAction::UnfreezeProcess { .. }),
+            OperationMode::Observe => false,
+            OperationMode::Conservative => matches!(
+                action,
+                RootAction::UnfreezeProcess { .. }
+                    | RootAction::SetThreadQoS { .. }
+                    | RootAction::BoostProcess { .. }
+            ),
+            OperationMode::Full => true,
+        };
+        if admitted {
+            allowed.push(action);
+        } else {
+            blocked.push((action, reason));
+        }
+    }
+    (allowed, blocked)
 }
 
 /// Run the filter pipeline.
@@ -233,32 +270,8 @@ pub fn run_filter_pipeline(
         };
 
     // ── Mode filter ──────────────────────────────────────────────
-    let filtered_actions: Vec<RootAction> = if op_mode == OperationMode::Emergency {
-        // Emergency: only unfreeze, no new actions.
-        final_actions
-            .into_iter()
-            .filter(|a| matches!(a, RootAction::UnfreezeProcess { .. }))
-            .collect()
-    } else if op_mode == OperationMode::Observe {
-        // Observe: no actions at all.
-        Vec::new()
-    } else if op_mode == OperationMode::Conservative {
-        // Conservative: only unfreeze + QoS hints (no SIGSTOP, no throttle).
-        final_actions
-            .into_iter()
-            .filter(|a| {
-                matches!(
-                    a,
-                    RootAction::UnfreezeProcess { .. }
-                        | RootAction::SetThreadQoS { .. }
-                        | RootAction::BoostProcess { .. }
-                )
-            })
-            .collect()
-    } else {
-        // Full: all actions pass through.
-        final_actions
-    };
+    let (filtered_actions, mut blocked_actions) =
+        filter_actions_for_mode(final_actions, op_mode.clone());
 
     // ── Causal QoS upgrade ───────────────────────────────────────
     // FreezeProcess → ThrottleProcess for CPU-dominant processes.
@@ -279,8 +292,13 @@ pub fn run_filter_pipeline(
             .unwrap_or_else(|e| e.into_inner())
             .clone()
             .unwrap_or_default();
-        let (deduped, this_cycle) = dedup_throttle_actions(filtered_actions, &previous);
+        let (deduped, this_cycle, dropped) = dedup_throttle_actions(filtered_actions, &previous);
         *PREV_THROTTLED.lock().unwrap_or_else(|e| e.into_inner()) = Some(this_cycle);
+        blocked_actions.extend(
+            dropped
+                .into_iter()
+                .map(|action| (action, "previous-cycle-throttle-dedup")),
+        );
         deduped
     };
 
@@ -289,6 +307,7 @@ pub fn run_filter_pipeline(
         cb_is_open,
         op_mode,
         causal_qos_upgrades,
+        blocked_actions,
     }
 }
 
@@ -325,8 +344,9 @@ mod tests {
         ));
 
         let previous = HashSet::from([42]);
-        let (deduped, proposed_this_cycle) = dedup_throttle_actions(upgraded, &previous);
+        let (deduped, proposed_this_cycle, blocked) = dedup_throttle_actions(upgraded, &previous);
         assert!(deduped.is_empty(), "converted throttle must respect dedup");
+        assert_eq!(blocked.len(), 1);
         assert!(
             proposed_this_cycle.contains(&42),
             "dedup state must remember recurring proposals"
@@ -343,6 +363,55 @@ mod tests {
         assert!(matches!(
             actions.as_slice(),
             [RootAction::FreezeProcess { pid: 7, .. }]
+        ));
+    }
+
+    #[test]
+    fn mode_filter_retains_blocked_actions_for_receipts() {
+        let (allowed, blocked) = filter_actions_for_mode(
+            vec![
+                freeze(7, "background-worker"),
+                RootAction::unfreeze(
+                    8,
+                    "foreground-worker",
+                    "recovery",
+                    DecisionReason::PressureContext,
+                ),
+            ],
+            OperationMode::Emergency,
+        );
+
+        assert!(matches!(
+            allowed.as_slice(),
+            [RootAction::UnfreezeProcess { pid: 8, .. }]
+        ));
+        assert!(matches!(
+            blocked.as_slice(),
+            [(
+                RootAction::FreezeProcess { pid: 7, .. },
+                "operation-mode-emergency"
+            )]
+        ));
+    }
+
+    #[test]
+    fn throttle_dedup_returns_the_suppressed_action() {
+        let previous = HashSet::from([42]);
+        let action = RootAction::throttle(
+            42,
+            "worker",
+            false,
+            "repeat",
+            DecisionReason::PressureContext,
+        );
+
+        let (allowed, proposed, blocked) = dedup_throttle_actions(vec![action], &previous);
+
+        assert!(allowed.is_empty());
+        assert!(proposed.contains(&42));
+        assert!(matches!(
+            blocked.as_slice(),
+            [RootAction::ThrottleProcess { pid: 42, .. }]
         ));
     }
 }

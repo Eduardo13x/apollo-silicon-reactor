@@ -115,6 +115,7 @@ struct LedgerEntry {
 pub const DEFAULT_TTL: Duration = Duration::from_secs(600);
 const REVERT_RETRY_TTL: Duration = Duration::from_secs(30);
 const REVERT_SLOW_RETRY_TTL: Duration = Duration::from_secs(300);
+const MAX_RECONCILE_RECEIPTS: usize = 640;
 
 fn schedule_revert_retry(entry: &mut LedgerEntry) -> bool {
     let first_failure = entry.revert_failures == 0;
@@ -128,10 +129,56 @@ fn schedule_revert_retry(entry: &mut LedgerEntry) -> bool {
     first_failure
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileDisposition {
+    Reverted,
+    Failed,
+    NoOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReconcileReceipt {
+    pub effect: AppliedEffect,
+    pub disposition: ReconcileDisposition,
+}
+
+impl ReconcileReceipt {
+    pub fn action_key(self) -> &'static str {
+        match self.effect {
+            AppliedEffect::Nice { .. } => "boost:effect_reconcile",
+            AppliedEffect::MachTier { .. } | AppliedEffect::TaskQoS { .. } => {
+                "interaction_qos:effect_reconcile"
+            }
+            AppliedEffect::JetsamPriority { .. } | AppliedEffect::Memlimit { .. } => {
+                "memorystatus:effect_reconcile"
+            }
+            AppliedEffect::AppNap { .. } | AppliedEffect::DarwinBg { .. } => {
+                "throttle:effect_reconcile"
+            }
+        }
+    }
+
+    pub fn target(self) -> String {
+        format!("pid:{}", self.effect.pid())
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ReconcileOutcome {
     pub reverted: u64,
     pub failed: u64,
+    pub receipts: Vec<ReconcileReceipt>,
+    pub receipts_dropped: u64,
+}
+
+impl ReconcileOutcome {
+    fn push_receipt(&mut self, receipt: ReconcileReceipt) {
+        if self.receipts.len() < MAX_RECONCILE_RECEIPTS {
+            self.receipts.push(receipt);
+        } else {
+            self.receipts_dropped = self.receipts_dropped.saturating_add(1);
+        }
+    }
 }
 
 pub struct EffectLedger {
@@ -357,6 +404,10 @@ pub fn reconcile_global(
         // PID-identity guard: only undo on the same process we mutated.
         let (live_sec, _) = crate::engine::daemon_helpers::pid_start_time(pid);
         if live_sec == 0 || live_sec != entry.start_sec {
+            outcome.push_receipt(ReconcileReceipt {
+                effect: entry.effect,
+                disposition: ReconcileDisposition::NoOp,
+            });
             continue;
         }
         let reverted = match entry.effect {
@@ -396,6 +447,10 @@ pub fn reconcile_global(
             }
         };
         if !reverted {
+            outcome.push_receipt(ReconcileReceipt {
+                effect: entry.effect,
+                disposition: ReconcileDisposition::Failed,
+            });
             let first_failure = schedule_revert_retry(&mut entry);
             outcome.failed += u64::from(first_failure);
             tracing::warn!(
@@ -410,6 +465,10 @@ pub fn reconcile_global(
             continue;
         }
         crate::engine::lse_counters::LSE_COUNTERS.inc_effect_ledger_revert();
+        outcome.push_receipt(ReconcileReceipt {
+            effect: entry.effect,
+            disposition: ReconcileDisposition::Reverted,
+        });
         tracing::debug!(
             pid,
             effect = ?entry.effect,
@@ -465,6 +524,17 @@ mod tests {
             !is_orphan_boost_signature(-5, false),
             "other negative not ours"
         );
+    }
+
+    #[test]
+    fn reconcile_receipt_preserves_effect_family_and_pid() {
+        let receipt = ReconcileReceipt {
+            effect: AppliedEffect::Memlimit { pid: 42 },
+            disposition: ReconcileDisposition::Reverted,
+        };
+
+        assert_eq!(receipt.action_key(), "memorystatus:effect_reconcile");
+        assert_eq!(receipt.target(), "pid:42");
     }
 
     #[test]

@@ -19,8 +19,11 @@ use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest}
 use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
 use apollo_engine::engine::daemon_helpers::write_frozen_state;
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{ActuatorDecisionOutcome, CycleDecisionEvents};
 use apollo_engine::engine::degradation::DegradationInputs;
-use apollo_engine::engine::execute_actions::ExecuteOutcomes;
+use apollo_engine::engine::execute_actions::{
+    decision_event_for_root_action_from, ExecuteOutcomes,
+};
 use apollo_engine::engine::gpu_imagination::{
     GpuImaginationCandidate, GpuImaginationGate, GpuImaginationRequest, GpuImaginationWorker,
 };
@@ -111,9 +114,17 @@ fn thread_qos_rank(action: &RootAction) -> u8 {
 /// before execute_actions eliminates the bug class without touching
 /// every emission site.
 pub fn consolidate_actions_per_pid(actions: Vec<RootAction>) -> (Vec<RootAction>, DedupStats) {
+    let (actions, stats, _) = consolidate_actions_per_pid_with_dropped(actions);
+    (actions, stats)
+}
+
+fn consolidate_actions_per_pid_with_dropped(
+    actions: Vec<RootAction>,
+) -> (Vec<RootAction>, DedupStats, Vec<RootAction>) {
     let mut seen: HashMap<(u32, DedupKind, u32), usize> = HashMap::with_capacity(actions.len());
     let mut stats = DedupStats::default();
     let mut out: Vec<RootAction> = Vec::with_capacity(actions.len());
+    let mut dropped = Vec::new();
 
     for action in actions {
         match dedup_key(&action) {
@@ -133,15 +144,19 @@ pub fn consolidate_actions_per_pid(actions: Vec<RootAction>) -> (Vec<RootAction>
                     if key.1 == DedupKind::SetThreadQoS {
                         let existing_idx = seen[&key];
                         if thread_qos_rank(&action) > thread_qos_rank(&out[existing_idx]) {
-                            out[existing_idx] = action;
+                            dropped.push(std::mem::replace(&mut out[existing_idx], action));
+                        } else {
+                            dropped.push(action);
                         }
+                    } else {
+                        dropped.push(action);
                     }
                 }
             }
             None => out.push(action),
         }
     }
-    (out, stats)
+    (out, stats, dropped)
 }
 
 /// Increment lock-free dedup_drops counters from DedupStats.
@@ -941,6 +956,15 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     let op_mode = filter_outcome.op_mode;
     let mut filtered_actions = filter_outcome.filtered_actions;
     let causal_qos_upgrades = filter_outcome.causal_qos_upgrades;
+    let mut dispatch_decision_events = CycleDecisionEvents::default();
+    for (action, reason) in filter_outcome.blocked_actions {
+        dispatch_decision_events.push(decision_event_for_root_action_from(
+            &action,
+            ActuatorDecisionOutcome::Blocked,
+            "dispatch-mode-filter",
+            reason.to_string(),
+        ));
+    }
 
     // Universal world-model gate for discretionary actions. Pressure relief
     // and recovery remain governed by their specialist safety paths. An
@@ -948,21 +972,28 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     let mut utility_vetoes = 0_u64;
     let mut last_utility_veto = None;
     let mut utility_abstentions = Vec::new();
-    filtered_actions.retain(|action| {
-        match evaluate_utility_gate(action, world_model, workload) {
+    let mut utility_admitted = Vec::with_capacity(filtered_actions.len());
+    for action in filtered_actions {
+        match evaluate_utility_gate(&action, world_model, workload) {
             UtilityGateDecision::Veto(influence) => {
                 utility_vetoes = utility_vetoes.saturating_add(1);
                 tracing::debug!(action_key = %influence.action_key, workload, "world model vetoed low-utility action");
                 last_utility_veto = Some(influence);
-                false
+                dispatch_decision_events.push(decision_event_for_root_action_from(
+                    &action,
+                    ActuatorDecisionOutcome::Vetoed,
+                    "world-model-gate",
+                    "world-model-utility-veto".to_string(),
+                ));
             }
             UtilityGateDecision::Abstained { reason, action_key } => {
                 utility_abstentions.push((reason, action_key));
-                true
+                utility_admitted.push(action);
             }
-            UtilityGateDecision::Admit => true,
+            UtilityGateDecision::Admit => utility_admitted.push(action),
         }
-    });
+    }
+    filtered_actions = utility_admitted;
     if utility_vetoes > 0 || !utility_abstentions.is_empty() {
         let mut metrics = state.metrics.lock_recover();
         metrics.metrics.world_model_utility_vetoes_total = metrics
@@ -983,8 +1014,17 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     // here we collapse duplicate (pid, kind) pairs. Without this, pid 65808
     // received SetMemorystatus 8× in the same second (prod observation).
     // [Saltzer & Schroeder 1975] Economy of Mechanism.
-    let (deduped, dedup_stats) = consolidate_actions_per_pid(filtered_actions);
+    let (deduped, dedup_stats, dedup_dropped) =
+        consolidate_actions_per_pid_with_dropped(filtered_actions);
     filtered_actions = deduped;
+    for action in dedup_dropped {
+        dispatch_decision_events.push(decision_event_for_root_action_from(
+            &action,
+            ActuatorDecisionOutcome::NoOp,
+            "dispatch-dedup",
+            "same-cycle-dedup".to_string(),
+        ));
+    }
     if let Some(lf) = lf_metrics {
         record_dedup_drops(lf, &dedup_stats);
     }
@@ -1011,8 +1051,9 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         let pressure = snapshot.pressure.memory_pressure;
         if pressure > PRED_GATE_PRESSURE {
             let mut deferred = 0u32;
-            filtered_actions.retain(|a| {
-                if let RootAction::UnfreezeProcess { pid, name, .. } = a {
+            let mut admitted = Vec::with_capacity(filtered_actions.len());
+            for action in filtered_actions {
+                if let RootAction::UnfreezeProcess { pid, name, .. } = &action {
                     let m_0 = collector
                         .system()
                         .process(sysinfo::Pid::from_u32(*pid))
@@ -1030,11 +1071,18 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
                             "deferring thaw: predicted RSS growth exceeds headroom"
                         );
                         deferred += 1;
-                        return false;
+                        dispatch_decision_events.push(decision_event_for_root_action_from(
+                            &action,
+                            ActuatorDecisionOutcome::Blocked,
+                            "predictive-thaw-gate",
+                            "predictive-thaw-rss-growth".to_string(),
+                        ));
+                        continue;
                     }
                 }
-                true
-            });
+                admitted.push(action);
+            }
+            filtered_actions = admitted;
             if deferred > 0 {
                 tracing::warn!(
                     target: "apollo.unfreeze_decay",
@@ -1094,6 +1142,12 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
                 action: action.clone(),
                 action_key: key,
             });
+            dispatch_decision_events.push(decision_event_for_root_action_from(
+                action,
+                ActuatorDecisionOutcome::Rejected,
+                "controlled-holdout",
+                "controlled-counterfactual-holdout".to_string(),
+            ));
             false
         });
     }
@@ -1129,10 +1183,19 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             op_mode = op_mode.as_str(),
             "circuit-breaker: open — skipping execute_actions, dispatching unfreeze only"
         );
-        let safe_actions: Vec<RootAction> = filtered_actions
-            .into_iter()
-            .filter(|a| matches!(a, RootAction::UnfreezeProcess { .. }))
-            .collect();
+        let mut safe_actions = Vec::with_capacity(filtered_actions.len());
+        for action in filtered_actions {
+            if matches!(action, RootAction::UnfreezeProcess { .. }) {
+                safe_actions.push(action);
+            } else {
+                dispatch_decision_events.push(decision_event_for_root_action_from(
+                    &action,
+                    ActuatorDecisionOutcome::Blocked,
+                    "circuit-breaker",
+                    "circuit-breaker-open".to_string(),
+                ));
+            }
+        }
         broker.execute(ActuationRequest {
             actions: safe_actions,
             caps,
@@ -1186,7 +1249,10 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             .privileged_action_rejections_total
             .saturating_add(broker_execution.rejected);
     }
-    let outcomes = broker_execution.outcomes;
+    let mut outcomes = broker_execution.outcomes;
+    outcomes
+        .decision_events
+        .extend(dispatch_decision_events.as_slice().iter().cloned());
 
     // Update degradation controller with new failure count.
     if outcomes.failures > 0 {
@@ -1474,6 +1540,21 @@ mod tests {
             start_sec: 0,
             start_usec: 0,
         }
+    }
+
+    #[test]
+    fn same_cycle_dedup_returns_noop_receipt_candidates() {
+        let action = throttle(41);
+
+        let (kept, stats, dropped) =
+            consolidate_actions_per_pid_with_dropped(vec![action.clone(), action]);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(stats.throttle, 1);
+        assert!(matches!(
+            dropped.as_slice(),
+            [RootAction::ThrottleProcess { pid: 41, .. }]
+        ));
     }
 
     fn freeze(pid: u32) -> RootAction {
@@ -1982,6 +2063,7 @@ mod tests {
         let episodes = (1..=2)
             .map(|id| ResolvedActuatorEvidence {
                 id,
+                decision_id: None,
                 family: ActuatorFamily::Boost,
                 objective: ActuatorObjective::Responsiveness,
                 action_key: "boost:p200".to_string(),

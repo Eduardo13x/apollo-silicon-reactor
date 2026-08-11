@@ -37,6 +37,9 @@ use std::time::{Duration, Instant};
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 use apollo_engine::engine::build_tracker::BuildPhase;
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::io_tiering::IoShaper;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -94,6 +97,28 @@ const LEDGER_GRACE: Duration = Duration::from_secs(5);
 const TASK_QOS_OWNER: &str = "acceleration lease: interactive task QoS";
 const NICE_OWNER: &str = "acceleration lease: nice fallback";
 const LEASE_NICE: i32 = -2;
+
+#[derive(Debug, Default)]
+pub struct AccelerationTickOutput {
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn acceleration_event(
+    action_key: &str,
+    pid: u32,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        action_key,
+        format!("pid:{pid}"),
+        cycle,
+        outcome,
+        "acceleration-lease",
+        detail,
+    )
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaseTtlBand {
@@ -181,6 +206,15 @@ fn select_distinct_ttl_band(
 
 fn contextual_io_release_allowed(bias: ContextualActionBias) -> bool {
     !bias.authoritative || bias.score > -0.50
+}
+
+fn contextual_io_outcome(bias: ContextualActionBias) -> Option<ActuatorDecisionOutcome> {
+    (bias.is_informative() && !contextual_io_release_allowed(bias))
+        .then_some(ActuatorDecisionOutcome::Vetoed)
+}
+
+fn lease_renewal_outcome() -> ActuatorDecisionOutcome {
+    ActuatorDecisionOutcome::NoOp
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -863,7 +897,7 @@ fn acquire_acceleration_lease(
 /// broker still owns. QoS is a scheduler hint on Apple Silicon, not physical
 /// P/E-core affinity. Chromium keeps its non-invasive B.6 policy.
 #[allow(clippy::too_many_arguments)]
-pub fn update_acceleration_lease(
+fn update_acceleration_lease_inner(
     state: &SharedState,
     controller: &mut AccelerationLeaseBroker,
     fluidity_state: &FluidityState,
@@ -992,6 +1026,171 @@ pub fn update_acceleration_lease(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn update_acceleration_lease(
+    state: &SharedState,
+    controller: &mut AccelerationLeaseBroker,
+    fluidity_state: &FluidityState,
+    thermal_action: &ThermalAction,
+    foreground_pid: Option<u32>,
+    build_phase: BuildPhase,
+    idle_secs: f64,
+    process_tree: &ProcessTree,
+    snapshots: &[ProcessSnapshot],
+    io_shaper: &mut IoShaper,
+    world_model: &WorldModel,
+    workload: &str,
+    cycle: u64,
+) -> AccelerationTickOutput {
+    #[derive(Clone, Copy)]
+    struct Counters {
+        activations: u64,
+        renewals: u64,
+        reverts: u64,
+        io_promotions: u64,
+        identity_skips: u64,
+        capability_skips: u64,
+        nice_failures: u64,
+        conflict_skips: u64,
+        contextual_io: u64,
+    }
+    let snapshot = |state: &SharedState| {
+        let metrics = state.metrics.lock_recover();
+        Counters {
+            activations: metrics.metrics.interaction_qos_activations,
+            renewals: metrics.metrics.acceleration_lease_renewals_total,
+            reverts: metrics.metrics.interaction_qos_reverts,
+            io_promotions: metrics.metrics.acceleration_lease_io_promotions_total,
+            identity_skips: metrics.metrics.acceleration_lease_identity_skips_total,
+            capability_skips: metrics.metrics.acceleration_lease_capability_skips_total,
+            nice_failures: metrics.metrics.acceleration_lease_nice_failures_total,
+            conflict_skips: metrics.metrics.acceleration_lease_conflict_skips_total,
+            contextual_io: metrics.metrics.world_model_contextual_io_total,
+        }
+    };
+    let before = snapshot(state);
+    let prior_root = controller.active.as_ref().map(|lease| lease.root_pid);
+    let expired = controller.active.as_ref().is_some_and(|lease| {
+        Instant::now() >= lease.expires_at || Instant::now() >= lease.hard_deadline
+    });
+    update_acceleration_lease_inner(
+        state,
+        controller,
+        fluidity_state,
+        thermal_action,
+        foreground_pid,
+        build_phase,
+        idle_secs,
+        process_tree,
+        snapshots,
+        io_shaper,
+        world_model,
+        workload,
+    );
+    let after = snapshot(state);
+    let target = controller
+        .active
+        .as_ref()
+        .map(|lease| lease.root_pid)
+        .or(prior_root)
+        .or(foreground_pid)
+        .unwrap_or(0);
+    let mut output = AccelerationTickOutput::default();
+    let (interaction_action_key, io_bias) = {
+        let metrics = state.metrics.lock_recover();
+        let key = match (
+            metrics.metrics.interaction_qos_ttl_exploratory,
+            metrics.metrics.interaction_qos_ttl_band.as_str(),
+        ) {
+            (true, band @ ("short" | "standard" | "long")) => {
+                format!("interaction_qos:foreground@{band}")
+            }
+            _ => "interaction_qos:foreground".to_string(),
+        };
+        (
+            key,
+            world_model.contextual_action_bias("io_shaping:interactive_release", workload),
+        )
+    };
+    if expired {
+        output.decision_events.push(acceleration_event(
+            &interaction_action_key,
+            target,
+            cycle,
+            ActuatorDecisionOutcome::Expired,
+            "lease deadline reached",
+        ));
+    }
+    if after.reverts > before.reverts {
+        output.decision_events.push(acceleration_event(
+            &interaction_action_key,
+            target,
+            cycle,
+            ActuatorDecisionOutcome::Reverted,
+            "owned QoS lease effects restored",
+        ));
+    }
+    if after.activations > before.activations {
+        output.decision_events.push(acceleration_event(
+            &interaction_action_key,
+            target,
+            cycle,
+            ActuatorDecisionOutcome::Applied,
+            "bounded foreground family lease acquired",
+        ));
+    }
+    if after.renewals > before.renewals {
+        output.decision_events.push(acceleration_event(
+            &interaction_action_key,
+            target,
+            cycle,
+            lease_renewal_outcome(),
+            "active lease refreshed without a new kernel mutation",
+        ));
+    }
+    if after.io_promotions > before.io_promotions {
+        output.decision_events.push(acceleration_event(
+            "io_shaping:interactive_release",
+            target,
+            cycle,
+            ActuatorDecisionOutcome::Applied,
+            "interactive I/O promotion applied",
+        ));
+    }
+    if after.nice_failures > before.nice_failures {
+        output.decision_events.push(acceleration_event(
+            &interaction_action_key,
+            target,
+            cycle,
+            ActuatorDecisionOutcome::Failed,
+            "nice fallback failed",
+        ));
+    } else if after.identity_skips > before.identity_skips
+        || after.capability_skips > before.capability_skips
+        || after.conflict_skips > before.conflict_skips
+    {
+        output.decision_events.push(acceleration_event(
+            &interaction_action_key,
+            target,
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            "identity, capability, or ownership gate",
+        ));
+    }
+    if after.contextual_io > before.contextual_io {
+        if let Some(outcome) = contextual_io_outcome(io_bias) {
+            output.decision_events.push(acceleration_event(
+                "io_shaping:interactive_release",
+                target,
+                cycle,
+                outcome,
+                "authoritative contextual utility veto",
+            ));
+        }
+    }
+    output
+}
+
 pub fn release_acceleration_lease(controller: &mut AccelerationLeaseBroker, state: &SharedState) {
     let Some(lease) = controller.active.take() else {
         return;
@@ -1112,6 +1311,36 @@ pub fn release_acceleration_lease(controller: &mut AccelerationLeaseBroker, stat
 mod interaction_qos_tests {
     use super::*;
     use apollo_engine::engine::process_tree::ProcessEntry;
+
+    #[test]
+    fn acceleration_event_preserves_side_channel_family_and_pid() {
+        let event = acceleration_event(
+            "interaction_qos:foreground",
+            42,
+            15,
+            apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Applied,
+            "task QoS applied",
+        );
+
+        assert_eq!(event.proposal.action_key, "interaction_qos:foreground");
+        assert_eq!(event.proposal.target, "pid:42");
+        assert_eq!(event.proposal.proposed_cycle, 15);
+    }
+
+    #[test]
+    fn renewal_is_noop_and_authoritative_io_denial_is_vetoed() {
+        assert_eq!(lease_renewal_outcome(), ActuatorDecisionOutcome::NoOp);
+        assert_eq!(
+            contextual_io_outcome(ContextualActionBias {
+                score: -0.8,
+                authoritative: true,
+                model_observations: 12,
+                ..ContextualActionBias::default()
+            }),
+            Some(ActuatorDecisionOutcome::Vetoed)
+        );
+        assert_eq!(contextual_io_outcome(ContextualActionBias::default()), None);
+    }
 
     #[test]
     fn contextual_acceleration_tuning_is_bounded_and_cannot_grant_io_authority() {

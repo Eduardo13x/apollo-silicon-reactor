@@ -23,6 +23,9 @@ use apollo_engine::engine::daemon_helpers::{
     apply_reversible_background_jetsam, write_frozen_state, ReversibleJetsamOutcome,
 };
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::focus_markov::FocusMarkov;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -33,6 +36,44 @@ use apollo_engine::engine::process_identity::ProcessIdentity;
 use apollo_engine::engine::types::{FreezeSource, FrozenEntry};
 use apollo_engine::engine::window_sensor::WorkloadIntent;
 use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
+
+#[derive(Debug, Default)]
+pub struct ChromiumTickOutput {
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn chromium_event(
+    action: &ChromiumAction,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    let (action_key, pid, name) = match action {
+        ChromiumAction::DemoteToEcores { pid, name } => {
+            ("chromium_ecore:background_renderer", *pid, name.as_str())
+        }
+        ChromiumAction::DemoteJetsam { pid, name } => {
+            ("chromium_jetsam:background_renderer", *pid, name.as_str())
+        }
+        ChromiumAction::PurgePurgeable { pid, name } => {
+            ("chromium_purge:purgeable_renderer", *pid, name.as_str())
+        }
+        ChromiumAction::FreezeRenderer { pid, name, .. } => {
+            ("freeze:chromium_renderer", *pid, name.as_str())
+        }
+        ChromiumAction::ThawRenderer { pid, name } => {
+            ("unfreeze:chromium_renderer", *pid, name.as_str())
+        }
+    };
+    ActuatorDecisionEvent::local(
+        action_key,
+        format!("{name}:pid:{pid}"),
+        cycle,
+        outcome,
+        "chromium-manager",
+        detail,
+    )
+}
 
 /// True when Apollo should hold off Chromium E-core demotion to protect a live
 /// Meet/call: audio is actively flowing AND memory is not in genuine crisis.
@@ -132,7 +173,8 @@ pub fn run_chromium_tick(
     external_4k_attached: bool,
     world_model: &WorldModel,
     workload: &str,
-) {
+) -> ChromiumTickOutput {
+    let mut output = ChromiumTickOutput::default();
     // Step 2 (2026-05-11): conditional SIGSTOP enablement on crisis only.
     // Historical context (commit 712b927, Apr 21): SIGSTOP on chromium renderers
     // caused Brave IPC timeouts / beachballs. Kept globally disabled.
@@ -315,6 +357,12 @@ pub fn run_chromium_tick(
             ChromiumAction::DemoteToEcores { pid, name } => {
                 if demote_unsafe_for_call {
                     chromium_mgr.confirm_ecore_demotion(*pid, false);
+                    output.decision_events.push(chromium_event(
+                        action,
+                        cycle_count,
+                        ActuatorDecisionOutcome::Blocked,
+                        "active audio call",
+                    ));
                     tracing::debug!(
                         pid = pid,
                         name = name.as_str(),
@@ -331,6 +379,12 @@ pub fn run_chromium_tick(
                 );
                 if !allowed {
                     chromium_mgr.confirm_ecore_demotion(*pid, false);
+                    output.decision_events.push(chromium_event(
+                        action,
+                        cycle_count,
+                        ActuatorDecisionOutcome::Vetoed,
+                        "mature negative contextual evidence",
+                    ));
                     continue;
                 }
                 tracing::debug!(
@@ -358,6 +412,21 @@ pub fn run_chromium_tick(
                         == Some(apollo_engine::engine::mediator::MachPolicyKind::Background)
                 });
                 chromium_mgr.confirm_ecore_demotion(*pid, confirmed);
+                let event_outcome = match &result {
+                    Ok(receipt) if confirmed && receipt.no_op => ActuatorDecisionOutcome::NoOp,
+                    Ok(_) if confirmed => ActuatorDecisionOutcome::Applied,
+                    _ => ActuatorDecisionOutcome::Failed,
+                };
+                output.decision_events.push(chromium_event(
+                    action,
+                    cycle_count,
+                    event_outcome,
+                    result
+                        .as_ref()
+                        .err()
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| "Mach policy receipt".to_string()),
+                ));
                 if confirmed {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.chromium_ecore_demotions_total = metrics
@@ -383,12 +452,24 @@ pub fn run_chromium_tick(
                     !allowed,
                 );
                 if !allowed {
+                    output.decision_events.push(chromium_event(
+                        action,
+                        cycle_count,
+                        ActuatorDecisionOutcome::Vetoed,
+                        "mature negative contextual evidence",
+                    ));
                     continue;
                 }
                 const OWNER: &str = "chromium visible background: jetsam BACKGROUND";
                 const TTL: std::time::Duration = std::time::Duration::from_secs(30);
                 match apply_reversible_background_jetsam(*pid, Some(name), TTL, OWNER) {
                     Ok(ReversibleJetsamOutcome::Applied) => {
+                        output.decision_events.push(chromium_event(
+                            action,
+                            cycle_count,
+                            ActuatorDecisionOutcome::Applied,
+                            "temporary jetsam demotion applied",
+                        ));
                         state
                             .metrics
                             .lock_recover()
@@ -400,17 +481,36 @@ pub fn run_chromium_tick(
                             "chromium: temporary reversible Jetsam demotion applied"
                         );
                     }
-                    Ok(
-                        ReversibleJetsamOutcome::Refreshed
-                        | ReversibleJetsamOutcome::Unchanged
-                        | ReversibleJetsamOutcome::Stale,
-                    ) => {}
-                    Err(error) => tracing::debug!(
-                        pid,
-                        name = name.as_str(),
-                        error = error.as_str(),
-                        "chromium: reversible Jetsam demotion skipped"
-                    ),
+                    Ok(ReversibleJetsamOutcome::Refreshed | ReversibleJetsamOutcome::Unchanged) => {
+                        output.decision_events.push(chromium_event(
+                            action,
+                            cycle_count,
+                            ActuatorDecisionOutcome::NoOp,
+                            "existing jetsam lease retained",
+                        ));
+                    }
+                    Ok(ReversibleJetsamOutcome::Stale) => {
+                        output.decision_events.push(chromium_event(
+                            action,
+                            cycle_count,
+                            ActuatorDecisionOutcome::Blocked,
+                            "stale process identity",
+                        ));
+                    }
+                    Err(error) => {
+                        output.decision_events.push(chromium_event(
+                            action,
+                            cycle_count,
+                            ActuatorDecisionOutcome::Failed,
+                            error.clone(),
+                        ));
+                        tracing::debug!(
+                            pid,
+                            name = name.as_str(),
+                            error = error.as_str(),
+                            "chromium: reversible Jetsam demotion skipped"
+                        );
+                    }
                 }
             }
             ChromiumAction::PurgePurgeable { pid, name } => {
@@ -423,6 +523,12 @@ pub fn run_chromium_tick(
                 );
                 if !allowed {
                     chromium_mgr.confirm_purge_observation(*pid, false);
+                    output.decision_events.push(chromium_event(
+                        action,
+                        cycle_count,
+                        ActuatorDecisionOutcome::Vetoed,
+                        "mature negative contextual evidence",
+                    ));
                     continue;
                 }
                 // RAM Switch-5 (2026-06-03): route through PurgeableEffector
@@ -448,6 +554,20 @@ pub fn run_chromium_tick(
                     _ => 0,
                 };
                 let purge_noop = receipt.as_ref().is_ok_and(|result| result.no_op);
+                output.decision_events.push(chromium_event(
+                    action,
+                    cycle_count,
+                    match &receipt {
+                        Ok(result) if result.no_op => ActuatorDecisionOutcome::NoOp,
+                        Ok(_) if purged > 0 => ActuatorDecisionOutcome::Applied,
+                        _ => ActuatorDecisionOutcome::Failed,
+                    },
+                    receipt
+                        .as_ref()
+                        .err()
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| format!("regions_purged={purged}")),
+                ));
                 chromium_mgr.confirm_purge_observation(*pid, purged > 0);
                 {
                     let mut metrics = state.metrics.lock_recover();
@@ -489,6 +609,16 @@ pub fn run_chromium_tick(
                     // Confirm or roll back optimistic internal state from update().
                     // Keeps chromium_manager in sync with reality when SIGSTOP fails.
                     chromium_mgr.confirm_freeze(*pid, ok);
+                    output.decision_events.push(chromium_event(
+                        action,
+                        cycle_count,
+                        if ok {
+                            ActuatorDecisionOutcome::Applied
+                        } else {
+                            ActuatorDecisionOutcome::Failed
+                        },
+                        "renderer SIGSTOP",
+                    ));
                     if ok {
                         let mut fs = state.frozen_state.lock_recover();
                         if let std::collections::hash_map::Entry::Vacant(slot) = fs.entry(*pid) {
@@ -514,6 +644,16 @@ pub fn run_chromium_tick(
                     );
                     let ok = ChromiumManager::thaw_renderer(*pid);
                     chromium_mgr.confirm_thaw(*pid, ok);
+                    output.decision_events.push(chromium_event(
+                        action,
+                        cycle_count,
+                        if ok {
+                            ActuatorDecisionOutcome::Reverted
+                        } else {
+                            ActuatorDecisionOutcome::Failed
+                        },
+                        "renderer SIGCONT",
+                    ));
                     if ok {
                         // Restore Mach scheduling to Normal (P-cores) so renderer resumes fast.
                         // Switch-4b (2026-06-03): route through MachPolicyEffector.
@@ -568,11 +708,16 @@ pub fn run_chromium_tick(
         m.metrics.chromium_freed_mb = cm.estimated_freed_mb;
         m.metrics.chromium_browsers_managed = cm.browsers_managed;
     }
+    output
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{contextual_chromium_action_allowed, ecore_demote_suppressed_for_call};
+    use super::{
+        chromium_event, contextual_chromium_action_allowed, ecore_demote_suppressed_for_call,
+    };
+    use apollo_engine::engine::chromium_manager::ChromiumAction;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
     use apollo_engine::engine::world_model::ContextualActionBias;
 
     #[test]
@@ -626,5 +771,25 @@ mod tests {
             },
             0.30
         ));
+    }
+
+    #[test]
+    fn chromium_side_channel_event_keeps_pid_and_exact_family() {
+        let event = chromium_event(
+            &ChromiumAction::DemoteToEcores {
+                pid: 42,
+                name: "Brave Browser Helper (Renderer)".to_string(),
+            },
+            12,
+            ActuatorDecisionOutcome::Applied,
+            "confirmed",
+        );
+
+        assert_eq!(
+            event.proposal.action_key,
+            "chromium_ecore:background_renderer"
+        );
+        assert!(event.proposal.target.contains("pid:42"));
+        assert_eq!(event.proposal.proposed_cycle, 12);
     }
 }

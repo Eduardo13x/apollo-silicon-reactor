@@ -1,5 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -8,6 +8,9 @@ pub const MAX_RECENT_DECISIONS: usize = 64;
 pub const MAX_EPISODIC_DECISIONS: usize = 128;
 pub const MAX_CANDIDATE_ALTERNATIVES: usize = 8;
 pub const MAX_ADVISER_CONTRIBUTIONS: usize = 8;
+/// One daemon cycle can contain the broker's bounded 512-action batch plus
+/// bounded side-channel and coordination receipts.
+pub const MAX_CYCLE_DECISION_EVENTS: usize = 640;
 const MAX_RETAINED_DECISION_IDS: usize =
     MAX_PENDING_DECISIONS + MAX_RECENT_DECISIONS + MAX_EPISODIC_DECISIONS;
 
@@ -170,6 +173,9 @@ pub struct DecisionEnvelope {
     pub adviser_contributions: Vec<AdviserContribution>,
     pub lifecycle: DecisionLifecycle,
     pub terminal_reason: String,
+    /// Provenance for terminal outcomes that do not carry an execution
+    /// receipt, including rejection, veto, and expiry.
+    pub terminal_attribution: Option<ReceiptAttribution>,
     pub receipt: Option<ExecutionReceipt>,
 }
 
@@ -181,6 +187,224 @@ pub struct ResolvedDecisionEpisode {
     pub settled_cycle: u64,
     pub authority_eligible: bool,
     pub envelope: DecisionEnvelope,
+}
+
+/// Terminal result emitted by an existing actuator owner. The event is a
+/// transport record only; it grants no actuation authority.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ActuatorDecisionOutcome {
+    #[default]
+    Applied,
+    Blocked,
+    Failed,
+    NoOp,
+    Reverted,
+    Rejected,
+    Vetoed,
+    Expired,
+}
+
+/// Cycle-local proposal and exact terminal outcome produced at an existing
+/// actuator boundary. `DecisionLedger` assigns the stable `DecisionId` while
+/// ingesting the single bounded batch owned by the daemon loop.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct ActuatorDecisionEvent {
+    pub proposal: DecisionProposal,
+    pub outcome: ActuatorDecisionOutcome,
+    pub attribution: ReceiptAttribution,
+    pub detail: String,
+}
+
+impl ActuatorDecisionEvent {
+    pub fn local(
+        action_key: impl Into<String>,
+        target: impl Into<String>,
+        cycle: u64,
+        outcome: ActuatorDecisionOutcome,
+        source: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            proposal: DecisionProposal {
+                action_key: bounded_text(&action_key.into(), MAX_ACTION_KEY_CHARS),
+                target: bounded_text(&target.into(), MAX_TARGET_CHARS),
+                proposed_cycle: cycle,
+                ..DecisionProposal::default()
+            },
+            outcome,
+            attribution: ReceiptAttribution::local(source),
+            detail: bounded_text(&detail.into(), MAX_REASON_CHARS),
+        }
+    }
+
+    pub fn imported(
+        action_key: impl Into<String>,
+        target: impl Into<String>,
+        cycle: u64,
+        outcome: ActuatorDecisionOutcome,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self {
+            proposal: DecisionProposal {
+                action_key: bounded_text(&action_key.into(), MAX_ACTION_KEY_CHARS),
+                target: bounded_text(&target.into(), MAX_TARGET_CHARS),
+                proposed_cycle: cycle,
+                ..DecisionProposal::default()
+            },
+            outcome,
+            attribution: ReceiptAttribution::Imported,
+            detail: bounded_text(&detail.into(), MAX_REASON_CHARS),
+        }
+    }
+
+    pub fn with_expiry(mut self, expires_cycle: u64) -> Self {
+        self.proposal.expires_cycle = expires_cycle;
+        self
+    }
+
+    pub fn with_hierarchy(mut self, hierarchy: HierarchyCoordinates) -> Self {
+        self.proposal.hierarchy = hierarchy;
+        self
+    }
+
+    pub fn with_prediction(mut self, prediction: PredictionRecord) -> Self {
+        if self.proposal.predictions.len() < MAX_PREDICTIONS {
+            self.proposal.predictions.push(prediction);
+        }
+        self
+    }
+
+    pub fn set_cycle(&mut self, cycle: u64) {
+        self.proposal.proposed_cycle = cycle;
+    }
+}
+
+/// Bounded, cycle-local handoff from actuator owners to the daemon's single
+/// ledger ingestion point. It contains no lock and performs no I/O.
+#[derive(Debug, Clone)]
+pub struct CycleDecisionEvents {
+    events: Vec<ActuatorDecisionEvent>,
+    dropped_total: u64,
+}
+
+impl Default for CycleDecisionEvents {
+    fn default() -> Self {
+        Self {
+            events: Vec::with_capacity(32),
+            dropped_total: 0,
+        }
+    }
+}
+
+impl CycleDecisionEvents {
+    pub fn push(&mut self, event: ActuatorDecisionEvent) -> bool {
+        if self.events.len() >= MAX_CYCLE_DECISION_EVENTS {
+            self.dropped_total = self.dropped_total.saturating_add(1);
+            return false;
+        }
+        self.events.push(event);
+        true
+    }
+
+    pub fn extend(&mut self, events: impl IntoIterator<Item = ActuatorDecisionEvent>) {
+        for event in events {
+            self.push(event);
+        }
+    }
+
+    pub fn extend_at_cycle(&mut self, events: &[ActuatorDecisionEvent], cycle: u64) {
+        for event in events {
+            let mut event = event.clone();
+            event.set_cycle(cycle);
+            self.push(event);
+        }
+    }
+
+    pub fn as_slice(&self) -> &[ActuatorDecisionEvent] {
+        &self.events
+    }
+
+    pub fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total
+    }
+
+    fn drain(&mut self) -> impl Iterator<Item = ActuatorDecisionEvent> + '_ {
+        self.events.drain(..)
+    }
+}
+
+/// Build one cohort-level receipt when multiple actuator families applied in
+/// the same bounded cycle batch. Deterministic bounded sets avoid pairwise
+/// action comparisons.
+pub fn coordinated_action_event(
+    events: &CycleDecisionEvents,
+    cycle: u64,
+) -> Option<ActuatorDecisionEvent> {
+    let mut families = BTreeSet::new();
+    let mut action_keys = BTreeSet::new();
+    for event in events.as_slice() {
+        if event.outcome != ActuatorDecisionOutcome::Applied {
+            continue;
+        }
+        let family = event
+            .proposal
+            .action_key
+            .split_once(':')
+            .map_or(event.proposal.action_key.as_str(), |(family, _)| family);
+        if family == "coordinated" {
+            continue;
+        }
+        families.insert(family.to_string());
+        action_keys.insert(event.proposal.action_key.clone());
+    }
+    if families.len() < 2 {
+        return None;
+    }
+    let action_key = format!(
+        "coordinated:{}",
+        families.into_iter().collect::<Vec<_>>().join("+")
+    );
+    let mut target = String::new();
+    for key in action_keys {
+        let separator_len = usize::from(!target.is_empty());
+        if target
+            .len()
+            .saturating_add(separator_len)
+            .saturating_add(key.len())
+            > MAX_TARGET_CHARS
+        {
+            break;
+        }
+        if !target.is_empty() {
+            target.push('|');
+        }
+        target.push_str(&key);
+    }
+    Some(
+        ActuatorDecisionEvent::local(
+            action_key,
+            target,
+            cycle,
+            ActuatorDecisionOutcome::Applied,
+            "coordinated-audit",
+            "multiple actuator families applied in one cycle",
+        )
+        .with_hierarchy(HierarchyCoordinates {
+            level: 1,
+            cohort: cycle,
+            ..HierarchyCoordinates::default()
+        }),
+    )
 }
 
 /// Bounded, per-owner ledger. It is intentionally not global: callers keep a
@@ -252,6 +476,59 @@ impl DecisionLedger {
         Self::default()
     }
 
+    /// Assign IDs and close one bounded cycle batch. Every returned episode
+    /// contains the `DecisionId` shared by its proposal and receipt.
+    pub fn ingest_cycle_events(
+        &mut self,
+        events: &mut CycleDecisionEvents,
+    ) -> Vec<ResolvedDecisionEpisode> {
+        let mut episodes = Vec::with_capacity(events.len());
+        for event in events.drain() {
+            if let Some(episode) = self.ingest_event(event) {
+                episodes.push(episode);
+            }
+        }
+        episodes
+    }
+
+    fn ingest_event(&mut self, event: ActuatorDecisionEvent) -> Option<ResolvedDecisionEpisode> {
+        let settled_cycle = event.proposal.proposed_cycle;
+        let id = self.propose(event.proposal);
+        if let Some(envelope) = self.pending.get_mut(&id) {
+            envelope.terminal_attribution = Some(event.attribution.clone().bounded());
+        }
+        let closed = match event.outcome {
+            ActuatorDecisionOutcome::Rejected => self.reject(id, &event.detail),
+            ActuatorDecisionOutcome::Vetoed => self.veto(id, &event.detail),
+            ActuatorDecisionOutcome::Expired => {
+                self.close_without_execution(id, DecisionLifecycle::Expired, &event.detail)
+            }
+            outcome => {
+                let disposition = match outcome {
+                    ActuatorDecisionOutcome::Applied => ExecutionDisposition::Applied,
+                    ActuatorDecisionOutcome::Blocked => ExecutionDisposition::Blocked,
+                    ActuatorDecisionOutcome::Failed => ExecutionDisposition::Failed,
+                    ActuatorDecisionOutcome::NoOp => ExecutionDisposition::NoOp,
+                    ActuatorDecisionOutcome::Reverted => ExecutionDisposition::Reverted,
+                    ActuatorDecisionOutcome::Rejected
+                    | ActuatorDecisionOutcome::Vetoed
+                    | ActuatorDecisionOutcome::Expired => unreachable!(),
+                };
+                self.record_execution(
+                    id,
+                    ExecutionReceipt {
+                        receipt_id: id.0,
+                        disposition,
+                        observed_cycle: settled_cycle,
+                        attribution: Some(event.attribution),
+                        detail: event.detail,
+                    },
+                )
+            }
+        };
+        closed.then(|| self.settle(id, settled_cycle)).flatten()
+    }
+
     pub fn propose(&mut self, proposal: DecisionProposal) -> DecisionId {
         if self.pending.len() >= MAX_PENDING_DECISIONS {
             if let Some(evicted_id) = self.pending_order.pop_front() {
@@ -290,6 +567,7 @@ impl DecisionLedger {
                 .take(MAX_ADVISER_CONTRIBUTIONS)
                 .collect(),
             lifecycle: DecisionLifecycle::Proposed,
+            terminal_attribution: None,
             terminal_reason: String::new(),
             receipt: None,
         };
@@ -584,6 +862,12 @@ impl DecisionEnvelope {
             .take(MAX_ADVISER_CONTRIBUTIONS)
             .collect();
         self.terminal_reason = bounded_text(&self.terminal_reason, MAX_REASON_CHARS);
+        self.terminal_attribution =
+            self.terminal_attribution
+                .and_then(|attribution| match attribution.bounded() {
+                    ReceiptAttribution::Local { source } if source.is_empty() => None,
+                    attribution => Some(attribution),
+                });
         self.receipt = self.receipt.map(ExecutionReceipt::bounded);
         self
     }
@@ -706,10 +990,12 @@ fn episode_authority_eligible(envelope: &DecisionEnvelope) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        select_reconstructed_pending, AdviserContribution, CandidateAlternative, DecisionEnvelope,
-        DecisionId, DecisionLedger, DecisionLifecycle, DecisionProposal, ExecutionDisposition,
-        ExecutionReceipt, ReceiptAttribution, ResolvedDecisionEpisode, MAX_ADVISER_CONTRIBUTIONS,
-        MAX_CANDIDATE_ALTERNATIVES, MAX_PENDING_DECISIONS,
+        coordinated_action_event, select_reconstructed_pending, ActuatorDecisionEvent,
+        ActuatorDecisionOutcome, AdviserContribution, CandidateAlternative, CycleDecisionEvents,
+        DecisionEnvelope, DecisionId, DecisionLedger, DecisionLifecycle, DecisionProposal,
+        ExecutionDisposition, ExecutionReceipt, ReceiptAttribution, ResolvedDecisionEpisode,
+        MAX_ADVISER_CONTRIBUTIONS, MAX_CANDIDATE_ALTERNATIVES, MAX_CYCLE_DECISION_EVENTS,
+        MAX_PENDING_DECISIONS,
     };
 
     #[test]
@@ -1184,5 +1470,162 @@ mod tests {
         let new_id = ledger.propose(DecisionProposal::default());
 
         assert_eq!(new_id, DecisionId(3));
+    }
+
+    #[test]
+    fn cycle_events_close_every_supported_lifecycle_with_decision_ids() {
+        let mut events = CycleDecisionEvents::default();
+        for outcome in [
+            ActuatorDecisionOutcome::Applied,
+            ActuatorDecisionOutcome::Blocked,
+            ActuatorDecisionOutcome::Failed,
+            ActuatorDecisionOutcome::NoOp,
+            ActuatorDecisionOutcome::Reverted,
+            ActuatorDecisionOutcome::Rejected,
+            ActuatorDecisionOutcome::Vetoed,
+            ActuatorDecisionOutcome::Expired,
+        ] {
+            assert!(events.push(ActuatorDecisionEvent::local(
+                format!("test:{outcome:?}"),
+                "pid:42",
+                7,
+                outcome,
+                "test-actuator",
+                "focused lifecycle test",
+            )));
+        }
+        let mut ledger = DecisionLedger::new();
+
+        let episodes = ledger.ingest_cycle_events(&mut events);
+
+        assert!(events.is_empty());
+        assert_eq!(episodes.len(), 8);
+        assert!(episodes.iter().all(|episode| episode.id.0 > 0));
+        assert_eq!(
+            episodes
+                .iter()
+                .map(|episode| episode.envelope.lifecycle)
+                .collect::<Vec<_>>(),
+            vec![
+                DecisionLifecycle::Applied,
+                DecisionLifecycle::Blocked,
+                DecisionLifecycle::Failed,
+                DecisionLifecycle::NoOp,
+                DecisionLifecycle::Reverted,
+                DecisionLifecycle::Rejected,
+                DecisionLifecycle::Vetoed,
+                DecisionLifecycle::Expired,
+            ]
+        );
+        assert!(episodes[0].authority_eligible);
+        assert!(episodes[0].envelope.receipt.is_some());
+        assert!(episodes[1].envelope.receipt.is_some());
+        assert!(episodes[5].envelope.receipt.is_none());
+    }
+
+    #[test]
+    fn cycle_event_buffer_is_bounded_and_reports_drops() {
+        let mut events = CycleDecisionEvents::default();
+        for index in 0..MAX_CYCLE_DECISION_EVENTS {
+            assert!(events.push(ActuatorDecisionEvent::local(
+                format!("bounded:{index}"),
+                "host",
+                1,
+                ActuatorDecisionOutcome::NoOp,
+                "test",
+                "bounded",
+            )));
+        }
+
+        assert!(!events.push(ActuatorDecisionEvent::local(
+            "bounded:overflow",
+            "host",
+            1,
+            ActuatorDecisionOutcome::NoOp,
+            "test",
+            "bounded",
+        )));
+        assert_eq!(events.len(), MAX_CYCLE_DECISION_EVENTS);
+        assert_eq!(events.dropped_total(), 1);
+    }
+
+    #[test]
+    fn imported_cycle_event_cannot_gain_local_learning_authority() {
+        let mut events = CycleDecisionEvents::default();
+        assert!(events.push(ActuatorDecisionEvent::imported(
+            "chromium_purge:purgeable_renderer",
+            "pid:77",
+            4,
+            ActuatorDecisionOutcome::Applied,
+            "imported receipt",
+        )));
+        let mut ledger = DecisionLedger::new();
+
+        let episode = ledger.ingest_cycle_events(&mut events).remove(0);
+
+        assert!(!episode.authority_eligible);
+        assert!(ledger.episodic().is_empty());
+    }
+
+    #[test]
+    fn rejected_cycle_event_retains_local_terminal_attribution() {
+        let mut events = CycleDecisionEvents::default();
+        events.push(ActuatorDecisionEvent::local(
+            "boost:Editor",
+            "Editor:pid:42",
+            9,
+            ActuatorDecisionOutcome::Rejected,
+            "dispatch-filter",
+            "controlled holdout",
+        ));
+
+        let episode = DecisionLedger::new()
+            .ingest_cycle_events(&mut events)
+            .pop()
+            .expect("settled rejection");
+
+        assert_eq!(
+            episode.envelope.terminal_attribution,
+            Some(ReceiptAttribution::local("dispatch-filter"))
+        );
+        assert!(!episode.authority_eligible);
+    }
+
+    #[test]
+    fn coordinated_event_uses_distinct_applied_families_without_quadratic_pairing() {
+        let mut events = CycleDecisionEvents::default();
+        events.push(ActuatorDecisionEvent::local(
+            "freeze:background",
+            "worker:pid:1",
+            12,
+            ActuatorDecisionOutcome::Applied,
+            "broker",
+            "applied",
+        ));
+        events.push(ActuatorDecisionEvent::local(
+            "predictive_purge:maintenance",
+            "host",
+            12,
+            ActuatorDecisionOutcome::Applied,
+            "maintenance",
+            "applied",
+        ));
+        events.push(ActuatorDecisionEvent::local(
+            "freeze:other",
+            "worker:pid:2",
+            12,
+            ActuatorDecisionOutcome::Applied,
+            "broker",
+            "applied",
+        ));
+
+        let event = coordinated_action_event(&events, 12).expect("multi-family cohort");
+
+        assert_eq!(
+            event.proposal.action_key,
+            "coordinated:freeze+predictive_purge"
+        );
+        assert_eq!(event.outcome, ActuatorDecisionOutcome::Applied);
+        assert_eq!(event.proposal.hierarchy.cohort, 12);
     }
 }

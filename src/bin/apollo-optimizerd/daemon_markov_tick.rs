@@ -21,6 +21,9 @@ use apollo_engine::engine::cache_warmer::CacheWarmer;
 use apollo_engine::engine::coalition::CoalitionTracker;
 use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::focus_markov::{FocusMarkov, PrewarmAdmission, PrewarmContext};
 use apollo_engine::engine::freeze_intelligence::FreezeIntelligence;
 use apollo_engine::engine::jetsam_control;
@@ -36,6 +39,23 @@ const TEMPORAL_PREWARM_COOLDOWN_SECS: u64 = 120;
 pub struct MarkovTickOutput {
     pub temporal_hour: u8,
     pub temporal_weekday: u8,
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn markov_event(
+    target: impl Into<String>,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        "markov_prewarm:predicted_app",
+        target,
+        cycle,
+        outcome,
+        "focus-markov",
+        detail,
+    )
 }
 
 /// One speculative acceleration lease. A prediction is evaluated on an
@@ -131,6 +151,7 @@ pub fn run_markov_tick(
     frozen_state_path: &Path,
     world_model: &WorldModel,
 ) -> MarkovTickOutput {
+    let mut decision_events = CycleDecisionEvents::default();
     // Fight-hunt fix (2026-06-10): prefetch is a luxury. Under pressure the
     // maintenance/survival paths are EVICTING file cache while these
     // warm_pid calls fault pages back in — Apollo fighting itself,
@@ -275,7 +296,31 @@ pub fn run_markov_tick(
                 state.metrics.lock_recover().metrics.markov_prewarm_misses += 1;
             }
             if let Some(lease) = markov_prewarm.take() {
-                release_markov_prewarm(lease, state);
+                let target = lease.predicted_app.clone();
+                if now >= lease.expires_at {
+                    decision_events.push(markov_event(
+                        target.clone(),
+                        cycle_count,
+                        ActuatorDecisionOutcome::Expired,
+                        "prediction lease reached its deadline",
+                    ));
+                }
+                let release = release_markov_prewarm(lease, state);
+                decision_events.push(markov_event(
+                    target,
+                    cycle_count,
+                    if release.reverted_effects > 0 {
+                        ActuatorDecisionOutcome::Reverted
+                    } else if release.deferred_effects > 0 {
+                        ActuatorDecisionOutcome::Failed
+                    } else {
+                        ActuatorDecisionOutcome::NoOp
+                    },
+                    format!(
+                        "reverted_effects={},deferred_effects={}",
+                        release.reverted_effects, release.deferred_effects
+                    ),
+                ));
             }
         }
         LeaseResolution::Pending => {}
@@ -415,6 +460,18 @@ pub fn run_markov_tick(
                     })
                     .count();
                 let applied = !members.is_empty();
+                decision_events.push(markov_event(
+                    pred.app_name.clone(),
+                    cycle_count,
+                    if applied {
+                        ActuatorDecisionOutcome::Applied
+                    } else {
+                        ActuatorDecisionOutcome::NoOp
+                    },
+                    format!(
+                        "members={members_applied},kernel_members={kernel_members},cache_bytes={cache_bytes}"
+                    ),
+                ));
 
                 let lease_secs = contextual_prewarm_lease_secs(
                     (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0),
@@ -467,7 +524,27 @@ pub fn run_markov_tick(
             } else {
                 blocker = "target-not-running";
                 state.metrics.lock_recover().metrics.markov_prewarm_blocker = blocker.to_string();
+                decision_events.push(markov_event(
+                    pred.app_name.clone(),
+                    cycle_count,
+                    ActuatorDecisionOutcome::Blocked,
+                    blocker,
+                ));
             }
+        } else if markov_prewarm.is_none() {
+            decision_events.push(markov_event(
+                pred.app_name.clone(),
+                cycle_count,
+                markov_blocker_outcome(blocker),
+                blocker,
+            ));
+        } else if prewarm_eligible {
+            decision_events.push(markov_event(
+                pred.app_name.clone(),
+                cycle_count,
+                ActuatorDecisionOutcome::NoOp,
+                "matching prewarm lease already active",
+            ));
         }
 
         // Score one passive prediction when no real lease is available. This
@@ -513,6 +590,12 @@ pub fn run_markov_tick(
         metrics.metrics.markov_prewarm_reliability = 0.5;
         metrics.metrics.markov_prewarm_context_trials = 0;
         metrics.metrics.markov_prewarm_probe_transitions_remaining = 0;
+        decision_events.push(markov_event(
+            "none",
+            cycle_count,
+            ActuatorDecisionOutcome::NoOp,
+            "no-prediction",
+        ));
     }
 
     // ── Universal pre-thaw: FocusMarkov → pre-thaw ALL frozen processes ──────
@@ -543,6 +626,36 @@ pub fn run_markov_tick(
                     .collect();
                 if !candidates.is_empty() {
                     let outcome = unfreeze_pids_verified_outcome(&candidates);
+                    for pid in &outcome.applied_pids {
+                        decision_events.push(ActuatorDecisionEvent::local(
+                            "unfreeze:markov_prethaw",
+                            format!("pid:{pid}"),
+                            cycle_count,
+                            ActuatorDecisionOutcome::Reverted,
+                            "focus-markov",
+                            "predicted category pre-thaw applied",
+                        ));
+                    }
+                    for pid in &outcome.stale_pids {
+                        decision_events.push(ActuatorDecisionEvent::local(
+                            "unfreeze:markov_prethaw",
+                            format!("pid:{pid}"),
+                            cycle_count,
+                            ActuatorDecisionOutcome::Blocked,
+                            "focus-markov",
+                            "stale process identity",
+                        ));
+                    }
+                    for pid in &outcome.failed_pids {
+                        decision_events.push(ActuatorDecisionEvent::local(
+                            "unfreeze:markov_prethaw",
+                            format!("pid:{pid}"),
+                            cycle_count,
+                            ActuatorDecisionOutcome::Failed,
+                            "focus-markov",
+                            "pre-thaw SIGCONT failed",
+                        ));
+                    }
                     for pid in outcome.forgettable_pids() {
                         frozen_guard.remove(&pid);
                     }
@@ -615,6 +728,16 @@ pub fn run_markov_tick(
                 if cooldown_open || candidate_changed {
                     if let Some(pid) = find_running_pid(collector, &tpred.app_name) {
                         let bytes = cache_warmer.warm_pid(pid);
+                        decision_events.push(markov_event(
+                            tpred.app_name.clone(),
+                            cycle_count,
+                            if bytes > 0 {
+                                ActuatorDecisionOutcome::Applied
+                            } else {
+                                ActuatorDecisionOutcome::NoOp
+                            },
+                            format!("temporal_cache_bytes={bytes}"),
+                        ));
                         markov_shadow.temporal_last_app = Some(tpred.app_name.clone());
                         markov_shadow.temporal_last_at = Some(Instant::now());
                         let mut metrics = state.metrics.lock_recover();
@@ -641,6 +764,7 @@ pub fn run_markov_tick(
     MarkovTickOutput {
         temporal_hour,
         temporal_weekday,
+        decision_events,
     }
 }
 
@@ -885,6 +1009,14 @@ fn prewarm_blocker(
     }
 }
 
+fn markov_blocker_outcome(blocker: &str) -> ActuatorDecisionOutcome {
+    if blocker == "quarantine" {
+        ActuatorDecisionOutcome::Vetoed
+    } else {
+        ActuatorDecisionOutcome::Blocked
+    }
+}
+
 fn contextual_prewarm_probability_floor(bias: ContextualActionBias) -> f64 {
     if !bias.is_informative() {
         return 0.50;
@@ -998,7 +1130,16 @@ fn lease_resolution(
 /// Release all reversible kernel state associated with one prediction.
 /// Also used on clean daemon shutdown so a pre-warm cannot ratchet across a
 /// service restart.
-pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MarkovReleaseReport {
+    pub reverted_effects: u64,
+    pub deferred_effects: u64,
+}
+
+pub fn release_markov_prewarm(
+    lease: MarkovPrewarmLease,
+    state: &SharedState,
+) -> MarkovReleaseReport {
     let mut reverted = false;
     let mut reverted_effects = 0u64;
     let mut deferred_effects = 0u64;
@@ -1088,6 +1229,10 @@ pub fn release_markov_prewarm(lease: MarkovPrewarmLease, state: &SharedState) {
         deferred_effects,
         "markov: released coalition lease"
     );
+    MarkovReleaseReport {
+        reverted_effects,
+        deferred_effects,
+    }
 }
 
 /// Anti-ratchet (2026-06-10): what jetsam priority to restore after a
@@ -1108,6 +1253,7 @@ fn cache_warm_allowed_at(pressure: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
 
     fn lease(expires_at: Instant, activated: bool) -> MarkovPrewarmLease {
         MarkovPrewarmLease {
@@ -1137,6 +1283,32 @@ mod tests {
         assert!(cache_warm_allowed_at(0.59));
         assert!(!cache_warm_allowed_at(0.60));
         assert!(!cache_warm_allowed_at(0.75));
+    }
+
+    #[test]
+    fn markov_event_carries_prediction_and_cycle() {
+        let event = markov_event(
+            "Terminal",
+            31,
+            ActuatorDecisionOutcome::Applied,
+            "coalition lease acquired",
+        );
+
+        assert_eq!(event.proposal.action_key, "markov_prewarm:predicted_app");
+        assert_eq!(event.proposal.target, "Terminal");
+        assert_eq!(event.proposal.proposed_cycle, 31);
+    }
+
+    #[test]
+    fn quarantine_blocker_is_vetoed_while_other_markov_gates_are_blocked() {
+        assert_eq!(
+            markov_blocker_outcome("quarantine"),
+            ActuatorDecisionOutcome::Vetoed
+        );
+        assert_eq!(
+            markov_blocker_outcome("resource-gate"),
+            ActuatorDecisionOutcome::Blocked
+        );
     }
 
     #[test]

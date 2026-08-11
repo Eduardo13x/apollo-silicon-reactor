@@ -16,13 +16,79 @@ use std::collections::VecDeque;
 use std::path::Path;
 
 use apollo_engine::engine::background_collectors::PressureCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{
+    unfreeze_pids_verified_outcome, write_frozen_state, UnfreezeOutcome,
+};
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
 
 /// Maximum PIDs to SIGCONT per cycle under normal conditions.
 const WAKE_UNFREEZE_BATCH: usize = 5;
+
+#[derive(Debug, Default)]
+pub struct WakeUnfreezeOutput {
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn wake_recovery_event(
+    pid: u32,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        "unfreeze:wake_recovery",
+        format!("pid:{pid}"),
+        cycle,
+        outcome,
+        "wake-recovery",
+        detail,
+    )
+}
+
+pub fn recovery_unfreeze_events(
+    outcome: &UnfreezeOutcome,
+    cycle: u64,
+    action_key: &str,
+    source: &str,
+) -> CycleDecisionEvents {
+    let mut events = CycleDecisionEvents::default();
+    for &pid in &outcome.applied_pids {
+        events.push(ActuatorDecisionEvent::local(
+            action_key,
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Reverted,
+            source,
+            "verified SIGCONT applied",
+        ));
+    }
+    for &pid in &outcome.stale_pids {
+        events.push(ActuatorDecisionEvent::local(
+            action_key,
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            source,
+            "PID identity stale; signal suppressed",
+        ));
+    }
+    for &pid in &outcome.failed_pids {
+        events.push(ActuatorDecisionEvent::local(
+            action_key,
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Failed,
+            source,
+            "SIGCONT failed",
+        ));
+    }
+    events
+}
 
 /// Drain one batch from the wake-unfreeze queue.
 ///
@@ -38,9 +104,11 @@ pub fn run_wake_unfreeze(
     state: &SharedState,
     pressure_collector: &PressureCollector,
     frozen_state_path: &Path,
-) {
+    cycle: u64,
+) -> WakeUnfreezeOutput {
+    let mut output = WakeUnfreezeOutput::default();
     if wake_unfreeze_queue.is_empty() {
-        return;
+        return output;
     }
 
     let wake_batch = {
@@ -88,6 +156,30 @@ pub fn run_wake_unfreeze(
         wake_unfreeze_queue.push_front(*pid);
     }
     let applied = outcome.applied_count();
+    for pid in &outcome.applied_pids {
+        output.decision_events.push(wake_recovery_event(
+            *pid,
+            cycle,
+            ActuatorDecisionOutcome::Reverted,
+            "verified SIGCONT applied",
+        ));
+    }
+    for pid in &outcome.stale_pids {
+        output.decision_events.push(wake_recovery_event(
+            *pid,
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            "stale process identity",
+        ));
+    }
+    for pid in &outcome.failed_pids {
+        output.decision_events.push(wake_recovery_event(
+            *pid,
+            cycle,
+            ActuatorDecisionOutcome::Failed,
+            "SIGCONT failed and was requeued",
+        ));
+    }
     if applied > 0 {
         let mut metrics = state.metrics.lock_recover();
         metrics.metrics.post_wake_defensive_unfreezes += applied;
@@ -117,4 +209,50 @@ pub fn run_wake_unfreeze(
 
     // Record actual-SIGCONT T0 for unfreeze_decay ODE τ learning.
     wake_thaw_pids.extend_from_slice(&outcome.applied_pids);
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
+
+    #[test]
+    fn wake_recovery_event_is_a_reverted_unfreeze() {
+        let event = wake_recovery_event(42, 8, ActuatorDecisionOutcome::Reverted, "SIGCONT");
+
+        assert_eq!(event.proposal.action_key, "unfreeze:wake_recovery");
+        assert_eq!(event.proposal.target, "pid:42");
+        assert_eq!(event.outcome, ActuatorDecisionOutcome::Reverted);
+    }
+
+    #[test]
+    fn recovery_outcome_closes_applied_stale_and_failed_pids() {
+        let outcome = apollo_engine::engine::daemon_helpers::UnfreezeOutcome {
+            applied_pids: vec![1],
+            stale_pids: vec![2],
+            failed_pids: vec![3],
+        };
+
+        let events = recovery_unfreeze_events(
+            &outcome,
+            11,
+            "unfreeze:deadlock_recovery",
+            "deadlock-recovery",
+        );
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Reverted
+        );
+        assert_eq!(
+            events.as_slice()[1].outcome,
+            ActuatorDecisionOutcome::Blocked
+        );
+        assert_eq!(
+            events.as_slice()[2].outcome,
+            ActuatorDecisionOutcome::Failed
+        );
+    }
 }

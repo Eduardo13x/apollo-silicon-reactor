@@ -20,6 +20,9 @@ use std::sync::atomic::Ordering;
 use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::coreaudio_active::AudioActivitySnapshot;
 use apollo_engine::engine::daemon_helpers::spawn_reaped_purge;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::shadow_signals;
@@ -49,6 +52,34 @@ pub enum SkipReason {
     /// induces user-visible jank — the gate must yield until the bus
     /// quiets. [Hennessy & Patterson 2017 §2.2]
     BusSaturated,
+}
+
+#[derive(Debug, Default)]
+pub struct MaintenanceTickOutput {
+    pub fired: bool,
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn maintenance_output(
+    fired: bool,
+    cycle: u64,
+    target: &str,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> MaintenanceTickOutput {
+    let mut decision_events = CycleDecisionEvents::default();
+    decision_events.push(ActuatorDecisionEvent::local(
+        "predictive_purge:maintenance",
+        target,
+        cycle,
+        outcome,
+        "maintenance-purge",
+        detail,
+    ));
+    MaintenanceTickOutput {
+        fired,
+        decision_events,
+    }
 }
 
 // B.4 purge band (2026-06-10): widened + hysteresis. Old gate [0.65, 0.85)
@@ -138,6 +169,27 @@ pub fn run_maintenance_tick(
     )
 }
 
+pub fn run_maintenance_tick_with_decisions(
+    snap: &SystemSnapshot,
+    ctx: &UserContext,
+    state: &mut MaintenanceState,
+    lf_metrics: &LockFreeMetrics,
+    build_active: bool,
+    bus_saturated: bool,
+    cycle: u64,
+) -> MaintenanceTickOutput {
+    run_maintenance_tick_with_audio_decisions(
+        snap,
+        ctx,
+        state,
+        lf_metrics,
+        build_active,
+        bus_saturated,
+        apollo_engine::engine::coreaudio_active::audio_activity_snapshot(),
+        cycle,
+    )
+}
+
 fn run_maintenance_tick_with_audio(
     snap: &SystemSnapshot,
     ctx: &UserContext,
@@ -147,6 +199,30 @@ fn run_maintenance_tick_with_audio(
     bus_saturated: bool,
     audio_snapshot: AudioActivitySnapshot,
 ) -> bool {
+    run_maintenance_tick_with_audio_decisions(
+        snap,
+        ctx,
+        state,
+        lf_metrics,
+        build_active,
+        bus_saturated,
+        audio_snapshot,
+        0,
+    )
+    .fired
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_maintenance_tick_with_audio_decisions(
+    snap: &SystemSnapshot,
+    ctx: &UserContext,
+    state: &mut MaintenanceState,
+    lf_metrics: &LockFreeMetrics,
+    build_active: bool,
+    bus_saturated: bool,
+    audio_snapshot: AudioActivitySnapshot,
+    cycle: u64,
+) -> MaintenanceTickOutput {
     state.push_swap_delta(snap.pressure.swap_delta_bytes_per_sec);
     // B.4: advance the Schmitt trigger before should_fire reads it.
     state.tick_pressure_band(snap.pressure.memory_pressure);
@@ -212,8 +288,15 @@ fn run_maintenance_tick_with_audio(
             pressure = snap.pressure.memory_pressure,
             "maintenance: emergency thrashing-bypass purge"
         );
-        return true;
+        return maintenance_output(
+            true,
+            cycle,
+            "emergency-thrashing",
+            ActuatorDecisionOutcome::Applied,
+            "emergency purge spawned",
+        );
     }
+    let emergency_spawn_failed = emergency;
 
     // Normal-path hard guard: a live full-duplex call blocks the background
     // purge regardless of the (possibly stale) pmset audio_active flag. The
@@ -223,7 +306,21 @@ fn run_maintenance_tick_with_audio(
         lf_metrics
             .maintenance_purge_skipped_idle_total
             .fetch_add(1, Ordering::Relaxed);
-        return false;
+        return maintenance_output(
+            false,
+            cycle,
+            "high-bandwidth-workload",
+            if emergency_spawn_failed {
+                ActuatorDecisionOutcome::Failed
+            } else {
+                ActuatorDecisionOutcome::Blocked
+            },
+            if emergency_spawn_failed {
+                "emergency purge spawn failed"
+            } else {
+                "high-bandwidth workload gate"
+            },
+        );
     }
 
     match should_fire_with_media_guard(
@@ -241,9 +338,21 @@ fn run_maintenance_tick_with_audio(
                 lf_metrics
                     .maintenance_purge_total
                     .fetch_add(1, Ordering::Relaxed);
-                return true;
+                return maintenance_output(
+                    true,
+                    cycle,
+                    "normal-maintenance",
+                    ActuatorDecisionOutcome::Applied,
+                    "maintenance purge spawned",
+                );
             }
-            false
+            maintenance_output(
+                false,
+                cycle,
+                "normal-maintenance",
+                ActuatorDecisionOutcome::Failed,
+                "purge spawn failed",
+            )
         }
         Some(reason) => {
             if reason == SkipReason::MediaActive && media_guard.active {
@@ -290,7 +399,21 @@ fn run_maintenance_tick_with_audio(
                 }
             };
             counter.fetch_add(1, Ordering::Relaxed);
-            false
+            maintenance_output(
+                false,
+                cycle,
+                "normal-maintenance",
+                if emergency_spawn_failed {
+                    ActuatorDecisionOutcome::Failed
+                } else {
+                    ActuatorDecisionOutcome::Blocked
+                },
+                if emergency_spawn_failed {
+                    "emergency purge spawn failed".to_string()
+                } else {
+                    format!("{reason:?}")
+                },
+            )
         }
     }
 }
@@ -499,6 +622,32 @@ mod tests {
         // that was already in the safe band (eligibility carried forward).
         state.purge_band_eligible = true;
         state
+    }
+
+    #[test]
+    fn maintenance_skip_returns_a_blocked_decision_event() {
+        let mut state = MaintenanceState::default();
+        let metrics = LockFreeMetrics::new();
+        let output = run_maintenance_tick_with_decisions(
+            &synth_snap(0.20, 0, 4_000_000_000),
+            &idle_ctx(),
+            &mut state,
+            &metrics,
+            false,
+            false,
+            17,
+        );
+
+        assert!(!output.fired);
+        assert_eq!(output.decision_events.len(), 1);
+        assert_eq!(
+            output.decision_events.as_slice()[0].outcome,
+            apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked
+        );
+        assert_eq!(
+            output.decision_events.as_slice()[0].proposal.proposed_cycle,
+            17
+        );
     }
 
     #[test]

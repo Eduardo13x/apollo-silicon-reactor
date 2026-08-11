@@ -1538,6 +1538,7 @@ mod tests {
         let mut graph = CausalGraph::new();
         let evidence = ResolvedActuatorEvidence {
             id: 7,
+            decision_id: None,
             family: ActuatorFamily::Boost,
             objective: ActuatorObjective::Responsiveness,
             action_key: "boost:Editor".to_string(),

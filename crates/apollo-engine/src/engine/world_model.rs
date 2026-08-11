@@ -1701,6 +1701,7 @@ mod tests {
     ) -> ResolvedActuatorEvidence {
         ResolvedActuatorEvidence {
             id,
+            decision_id: None,
             family,
             objective: ActuatorObjective::Responsiveness,
             action_key: action_key.to_string(),
