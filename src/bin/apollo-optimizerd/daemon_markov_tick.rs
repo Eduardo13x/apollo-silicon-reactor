@@ -735,8 +735,14 @@ pub fn run_markov_tick(
                     markov_shadow.temporal_last_app.as_deref() != Some(tpred.app_name.as_str());
                 if cooldown_open || candidate_changed {
                     if let Some(pid) = find_running_pid(collector, &tpred.app_name) {
+                        let forecasts = crate::daemon_dispatch_tick::decision_time_forecasts(
+                            world_model,
+                            "markov_prewarm:predicted_app",
+                            &workload,
+                            120,
+                        );
                         let bytes = cache_warmer.warm_pid(pid);
-                        decision_events.push(markov_event(
+                        let mut event = markov_event(
                             tpred.app_name.clone(),
                             cycle_count,
                             if bytes > 0 {
@@ -745,7 +751,11 @@ pub fn run_markov_tick(
                                 ActuatorDecisionOutcome::NoOp
                             },
                             format!("temporal_cache_bytes={bytes}"),
-                        ));
+                        );
+                        for forecast in forecasts {
+                            event = event.with_prediction(forecast);
+                        }
+                        decision_events.push(event);
                         markov_shadow.temporal_last_app = Some(tpred.app_name.clone());
                         markov_shadow.temporal_last_at = Some(Instant::now());
                         let mut metrics = state.metrics.lock_recover();

@@ -11,8 +11,11 @@
 //! a later observation, coherent telemetry, and low-confounding context.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fmt;
+use std::marker::PhantomData;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::collector::SystemSnapshot;
 use crate::engine::causal_dynamics::CausalDynamicsModel;
@@ -1115,9 +1118,9 @@ pub struct TelemetryMedallionPersisted {
     pub family_stats: BTreeMap<ActuatorFamily, ActuatorFamilyStats>,
     #[serde(default)]
     pub action_models: BTreeMap<String, ActionModelStats>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_recent_evidence")]
     pub recent_evidence: Vec<ResolvedActuatorEvidence>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_episodic_evidence")]
     pub episodic_evidence: Vec<ResolvedActuatorEvidence>,
     #[serde(default)]
     external_counters: ExternalActuatorCounters,
@@ -1181,6 +1184,52 @@ pub struct TelemetryMedallionPersisted {
     pub gpu_prediction_rejected_total: u64,
 }
 
+struct BoundedEvidenceVisitor<const MAX: usize>(PhantomData<ResolvedActuatorEvidence>);
+
+impl<'de, const MAX: usize> Visitor<'de> for BoundedEvidenceVisitor<MAX> {
+    type Value = Vec<ResolvedActuatorEvidence>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "at most {MAX} retained actuator evidence records"
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(MAX.min(sequence.size_hint().unwrap_or(MAX)));
+        while values.len() < MAX {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(values);
+            };
+            values.push(value);
+        }
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(values)
+    }
+}
+
+fn deserialize_recent_evidence<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ResolvedActuatorEvidence>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedEvidenceVisitor::<MAX_RECENT_EVIDENCE>(PhantomData))
+}
+
+fn deserialize_episodic_evidence<'de, D>(
+    deserializer: D,
+) -> Result<Vec<ResolvedActuatorEvidence>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedEvidenceVisitor::<MAX_EPISODIC_EVIDENCE>(PhantomData))
+}
+
 #[derive(Debug)]
 pub struct TelemetryMedallion {
     installation_id: InstallationId,
@@ -1222,6 +1271,7 @@ pub struct TelemetryMedallion {
     apollo_utility_observations: u64,
     decision_source_stats: BTreeMap<String, DecisionSourceStats>,
     model_calibration: ModelCalibrationStore,
+    quarantined_future_state: Option<Box<TelemetryMedallionPersisted>>,
     staged_attributions: BTreeMap<String, VecDeque<DecisionAttribution>>,
     staged_decision_episodes: VecDeque<StagedDecisionEpisode>,
     no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
@@ -1285,6 +1335,7 @@ impl Default for TelemetryMedallion {
             apollo_utility_observations: 0,
             decision_source_stats: BTreeMap::new(),
             model_calibration: ModelCalibrationStore::new(InstallationId::UNKNOWN),
+            quarantined_future_state: None,
             staged_attributions: BTreeMap::new(),
             staged_decision_episodes: VecDeque::new(),
             no_action_delta_ema: BTreeMap::new(),
@@ -3061,6 +3112,9 @@ impl TelemetryMedallion {
     }
 
     pub fn snapshot(&self) -> TelemetryMedallionPersisted {
+        if let Some(quarantined) = &self.quarantined_future_state {
+            return quarantined.as_ref().clone();
+        }
         TelemetryMedallionPersisted {
             actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
             context_schema_version: TELEMETRY_CONTEXT_SCHEMA_VERSION,
@@ -3114,6 +3168,13 @@ impl TelemetryMedallion {
 
     pub fn restore(&mut self, mut state: TelemetryMedallionPersisted) {
         let persisted_actuator_schema = state.actuator_evidence_schema_version;
+        if persisted_actuator_schema > ACTUATOR_EVIDENCE_SCHEMA_VERSION {
+            let installation_id = self.installation_id;
+            *self = Self::new(installation_id);
+            self.quarantined_future_state = Some(Box::new(state));
+            return;
+        }
+        self.quarantined_future_state = None;
         let current_hardware = state
             .latest
             .as_ref()
@@ -3139,7 +3200,7 @@ impl TelemetryMedallion {
             && state.installation_id.is_known()
             && state.installation_id == self.installation_id;
         let reset_actuator_evidence = persisted_actuator_schema < 2;
-        let reset_model_calibration = persisted_actuator_schema < ACTUATOR_EVIDENCE_SCHEMA_VERSION;
+        let reset_model_calibration = persisted_actuator_schema != ACTUATOR_EVIDENCE_SCHEMA_VERSION;
 
         self.bronze_total = state.bronze_total;
         self.gold_total = state.gold_total.min(self.bronze_total);
@@ -3206,8 +3267,9 @@ impl TelemetryMedallion {
         self.recent_evidence = state
             .recent_evidence
             .into_iter()
-            .filter(|evidence| {
-                evidence.action_key.len() <= 320
+            .filter_map(|mut evidence| {
+                evidence.calibration_provenance = evidence.calibration_provenance.bounded();
+                (evidence.action_key.len() <= 320
                     && evidence.target.len() <= 256
                     && evidence.workload.len() <= 64
                     && evidence.quality.is_finite()
@@ -3217,7 +3279,8 @@ impl TelemetryMedallion {
                     && evidence.utility.is_finite()
                     && evidence.attribution.predicted_gain.is_finite()
                     && evidence.attribution.uncertainty.is_finite()
-                    && (!evidence.context_before.valid || evidence.context_before.is_finite())
+                    && (!evidence.context_before.valid || evidence.context_before.is_finite()))
+                .then_some(evidence)
             })
             .take(MAX_RECENT_EVIDENCE)
             .collect();
@@ -3225,8 +3288,9 @@ impl TelemetryMedallion {
         for evidence in state
             .episodic_evidence
             .into_iter()
-            .filter(|evidence| {
-                evidence.tier != EvidenceTier::Bronze
+            .filter_map(|mut evidence| {
+                evidence.calibration_provenance = evidence.calibration_provenance.bounded();
+                (evidence.tier != EvidenceTier::Bronze
                     && evidence.action_key.len() <= 320
                     && evidence.target.len() <= 256
                     && evidence.workload.len() <= 64
@@ -3234,7 +3298,8 @@ impl TelemetryMedallion {
                     && evidence.net_utility_delta.is_finite()
                     && evidence.utility.is_finite()
                     && evidence.context_before.valid
-                    && evidence.context_before.is_finite()
+                    && evidence.context_before.is_finite())
+                .then_some(evidence)
             })
             .take(MAX_EPISODIC_EVIDENCE)
         {
@@ -3912,6 +3977,10 @@ fn stable_model_target(family: ActuatorFamily, target: &str) -> String {
 
 pub fn actuator_action_key(action: &RootAction) -> Option<String> {
     action_spec(action).map(|spec| spec.action_key)
+}
+
+pub fn actuator_horizon_cycles(action: &RootAction) -> Option<u64> {
+    action_spec(action).map(|spec| spec.horizon_cycles)
 }
 
 pub fn utility_veto_eligible(action: &RootAction) -> bool {
@@ -4838,6 +4907,120 @@ mod tests {
             restored.snapshot().actuator_evidence_schema_version,
             ACTUATOR_EVIDENCE_SCHEMA_VERSION
         );
+    }
+
+    #[test]
+    fn future_actuator_schema_is_quarantined_without_interpretation_or_downgrade() {
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut evidence = gold_evidence("boost:Editor", 0.2, 20_000_000, hardware);
+        evidence.decision_id = Some(DecisionId(9));
+        evidence.context_before = ActuatorEpisodeContext {
+            valid: true,
+            memory_pressure: 0.3,
+            thermal_score: 0.2,
+            foreground_app_hash: 1,
+            ..ActuatorEpisodeContext::default()
+        };
+        evidence.calibration_provenance = CalibrationProvenance {
+            local_authority_eligible: true,
+            proposer: "actuation-broker".to_string(),
+            predictions: vec![PredictionRecord {
+                source: "world-model".to_string(),
+                expected_utility: 0.2,
+                uncertainty: 0.1,
+                horizon_cycles: 3,
+                positive_probability: None,
+                binary_target: None,
+            }],
+            cohort_size: 1,
+            ..CalibrationProvenance::default()
+        };
+        let mut source = TelemetryMedallion::new(LOCAL_ID);
+        source.admit_resolved(evidence);
+        let mut persisted = source.snapshot();
+        persisted.actuator_evidence_schema_version = ACTUATOR_EVIDENCE_SCHEMA_VERSION + 1;
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(persisted);
+
+        assert_eq!(restored.model_calibration_metrics().record_count, 0);
+        assert!(restored.recent_actuator_evidence().is_empty());
+        assert_eq!(
+            restored.snapshot().actuator_evidence_schema_version,
+            ACTUATOR_EVIDENCE_SCHEMA_VERSION + 1
+        );
+    }
+
+    #[test]
+    fn persisted_evidence_deserialization_bounds_nested_calibration_provenance() {
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let oversized_source = "s".repeat(2_048);
+        let oversized_adviser = "a".repeat(2_048);
+        let mut evidence = gold_evidence("boost:Editor", 0.2, 20_000_000, hardware);
+        evidence.calibration_provenance = CalibrationProvenance {
+            local_authority_eligible: true,
+            proposer: "p".repeat(2_048),
+            predictions: (0..64)
+                .map(|_| PredictionRecord {
+                    source: oversized_source.clone(),
+                    expected_utility: 0.2,
+                    uncertainty: 0.1,
+                    horizon_cycles: 3,
+                    positive_probability: None,
+                    binary_target: None,
+                })
+                .collect(),
+            adviser_contributions: (0..64)
+                .map(|_| AdviserContribution {
+                    adviser: oversized_adviser.clone(),
+                    support: 0.1,
+                    uncertainty: 0.2,
+                })
+                .collect(),
+            ..CalibrationProvenance::default()
+        };
+        let mut state = TelemetryMedallionPersisted {
+            actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
+            context_schema_version: TELEMETRY_CONTEXT_SCHEMA_VERSION,
+            installation_id: LOCAL_ID,
+            recent_evidence: vec![evidence.clone(); MAX_RECENT_EVIDENCE + 32],
+            episodic_evidence: vec![evidence; MAX_EPISODIC_EVIDENCE + 32],
+            ..TelemetryMedallionPersisted::default()
+        };
+        state.decision_id_high_water = 1;
+
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let bounded: TelemetryMedallionPersisted = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(bounded.recent_evidence.len(), MAX_RECENT_EVIDENCE);
+        assert_eq!(bounded.episodic_evidence.len(), MAX_EPISODIC_EVIDENCE);
+        for evidence in bounded
+            .recent_evidence
+            .iter()
+            .chain(bounded.episodic_evidence.iter())
+        {
+            let provenance = &evidence.calibration_provenance;
+            assert!(provenance.proposer.chars().count() <= 48);
+            assert!(provenance.predictions.len() <= 8);
+            assert!(provenance.adviser_contributions.len() <= 8);
+            assert!(provenance.predictions.iter().all(|prediction| prediction
+                .source
+                .chars()
+                .count()
+                <= 48));
+            assert!(provenance
+                .adviser_contributions
+                .iter()
+                .all(|adviser| adviser.adviser.chars().count() <= 48));
+        }
     }
 
     #[test]

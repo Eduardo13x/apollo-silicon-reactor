@@ -8,7 +8,7 @@
 //! 5. Frozen state persistence.
 
 use chrono::Utc;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
@@ -19,7 +19,9 @@ use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest}
 use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
 use apollo_engine::engine::daemon_helpers::{write_frozen_state, AsyncCommandQueue};
 use apollo_engine::engine::daemon_state::SharedState;
-use apollo_engine::engine::decision_ledger::{ActuatorDecisionOutcome, CycleDecisionEvents};
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionOutcome, CycleDecisionEvents, PredictionRecord,
+};
 use apollo_engine::engine::degradation::DegradationInputs;
 use apollo_engine::engine::execute_actions::{
     decision_event_for_root_action_from, ExecuteOutcomes,
@@ -921,6 +923,74 @@ pub struct DispatchTickOutput {
     pub counterfactual_holdouts: Vec<CounterfactualHoldout>,
 }
 
+pub(crate) fn decision_time_forecasts(
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    action_key: &str,
+    workload: &str,
+    horizon_cycles: u64,
+) -> Vec<PredictionRecord> {
+    let mut forecasts = Vec::with_capacity(2);
+    if let Some(assessment) = world_model.assess_utility(action_key, workload) {
+        let uncertainty = (assessment.upper_bound - assessment.lower_bound) * 0.5;
+        if assessment.utility_ema.is_finite()
+            && (-1.0..=1.0).contains(&assessment.utility_ema)
+            && uncertainty.is_finite()
+            && uncertainty > 0.0
+        {
+            forecasts.push(PredictionRecord {
+                source: "world-model".to_string(),
+                expected_utility: assessment.utility_ema,
+                uncertainty,
+                horizon_cycles,
+                positive_probability: None,
+                binary_target: None,
+            });
+        }
+    }
+    if let Some(advice) = world_model.gpu_forecast_for(action_key, workload) {
+        if advice.mean_gain.is_finite()
+            && (-1.0..=1.0).contains(&advice.mean_gain)
+            && advice.uncertainty.is_finite()
+            && advice.uncertainty > 0.0
+        {
+            forecasts.push(PredictionRecord {
+                source: "gpu-model".to_string(),
+                expected_utility: advice.mean_gain,
+                uncertainty: advice.uncertainty,
+                horizon_cycles,
+                positive_probability: None,
+                binary_target: None,
+            });
+        }
+    }
+    forecasts
+}
+
+fn capture_decision_time_forecasts(
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    actions: &[RootAction],
+    workload: &str,
+) -> BTreeMap<String, Vec<PredictionRecord>> {
+    let mut captured = BTreeMap::new();
+    for action in actions {
+        let Some(action_key) =
+            apollo_engine::engine::telemetry_medallion::actuator_action_key(action)
+        else {
+            continue;
+        };
+        if captured.contains_key(&action_key) {
+            continue;
+        }
+        let horizon = apollo_engine::engine::telemetry_medallion::actuator_horizon_cycles(action)
+            .unwrap_or(1);
+        let forecasts = decision_time_forecasts(world_model, &action_key, workload, horizon);
+        if !forecasts.is_empty() {
+            captured.insert(action_key, forecasts);
+        }
+    }
+    captured
+}
+
 /// Runs the dispatch and execution orchestration logic.
 pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     let DispatchTickInput {
@@ -1172,6 +1242,10 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             pg.learned_policy.interactive_patterns.clone(),
         )
     };
+    // Forecasts are captured from model state before the broker can produce a
+    // receipt or measured outcome. They remain descriptive through dispatch.
+    let decision_time_forecasts =
+        capture_decision_time_forecasts(world_model, &filtered_actions, workload);
     // S4 cutover (2026-06-06): pass the Arc clone directly; effectors lock
     // inside each call site. Drop the outer prelocked guard — the old
     // pattern was OK while execute_actions took &mut MachQoSManager but
@@ -1257,6 +1331,9 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     outcomes
         .decision_events
         .extend_buffer(&dispatch_decision_events);
+    outcomes
+        .decision_events
+        .attach_predictions(&decision_time_forecasts);
 
     // Update degradation controller with new failure count.
     if outcomes.failures > 0 {
@@ -1522,6 +1599,278 @@ mod tests {
         // When circuit is open, only unfreeze actions should be dispatched.
         assert_eq!(output.outcomes.unfreezes_applied, 1);
         assert_eq!(output.outcomes.throttles_applied, 0);
+    }
+
+    #[test]
+    fn production_decision_forecast_survives_ledger_and_reaches_gold_calibration() {
+        use apollo_engine::engine::decision_ledger::{
+            ActuatorDecisionOutcome, CycleDecisionEvents, DecisionLedger,
+        };
+        use apollo_engine::engine::installation_identity::InstallationId;
+        use apollo_engine::engine::predictive_agent::Intervention;
+        use apollo_engine::engine::signal_intelligence::SignalDigest;
+        use apollo_engine::engine::telemetry_medallion::{
+            ActionModelStats, HardwareRegime, TelemetryContextSummary, TelemetryMedallion,
+            TelemetryMedallionMetrics, TelemetryObservation, TrustedTelemetryView,
+        };
+        use apollo_engine::engine::world_model::WorldModel;
+        use std::collections::{BTreeMap, VecDeque};
+
+        const LOCAL_ID: InstallationId = InstallationId(0x55aa);
+        let action = boost(200);
+        let action_key = apollo_engine::engine::telemetry_medallion::actuator_action_key(&action)
+            .expect("root action key");
+        let now_unix = Utc::now().timestamp();
+        let context = TelemetryContextSummary {
+            timestamp_unix: now_unix,
+            cpu_core_count: 10,
+            p_core_count: 4,
+            e_core_count: 6,
+            total_ram_bytes: 16 * 1024 * 1024 * 1024,
+            ..TelemetryContextSummary::default()
+        };
+        let action_models = [(
+            format!("idle|{action_key}"),
+            ActionModelStats {
+                observations: 12,
+                effective_observations: 10,
+                utility_ema: 0.08,
+                evidence_mass: 12.0,
+                utility_variance_ema: 0.0001,
+                quality_ema: 0.95,
+                last_cycle: 100,
+                last_observed_unix: now_unix,
+                hardware_regime: HardwareRegime {
+                    p_core_count: 4,
+                    e_core_count: 6,
+                    ram_gib: 16,
+                },
+                installation_id: LOCAL_ID,
+                ..ActionModelStats::default()
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let controlled_models = BTreeMap::new();
+        let episodic_evidence = VecDeque::new();
+        let causal_dynamics =
+            apollo_engine::engine::causal_dynamics::CausalDynamicsModel::default();
+        let gpu_calibration_models = BTreeMap::new();
+        let mut world_model = WorldModel::default();
+        world_model.attach_context(TrustedTelemetryView {
+            current: Some(&context),
+            installation_id: LOCAL_ID,
+            action_models: &action_models,
+            action_models_revision: 1,
+            controlled_models: &controlled_models,
+            controlled_models_revision: 0,
+            episodic_evidence: &episodic_evidence,
+            causal_dynamics: &causal_dynamics,
+            causal_dynamics_revision: 0,
+            gpu_calibration_models: &gpu_calibration_models,
+            gpu_calibration_revision: 0,
+            metrics: TelemetryMedallionMetrics {
+                bronze_total: 1,
+                gold_total: 1,
+                local_gold_total: 1,
+                ..TelemetryMedallionMetrics::default()
+            },
+        });
+        assert_eq!(
+            world_model.attach_gpu_imagination(
+                &apollo_engine::engine::gpu_imagination::GpuImaginationResult {
+                    generation: 0,
+                    workload: "idle".to_string(),
+                    backend: apollo_engine::engine::gpu_imagination::GpuImaginationBackend::Metal,
+                    device_name: "test-gpu".to_string(),
+                    samples: 4_096,
+                    gpu_time_ns: 8_000,
+                    wall_time_ns: 20_000,
+                    candidates: vec![apollo_engine::engine::gpu_imagination::GpuCandidateAdvice {
+                        action_key: action_key.clone(),
+                        expected_gain: 0.05,
+                        uncertainty: 0.12,
+                        mean_gain: 0.04,
+                        p10_gain: 0.01,
+                        positive_probability: 0.80,
+                        rank_support: 0.003,
+                        context_score: 0.02,
+                    },],
+                    error: None,
+                },
+            ),
+            1
+        );
+
+        let captured = capture_decision_time_forecasts(&world_model, &[action.clone()], "idle");
+        let mut events = CycleDecisionEvents::default();
+        let mut event = decision_event_for_root_action_from(
+            &action,
+            ActuatorDecisionOutcome::Applied,
+            "actuation-broker",
+            "confirmed production action".to_string(),
+        );
+        // The daemon's single merge point stamps broker events with the live
+        // cycle before ledger ingestion.
+        event.set_cycle(1);
+        events.push(event);
+        events.attach_predictions(&captured);
+        let event = events.as_slice().first().expect("production event");
+        assert_eq!(event.proposal.predictions.len(), 2);
+        assert_eq!(event.proposal.predictions[0].source, "world-model");
+        assert!((event.proposal.predictions[0].expected_utility - 0.08).abs() < 1e-12);
+        assert_eq!(event.proposal.predictions[1].source, "gpu-model");
+        assert!((event.proposal.predictions[1].expected_utility - 0.04).abs() < 1e-12);
+        assert!((event.proposal.predictions[1].uncertainty - 0.12).abs() < 1e-12);
+
+        let episodes = DecisionLedger::new().ingest_cycle_events(&mut events);
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = RuntimeMetrics {
+            collector_pressure_alive: true,
+            reactor_health: "healthy".to_string(),
+            pressure_dominant_factor: "memory".to_string(),
+            ..RuntimeMetrics::default()
+        };
+        let capabilities = CapabilityReport {
+            can_taskpolicy: true,
+            can_sysctl: true,
+            can_memorystatus: true,
+            can_memory_pressure_send: false,
+            can_mdutil: true,
+            can_tmutil: true,
+            is_root: true,
+            p_core_count: Some(4),
+            e_core_count: Some(6),
+            unavailable: Vec::new(),
+            memorystatus_probe: Some("ok".to_string()),
+            task_for_pid_probe: Some("ok".to_string()),
+        };
+        let signal = SignalDigest {
+            pressure_smooth: 0.2,
+            pressure_velocity: 0.0,
+            pressure_predicted_5s: 0.2,
+            pressure_predicted_30s: 0.2,
+            swap_velocity_smooth: 0.0,
+            pressure_integral: 0.0,
+            regime_shift_up: false,
+            regime_shift_down: false,
+            cusum_score: 0.0,
+            entropy_anomaly: 0.0,
+            p_oom_30s: 0.0,
+            monopoly_risk: 0.0,
+            stability_regime: apollo_engine::engine::lotka_volterra::StabilityRegime::Degenerate,
+            mpc_recommendation: 0,
+            urgency: 0.0,
+            transformer_anomaly: 0.0,
+            memory_scan_available: false,
+            fluidity_score: 1.0,
+            window_op_active: false,
+            app_launching: false,
+            swap_net_rate_volatility: 0.0,
+            lyapunov_exponent: 0.0,
+            cumulative_stress: 0.0,
+            hw_seasonal_anomaly: 1.0,
+        };
+        let mut snapshot = SystemSnapshot {
+            timestamp: Utc::now(),
+            cpu: CpuStats {
+                global_usage: 20.0,
+                core_count: 10,
+            },
+            memory: MemoryStats {
+                total_ram: 16 * 1024 * 1024 * 1024,
+                used_ram: 8 * 1024 * 1024 * 1024,
+                free_ram: 8 * 1024 * 1024 * 1024,
+                total_swap: 4 * 1024 * 1024 * 1024,
+                used_swap: 0,
+            },
+            pressure: PressureStats {
+                memory_pressure: 0.2,
+                swap_used_bytes: 0,
+                swap_total_bytes: 4 * 1024 * 1024 * 1024,
+                swap_delta_bytes_per_sec: 0.0,
+                thermal_level: "nominal".to_string(),
+                compressor_pressure: 0.1,
+                thrashing_score: 0.0,
+                memory_pressure_raw: 0.2,
+                refault_delta_per_sec: 0.0,
+            },
+            disks: Vec::new(),
+            networks: Vec::new(),
+            top_processes: Vec::new(),
+        };
+        let applied_outcomes = ExecuteOutcomes {
+            audit_traces: vec![PolicyDecisionTrace {
+                t: Utc::now(),
+                cycle: 1,
+                intended_action: action,
+                decision_reason: DecisionReason::InteractiveFocus,
+                applied: true,
+                block_reason: None,
+                pressure: 0.2,
+                swap_gb: 0.0,
+                thrashing: 0.0,
+            }],
+            ..ExecuteOutcomes::default()
+        };
+        medallion.observe(TelemetryObservation {
+            snapshot: &snapshot,
+            hardware: None,
+            runtime: &runtime,
+            capabilities: Some(&capabilities),
+            signal: &signal,
+            workload: "idle",
+            cycle: 1,
+            outcomes: &applied_outcomes,
+            intervention: Intervention::Observe,
+            applied_intervention: None,
+            purge_recent: false,
+            nars_drift_score: 0.0,
+            nars_beliefs_total: 1,
+            natural_drift: 0.0,
+            arousal_level: 0.5,
+        });
+        medallion.stage_decision_episodes(&episodes);
+        for cycle in 2..=4 {
+            snapshot.timestamp = Utc::now();
+            medallion.observe(TelemetryObservation {
+                snapshot: &snapshot,
+                hardware: None,
+                runtime: &runtime,
+                capabilities: Some(&capabilities),
+                signal: &signal,
+                workload: "idle",
+                cycle,
+                outcomes: &ExecuteOutcomes::default(),
+                intervention: Intervention::Observe,
+                applied_intervention: None,
+                purge_recent: false,
+                nars_drift_score: 0.0,
+                nars_beliefs_total: 1,
+                natural_drift: 0.0,
+                arousal_level: 0.5,
+            });
+        }
+
+        let evidence = medallion
+            .recent_actuator_evidence()
+            .back()
+            .expect("production event resolved into medallion evidence");
+        assert_eq!(evidence.calibration_provenance.predictions.len(), 2);
+        assert!(
+            evidence.calibration_provenance.local_authority_eligible,
+            "provenance={:?}",
+            evidence.calibration_provenance
+        );
+        assert_eq!(
+            medallion
+                .model_calibration_metrics()
+                .accepted_forecasts_total,
+            2,
+            "metrics={:?}",
+            medallion.model_calibration_metrics()
+        );
+        assert_eq!(medallion.model_calibration_metrics().record_count, 2);
     }
 
     // ── Per-PID dedup unit tests ─────────────────────────────────────────────

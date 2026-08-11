@@ -762,6 +762,18 @@ impl WorldModel {
         (support.abs() > f64::EPSILON).then_some(support)
     }
 
+    /// Return the untouched output of a still-fresh GPU imagination. This is
+    /// a read-only decision-time forecast; callers must not treat it as
+    /// actuation authority.
+    pub fn gpu_forecast_for(
+        &self,
+        action_key: &str,
+        workload: &str,
+    ) -> Option<&GpuCandidateAdvice> {
+        self.fresh_gpu_advice(action_key, workload)
+            .map(|entry| &entry.advice)
+    }
+
     /// Summarize current causal and GPU evidence for local deliberation.
     pub fn deliberation_evidence(&self, workload: &str) -> DeliberationEvidence {
         let mut evidence = DeliberationEvidence {

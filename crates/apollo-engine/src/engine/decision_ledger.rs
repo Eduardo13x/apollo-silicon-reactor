@@ -1,6 +1,8 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::fmt;
 
+use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub const MAX_PENDING_DECISIONS: usize = 192;
@@ -80,6 +82,7 @@ pub struct HierarchyCoordinates {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct PredictionRecord {
+    #[serde(default, deserialize_with = "deserialize_source")]
     pub source: String,
     pub expected_utility: f64,
     pub uncertainty: f64,
@@ -99,6 +102,7 @@ pub enum BinaryPredictionTarget {
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct AdviserContribution {
+    #[serde(default, deserialize_with = "deserialize_source")]
     pub adviser: String,
     pub support: f64,
     pub uncertainty: f64,
@@ -298,7 +302,7 @@ impl ActuatorDecisionEvent {
 
     pub fn with_prediction(mut self, prediction: PredictionRecord) -> Self {
         if self.proposal.predictions.len() < MAX_PREDICTIONS {
-            self.proposal.predictions.push(prediction);
+            self.proposal.predictions.push(prediction.bounded());
         }
         self
     }
@@ -386,6 +390,33 @@ impl CycleDecisionEvents {
 
     pub fn as_slice(&self) -> &[ActuatorDecisionEvent] {
         &self.events
+    }
+
+    /// Attach forecasts captured before execution to matching terminal
+    /// receipts. Existing specialist forecasts win and every event remains
+    /// bounded to the ledger's fixed prediction capacity.
+    pub fn attach_predictions(
+        &mut self,
+        forecasts: &BTreeMap<String, Vec<PredictionRecord>>,
+    ) -> usize {
+        let mut attached = 0;
+        for event in &mut self.events {
+            if !event.proposal.predictions.is_empty() {
+                continue;
+            }
+            let Some(predictions) = forecasts.get(&event.proposal.action_key) else {
+                continue;
+            };
+            event.proposal.predictions.extend(
+                predictions
+                    .iter()
+                    .take(MAX_PREDICTIONS)
+                    .cloned()
+                    .map(PredictionRecord::bounded),
+            );
+            attached += usize::from(!event.proposal.predictions.is_empty());
+        }
+        attached
     }
 
     pub fn len(&self) -> usize {
@@ -936,7 +967,7 @@ impl CandidateAlternative {
 }
 
 impl PredictionRecord {
-    fn bounded(mut self) -> Self {
+    pub(crate) fn bounded(mut self) -> Self {
         self.source = bounded_text(&self.source, MAX_SOURCE_CHARS);
         let calibration_valid = self.expected_utility.is_finite()
             && (-1.0..=1.0).contains(&self.expected_utility)
@@ -956,7 +987,7 @@ impl PredictionRecord {
 }
 
 impl AdviserContribution {
-    fn bounded(mut self) -> Self {
+    pub(crate) fn bounded(mut self) -> Self {
         self.adviser = bounded_text(&self.adviser, MAX_SOURCE_CHARS);
         self.support = finite_unit(self.support);
         self.uncertainty = finite_unit(self.uncertainty).max(0.0);
@@ -1014,6 +1045,37 @@ impl DecisionEnvelope {
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn deserialize_source<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedSourceVisitor;
+
+    impl Visitor<'_> for BoundedSourceVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded decision source string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(bounded_text(value, MAX_SOURCE_CHARS))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(bounded_text(&value, MAX_SOURCE_CHARS))
+        }
+    }
+
+    deserializer.deserialize_string(BoundedSourceVisitor)
 }
 
 fn finite_unit(value: f64) -> f64 {

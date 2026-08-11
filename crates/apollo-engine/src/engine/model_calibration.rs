@@ -1,6 +1,10 @@
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
+use std::marker::PhantomData;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 pub use crate::engine::decision_ledger::BinaryPredictionTarget;
 use crate::engine::decision_ledger::{
@@ -258,8 +262,11 @@ pub enum SeparabilityState {
 #[serde(default)]
 pub struct CalibrationProvenance {
     pub local_authority_eligible: bool,
+    #[serde(default, deserialize_with = "deserialize_proposer")]
     pub proposer: String,
+    #[serde(default, deserialize_with = "deserialize_predictions")]
     pub predictions: Vec<PredictionRecord>,
+    #[serde(default, deserialize_with = "deserialize_advisers")]
     pub adviser_contributions: Vec<AdviserContribution>,
     pub hierarchy: HierarchyCoordinates,
     pub cohort_size: u16,
@@ -269,8 +276,20 @@ pub struct CalibrationProvenance {
 impl CalibrationProvenance {
     pub fn bounded(mut self) -> Self {
         self.proposer = bounded_text(self.proposer.trim(), MAX_PRODUCER_CHARS);
-        self.predictions.truncate(8);
-        self.adviser_contributions.truncate(8);
+        self.predictions = self
+            .predictions
+            .into_iter()
+            .take(8)
+            .map(PredictionRecord::bounded)
+            .filter(|prediction| !prediction.source.is_empty())
+            .collect();
+        self.adviser_contributions = self
+            .adviser_contributions
+            .into_iter()
+            .take(8)
+            .map(AdviserContribution::bounded)
+            .filter(|adviser| !adviser.adviser.is_empty())
+            .collect();
         self
     }
 }
@@ -391,7 +410,9 @@ pub struct ModelTrustRecord {
     pub welford_count: u64,
     pub welford_mean: f64,
     pub welford_m2: f64,
+    #[serde(default, deserialize_with = "deserialize_contexts")]
     pub contexts: Vec<ContextFingerprint>,
+    #[serde(default, deserialize_with = "deserialize_windows")]
     pub completed_windows: Vec<CalibrationWindow>,
     pub consecutive_bad_windows: u8,
     pub current_window_count: u8,
@@ -426,12 +447,332 @@ impl ModelTrustRecord {
 pub struct ModelCalibrationPersisted {
     pub installation_id: InstallationId,
     pub hardware_regime: HardwareRegime,
+    #[serde(default, deserialize_with = "deserialize_calibration_records")]
     pub records: Vec<CalibrationRecord>,
+    #[serde(default, deserialize_with = "deserialize_model_records")]
     pub models: Vec<ModelTrustRecord>,
+    #[serde(default, deserialize_with = "deserialize_decision_ids")]
     pub accepted_decision_ids: Vec<DecisionId>,
     pub accepted_decision_id_high_water: u64,
     pub update_sequence: u64,
     pub metrics: ModelCalibrationMetrics,
+}
+
+fn deserialize_proposer<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_text(deserializer, MAX_PRODUCER_CHARS)
+}
+
+fn deserialize_bounded_text<'de, D>(deserializer: D, max_chars: usize) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedTextVisitor {
+        max_chars: usize,
+    }
+
+    impl Visitor<'_> for BoundedTextVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded calibration string")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(bounded_text(value, self.max_chars))
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(bounded_text(&value, self.max_chars))
+        }
+    }
+
+    deserializer.deserialize_string(BoundedTextVisitor { max_chars })
+}
+
+struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "a sequence containing at most {MAX} retained items"
+        )
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(MAX.min(sequence.size_hint().unwrap_or(MAX)));
+        while values.len() < MAX {
+            let Some(value) = sequence.next_element()? else {
+                return Ok(values);
+            };
+            values.push(value);
+        }
+        while sequence.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(values)
+    }
+}
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(PhantomData))
+}
+
+fn deserialize_predictions<'de, D>(deserializer: D) -> Result<Vec<PredictionRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, PredictionRecord, 8>(deserializer)
+}
+
+fn deserialize_advisers<'de, D>(deserializer: D) -> Result<Vec<AdviserContribution>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, AdviserContribution, 8>(deserializer)
+}
+
+fn deserialize_contexts<'de, D>(deserializer: D) -> Result<Vec<ContextFingerprint>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, ContextFingerprint, 16>(deserializer)
+}
+
+fn deserialize_windows<'de, D>(deserializer: D) -> Result<Vec<CalibrationWindow>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, CalibrationWindow, 3>(deserializer)
+}
+
+struct RankedCalibrationRecords {
+    capacity: usize,
+    by_key: BTreeMap<CalibrationKey, CalibrationRecord>,
+    by_rank: BTreeSet<(u64, CalibrationKey)>,
+}
+
+impl RankedCalibrationRecords {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            by_key: BTreeMap::new(),
+            by_rank: BTreeSet::new(),
+        }
+    }
+
+    fn push(&mut self, record: CalibrationRecord) -> bool {
+        let key = record.key.clone();
+        let rank = (record.last_update_sequence, key.clone());
+        if let Some(existing) = self.by_key.get(&key) {
+            if rank.0 <= existing.last_update_sequence {
+                return false;
+            }
+            self.by_rank
+                .remove(&(existing.last_update_sequence, key.clone()));
+        } else if self.by_key.len() >= self.capacity {
+            let Some(victim_rank) = self.by_rank.first().cloned() else {
+                return false;
+            };
+            if rank <= victim_rank {
+                return false;
+            }
+            self.by_rank.remove(&victim_rank);
+            self.by_key.remove(&victim_rank.1);
+        }
+        self.by_rank.insert(rank);
+        self.by_key.insert(key, record);
+        true
+    }
+
+    fn into_values(self) -> impl Iterator<Item = CalibrationRecord> {
+        self.by_key.into_values()
+    }
+}
+
+struct BoundedCalibrationRecords {
+    exact: RankedCalibrationRecords,
+    family: RankedCalibrationRecords,
+}
+
+impl BoundedCalibrationRecords {
+    fn new() -> Self {
+        Self {
+            exact: RankedCalibrationRecords::new(MAX_EXACT_CALIBRATION_KEYS),
+            family: RankedCalibrationRecords::new(MAX_FAMILY_CALIBRATION_KEYS),
+        }
+    }
+
+    fn push(&mut self, record: CalibrationRecord) -> bool {
+        if record.family_fallback {
+            self.family.push(record)
+        } else {
+            self.exact.push(record)
+        }
+    }
+
+    fn into_vec(self) -> Vec<CalibrationRecord> {
+        self.exact
+            .into_values()
+            .chain(self.family.into_values())
+            .collect()
+    }
+}
+
+struct BoundedModelRecords {
+    by_key: BTreeMap<ModelKey, ModelTrustRecord>,
+    by_rank: BTreeSet<(u64, ModelKey)>,
+}
+
+impl BoundedModelRecords {
+    fn new() -> Self {
+        Self {
+            by_key: BTreeMap::new(),
+            by_rank: BTreeSet::new(),
+        }
+    }
+
+    fn push(&mut self, model: ModelTrustRecord) -> bool {
+        let key = model.key.clone();
+        let rank = (model.last_update_sequence, key.clone());
+        if let Some(existing) = self.by_key.get(&key) {
+            if rank.0 <= existing.last_update_sequence {
+                return false;
+            }
+            self.by_rank
+                .remove(&(existing.last_update_sequence, key.clone()));
+        } else if self.by_key.len() >= MAX_CALIBRATION_KEYS {
+            let Some(victim_rank) = self.by_rank.first().cloned() else {
+                return false;
+            };
+            if rank <= victim_rank {
+                return false;
+            }
+            self.by_rank.remove(&victim_rank);
+            self.by_key.remove(&victim_rank.1);
+        }
+        self.by_rank.insert(rank);
+        self.by_key.insert(key, model);
+        true
+    }
+
+    fn into_vec(self) -> Vec<ModelTrustRecord> {
+        self.by_key.into_values().collect()
+    }
+}
+
+fn deserialize_calibration_records<'de, D>(
+    deserializer: D,
+) -> Result<Vec<CalibrationRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct RecordsVisitor;
+
+    impl<'de> Visitor<'de> for RecordsVisitor {
+        type Value = Vec<CalibrationRecord>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded calibration record sequence")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut retained = BoundedCalibrationRecords::new();
+            while let Some(record) = sequence.next_element()? {
+                retained.push(record);
+            }
+            Ok(retained.into_vec())
+        }
+    }
+
+    deserializer.deserialize_seq(RecordsVisitor)
+}
+
+fn deserialize_model_records<'de, D>(deserializer: D) -> Result<Vec<ModelTrustRecord>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct ModelsVisitor;
+
+    impl<'de> Visitor<'de> for ModelsVisitor {
+        type Value = Vec<ModelTrustRecord>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded model trust sequence")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut retained = BoundedModelRecords::new();
+            while let Some(model) = sequence.next_element()? {
+                retained.push(model);
+            }
+            Ok(retained.into_vec())
+        }
+    }
+
+    deserializer.deserialize_seq(ModelsVisitor)
+}
+
+fn deserialize_decision_ids<'de, D>(deserializer: D) -> Result<Vec<DecisionId>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DecisionIdsVisitor;
+
+    impl<'de> Visitor<'de> for DecisionIdsVisitor {
+        type Value = Vec<DecisionId>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a bounded decision-id sequence")
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut retained = VecDeque::with_capacity(MAX_ACCEPTED_DECISION_IDS);
+            let mut seen = BTreeSet::new();
+            while let Some(id) = sequence.next_element::<DecisionId>()? {
+                if id.0 == 0 || !seen.insert(id) {
+                    continue;
+                }
+                retained.push_back(id);
+                if retained.len() > MAX_ACCEPTED_DECISION_IDS {
+                    if let Some(oldest) = retained.pop_front() {
+                        seen.remove(&oldest);
+                    }
+                }
+            }
+            Ok(retained.into_iter().collect())
+        }
+    }
+
+    deserializer.deserialize_seq(DecisionIdsVisitor)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -794,7 +1135,7 @@ impl ModelCalibrationStore {
     }
 
     pub fn snapshot(&self) -> ModelCalibrationPersisted {
-        let mut state = ModelCalibrationPersisted {
+        let state = ModelCalibrationPersisted {
             installation_id: self.installation_id,
             hardware_regime: self.hardware_regime,
             records: self.records.values().cloned().collect(),
@@ -804,52 +1145,33 @@ impl ModelCalibrationStore {
             update_sequence: self.update_sequence,
             metrics: self.metrics,
         };
-        while serde_json::to_vec(&state)
-            .map_or(true, |encoded| encoded.len() > MAX_CALIBRATION_STATE_BYTES)
-            && !state.records.is_empty()
-        {
-            let victim = state
-                .records
-                .iter()
-                .enumerate()
-                .min_by(|left, right| {
-                    left.1
-                        .last_update_sequence
-                        .cmp(&right.1.last_update_sequence)
-                        .then_with(|| left.1.key.cmp(&right.1.key))
-                })
-                .map(|(index, _)| index)
-                .unwrap_or(0);
-            state.records.remove(victim);
-            let retained_models: BTreeSet<ModelKey> = state
-                .records
-                .iter()
-                .map(|record| ModelKey {
-                    producer: record.key.producer,
-                    action: record.key.action.clone(),
-                })
-                .collect();
-            state
-                .models
-                .retain(|model| retained_models.contains(&model.key));
-        }
-        state
+        bound_snapshot_state(state).0
     }
 
     pub fn restore(&mut self, state: ModelCalibrationPersisted, current: HardwareRegime) {
+        let ModelCalibrationPersisted {
+            installation_id: persisted_installation,
+            hardware_regime: persisted_hardware,
+            records,
+            models,
+            accepted_decision_ids,
+            accepted_decision_id_high_water,
+            update_sequence,
+            metrics,
+        } = state;
         self.records.clear();
         self.models.clear();
         self.accepted_decision_ids.clear();
         self.accepted_decision_order.clear();
         self.exact_count = 0;
         self.family_count = 0;
-        self.metrics = state.metrics;
+        self.metrics = metrics;
         self.metrics.record_count = 0;
         self.metrics.exact_record_count = 0;
         self.metrics.family_record_count = 0;
         if !self.installation_id.is_known()
-            || state.installation_id != self.installation_id
-            || !state.installation_id.is_known()
+            || persisted_installation != self.installation_id
+            || !persisted_installation.is_known()
             || !current.is_known()
         {
             self.hardware_regime = current;
@@ -857,15 +1179,10 @@ impl ModelCalibrationStore {
             return;
         }
 
-        let persisted_hardware = state.hardware_regime;
         self.hardware_regime = current;
-        self.update_sequence = state.update_sequence;
-        self.accepted_decision_id_high_water = state.accepted_decision_id_high_water;
-        for id in state
-            .accepted_decision_ids
-            .into_iter()
-            .filter(|id| id.0 > 0)
-        {
+        self.update_sequence = update_sequence;
+        self.accepted_decision_id_high_water = accepted_decision_id_high_water;
+        for id in accepted_decision_ids.into_iter().filter(|id| id.0 > 0) {
             if self.accepted_decision_ids.insert(id) {
                 self.accepted_decision_order.push_back(id);
             }
@@ -876,7 +1193,8 @@ impl ModelCalibrationStore {
             }
         }
 
-        for mut record in state.records {
+        let mut retained_records = BoundedCalibrationRecords::new();
+        for mut record in records {
             if !valid_restored_record(&record)
                 || record.installation_id != self.installation_id
                 || record.hardware_regime != persisted_hardware
@@ -886,47 +1204,13 @@ impl ModelCalibrationStore {
                 continue;
             }
             record.trust = TrustState::Immature;
-            let partition_capacity = if record.family_fallback {
-                MAX_FAMILY_CALIBRATION_KEYS
-            } else {
-                MAX_EXACT_CALIBRATION_KEYS
-            };
-            let partition_len = if record.family_fallback {
-                self.family_count
-            } else {
-                self.exact_count
-            };
-            if let Some(existing) = self.records.get(&record.key) {
-                if (record.last_update_sequence, &record.key)
-                    <= (existing.last_update_sequence, &existing.key)
-                {
-                    continue;
-                }
-                self.records.insert(record.key.clone(), record);
-                continue;
-            }
-            if partition_len >= partition_capacity {
-                let victim = self
-                    .records
-                    .iter()
-                    .filter(|(_, candidate)| candidate.family_fallback == record.family_fallback)
-                    .min_by(|left, right| {
-                        left.1
-                            .last_update_sequence
-                            .cmp(&right.1.last_update_sequence)
-                            .then_with(|| left.0.cmp(right.0))
-                    })
-                    .map(|(key, candidate)| (key.clone(), candidate.last_update_sequence));
-                let Some((victim_key, victim_sequence)) = victim else {
-                    continue;
-                };
-                if (record.last_update_sequence, &record.key) <= (victim_sequence, &victim_key) {
-                    continue;
-                }
-                self.records.remove(&victim_key);
+            if !retained_records.push(record) {
                 self.metrics.restore_discarded_total =
                     self.metrics.restore_discarded_total.saturating_add(1);
-            } else if record.family_fallback {
+            }
+        }
+        for record in retained_records.into_vec() {
+            if record.family_fallback {
                 self.family_count = self.family_count.saturating_add(1);
             } else {
                 self.exact_count = self.exact_count.saturating_add(1);
@@ -934,51 +1218,49 @@ impl ModelCalibrationStore {
             self.records.insert(record.key.clone(), record);
         }
 
-        let retained_model_keys: BTreeSet<ModelKey> = self
-            .records
-            .keys()
-            .map(|key| ModelKey {
-                producer: key.producer,
-                action: key.action.clone(),
-            })
-            .collect();
-        for mut model in state.models {
-            if !retained_model_keys.contains(&model.key) || !sanitize_model(&mut model) {
+        let model_evidence = restored_model_evidence(&self.records);
+        let mut retained_models = BoundedModelRecords::new();
+        for mut model in models {
+            if !model_evidence.contains_key(&model.key) || !sanitize_model(&mut model) {
                 self.metrics.restore_discarded_total =
                     self.metrics.restore_discarded_total.saturating_add(1);
                 continue;
             }
-            if persisted_hardware != current
+            if !retained_models.push(model) {
+                self.metrics.restore_discarded_total =
+                    self.metrics.restore_discarded_total.saturating_add(1);
+            }
+        }
+        for mut model in retained_models.into_vec() {
+            let evidence = model_evidence
+                .get(&model.key)
+                .expect("retained model evidence");
+            let cold_reset = persisted_hardware != current
                 || !persisted_hardware.is_known()
                 || model.hardware_regime != current
                 || model.installation_id != self.installation_id
-            {
-                reset_model_authority(&mut model, current);
+                || !restored_model_matches(&model, evidence);
+            if cold_reset {
+                cold_reset_restored_model(&mut model, evidence, &mut self.records, current);
+                self.metrics.restore_discarded_total =
+                    self.metrics.restore_discarded_total.saturating_add(1);
             } else {
                 recompute_trust(&mut model);
             }
-            let replace = self.models.get(&model.key).is_none_or(|existing| {
-                (model.last_update_sequence, &model.key)
-                    > (existing.last_update_sequence, &existing.key)
-            });
-            if replace {
-                self.models.insert(model.key.clone(), model);
-            }
+            self.models.insert(model.key.clone(), model);
         }
-        for model_key in retained_model_keys {
-            self.models
-                .entry(model_key.clone())
-                .or_insert_with(|| ModelTrustRecord {
-                    key: model_key,
-                    installation_id: self.installation_id,
-                    hardware_regime: current,
-                    ..ModelTrustRecord::default()
-                });
-        }
-        if persisted_hardware != current || !persisted_hardware.is_known() {
-            for record in self.records.values_mut() {
-                reset_record_authority(record, current);
+        for (model_key, evidence) in &model_evidence {
+            if self.models.contains_key(model_key) {
+                continue;
             }
+            let mut model = ModelTrustRecord {
+                key: model_key.clone(),
+                installation_id: self.installation_id,
+                hardware_regime: current,
+                ..ModelTrustRecord::default()
+            };
+            cold_reset_restored_model(&mut model, evidence, &mut self.records, current);
+            self.models.insert(model_key.clone(), model);
         }
         for record in self.records.values_mut() {
             record.trust = self
@@ -1091,6 +1373,199 @@ impl ModelCalibrationStore {
             .collect();
         self.models.retain(|key, _| retained.contains(key));
     }
+}
+
+#[derive(Debug, Default)]
+struct RestoredModelEvidence {
+    record_keys: Vec<CalibrationKey>,
+    contexts: BTreeSet<ContextFingerprint>,
+    lifetime_forecast_count: u64,
+    authority_gold_count: u64,
+    welford_count: u64,
+    welford_mean: f64,
+    welford_m2: f64,
+    authority_epoch: u64,
+    last_update_sequence: u64,
+}
+
+fn restored_model_evidence(
+    records: &BTreeMap<CalibrationKey, CalibrationRecord>,
+) -> BTreeMap<ModelKey, RestoredModelEvidence> {
+    let mut evidence = BTreeMap::new();
+    for record in records.values() {
+        let model_key = ModelKey {
+            producer: record.key.producer,
+            action: record.key.action.clone(),
+        };
+        let aggregate = evidence
+            .entry(model_key)
+            .or_insert_with(RestoredModelEvidence::default);
+        aggregate.record_keys.push(record.key.clone());
+        aggregate.contexts.insert(context_fingerprint(&record.key));
+        aggregate.lifetime_forecast_count = aggregate
+            .lifetime_forecast_count
+            .saturating_add(record.lifetime_forecast_count);
+        aggregate.authority_gold_count = aggregate
+            .authority_gold_count
+            .saturating_add(record.authority_gold_count);
+        combine_welford(
+            aggregate,
+            record.welford_count,
+            record.welford_mean,
+            record.welford_m2,
+        );
+        aggregate.authority_epoch = aggregate.authority_epoch.max(record.authority_epoch);
+        aggregate.last_update_sequence = aggregate
+            .last_update_sequence
+            .max(record.last_update_sequence);
+    }
+    evidence
+}
+
+fn combine_welford(aggregate: &mut RestoredModelEvidence, count: u64, mean: f64, m2: f64) {
+    if count == 0 {
+        return;
+    }
+    if aggregate.welford_count == 0 {
+        aggregate.welford_count = count;
+        aggregate.welford_mean = mean;
+        aggregate.welford_m2 = m2;
+        return;
+    }
+    let prior_count = aggregate.welford_count;
+    let combined_count = prior_count.saturating_add(count);
+    let delta = mean - aggregate.welford_mean;
+    aggregate.welford_mean += delta * count as f64 / combined_count as f64;
+    aggregate.welford_m2 +=
+        m2 + delta * delta * prior_count as f64 * count as f64 / combined_count as f64;
+    aggregate.welford_count = combined_count;
+}
+
+fn restored_model_matches(model: &ModelTrustRecord, evidence: &RestoredModelEvidence) -> bool {
+    let expected_contexts = evidence.contexts.len().min(16);
+    let contexts_match = if model.authority_gold_count == 0 {
+        model.contexts.is_empty()
+    } else {
+        model.contexts.len() == expected_contexts
+            && model
+                .contexts
+                .iter()
+                .all(|context| evidence.contexts.contains(context))
+    };
+    let expected_windows = (model.authority_gold_count / 10).min(3) as usize;
+    let window_cardinality_matches = model.current_window_count as u64
+        == model.authority_gold_count % 10
+        && model.completed_windows.len() == expected_windows;
+    let retained_window_mae_matches = if model.authority_gold_count <= 30 {
+        let completed_sum: f64 = model
+            .completed_windows
+            .iter()
+            .map(|window| window.normalized_mae * 10.0)
+            .sum();
+        approximately_equal(
+            completed_sum + model.current_window_mae_sum,
+            model.welford_mean * model.welford_count as f64,
+        )
+    } else {
+        true
+    };
+    model.lifetime_forecast_count == evidence.lifetime_forecast_count
+        && model.authority_gold_count == evidence.authority_gold_count
+        && model.welford_count == evidence.welford_count
+        && approximately_equal(model.welford_mean, evidence.welford_mean)
+        && approximately_equal(model.welford_m2, evidence.welford_m2)
+        && model.last_update_sequence == evidence.last_update_sequence
+        && contexts_match
+        && window_cardinality_matches
+        && retained_window_mae_matches
+}
+
+fn approximately_equal(left: f64, right: f64) -> bool {
+    (left - right).abs() <= 1e-9 * (1.0 + left.abs().max(right.abs()))
+}
+
+fn cold_reset_restored_model(
+    model: &mut ModelTrustRecord,
+    evidence: &RestoredModelEvidence,
+    records: &mut BTreeMap<CalibrationKey, CalibrationRecord>,
+    hardware: HardwareRegime,
+) {
+    model.lifetime_forecast_count = evidence.lifetime_forecast_count;
+    model.authority_epoch = evidence.authority_epoch;
+    model.last_update_sequence = evidence.last_update_sequence;
+    reset_model_authority(model, hardware);
+    for key in &evidence.record_keys {
+        if let Some(record) = records.get_mut(key) {
+            reset_record_authority(record, hardware);
+        }
+    }
+}
+
+fn bound_snapshot_state(
+    mut state: ModelCalibrationPersisted,
+) -> (ModelCalibrationPersisted, usize) {
+    let mut serializations = 1;
+    let mut encoded_len = serde_json::to_vec(&state).map_or(usize::MAX, |encoded| encoded.len());
+    if encoded_len <= MAX_CALIBRATION_STATE_BYTES {
+        return (state, serializations);
+    }
+
+    for _ in 0..2 {
+        if state.records.is_empty() {
+            break;
+        }
+        let proportional = state
+            .records
+            .len()
+            .saturating_mul(MAX_CALIBRATION_STATE_BYTES)
+            .checked_div(encoded_len.max(1))
+            .unwrap_or(0);
+        let keep = proportional
+            .saturating_mul(9)
+            .checked_div(10)
+            .unwrap_or(0)
+            .max(1)
+            .min(state.records.len().saturating_sub(1));
+        retain_snapshot_records(&mut state, keep);
+        serializations += 1;
+        encoded_len = serde_json::to_vec(&state).map_or(usize::MAX, |encoded| encoded.len());
+        if encoded_len <= MAX_CALIBRATION_STATE_BYTES {
+            return (state, serializations);
+        }
+    }
+
+    // Fixed final fallback: a bounded metadata-only state is always far below
+    // the one-MiB calibration budget and requires no fourth serialization.
+    state.records.clear();
+    state.models.clear();
+    (state, serializations)
+}
+
+fn retain_snapshot_records(state: &mut ModelCalibrationPersisted, keep: usize) {
+    let mut ranked = BTreeMap::new();
+    for record in state.records.drain(..) {
+        let priority = u8::from(record.family_fallback);
+        ranked.insert(
+            (
+                priority,
+                Reverse(record.last_update_sequence),
+                record.key.clone(),
+            ),
+            record,
+        );
+    }
+    state.records = ranked.into_values().take(keep).collect();
+    let retained_models: BTreeSet<ModelKey> = state
+        .records
+        .iter()
+        .map(|record| ModelKey {
+            producer: record.key.producer,
+            action: record.key.action.clone(),
+        })
+        .collect();
+    state
+        .models
+        .retain(|model| retained_models.contains(&model.key));
 }
 
 fn update_record(
@@ -2174,6 +2649,7 @@ mod tests {
         newer_duplicate.last_update_sequence = newer_duplicate.last_update_sequence + 1_000;
         newer_duplicate.signed_error_ema = 0.123;
         duplicate_state.records.push(newer_duplicate.clone());
+        duplicate_state.models[0].last_update_sequence = newer_duplicate.last_update_sequence;
         let mut deduplicated = ModelCalibrationStore::new(LOCAL_ID);
         deduplicated.restore(duplicate_state, HARDWARE);
         assert_eq!(
@@ -2213,5 +2689,158 @@ mod tests {
             r#"{"records":[{"key":{"producer":"future-producer"}}]}"#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn restore_cold_resets_a_forged_model_disconnected_from_retained_records() {
+        let mut source = ModelCalibrationStore::new(LOCAL_ID);
+        observe_sample(&mut source, 1, 0.0, 0.0, 0.2, 0.95, 0);
+        let key = first_key(&source);
+        let mut state = source.snapshot();
+        let model = state.models.first_mut().expect("model fixture");
+        model.lifetime_forecast_count = 50;
+        model.authority_gold_count = 50;
+        model.welford_count = 50;
+        model.welford_mean = 0.0;
+        model.welford_m2 = 0.0;
+        model.contexts = (0..5)
+            .map(|index| ContextFingerprint {
+                workload: format!("forged-{index}"),
+                process_class: ProcessClass::Foreground,
+                horizon: CalibrationHorizon::Sec5,
+                pressure: PressureBand::Moderate,
+                thermal: ThermalBand::Nominal,
+                foreground: ForegroundContext::Active,
+            })
+            .collect();
+        model.completed_windows = vec![
+            CalibrationWindow {
+                quality: 0.99,
+                normalized_mae: 0.0,
+                coverage: 1.0,
+            };
+            3
+        ];
+        model.trust = TrustState::Trusted;
+
+        let mut restored = ModelCalibrationStore::new(LOCAL_ID);
+        restored.restore(state, HARDWARE);
+
+        let restored_model = restored.model_for(&key).expect("cold model retained");
+        assert_ne!(restored_model.trust, TrustState::Trusted);
+        assert_eq!(restored_model.authority_gold_count, 0);
+        assert_eq!(restored_model.welford_count, 0);
+        assert!(restored_model.contexts.is_empty());
+        assert!(restored_model.completed_windows.is_empty());
+        assert_eq!(restored.record(&key).unwrap().authority_gold_count, 0);
+    }
+
+    #[test]
+    fn persisted_deserialization_caps_hostile_collections_before_restore() {
+        let mut state = ModelCalibrationPersisted::default();
+        for index in 0..700_u64 {
+            let action = CalibrationActionScope::Exact(format!("boost:model-{index}"));
+            state.records.push(CalibrationRecord {
+                key: CalibrationKey {
+                    producer: ProducerId::WorldModel,
+                    action: action.clone(),
+                    workload: format!("context-{index}"),
+                    ..CalibrationKey::default()
+                },
+                last_update_sequence: index,
+                ..CalibrationRecord::default()
+            });
+            state.models.push(ModelTrustRecord {
+                key: ModelKey {
+                    producer: ProducerId::WorldModel,
+                    action,
+                },
+                contexts: (0..40)
+                    .map(|context| ContextFingerprint {
+                        workload: format!("context-{context}"),
+                        ..ContextFingerprint::default()
+                    })
+                    .collect(),
+                completed_windows: vec![CalibrationWindow::default(); 12],
+                last_update_sequence: index,
+                ..ModelTrustRecord::default()
+            });
+        }
+        state.accepted_decision_ids = (1..=500).map(DecisionId).collect();
+
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let bounded: ModelCalibrationPersisted = serde_json::from_slice(&encoded).unwrap();
+
+        assert!(bounded.records.len() <= MAX_CALIBRATION_KEYS);
+        assert!(bounded.models.len() <= MAX_CALIBRATION_KEYS);
+        assert!(bounded.accepted_decision_ids.len() <= MAX_ACCEPTED_DECISION_IDS);
+        assert!(bounded
+            .models
+            .iter()
+            .all(|model| model.contexts.len() <= 16));
+        assert!(bounded
+            .models
+            .iter()
+            .all(|model| model.completed_windows.len() <= 3));
+    }
+
+    #[test]
+    fn over_budget_snapshot_prunes_in_a_fixed_serialization_budget() {
+        let mut state = ModelCalibrationPersisted::default();
+        for index in 0..MAX_EXACT_CALIBRATION_KEYS {
+            let action = CalibrationActionScope::Exact(format!("boost:model-{index:084}"));
+            state.records.push(CalibrationRecord {
+                key: CalibrationKey {
+                    producer: ProducerId::WorldModel,
+                    action: action.clone(),
+                    workload: format!("workload-{index:055}"),
+                    ..CalibrationKey::default()
+                },
+                last_update_sequence: index as u64,
+                ..CalibrationRecord::default()
+            });
+            state.models.push(ModelTrustRecord {
+                key: ModelKey {
+                    producer: ProducerId::WorldModel,
+                    action,
+                },
+                contexts: (0..16)
+                    .map(|context| ContextFingerprint {
+                        workload: format!("context-{index:039}-{context:02}"),
+                        ..ContextFingerprint::default()
+                    })
+                    .collect(),
+                completed_windows: vec![CalibrationWindow::default(); 3],
+                last_update_sequence: index as u64,
+                ..ModelTrustRecord::default()
+            });
+        }
+        for index in 0..MAX_FAMILY_CALIBRATION_KEYS {
+            state.records.push(CalibrationRecord {
+                key: CalibrationKey {
+                    producer: ProducerId::GpuModel,
+                    action: CalibrationActionScope::Family(ActuatorFamily::Boost),
+                    workload: format!("family-{index:056}"),
+                    ..CalibrationKey::default()
+                },
+                family_fallback: true,
+                last_update_sequence: (MAX_EXACT_CALIBRATION_KEYS + index) as u64,
+                ..CalibrationRecord::default()
+            });
+        }
+        assert!(serde_json::to_vec(&state).unwrap().len() > MAX_CALIBRATION_STATE_BYTES);
+
+        let (bounded, serializations) = bound_snapshot_state(state);
+        let encoded = serde_json::to_vec(&bounded).unwrap();
+        let exact = bounded
+            .records
+            .iter()
+            .filter(|record| !record.family_fallback)
+            .count();
+        let family = bounded.records.len() - exact;
+
+        assert!(encoded.len() <= MAX_CALIBRATION_STATE_BYTES);
+        assert!(serializations <= 3, "serializations={serializations}");
+        assert!(family == 0 || exact == MAX_EXACT_CALIBRATION_KEYS);
     }
 }
