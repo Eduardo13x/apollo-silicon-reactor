@@ -66,6 +66,17 @@ extern "C" fn handle_sigterm(_sig: libc::c_int) {
     STOP_REQUESTED.store(true, Ordering::Release);
 }
 
+fn wait_for_cycle_signal(cycle_condvar: &Arc<(Mutex<bool>, Condvar)>, timeout: Duration) -> bool {
+    let (lock, cvar) = &**cycle_condvar;
+    let guard = lock.lock_recover();
+    let (mut triggered, _) = cvar
+        .wait_timeout_while(guard, timeout, |pending| !*pending)
+        .unwrap_or_else(|error| error.into_inner());
+    let was_triggered = *triggered;
+    *triggered = false;
+    was_triggered
+}
+
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::action_accumulator::{ActionAccumulator, ActionPhase, EmitContext};
 use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest};
@@ -1922,9 +1933,64 @@ fn main() -> anyhow::Result<()> {
                     tracing::warn!(
                         target: "apollo.stall_candidate",
                         cycle_count,
-                        "stall_candidate_F1: 5s sleep in cycle loop (kill-switch pause branch)"
+                        "stall_candidate_F1: interruptible 5s pause in kill-switch branch"
                     );
-                    thread::sleep(Duration::from_secs(5));
+
+                    // The resource sentinel remains active while ordinary
+                    // optimization is paused. Resolve proposals emitted after
+                    // the entry drain, then settle this cycle's exact receipts
+                    // before waiting. A proposal arriving after this drain sets
+                    // the condvar predicate and starts the next cycle
+                    // immediately instead of waiting five seconds.
+                    {
+                        let pressure = pressure_collector.latest().memory_pressure;
+                        let mut executor =
+                            daemon_resource_interrupt_tick::ResourceInterruptExecutor {
+                                state: &state,
+                                caps: &caps,
+                                journal_path: &journal_path,
+                                frozen_state_path: &frozen_state_path,
+                                dry_run,
+                                cycle: cycle_count,
+                                memory_pressure: pressure,
+                            };
+                        let events = executor.execute_batch(
+                            &resource_interrupt_window,
+                            resource_interrupt_proposal_rx.drain(),
+                        );
+                        cycle_decision_events.extend_buffer(&events);
+                    }
+                    if let Some(coordinated) =
+                        apollo_engine::engine::decision_ledger::coordinated_action_event(
+                            &cycle_decision_events,
+                            cycle_count,
+                        )
+                    {
+                        cycle_decision_events.push(coordinated);
+                    }
+                    let overflow_summary_emitted =
+                        cycle_decision_events.seal_overflow_summary(cycle_count);
+                    let dropped_decision_events = cycle_decision_events.dropped_total();
+                    if dropped_decision_events > 0 {
+                        tracing::warn!(
+                            dropped = dropped_decision_events,
+                            "decision event pause buffer reached its bounded capacity"
+                        );
+                        let mut metrics = state.metrics.lock_recover();
+                        metrics.metrics.decision_event_drops_total = metrics
+                            .metrics
+                            .decision_event_drops_total
+                            .saturating_add(dropped_decision_events);
+                        metrics.metrics.decision_event_overflow_summaries_total = metrics
+                            .metrics
+                            .decision_event_overflow_summaries_total
+                            .saturating_add(u64::from(overflow_summary_emitted));
+                    }
+                    let resolved_decisions =
+                        decision_ledger.ingest_cycle_events(&mut cycle_decision_events);
+                    telemetry_medallion.stage_decision_episodes(&resolved_decisions);
+
+                    wait_for_cycle_signal(&state.cycle_condvar, Duration::from_secs(5));
                     continue;
                 }
 
@@ -6956,14 +7022,7 @@ fn main() -> anyhow::Result<()> {
                 // with-notify race could swallow a signal and delay the next
                 // cycle by up to 2 seconds. `wait_timeout_while` explicitly
                 // loops on the predicate under the lock, eliminating the race.
-                {
-                    let (lock, cvar) = &*state.cycle_condvar;
-                    let guard = lock.lock_recover();
-                    let (mut triggered, _) = cvar
-                        .wait_timeout_while(guard, wait_duration, |t| !*t)
-                        .unwrap_or_else(|e| e.into_inner());
-                    *triggered = false;
-                }
+                wait_for_cycle_signal(&state.cycle_condvar, wait_duration);
             }
 
             // Structurally close sentinel actuation before shutdown. The
@@ -7227,13 +7286,31 @@ mod tests {
 
     use super::{
         contention_mach_tier_event, fingerprint_top_processes, is_dev_tool_name,
-        swap_reclaim_bypass_active, CompanionFgCache,
+        swap_reclaim_bypass_active, wait_for_cycle_signal, CompanionFgCache,
     };
     use apollo_engine::collector::ProcessStats;
     use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
     use apollo_engine::engine::mach_qos::{QoSAuditDisposition, QoSOutcome, SchedulingTier};
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn kill_switch_pause_returns_immediately_for_a_pending_resource_wake() {
+        let cycle_condvar = Arc::new((Mutex::new(true), Condvar::new()));
+        let started = Instant::now();
+
+        assert!(wait_for_cycle_signal(
+            &cycle_condvar,
+            Duration::from_secs(5)
+        ));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a proposal queued between the pause drain and wait must start the next cycle"
+        );
+        assert!(!*cycle_condvar.0.lock().unwrap());
+    }
 
     #[test]
     fn contention_mach_receipt_classifies_exact_effector_disposition() {
