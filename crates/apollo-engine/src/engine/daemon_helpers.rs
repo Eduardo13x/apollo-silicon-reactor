@@ -651,7 +651,10 @@ pub fn unfreeze_outcome_events(
     events
 }
 
-fn send_sigcont(pid: u32, outcome: &mut UnfreezeOutcome) {
+fn send_sigcont_if(pid: u32, outcome: &mut UnfreezeOutcome, authorized: &mut impl FnMut() -> bool) {
+    if !authorized() {
+        return;
+    }
     let rc = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
     if rc == 0 {
         outcome.applied_pids.push(pid);
@@ -668,6 +671,15 @@ fn send_sigcont(pid: u32, outcome: &mut UnfreezeOutcome) {
 }
 
 pub fn unfreeze_pids_outcome(pids: impl Iterator<Item = u32>) -> UnfreezeOutcome {
+    unfreeze_pids_outcome_if(pids, || true)
+}
+
+/// Unfreeze with a revocable authority callback checked immediately before
+/// every SIGCONT. Authority denial leaves the PID unresolved for its owner.
+pub fn unfreeze_pids_outcome_if(
+    pids: impl Iterator<Item = u32>,
+    mut authorized: impl FnMut() -> bool,
+) -> UnfreezeOutcome {
     let mut outcome = UnfreezeOutcome::default();
     for pid in pids {
         // A2 fix (round-3): skip zombies — SIGCONT to a zombie is a no-op
@@ -676,7 +688,7 @@ pub fn unfreeze_pids_outcome(pids: impl Iterator<Item = u32>) -> UnfreezeOutcome
             outcome.stale_pids.push(pid);
             continue;
         }
-        send_sigcont(pid, &mut outcome);
+        send_sigcont_if(pid, &mut outcome, &mut authorized);
     }
     outcome
 }
@@ -696,6 +708,15 @@ pub fn unfreeze_pids(pids: impl Iterator<Item = u32>) -> u64 {
 /// Entries without `start_sec` (legacy, or capture failed) fall through
 /// to the plain name-based behaviour.
 pub fn unfreeze_pids_verified_outcome(entries: &HashMap<u32, FrozenEntry>) -> UnfreezeOutcome {
+    unfreeze_pids_verified_outcome_if(entries, || true)
+}
+
+/// Identity-verified unfreeze with a revocable callback checked at each kernel
+/// mutation boundary. This retains the legacy helper's result contract.
+pub fn unfreeze_pids_verified_outcome_if(
+    entries: &HashMap<u32, FrozenEntry>,
+    mut authorized: impl FnMut() -> bool,
+) -> UnfreezeOutcome {
     let mut outcome = UnfreezeOutcome::default();
     for (&pid, entry) in entries.iter() {
         if crate::engine::proc_taskinfo::is_zombie_pid(pid) {
@@ -718,13 +739,15 @@ pub fn unfreeze_pids_verified_outcome(entries: &HashMap<u32, FrozenEntry>) -> Un
         }
 
         let applied_before = outcome.applied_pids.len();
-        send_sigcont(pid, &mut outcome);
+        send_sigcont_if(pid, &mut outcome, &mut authorized);
         // A5/D1 restoration: if we captured a jetsam priority at freeze
         // time, restore it verbatim instead of letting the caller clobber
         // it with a blanket FOREGROUND.
         if outcome.applied_pids.len() > applied_before {
             if let Some(prio) = entry.original_jetsam_priority {
-                let _ = crate::engine::jetsam_control::set_priority(pid, prio);
+                if authorized() {
+                    let _ = crate::engine::jetsam_control::set_priority(pid, prio);
+                }
             }
         }
     }

@@ -584,6 +584,18 @@ impl MachQoSManager {
         pid: u32,
         tier: SchedulingTier,
     ) -> (QoSOutcome, QoSAuditDisposition) {
+        self.set_tier_audited_if(pid, tier, || true)
+    }
+
+    /// Audited tier application with a revocable callback checked immediately
+    /// before `task_policy_set`. Denial is reported as `Blocked` and does not
+    /// change the tier cache.
+    pub fn set_tier_audited_if(
+        &mut self,
+        pid: u32,
+        tier: SchedulingTier,
+        mut authorized: impl FnMut() -> bool,
+    ) -> (QoSOutcome, QoSAuditDisposition) {
         // Permanently blocked PIDs (SIP-protected) — never retry.
         if self.permanently_blocked.contains(&pid) {
             return (
@@ -625,7 +637,10 @@ impl MachQoSManager {
             // external writers may have changed the live policy underneath us.
             // Cached with a different tier — skip is_sip_protected (already
             // proven non-SIP) and go straight to apply_task_policy below.
-            let result = self.apply_task_policy(pid, tier);
+            let (result, authority_denied) = self.apply_task_policy_if(pid, tier, &mut authorized);
+            if authority_denied {
+                return (result, QoSAuditDisposition::Blocked);
+            }
             if result.success {
                 self.current_tier
                     .insert(pid, (tier, std::time::Instant::now()));
@@ -659,7 +674,10 @@ impl MachQoSManager {
             );
         }
 
-        let result = self.apply_task_policy(pid, tier);
+        let (result, authority_denied) = self.apply_task_policy_if(pid, tier, &mut authorized);
+        if authority_denied {
+            return (result, QoSAuditDisposition::Blocked);
+        }
 
         if result.success {
             self.current_tier
@@ -1522,7 +1540,12 @@ impl MachQoSManager {
     }
 
     #[cfg(target_os = "macos")]
-    fn apply_task_policy(&self, pid: u32, tier: SchedulingTier) -> QoSOutcome {
+    fn apply_task_policy_if(
+        &self,
+        pid: u32,
+        tier: SchedulingTier,
+        authorized: &mut impl FnMut() -> bool,
+    ) -> (QoSOutcome, bool) {
         use self::ffi::*;
         use self::mach_sys::*;
 
@@ -1537,16 +1560,32 @@ impl MachQoSManager {
             let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
 
             if kr != KERN_SUCCESS {
-                return QoSOutcome {
-                    pid,
-                    tier,
-                    success: false,
-                    mutated: false,
-                    error: Some(format!("task_for_pid failed: kern_return={}", kr)),
-                };
+                return (
+                    QoSOutcome {
+                        pid,
+                        tier,
+                        success: false,
+                        mutated: false,
+                        error: Some(format!("task_for_pid failed: kern_return={}", kr)),
+                    },
+                    false,
+                );
             }
 
             let policy = TaskCategoryPolicy { role };
+            if !authorized() {
+                mach_port_deallocate(mach_task_self(), task_port);
+                return (
+                    QoSOutcome {
+                        pid,
+                        tier,
+                        success: true,
+                        mutated: false,
+                        error: None,
+                    },
+                    true,
+                );
+            }
             let kr2 = task_policy_set(
                 task_port,
                 TASK_CATEGORY_POLICY,
@@ -1557,34 +1596,50 @@ impl MachQoSManager {
             mach_port_deallocate(mach_task_self(), task_port);
 
             if kr2 != KERN_SUCCESS {
-                return QoSOutcome {
-                    pid,
-                    tier,
-                    success: false,
-                    mutated: false,
-                    error: Some(format!("task_policy_set failed: kern_return={}", kr2)),
-                };
+                return (
+                    QoSOutcome {
+                        pid,
+                        tier,
+                        success: false,
+                        mutated: false,
+                        error: Some(format!("task_policy_set failed: kern_return={}", kr2)),
+                    },
+                    false,
+                );
             }
         }
 
-        QoSOutcome {
-            pid,
-            tier,
-            success: true,
-            mutated: true,
-            error: None,
-        }
+        (
+            QoSOutcome {
+                pid,
+                tier,
+                success: true,
+                mutated: true,
+                error: None,
+            },
+            false,
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
-    fn apply_task_policy(&self, pid: u32, tier: SchedulingTier) -> QoSOutcome {
-        QoSOutcome {
-            pid,
-            tier,
-            success: false,
-            mutated: false,
-            error: Some("task_policy_set only available on macOS".into()),
-        }
+    fn apply_task_policy_if(
+        &self,
+        pid: u32,
+        tier: SchedulingTier,
+        authorized: &mut impl FnMut() -> bool,
+    ) -> (QoSOutcome, bool) {
+        let authority_denied = !authorized();
+        (
+            QoSOutcome {
+                pid,
+                tier,
+                success: authority_denied,
+                mutated: false,
+                error: (!authority_denied)
+                    .then(|| "task_policy_set only available on macOS".into()),
+            },
+            authority_denied,
+        )
     }
 
     // ── Mach port accounting ─────────────────────────────────────────────

@@ -1063,7 +1063,7 @@ fn main() -> anyhow::Result<()> {
             // Shares the fg_detector so the sentinel never freezes the active foreground app.
             let (resource_interrupt_decision_tx, resource_interrupt_decision_rx) =
                 resource_interrupt_decision_channel();
-            spawn_resource_sentinel_with_decisions(
+            let mut resource_sentinel_shutdown = spawn_resource_sentinel_with_decisions(
                 smc_reader.cache_arc(),
                 pressure_collector.cache_arc(),
                 state.resource_interrupt.clone(),
@@ -6930,6 +6930,15 @@ fn main() -> anyhow::Result<()> {
             // Release speculative kernel state before persisting on shutdown.
             let mut shutdown_decision_events =
                 apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
+            let resource_sentinel_quiesced =
+                resource_sentinel_shutdown.quiesce(Duration::from_millis(750));
+            resource_interrupt_decision_rx.drain_into(cycle_count, &mut shutdown_decision_events);
+            if !resource_sentinel_quiesced {
+                tracing::warn!(
+                    worker_finished = resource_sentinel_shutdown.worker_finished(),
+                    "resource-sentinel: bounded quiescence wait expired; direct-effect authority remains revoked"
+                );
+            }
             if let Some(lease) = last_markov_prethaw.take() {
                 let report = daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
                 shutdown_decision_events.extend_buffer(&report.decision_events);

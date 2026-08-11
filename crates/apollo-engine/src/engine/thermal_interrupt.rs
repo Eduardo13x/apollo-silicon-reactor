@@ -12,15 +12,15 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::engine::activity_sensor::active_pids;
 use crate::engine::background_collectors::PressureData;
 use crate::engine::daemon_helpers::{
-    unfreeze_outcome_events, unfreeze_pids_outcome, unfreeze_pids_verified_outcome,
+    unfreeze_outcome_events, unfreeze_pids_outcome_if, unfreeze_pids_verified_outcome_if,
     write_frozen_state,
 };
 use crate::engine::decision_ledger::{
@@ -132,6 +132,93 @@ impl Default for ResourceInterruptState {
 }
 
 const RESOURCE_INTERRUPT_DECISION_CAPACITY: usize = 128;
+const RESOURCE_SENTINEL_WAKE_CAPACITY: usize = 1;
+
+/// Revocable capability for the sentinel's existing direct actuator authority.
+/// Closing it never grants a new path; it only prevents subsequent mutations.
+struct SentinelMutationAuthority {
+    open: AtomicBool,
+}
+
+impl SentinelMutationAuthority {
+    fn new() -> Self {
+        Self {
+            open: AtomicBool::new(true),
+        }
+    }
+
+    #[inline]
+    fn is_authorized(&self, stop: &AtomicBool) -> bool {
+        self.open.load(Ordering::Acquire) && !stop.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn run_if_authorized<R>(&self, stop: &AtomicBool, effect: impl FnOnce() -> R) -> Option<R> {
+        self.is_authorized(stop).then(effect)
+    }
+
+    fn revoke(&self) {
+        self.open.store(false, Ordering::Release);
+    }
+}
+
+/// Lifecycle handle retained by the loop so final receipt ingestion cannot race
+/// a detached resource-sentinel actuator tick.
+#[must_use = "retain the handle and quiesce the resource sentinel before shutdown"]
+pub struct ResourceSentinelShutdownHandle {
+    stop: Arc<AtomicBool>,
+    authority: Arc<SentinelMutationAuthority>,
+    wake: SyncSender<()>,
+    quiesced: Receiver<()>,
+    worker: Option<JoinHandle<()>>,
+    acknowledged: bool,
+    revoke_on_drop: bool,
+}
+
+impl ResourceSentinelShutdownHandle {
+    /// Revoke direct-effect authority and interrupt the sentinel's poll sleep.
+    /// This method never waits.
+    pub fn request_stop(&self) {
+        self.authority.revoke();
+        self.stop.store(true, Ordering::Release);
+        let _ = self.wake.try_send(());
+    }
+
+    /// Wait at most `timeout` for the worker to pass its final effect/event
+    /// boundary. A timeout leaves authority revoked, so no later kernel mutation
+    /// can begin even though the worker handle remains detached until it exits.
+    pub fn wait_for_quiescence(&mut self, timeout: Duration) -> bool {
+        if self.acknowledged {
+            return true;
+        }
+        self.acknowledged = match self.quiesced.recv_timeout(timeout) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => true,
+            Err(RecvTimeoutError::Timeout) => false,
+        };
+        self.acknowledged
+    }
+
+    pub fn quiesce(&mut self, timeout: Duration) -> bool {
+        self.request_stop();
+        self.wait_for_quiescence(timeout)
+    }
+
+    pub fn worker_finished(&self) -> bool {
+        self.worker.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    fn detach_legacy(mut self) {
+        self.revoke_on_drop = false;
+    }
+}
+
+impl Drop for ResourceSentinelShutdownHandle {
+    fn drop(&mut self) {
+        if self.revoke_on_drop {
+            self.request_stop();
+        }
+    }
+}
 
 /// Non-blocking producer retained by the background sentinel. Channel loss is
 /// counted atomically and propagated into the loop's bounded overflow receipt.
@@ -494,7 +581,8 @@ pub fn spawn_resource_sentinel(
         qos_mgr,
         frozen_state_path,
         None,
-    );
+    )
+    .detach_legacy();
 }
 
 /// Spawn the live sentinel with a bounded decision-event handoff owned by the
@@ -510,7 +598,7 @@ pub fn spawn_resource_sentinel_with_decisions(
     qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
     frozen_state_path: PathBuf,
     decisions: ResourceInterruptDecisionSender,
-) {
+) -> ResourceSentinelShutdownHandle {
     spawn_resource_sentinel_inner(
         hw_cache,
         pressure_cache,
@@ -522,7 +610,7 @@ pub fn spawn_resource_sentinel_with_decisions(
         qos_mgr,
         frozen_state_path,
         Some(decisions),
-    );
+    )
 }
 
 fn spawn_resource_sentinel_inner(
@@ -536,29 +624,58 @@ fn spawn_resource_sentinel_inner(
     qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
     frozen_state_path: PathBuf,
     decisions: Option<ResourceInterruptDecisionSender>,
-) {
-    if let Err(e) = thread::Builder::new()
+) -> ResourceSentinelShutdownHandle {
+    let authority = Arc::new(SentinelMutationAuthority::new());
+    let (wake_tx, wake_rx) = mpsc::sync_channel(RESOURCE_SENTINEL_WAKE_CAPACITY);
+    let wake_keepalive = wake_tx.clone();
+    let (quiesced_tx, quiesced_rx) = mpsc::sync_channel(1);
+    let worker_stop = stop.clone();
+    let worker_authority = authority.clone();
+    let worker = match thread::Builder::new()
         .name("resource-sentinel".into())
         .spawn(move || {
+            let _wake_keepalive = wake_keepalive;
             // Pin to E-cores via QOS_CLASS_BACKGROUND so the sentinel never
             // competes with user workloads on P-cores.
-            pin_to_ecores();
+            if worker_authority
+                .run_if_authorized(&worker_stop, pin_to_ecores)
+                .is_some()
+            {
+                sentinel_loop(
+                    hw_cache,
+                    pressure_cache,
+                    interrupt_state,
+                    main_frozen,
+                    worker_stop,
+                    config,
+                    fg_detector,
+                    qos_mgr,
+                    frozen_state_path,
+                    decisions,
+                    worker_authority,
+                    wake_rx,
+                );
+            }
 
-            sentinel_loop(
-                hw_cache,
-                pressure_cache,
-                interrupt_state,
-                main_frozen,
-                stop,
-                config,
-                fg_detector,
-                qos_mgr,
-                frozen_state_path,
-                decisions,
-            );
-        })
-    {
-        eprintln!("warning: failed to spawn resource-sentinel: {}", e);
+            // All direct effects and event sends happen-before this ack.
+            let _ = quiesced_tx.try_send(());
+        }) {
+        Ok(worker) => Some(worker),
+        Err(e) => {
+            eprintln!("warning: failed to spawn resource-sentinel: {}", e);
+            authority.revoke();
+            None
+        }
+    };
+
+    ResourceSentinelShutdownHandle {
+        stop,
+        authority,
+        wake: wake_tx,
+        quiesced: quiesced_rx,
+        worker,
+        acknowledged: false,
+        revoke_on_drop: true,
     }
 }
 
@@ -590,6 +707,8 @@ fn sentinel_loop(
     qos_mgr: Option<Arc<Mutex<MachQoSManager>>>,
     frozen_state_path: PathBuf,
     decisions: Option<ResourceInterruptDecisionSender>,
+    authority: Arc<SentinelMutationAuthority>,
+    wake: Receiver<()>,
 ) {
     let mut bufs = SentinelBuffers::new(fg_detector);
     let mut last_escalation = Instant::now() - config.debounce;
@@ -708,6 +827,8 @@ fn sentinel_loop(
                     &mut bufs,
                     &qos_mgr,
                     decisions.as_ref(),
+                    &authority,
+                    &stop,
                 );
             } else {
                 // De-escalation → recovery.
@@ -719,6 +840,8 @@ fn sentinel_loop(
                         &mut bufs,
                         &qos_mgr,
                         decisions.as_ref(),
+                        &authority,
+                        &stop,
                     );
                     state.active.store(false, Ordering::Release);
                 }
@@ -749,9 +872,13 @@ fn sentinel_loop(
                     .is_some_and(|sf| sf.contains(&pid));
                 if entry.is_some() || sentinel_owned {
                     let outcome = if let Some(entry) = entry {
-                        unfreeze_pids_verified_outcome(&HashMap::from([(pid, entry)]))
+                        unfreeze_pids_verified_outcome_if(&HashMap::from([(pid, entry)]), || {
+                            authority.is_authorized(&stop)
+                        })
                     } else {
-                        unfreeze_pids_outcome(std::iter::once(pid))
+                        unfreeze_pids_outcome_if(std::iter::once(pid), || {
+                            authority.is_authorized(&stop)
+                        })
                     };
                     let outcome_events = unfreeze_outcome_events(
                         "thermal_interrupt:foreground_sigcont",
@@ -785,7 +912,10 @@ fn sentinel_loop(
         // Sleep until next poll.
         let elapsed = tick_start.elapsed();
         if elapsed < config.poll_interval {
-            thread::sleep(config.poll_interval - elapsed);
+            match wake.recv_timeout(config.poll_interval - elapsed) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => {}
+            }
         }
     }
 }
@@ -855,22 +985,64 @@ fn respond_to_phase(
     bufs: &mut SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
     decisions: Option<&ResourceInterruptDecisionSender>,
+    authority: &SentinelMutationAuthority,
+    stop: &AtomicBool,
 ) {
     match phase {
         InterruptPhase::Moderate => {
             // Migrate non-protected to E-cores via direct Mach syscall.
-            migrate_to_ecores(state, main_frozen, bufs, qos_mgr, decisions);
+            migrate_to_ecores(
+                state,
+                main_frozen,
+                bufs,
+                qos_mgr,
+                decisions,
+                authority,
+                stop,
+            );
         }
         InterruptPhase::Emergency => {
             // SIGSTOP non-critical + E-core migration + memory pressure hint.
-            freeze_non_critical(state, main_frozen, frozen_state_path, bufs, decisions);
-            migrate_to_ecores(state, main_frozen, bufs, qos_mgr, decisions);
+            freeze_non_critical(
+                state,
+                main_frozen,
+                frozen_state_path,
+                bufs,
+                decisions,
+                authority,
+                stop,
+            );
+            migrate_to_ecores(
+                state,
+                main_frozen,
+                bufs,
+                qos_mgr,
+                decisions,
+                authority,
+                stop,
+            );
             send_memory_pressure_hint();
         }
         InterruptPhase::SuperEmergency => {
             // Everything above + I/O throttle.
-            freeze_non_critical(state, main_frozen, frozen_state_path, bufs, decisions);
-            migrate_to_ecores(state, main_frozen, bufs, qos_mgr, decisions);
+            freeze_non_critical(
+                state,
+                main_frozen,
+                frozen_state_path,
+                bufs,
+                decisions,
+                authority,
+                stop,
+            );
+            migrate_to_ecores(
+                state,
+                main_frozen,
+                bufs,
+                qos_mgr,
+                decisions,
+                authority,
+                stop,
+            );
             send_memory_pressure_hint();
             enable_io_throttle();
         }
@@ -885,6 +1057,8 @@ fn migrate_to_ecores(
     bufs: &SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
     decisions: Option<&ResourceInterruptDecisionSender>,
+    authority: &SentinelMutationAuthority,
+    stop: &AtomicBool,
 ) {
     let main_frozen_pids: HashSet<u32> = main_frozen
         .try_lock()
@@ -906,6 +1080,9 @@ fn migrate_to_ecores(
     let recently_active_window = std::time::Duration::from_secs(300);
 
     for (pid, proc_info) in sys.processes() {
+        if !authority.is_authorized(stop) {
+            break;
+        }
         let pid_u32 = pid.as_u32();
         if pid_u32 <= 1 || main_frozen_pids.contains(&pid_u32) {
             continue;
@@ -937,7 +1114,12 @@ fn migrate_to_ecores(
         // Phase 2: direct Mach syscall for E-core migration.
         let (action_key, applied_effect, outcome, detail) = if let Some(ref mut mgr) = qos_guard {
             let (qos_outcome, audit_disposition) =
-                mgr.set_tier_audited(pid_u32, SchedulingTier::Background);
+                mgr.set_tier_audited_if(pid_u32, SchedulingTier::Background, || {
+                    authority.is_authorized(stop)
+                });
+            if !authority.is_authorized(stop) && !qos_outcome.mutated {
+                break;
+            }
             match audit_disposition {
                 QoSAuditDisposition::Applied => (
                     "thermal_interrupt:mach_tier_background",
@@ -971,7 +1153,12 @@ fn migrate_to_ecores(
             // Do NOT use PRIO_PROCESS+nice=20 — that breaks the Mach
             // priority-inheritance chain and causes WindowServer IPC hangs.
             const PRIO_DARWIN_BG: libc::c_int = 0x1000;
-            if unsafe { libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1) } == 0 {
+            let Some(rc) = authority.run_if_authorized(stop, || unsafe {
+                libc::setpriority(PRIO_DARWIN_BG, pid_u32, 1)
+            }) else {
+                break;
+            };
+            if rc == 0 {
                 (
                     "thermal_interrupt:darwin_bg_enable",
                     Some(crate::engine::effect_ledger::AppliedEffect::DarwinBg { pid: pid_u32 }),
@@ -1022,6 +1209,8 @@ fn freeze_non_critical(
     frozen_state_path: &Path,
     bufs: &SentinelBuffers,
     decisions: Option<&ResourceInterruptDecisionSender>,
+    authority: &SentinelMutationAuthority,
+    stop: &AtomicBool,
 ) {
     let main_frozen_pids: HashSet<u32> = main_frozen
         .try_lock()
@@ -1110,6 +1299,9 @@ fn freeze_non_critical(
             sysinfo::RefreshKind::new().with_processes(sysinfo::ProcessRefreshKind::new()),
         );
         for (pid_u32, expected_name) in &newly_frozen {
+            if !authority.is_authorized(stop) {
+                break;
+            }
             let pid_key = sysinfo::Pid::from_u32(*pid_u32);
             match verify_sys.process(pid_key) {
                 None => {
@@ -1166,7 +1358,12 @@ fn freeze_non_critical(
                 );
                 continue;
             }
-            if unsafe { libc::kill(*pid_u32 as i32, libc::SIGSTOP) } == 0 {
+            let Some(rc) = authority.run_if_authorized(stop, || unsafe {
+                libc::kill(*pid_u32 as i32, libc::SIGSTOP)
+            }) else {
+                break;
+            };
+            if rc == 0 {
                 let start_sec = ProcessIdentity::from_pid(*pid_u32)
                     .map(|identity| identity.start_sec)
                     .unwrap_or(0);
@@ -1261,6 +1458,8 @@ fn recover(
     _bufs: &mut SentinelBuffers,
     qos_mgr: &Option<Arc<Mutex<MachQoSManager>>>,
     decisions: Option<&ResourceInterruptDecisionSender>,
+    authority: &SentinelMutationAuthority,
+    stop: &AtomicBool,
 ) {
     // Disable I/O throttle if it was enabled during SuperEmergency.
     disable_io_throttle();
@@ -1282,6 +1481,9 @@ fn recover(
             let mut qos_guard = qos_mgr.as_ref().and_then(|m| m.try_lock().ok());
             let mut resolved = Vec::new();
             for pid in &migrated {
+                if !authority.is_authorized(stop) {
+                    break;
+                }
                 let mach_effect =
                     crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid };
                 let darwin_effect =
@@ -1294,7 +1496,12 @@ fn recover(
                 let (action_key, outcome, detail, restored) = if mach_owned {
                     if let Some(mgr) = qos_guard.as_mut() {
                         let (qos_outcome, audit_disposition) =
-                            mgr.set_tier_audited(*pid, SchedulingTier::Normal);
+                            mgr.set_tier_audited_if(*pid, SchedulingTier::Normal, || {
+                                authority.is_authorized(stop)
+                            });
+                        if !authority.is_authorized(stop) && !qos_outcome.mutated {
+                            break;
+                        }
                         match audit_disposition {
                             QoSAuditDisposition::Applied => (
                                 "thermal_interrupt:mach_tier_restore",
@@ -1332,7 +1539,12 @@ fn recover(
                         )
                     }
                 } else if darwin_owned {
-                    if unsafe { libc::setpriority(PRIO_DARWIN_BG, *pid, 0) } == 0 {
+                    let Some(rc) = authority.run_if_authorized(stop, || unsafe {
+                        libc::setpriority(PRIO_DARWIN_BG, *pid, 0)
+                    }) else {
+                        break;
+                    };
+                    if rc == 0 {
                         (
                             "thermal_interrupt:darwin_bg_restore",
                             ActuatorDecisionOutcome::Reverted,
@@ -1444,8 +1656,11 @@ fn recover(
         (verified, missing, transferred)
     };
 
-    let verified_outcome = unfreeze_pids_verified_outcome(&verified_entries);
-    let missing_outcome = unfreeze_pids_outcome(missing_entries.into_iter());
+    let verified_outcome =
+        unfreeze_pids_verified_outcome_if(&verified_entries, || authority.is_authorized(stop));
+    let missing_outcome = unfreeze_pids_outcome_if(missing_entries.into_iter(), || {
+        authority.is_authorized(stop)
+    });
     for outcome in [&verified_outcome, &missing_outcome] {
         let outcome_events = unfreeze_outcome_events(
             "thermal_interrupt:sigcont_recovery",
@@ -1519,6 +1734,64 @@ impl Ord for InterruptPhase {
 mod tests {
     use super::*;
     use crate::engine::decision_ledger::{ActuatorDecisionOutcome, CycleDecisionEvents};
+
+    #[test]
+    fn shutdown_revokes_effect_after_tick_check_even_when_quiescence_times_out() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let authority = Arc::new(SentinelMutationAuthority::new());
+        let (wake_tx, _wake_rx) = mpsc::sync_channel(1);
+        let (quiesced_tx, quiesced_rx) = mpsc::sync_channel(1);
+        let (at_effect_tx, at_effect_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let (decision_tx, decision_rx) = resource_interrupt_decision_channel();
+        let mutations = Arc::new(AtomicU64::new(0));
+
+        let worker_stop = stop.clone();
+        let worker_authority = authority.clone();
+        let worker_mutations = mutations.clone();
+        let worker = thread::spawn(move || {
+            assert!(!worker_stop.load(Ordering::Acquire));
+            at_effect_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            if worker_authority
+                .run_if_authorized(&worker_stop, || {
+                    worker_mutations.fetch_add(1, Ordering::Relaxed);
+                })
+                .is_some()
+            {
+                decision_tx.emit(interrupt_effect_event(
+                    "thermal_interrupt:freeze",
+                    4242,
+                    ActuatorDecisionOutcome::Applied,
+                    "late SIGSTOP",
+                ));
+            }
+            quiesced_tx.send(()).unwrap();
+        });
+        let mut shutdown = ResourceSentinelShutdownHandle {
+            stop: stop.clone(),
+            authority,
+            wake: wake_tx,
+            quiesced: quiesced_rx,
+            worker: Some(worker),
+            acknowledged: false,
+            revoke_on_drop: true,
+        };
+
+        at_effect_rx.recv().unwrap();
+        shutdown.request_stop();
+        assert!(!shutdown.wait_for_quiescence(Duration::from_millis(1)));
+
+        let mut final_events = CycleDecisionEvents::default();
+        decision_rx.drain_into(99, &mut final_events);
+        assert!(final_events.is_empty());
+
+        release_tx.send(()).unwrap();
+        assert!(shutdown.wait_for_quiescence(Duration::from_secs(1)));
+        assert_eq!(mutations.load(Ordering::Relaxed), 0);
+        decision_rx.drain_into(99, &mut final_events);
+        assert!(final_events.is_empty());
+    }
 
     #[test]
     fn bounded_interrupt_handoff_preserves_pid_effect_and_all_dispositions() {
