@@ -1654,6 +1654,7 @@ mod tests {
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
+            perceptual_latency_improvement: 0.0,
             net_state_delta: Default::default(),
             context_before: ActuatorEpisodeContext::from_telemetry(context),
             effective: utility > 0.0,

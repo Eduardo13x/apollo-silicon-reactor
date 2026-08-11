@@ -18,6 +18,7 @@
 use std::sync::atomic::Ordering;
 
 use apollo_engine::collector::SystemSnapshot;
+use apollo_engine::engine::coreaudio_active::AudioActivitySnapshot;
 use apollo_engine::engine::daemon_helpers::spawn_reaped_purge;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
@@ -75,6 +76,46 @@ const EMERGENCY_THRASHING_MIN_CYCLES: u32 = 3;
 const EMERGENCY_PURGE_COOLDOWN_SECS: u64 = 300;
 const CRITICAL_THRASHING_P_OOM: f64 = 0.80;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AutomaticPurgeMediaGuard {
+    active: bool,
+    source: &'static str,
+}
+
+fn automatic_purge_media_guard(
+    ctx: &UserContext,
+    audio: AudioActivitySnapshot,
+) -> AutomaticPurgeMediaGuard {
+    if ctx.call_in_progress {
+        return AutomaticPurgeMediaGuard {
+            active: true,
+            source: "call",
+        };
+    }
+    if ctx.audio_active || audio.output_active || audio.input_active {
+        return AutomaticPurgeMediaGuard {
+            active: true,
+            source: "audio",
+        };
+    }
+    if ctx.has_sleep_assertion {
+        return AutomaticPurgeMediaGuard {
+            active: true,
+            source: "assertion",
+        };
+    }
+    if !audio.session_supported || !audio.output_probe_available || !audio.input_probe_available {
+        return AutomaticPurgeMediaGuard {
+            active: true,
+            source: "hal-unobservable",
+        };
+    }
+    AutomaticPurgeMediaGuard {
+        active: false,
+        source: "none",
+    }
+}
+
 /// Returns true if the maintenance tick fired a purge in this cycle.
 /// Caller should record `system_maintenance_purge` in the CausalGraph
 /// for observational outcome tracking (≥30 samples before trusting).
@@ -85,6 +126,26 @@ pub fn run_maintenance_tick(
     lf_metrics: &LockFreeMetrics,
     build_active: bool,
     bus_saturated: bool,
+) -> bool {
+    run_maintenance_tick_with_audio(
+        snap,
+        ctx,
+        state,
+        lf_metrics,
+        build_active,
+        bus_saturated,
+        apollo_engine::engine::coreaudio_active::audio_activity_snapshot(),
+    )
+}
+
+fn run_maintenance_tick_with_audio(
+    snap: &SystemSnapshot,
+    ctx: &UserContext,
+    state: &mut MaintenanceState,
+    lf_metrics: &LockFreeMetrics,
+    build_active: bool,
+    bus_saturated: bool,
+    audio_snapshot: AudioActivitySnapshot,
 ) -> bool {
     state.push_swap_delta(snap.pressure.swap_delta_bytes_per_sec);
     // B.4: advance the Schmitt trigger before should_fire reads it.
@@ -99,19 +160,16 @@ pub fn run_maintenance_tick(
     //
     // Emergency path: thrashing > 25k for ≥3 cycles AND no media/call AND
     // build_active false → purge bypass with 300s cooldown (not 1800s).
-    // Critical path: thrashing > 50k for ≥3 cycles can bypass media/assertion
-    // politeness too; at that flow rate the user is already paying the stall.
+    // Critical non-media path may use a sustained 50k streak. Any positive
+    // media guard requires a genuinely predicted OOM before purge is allowed.
     // [Camacho 2007] predictive control under sustained flow-crisis must
     // override level gates that are tuned for level thresholds.
     let thrash = snap.pressure.thrashing_score;
     state.push_thrashing(thrash);
     let p_oom_30s = shadow_signals::get_p_oom_30s().unwrap_or(0.0);
-    // Fresh full-duplex call probe (~100µs, two CoreAudio round-trips). This
-    // is the robust call signal: it reads the live mic+output device state, so
-    // it catches browser-based Meet (whose pmset assertion owner is "Brave",
-    // not a CALL_APP_NAME) and is immune to the pmset poll TTL that lets
-    // ctx.audio_active go stale between samples — the exact gap that let
-    // mid-call purges through.
+    // Compose direct HAL with pmset/user context. A root LaunchDaemon cannot
+    // observe login-session default devices, so unavailable HAL is treated as
+    // uncertainty and blocks automatic purge instead of pretending silence.
     let physical_pressure = if snap.pressure.memory_pressure_raw > 0.0 {
         snap.pressure.memory_pressure_raw
     } else {
@@ -123,7 +181,7 @@ pub fn run_maintenance_tick(
     // STREAK (consecutive_thrash_50k_cycles >= 10) still purges for relief.
     // Passing high_bw here (the 2026-06-15 regression) gave storms the call
     // treatment — blocking the streak relief → thrash strangled to 69k.
-    let realtime_call = apollo_engine::engine::coreaudio_active::is_realtime_call_active();
+    let media_guard = automatic_purge_media_guard(ctx, audio_snapshot);
     let emergency = emergency_thrashing_purge_allowed(
         thrash,
         p_oom_30s,
@@ -132,7 +190,7 @@ pub fn run_maintenance_tick(
         state,
         build_active,
         bus_saturated,
-        realtime_call,
+        media_guard.active,
     );
     // Phase 1 (fixed 2026-06-15): the gentler NORMAL purge holds off during a
     // TRANSIENT high-volume workload (call or fault-in storm). The survival
@@ -168,7 +226,14 @@ pub fn run_maintenance_tick(
         return false;
     }
 
-    match should_fire(snap, ctx, state, build_active, bus_saturated) {
+    match should_fire_with_media_guard(
+        snap,
+        ctx,
+        state,
+        build_active,
+        bus_saturated,
+        media_guard.active,
+    ) {
         None => {
             if spawn_reaped_purge() {
                 state.mark_purged();
@@ -181,6 +246,12 @@ pub fn run_maintenance_tick(
             false
         }
         Some(reason) => {
+            if reason == SkipReason::MediaActive && media_guard.active {
+                tracing::debug!(
+                    source = media_guard.source,
+                    "maintenance: media guard skipped purge"
+                );
+            }
             // B.4: split counters disambiguate the legacy aggregate (which
             // keeps incrementing as the sum for dashboard continuity).
             match reason {
@@ -232,7 +303,7 @@ fn emergency_thrashing_purge_allowed(
     state: &MaintenanceState,
     build_active: bool,
     bus_saturated: bool,
-    realtime_call: bool,
+    media_guarded: bool,
 ) -> bool {
     if thrash <= EMERGENCY_THRASHING_PURGE_SCORE
         || !state.thrashing_streak_above(
@@ -245,9 +316,10 @@ fn emergency_thrashing_purge_allowed(
         return false;
     }
 
-    let media_or_assertion = ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion;
     let critical_lockup = thrash > CRITICAL_THRASHING_PURGE_SCORE
         && (p_oom_30s >= CRITICAL_THRASHING_P_OOM || state.consecutive_thrash_50k_cycles >= 10);
+    let genuine_oom =
+        thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
 
     if bus_saturated && !critical_lockup {
         return false;
@@ -265,8 +337,8 @@ fn emergency_thrashing_purge_allowed(
     // heuristic does not qualify: a flow-crisis is survivable, a mid-call
     // glitch is certain. An imminent OOM kill would drop the call anyway, so
     // there the stall is the lesser evil.
-    if realtime_call {
-        return thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
+    if media_guarded || ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion {
+        return genuine_oom;
     }
 
     // 2026-06-13 pressure-floor fix — "stutter at random moments": a thrash
@@ -277,17 +349,14 @@ fn emergency_thrashing_purge_allowed(
     // is no scarcity to relieve. Below the floor, ONLY a genuinely predicted
     // OOM (the same critical bar used for live calls) justifies the emergency
     // purge; real escalating scarcity (pressure >= 0.70) still purges.
-    let genuine_oom =
-        thrash > CRITICAL_THRASHING_PURGE_SCORE && p_oom_30s >= CRITICAL_THRASHING_P_OOM;
     if pressure < EMERGENCY_PURGE_PRESSURE_FLOOR && !genuine_oom {
         return false;
     }
 
-    // B.5 (2026-06-09): sustained 50k+ thrashing (≥10 cycles) bypasses the
-    // MediaActive gate — a streak at this level is a flow crisis, not a
-    // transient audio glitch. Without this, Meet/streaming/audio sessions
-    // permanently block purge while thrashing climbs toward 62k+.
-    !media_or_assertion || critical_lockup || state.consecutive_thrash_50k_cycles >= 10
+    // B.5 (2026-06-09): sustained 50k+ thrashing (≥10 cycles) remains a
+    // non-media relief path. The media branch returned above and only a
+    // predicted OOM can override it.
+    critical_lockup || state.consecutive_thrash_50k_cycles >= 10
 }
 
 pub(crate) fn should_fire(
@@ -296,6 +365,17 @@ pub(crate) fn should_fire(
     state: &MaintenanceState,
     build_active: bool,
     bus_saturated: bool,
+) -> Option<SkipReason> {
+    should_fire_with_media_guard(snap, ctx, state, build_active, bus_saturated, false)
+}
+
+fn should_fire_with_media_guard(
+    snap: &SystemSnapshot,
+    ctx: &UserContext,
+    state: &MaintenanceState,
+    build_active: bool,
+    bus_saturated: bool,
+    media_guarded: bool,
 ) -> Option<SkipReason> {
     // Fight-hunt fix (2026-06-10): the purge gate judges PHYSICAL pressure.
     // The 2026-05-10 design spec mandated raw ("purge addresses memory
@@ -342,7 +422,7 @@ pub(crate) fn should_fire(
     // holders cannot tolerate page-cache invalidation. UserContext flags are
     // refreshed every cycle (pmset -g assertions polled with TTL) and combine
     // coreaudiod NoIdleSleep + NSPreventIdleSystemSleep + conferencing apps.
-    if ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion {
+    if media_guarded || ctx.audio_active || ctx.call_in_progress || ctx.has_sleep_assertion {
         return Some(SkipReason::MediaActive);
     }
     // Sprint 12 Convergence #5 (2026-05-17): bus-saturation gate.
@@ -637,6 +717,83 @@ mod tests {
     }
 
     #[test]
+    fn unobservable_hal_arms_app_agnostic_purge_guard() {
+        let ctx = idle_ctx();
+        let fallback = AudioActivitySnapshot::default();
+        let guard = automatic_purge_media_guard(&ctx, fallback);
+        assert!(guard.active);
+        assert_eq!(guard.source, "hal-unobservable");
+
+        let direct_silence = AudioActivitySnapshot {
+            session_supported: true,
+            output_probe_available: true,
+            input_probe_available: true,
+            ..AudioActivitySnapshot::default()
+        };
+        assert!(
+            !automatic_purge_media_guard(&ctx, direct_silence).active,
+            "only a complete direct HAL silence sample may clear uncertainty"
+        );
+    }
+
+    #[test]
+    fn direct_hal_playback_arms_purge_guard() {
+        let ctx = idle_ctx();
+        let audio = AudioActivitySnapshot {
+            output_active: true,
+            output_probe_available: true,
+            session_supported: true,
+            ..AudioActivitySnapshot::default()
+        };
+        let guard = automatic_purge_media_guard(&ctx, audio);
+        assert!(guard.active);
+        assert_eq!(guard.source, "audio");
+    }
+
+    #[test]
+    fn fallback_media_guard_preserves_normal_gate_order() {
+        let state = make_ready_state();
+        let ctx = idle_ctx();
+        let eligible = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
+        assert_eq!(
+            should_fire_with_media_guard(&eligible, &ctx, &state, false, false, true),
+            Some(SkipReason::MediaActive)
+        );
+
+        let low_pressure = synth_snap(0.30, 3_000_000_000, 4_000_000_000);
+        assert_eq!(
+            should_fire_with_media_guard(&low_pressure, &ctx, &state, false, false, true),
+            Some(SkipReason::PressureLow),
+            "media uncertainty must not hide the primary pressure diagnosis"
+        );
+    }
+
+    #[test]
+    fn maintenance_tick_never_spawns_purge_when_hal_is_unobservable() {
+        let snap = synth_snap(0.70, 3_000_000_000, 4_000_000_000);
+        let ctx = idle_ctx();
+        let mut state = make_ready_state();
+        let metrics = LockFreeMetrics::new();
+
+        assert!(!run_maintenance_tick_with_audio(
+            &snap,
+            &ctx,
+            &mut state,
+            &metrics,
+            false,
+            false,
+            AudioActivitySnapshot::default(),
+        ));
+        assert_eq!(metrics.maintenance_purge_total.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            metrics
+                .maintenance_purge_skipped_idle_total
+                .load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn emergency_thrashing_respects_media_until_critical() {
         let ctx = UserContext {
             idle_secs: 200.0,
@@ -701,6 +858,29 @@ mod tests {
                 60_000.0, 0.90, 0.80, &ctx, &state, false, false, true
             ),
             "critical_lockup (high p_oom) overrides the realtime-call guard"
+        );
+    }
+
+    #[test]
+    fn emergency_thrashing_fallback_media_guard_requires_predicted_oom() {
+        let ctx = idle_ctx();
+        let mut state = MaintenanceState {
+            consecutive_thrash_cycles: EMERGENCY_THRASHING_MIN_CYCLES,
+            ..Default::default()
+        };
+        state.consecutive_thrash_50k_cycles = 12;
+
+        assert!(
+            !emergency_thrashing_purge_allowed(
+                70_000.0, 0.30, 0.75, &ctx, &state, false, false, true
+            ),
+            "session-fallback media evidence must block the old streak bypass"
+        );
+        assert!(
+            emergency_thrashing_purge_allowed(
+                70_000.0, 0.90, 0.75, &ctx, &state, false, false, true
+            ),
+            "a genuinely predicted OOM remains the last-resort escape"
         );
     }
 

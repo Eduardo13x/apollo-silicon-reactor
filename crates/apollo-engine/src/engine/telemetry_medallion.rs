@@ -413,6 +413,10 @@ pub struct ResolvedActuatorEvidence {
     pub raw_utility_delta: f64,
     pub counterfactual_delta: f64,
     pub net_utility_delta: f64,
+    /// Positive means the local responsiveness proxy improved between the
+    /// episode's admitted pre/post contexts.
+    #[serde(default)]
+    pub perceptual_latency_improvement: f64,
     #[serde(default)]
     pub net_state_delta: WorldStateDelta,
     /// Compact state at action emission. This preserves enough universal
@@ -515,8 +519,16 @@ pub struct ActuatorEpisodeContext {
     pub used_ram_fraction: f64,
     pub thermal_score: f64,
     pub fluidity_score: f64,
+    /// Composite local responsiveness signal. Lower is better. This is kept
+    /// beside fluidity so pre/post actuator evidence can explain user-facing
+    /// benefit without confusing it with daemon cycle time.
+    pub perceptual_latency_score: f64,
+    pub scheduler_jitter_p95_ms: f64,
     pub windowserver_cpu_fraction: f64,
     pub arousal_level: f64,
+    pub signal_urgency: f64,
+    pub signal_entropy_anomaly: f64,
+    pub nars_drift_score: f64,
     pub markov_prediction_confidence: f64,
     pub network_retransmit_fraction: f64,
     pub network_drop_rate: f64,
@@ -536,6 +548,10 @@ pub struct ActuatorEpisodeContext {
     pub coreaudio_session_fallback: bool,
     pub markov_prewarm_active: bool,
     pub predictive_agent_active: bool,
+    pub kpc_available: bool,
+    pub kpc_memory_bound_score: f64,
+    pub amx_available: bool,
+    pub amx_cs_overhead_ns: u64,
 }
 
 impl ActuatorEpisodeContext {
@@ -552,8 +568,13 @@ impl ActuatorEpisodeContext {
             used_ram_fraction: context.used_ram_fraction,
             thermal_score: context.thermal_score,
             fluidity_score: context.fluidity_score,
+            perceptual_latency_score: context.perceptual_latency_score,
+            scheduler_jitter_p95_ms: context.scheduler_jitter_p95_ms,
             windowserver_cpu_fraction: context.windowserver_cpu_fraction,
             arousal_level: context.arousal_level,
+            signal_urgency: context.signal_urgency,
+            signal_entropy_anomaly: context.signal_entropy_anomaly,
+            nars_drift_score: context.nars_drift_score,
             markov_prediction_confidence: context.markov_prediction_confidence,
             network_retransmit_fraction: (context.network_retransmits_per_k / 1_000.0)
                 .clamp(0.0, 1.0),
@@ -574,6 +595,10 @@ impl ActuatorEpisodeContext {
             coreaudio_session_fallback: context.coreaudio_session_fallback,
             markov_prewarm_active: context.markov_prewarm_active,
             predictive_agent_active: context.predictive_agent_active,
+            kpc_available: context.kpc_available,
+            kpc_memory_bound_score: context.kpc_memory_bound_score,
+            amx_available: context.amx_available,
+            amx_cs_overhead_ns: context.amx_cs_overhead_ns,
         };
         episode.valid = episode.is_finite();
         episode
@@ -591,8 +616,13 @@ impl ActuatorEpisodeContext {
             self.used_ram_fraction,
             self.thermal_score,
             self.fluidity_score,
+            self.perceptual_latency_score,
+            self.scheduler_jitter_p95_ms,
             self.windowserver_cpu_fraction,
             self.arousal_level,
+            self.signal_urgency,
+            self.signal_entropy_anomaly,
+            self.nars_drift_score,
             self.markov_prediction_confidence,
             self.network_retransmit_fraction,
             self.network_drop_rate,
@@ -601,6 +631,7 @@ impl ActuatorEpisodeContext {
             self.e_cluster_util,
             self.ane_util_fraction,
             self.user_idle_fraction,
+            self.kpc_memory_bound_score,
         ]
         .into_iter()
         .all(f64::is_finite)
@@ -777,6 +808,8 @@ pub struct TelemetryContextSummary {
     pub battery_percent: Option<u32>,
     pub battery_watts: Option<f64>,
     pub fluidity_score: f64,
+    pub perceptual_latency_score: f64,
+    pub scheduler_jitter_p95_ms: f64,
     pub windowserver_cpu_fraction: f64,
     pub network_retransmits_per_k: f64,
     pub network_listen_drop_rate: f64,
@@ -829,6 +862,10 @@ pub struct TelemetryContextSummary {
     pub markov_prewarm_active: bool,
     pub predictive_agent_active: bool,
     pub predictive_intervention: String,
+    pub kpc_available: bool,
+    pub kpc_memory_bound_score: f64,
+    pub amx_available: bool,
+    pub amx_cs_overhead_ns: u64,
 }
 
 pub struct TelemetryObservation<'a> {
@@ -2024,6 +2061,9 @@ impl TelemetryMedallion {
         let counterfactual =
             (per_cycle_baseline * pending.horizon_cycles as f64).clamp(-0.25, 0.25);
         let net_delta = (raw_delta - counterfactual).clamp(-1.0, 1.0);
+        let perceptual_latency_improvement = (pending.before.perceptual_latency_score
+            - after.perceptual_latency_score)
+            .clamp(-1.0, 1.0);
         let raw_state_delta = WorldStateDelta::between(&pending.before, after);
         let counterfactual_state_delta = self
             .no_action_state_delta_ema
@@ -2120,6 +2160,7 @@ impl TelemetryMedallion {
             raw_utility_delta: finite_or_zero(raw_delta),
             counterfactual_delta: finite_or_zero(counterfactual),
             net_utility_delta: finite_or_zero(net_delta),
+            perceptual_latency_improvement: finite_or_zero(perceptual_latency_improvement),
             net_state_delta: if net_state_delta.is_finite() {
                 net_state_delta
             } else {
@@ -2956,14 +2997,48 @@ fn action_spec(action: &RootAction) -> Option<ActionSpec> {
         ),
     };
     let target = bounded_text(&target, 256);
+    let model_target = stable_model_target(family, &target);
     Some(ActionSpec {
         family,
         objective,
-        action_key: format!("{}:{}", family.as_str(), target),
+        action_key: format!("{}:{}", family.as_str(), model_target),
         target,
         target_pid,
         horizon_cycles,
     })
+}
+
+fn stable_model_target(family: ActuatorFamily, target: &str) -> String {
+    match family {
+        // A PID is an execution identity, not a reusable learning identity.
+        ActuatorFamily::Memorystatus => target
+            .rsplit_once(":priority:")
+            .map(|(_, priority)| format!("priority:{priority}"))
+            .unwrap_or_else(|| bounded_text(target, 256)),
+        ActuatorFamily::Boost
+        | ActuatorFamily::Throttle
+        | ActuatorFamily::Freeze
+        | ActuatorFamily::Unfreeze => {
+            let class = crate::engine::freeze_intelligence::FreezeIntelligence::classify(target);
+            if class == "generic" {
+                bounded_text(target, 256)
+            } else {
+                class.to_string()
+            }
+        }
+        ActuatorFamily::ThreadQos => {
+            let Some((name, tier)) = target.rsplit_once(':') else {
+                return bounded_text(target, 256);
+            };
+            let class = crate::engine::freeze_intelligence::FreezeIntelligence::classify(name);
+            if class == "generic" {
+                bounded_text(target, 256)
+            } else {
+                format!("{class}:{tier}")
+            }
+        }
+        _ => bounded_text(target, 256),
+    }
 }
 
 pub fn actuator_action_key(action: &RootAction) -> Option<String> {
@@ -3051,6 +3126,7 @@ fn utility_score(objective: ActuatorObjective, context: &TelemetryContextSummary
     let stall_health = 1.0 - context.stall_fraction.clamp(0.0, 1.0);
     let thermal_health = 1.0 - context.thermal_score.clamp(0.0, 1.0);
     let fluidity = context.fluidity_score.clamp(0.0, 1.0);
+    let latency_health = 1.0 - context.perceptual_latency_score.clamp(0.0, 1.0);
     let ws_headroom = 1.0 - context.windowserver_cpu_fraction.clamp(0.0, 1.0);
     let energy_health = 1.0 - (context.package_watts.unwrap_or(0.0) / 50.0).clamp(0.0, 1.0);
     let network_health = 1.0
@@ -3069,12 +3145,13 @@ fn utility_score(objective: ActuatorObjective, context: &TelemetryContextSummary
                 + 0.05 * fluidity
         }
         ActuatorObjective::Responsiveness => {
-            0.40 * fluidity
+            0.30 * fluidity
+                + 0.20 * latency_health
                 + 0.15 * stall_health
-                + 0.15 * refault_health
+                + 0.10 * refault_health
                 + 0.10 * ws_headroom
-                + 0.10 * pressure_health
-                + 0.10 * thermal_health
+                + 0.075 * pressure_health
+                + 0.075 * thermal_health
         }
         ActuatorObjective::Efficiency => {
             0.25 * energy_health
@@ -3265,6 +3342,8 @@ fn summarize(observation: &TelemetryObservation<'_>) -> TelemetryContextSummary 
         battery_percent: hardware.and_then(|h| h.battery_percent),
         battery_watts: hardware.and_then(|h| h.battery_watts).map(f64::from),
         fluidity_score: (signal.fluidity_score as f64).clamp(0.0, 1.0),
+        perceptual_latency_score: runtime.perceptual_latency_score.clamp(0.0, 1.0),
+        scheduler_jitter_p95_ms: runtime.scheduler_jitter_p95_ms.max(0.0),
         windowserver_cpu_fraction: (runtime.windowserver_cpu_pct as f64 / 100.0).clamp(0.0, 1.0),
         network_retransmits_per_k: runtime.network_retransmit_ratio.max(0.0),
         network_listen_drop_rate: runtime.network_listen_drop_rate.max(0.0),
@@ -3325,6 +3404,10 @@ fn summarize(observation: &TelemetryObservation<'_>) -> TelemetryContextSummary 
         markov_prewarm_active: runtime.markov_prewarm_active,
         predictive_agent_active: runtime.predictive_agent_active,
         predictive_intervention: format!("{intervention:?}"),
+        kpc_available: runtime.kpc_available,
+        kpc_memory_bound_score: runtime.kpc_memory_bound_score.clamp(0.0, 1.0),
+        amx_available: runtime.amx_available,
+        amx_cs_overhead_ns: runtime.amx_cs_overhead_ns,
     }
 }
 
@@ -3339,7 +3422,10 @@ fn context_quality(summary: &TelemetryContextSummary) -> f64 {
         summary.signal_urgency,
         summary.signal_entropy_anomaly,
         summary.signal_transformer_anomaly,
+        summary.kpc_memory_bound_score,
         summary.fluidity_score,
+        summary.perceptual_latency_score,
+        summary.scheduler_jitter_p95_ms,
         summary.stall_fraction,
         summary.windowserver_cpu_fraction,
         summary.network_retransmits_per_k,
@@ -3349,7 +3435,7 @@ fn context_quality(summary: &TelemetryContextSummary) -> f64 {
     .into_iter()
     .filter(|value| value.is_finite())
     .count();
-    finite as f64 / 15.0
+    finite as f64 / 18.0
 }
 
 #[cfg(test)]
@@ -3530,6 +3616,7 @@ mod tests {
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
+            perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
             context_before: ActuatorEpisodeContext::default(),
             effective: utility > 0.0,
@@ -3874,7 +3961,11 @@ mod tests {
     fn kernel_capabilities_and_apple_silicon_topology_enter_context() {
         let snapshot = snapshot();
         let signal = signal();
-        let runtime = healthy_runtime();
+        let mut runtime = healthy_runtime();
+        runtime.kpc_available = true;
+        runtime.kpc_memory_bound_score = 0.42;
+        runtime.amx_available = true;
+        runtime.amx_cs_overhead_ns = 50;
         let outcomes = ExecuteOutcomes::default();
         let capabilities = CapabilityReport {
             can_taskpolicy: true,
@@ -3917,6 +4008,15 @@ mod tests {
         assert_eq!(context.unavailable_capability_count, 1);
         assert!(context.memorystatus_probe_ok);
         assert!(context.task_for_pid_probe_ok);
+        assert!(context.kpc_available);
+        assert!((context.kpc_memory_bound_score - 0.42).abs() < f64::EPSILON);
+        assert!(context.amx_available);
+        assert_eq!(context.amx_cs_overhead_ns, 50);
+
+        let episode = ActuatorEpisodeContext::from_telemetry(context);
+        assert!(episode.kpc_available);
+        assert!(episode.amx_available);
+        assert_eq!(episode.signal_entropy_anomaly, signal.entropy_anomaly);
     }
 
     #[test]
@@ -4110,6 +4210,31 @@ mod tests {
         assert!(families.contains(&ActuatorFamily::ThreadQos));
         assert!(families.contains(&ActuatorFamily::Sysctl));
         assert!(families.contains(&ActuatorFamily::Unfreeze));
+    }
+
+    #[test]
+    fn learning_identity_is_stable_across_pids_and_helper_names() {
+        let reason = DecisionReason::PressureContext;
+        let first = RootAction::set_memorystatus(11, 10, "test", reason.clone());
+        let second = RootAction::set_memorystatus(99, 10, "test", reason.clone());
+        assert_eq!(
+            actuator_action_key(&first).as_deref(),
+            Some("memorystatus:priority:10")
+        );
+        assert_eq!(actuator_action_key(&first), actuator_action_key(&second));
+
+        let renderer = RootAction::BoostProcess {
+            pid: 42,
+            name: "Brave Browser Helper (Renderer)".to_string(),
+            reason: "test".to_string(),
+            decision_reason: reason,
+            start_sec: 0,
+            start_usec: 0,
+        };
+        let spec = action_spec(&renderer).expect("renderer actuator spec");
+        assert_eq!(spec.action_key, "boost:chromium-renderer");
+        assert_eq!(spec.target, "Brave Browser Helper (Renderer)");
+        assert_eq!(spec.target_pid, Some(42));
     }
 
     #[test]
@@ -4541,6 +4666,7 @@ mod tests {
                 raw_utility_delta: 0.08,
                 counterfactual_delta: 0.0,
                 net_utility_delta: 0.08,
+                perceptual_latency_improvement: 0.0,
                 net_state_delta: WorldStateDelta::default(),
                 context_before: ActuatorEpisodeContext::default(),
                 effective: true,
@@ -4568,6 +4694,7 @@ mod tests {
             raw_utility_delta: 1.0,
             counterfactual_delta: 0.0,
             net_utility_delta: 1.0,
+            perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
             context_before: ActuatorEpisodeContext::default(),
             effective: true,
@@ -4880,5 +5007,20 @@ mod tests {
                 .and_then(|pending| pending.gpu_prediction_generation),
             Some(2)
         );
+    }
+
+    #[test]
+    fn responsiveness_utility_rewards_measured_latency_improvement() {
+        let mut before = TelemetryContextSummary {
+            fluidity_score: 0.80,
+            perceptual_latency_score: 0.70,
+            ..TelemetryContextSummary::default()
+        };
+        let before_utility = utility_score(ActuatorObjective::Responsiveness, &before);
+        before.perceptual_latency_score = 0.10;
+        let after_utility = utility_score(ActuatorObjective::Responsiveness, &before);
+
+        assert!(after_utility > before_utility);
+        assert!((after_utility - before_utility - 0.12).abs() < 1e-9);
     }
 }

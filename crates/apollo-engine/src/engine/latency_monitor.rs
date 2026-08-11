@@ -64,6 +64,17 @@ pub enum LatencyCategory {
     Broken,
 }
 
+impl LatencyCategory {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Responsive => "responsive",
+            Self::Noticeable => "noticeable",
+            Self::Sluggish => "sluggish",
+            Self::Broken => "broken",
+        }
+    }
+}
+
 /// Compute the perceptual latency score from available signals.
 pub fn compute_latency(signals: &LatencySignals) -> LatencyScore {
     if !signals.has_foreground {

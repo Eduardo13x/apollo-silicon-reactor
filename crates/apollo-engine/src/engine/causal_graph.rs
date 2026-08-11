@@ -1554,6 +1554,7 @@ mod tests {
             raw_utility_delta: 0.08,
             counterfactual_delta: 0.01,
             net_utility_delta: 0.07,
+            perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta {
                 pressure: -0.05,
                 fluidity: 0.04,

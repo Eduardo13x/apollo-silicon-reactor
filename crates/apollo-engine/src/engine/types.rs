@@ -514,7 +514,52 @@ pub struct RuntimeMetrics {
     pub privileged_action_rejections_total: u64,
     pub last_error: Option<String>,
     pub last_cycle_at: Option<DateTime<Utc>>,
+    /// p95 wall time of Apollo's own control loop. Kept separate from
+    /// machine/user responsiveness so the dashboard cannot conflate them.
+    #[serde(default)]
+    pub daemon_cycle_p95_ms: f64,
     pub p95_cycle_ms: f64,
+    /// p95 of the bounded cntvct_el0 scheduler-jitter probe. This is a
+    /// process-responsiveness proxy, not a browser or HID latency metric.
+    #[serde(default)]
+    pub scheduler_jitter_p95_ms: f64,
+    #[serde(default)]
+    pub scheduler_jitter_samples: u64,
+    /// Composite local responsiveness signal in [0,1], where lower is better.
+    #[serde(default)]
+    pub perceptual_latency_score: f64,
+    #[serde(default)]
+    pub perceptual_latency_category: String,
+    #[serde(default)]
+    pub perceptual_latency_source: String,
+    /// Reserved for direct local HID/browser bridges. None means unmeasured;
+    /// Apollo must never synthesize these values from daemon timing.
+    #[serde(default)]
+    pub user_interaction_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub browser_lcp_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub browser_inp_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub browser_latency_samples: u64,
+    /// Latest resolved actuator episode, exported as an explanation rather
+    /// than as authority. The evidence tier and quality remain the gate.
+    #[serde(default)]
+    pub last_episode_id: u64,
+    #[serde(default)]
+    pub last_episode_resolved_cycle: u64,
+    #[serde(default)]
+    pub last_episode_action: String,
+    #[serde(default)]
+    pub last_episode_target: String,
+    #[serde(default)]
+    pub last_episode_tier: String,
+    #[serde(default)]
+    pub last_episode_quality: f64,
+    #[serde(default)]
+    pub last_episode_utility: f64,
+    #[serde(default)]
+    pub last_episode_latency_improvement: f64,
     /// Adaptive self-overhead governor. Critical sensing, execution and
     /// learning remain active; only optional refresh/speculation is shed.
     #[serde(default)]

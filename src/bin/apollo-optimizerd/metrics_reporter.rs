@@ -97,6 +97,23 @@ fn publish_world_model_metrics(
     metrics.world_model_actuator_expired_total = context.actuator_expired_total;
     metrics.world_model_actuator_quality = context.actuator_mean_quality;
     metrics.world_model_actuator_mean_utility = context.actuator_mean_utility;
+    if let Some(evidence) = telemetry_medallion.recent_actuator_evidence().back() {
+        if evidence.resolved_cycle > metrics.last_episode_resolved_cycle {
+            metrics.last_episode_id = evidence.id;
+            metrics.last_episode_resolved_cycle = evidence.resolved_cycle;
+            metrics.last_episode_action = evidence.action_key.clone();
+            metrics.last_episode_target = evidence.target.clone();
+            metrics.last_episode_tier = match evidence.tier {
+                apollo_engine::engine::telemetry_medallion::EvidenceTier::Bronze => "bronze",
+                apollo_engine::engine::telemetry_medallion::EvidenceTier::Silver => "silver",
+                apollo_engine::engine::telemetry_medallion::EvidenceTier::Gold => "gold",
+            }
+            .to_string();
+            metrics.last_episode_quality = evidence.quality;
+            metrics.last_episode_utility = evidence.net_utility_delta;
+            metrics.last_episode_latency_improvement = evidence.perceptual_latency_improvement;
+        }
+    }
     metrics.world_model_gpu_bronze_total = context.gpu_prediction_bronze_total;
     metrics.world_model_gpu_silver_total = context.gpu_prediction_silver_total;
     metrics.world_model_gpu_gold_total = context.gpu_prediction_gold_total;
@@ -641,6 +658,7 @@ pub fn merge_cycle_metrics<'a>(
     }
     metrics.metrics.p95_cycle_ms =
         compute_p95(metrics.metrics.cycle_durations_ms.make_contiguous());
+    metrics.metrics.daemon_cycle_p95_ms = metrics.metrics.p95_cycle_ms;
 
     // reactor_weight: write back local accumulated value to MetricsState
     apollo_engine::engine::lse_counters::LSE_COUNTERS.set_reactor_event_weight(reactor_weight);

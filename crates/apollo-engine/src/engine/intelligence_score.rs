@@ -105,6 +105,15 @@ pub struct AisInput {
     /// Mean structural/context quality of Bronze observations [0,1].
     #[serde(default)]
     pub learning_data_quality: f64,
+    /// Universal actuator outcomes with a resolved pre/post attribution.
+    #[serde(default)]
+    pub learning_attributed_observations: u64,
+    #[serde(default)]
+    pub learning_effective_observations: u64,
+    /// Mean counterfactual-adjusted utility in [-1,1]. This remains neutral
+    /// until attributed observations exist.
+    #[serde(default)]
+    pub learning_mean_utility: f64,
 
     // ── Resource efficiency ──────────────────────────────────────────────
     /// p95 cycle time in milliseconds.
@@ -485,6 +494,10 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let actuator_learning_raw = rm_u("world_model_actuator_bronze_total");
     let actuator_learning_gold = rm_u("world_model_actuator_gold_total");
     let actuator_learning_quality = rm_f("world_model_actuator_quality").clamp(0.0, 1.0);
+    let learning_attributed_observations = rm_u("world_model_actuator_bronze_total");
+    let learning_effective_observations =
+        rm_u("world_model_actuator_effective_total").min(learning_attributed_observations);
+    let learning_mean_utility = rm_f("world_model_actuator_mean_utility").clamp(-1.0, 1.0);
     let (learning_raw_observations, learning_gold_observations, learning_data_quality) =
         merge_learning_evidence(
             pressure_learning_raw,
@@ -617,6 +630,9 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         learning_raw_observations,
         learning_gold_observations,
         learning_data_quality,
+        learning_attributed_observations,
+        learning_effective_observations,
+        learning_mean_utility,
 
         p95_cycle_ms,
         target_cycle_ms: 100.0,
@@ -917,7 +933,25 @@ fn learning_velocity(input: &AisInput) -> f64 {
         );
         let observed_quality =
             0.60 * input.learning_data_quality.clamp(0.0, 1.0) + 0.40 * gold_rate;
-        let curation_score = 0.50 * (1.0 - maturity) + observed_quality * maturity;
+        let attributed_quality = if input.learning_attributed_observations > 0 {
+            let attribution_maturity = sample_strength(input.learning_attributed_observations, 20);
+            let effective_rate = safe_ratio(
+                input.learning_effective_observations,
+                input.learning_attributed_observations,
+            );
+            let utility_score =
+                (0.5 + input.learning_mean_utility.clamp(-1.0, 1.0) * 5.0).clamp(0.0, 1.0);
+            let measured = 0.50 * effective_rate + 0.50 * utility_score;
+            0.50 * (1.0 - attribution_maturity) + measured * attribution_maturity
+        } else {
+            0.50
+        };
+        let combined_quality = if input.learning_attributed_observations > 0 {
+            0.70 * observed_quality + 0.30 * attributed_quality
+        } else {
+            observed_quality
+        };
+        let curation_score = 0.50 * (1.0 - maturity) + combined_quality * maturity;
         (0.85 * core_learning + 0.15 * curation_score).clamp(0.0, 1.0)
     } else {
         core_learning
@@ -1663,6 +1697,10 @@ mod tests {
                 rm_u("world_model_actuator_gold_total"),
                 rm_f("world_model_actuator_quality"),
             );
+        let learning_attributed_observations = rm_u("world_model_actuator_bronze_total");
+        let learning_effective_observations =
+            rm_u("world_model_actuator_effective_total").min(learning_attributed_observations);
+        let learning_mean_utility = rm_f("world_model_actuator_mean_utility").clamp(-1.0, 1.0);
 
         // ── Build AisInput ───────────────────────────────────────────────────
         let input = AisInput {
@@ -1711,6 +1749,9 @@ mod tests {
             learning_raw_observations,
             learning_gold_observations,
             learning_data_quality,
+            learning_attributed_observations,
+            learning_effective_observations,
+            learning_mean_utility,
 
             // D4
             p95_cycle_ms,
@@ -1838,6 +1879,9 @@ mod tests {
             learning_raw_observations: 200,
             learning_gold_observations: 198,
             learning_data_quality: 0.99,
+            learning_attributed_observations: 200,
+            learning_effective_observations: 180,
+            learning_mean_utility: 0.04,
             // overflow_count from RL sim available as learning.10
 
             // Resource: LIVE from measured computation time
@@ -2520,6 +2564,44 @@ mod tests {
     }
 
     #[test]
+    fn attributed_utility_moves_learning_without_dominating_it() {
+        let base = AisInput {
+            rl_q_variance: 1.0,
+            rl_convergence_ticks: 250,
+            rl_max_ticks: 500,
+            causal_solid_edges: 4,
+            causal_weak_edges: 1,
+            causal_total_edges: 10,
+            reliable_skills: 3,
+            total_skills: 5,
+            dyna_transitions: 50,
+            learning_raw_observations: 200,
+            learning_gold_observations: 180,
+            learning_data_quality: 0.95,
+            learning_attributed_observations: 200,
+            ..Default::default()
+        };
+        let useful = AisInput {
+            learning_effective_observations: 170,
+            learning_mean_utility: 0.04,
+            ..base.clone()
+        };
+        let harmful = AisInput {
+            learning_effective_observations: 30,
+            learning_mean_utility: -0.04,
+            ..base
+        };
+
+        let useful_score = learning_velocity(&useful);
+        let harmful_score = learning_velocity(&harmful);
+        assert!(useful_score > harmful_score);
+        assert!(
+            useful_score - harmful_score < 0.08,
+            "attributed utility must remain a bounded correction"
+        );
+    }
+
+    #[test]
     fn test_safety_violation_zeroes_dimension() {
         let input = AisInput {
             total_decisions: 100,
@@ -2549,6 +2631,9 @@ mod tests {
             learning_raw_observations: 0,
             learning_gold_observations: 0,
             learning_data_quality: 0.0,
+            learning_attributed_observations: 0,
+            learning_effective_observations: 0,
+            learning_mean_utility: 0.0,
             p95_cycle_ms: 30.0,
             target_cycle_ms: 50.0,
             subsystem_skips: 50,
@@ -2803,6 +2888,9 @@ mod tests {
             learning_raw_observations: 100,
             learning_gold_observations: 99,
             learning_data_quality: 0.99,
+            learning_attributed_observations: 100,
+            learning_effective_observations: 90,
+            learning_mean_utility: 0.04,
 
             // D4: efficient resource use — fast cycles, good budget
             p95_cycle_ms: 60.0,
@@ -3081,6 +3169,9 @@ mod tests {
             learning_raw_observations: 100,
             learning_gold_observations: 20,
             learning_data_quality: 0.40,
+            learning_attributed_observations: 100,
+            learning_effective_observations: 20,
+            learning_mean_utility: -0.04,
 
             // D4: poor efficiency — slow cycles, poor budget
             p95_cycle_ms: 200.0,

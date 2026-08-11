@@ -85,6 +85,8 @@ pub enum ContextField {
     UsedRamFraction,
     ThermalScore,
     FluidityScore,
+    PerceptualLatencyScore,
+    SchedulerJitterP95Ms,
     TopProcessCpu,
     WindowserverCpuFraction,
     SignalPressureSmooth,
@@ -122,7 +124,7 @@ pub enum ContextField {
 }
 
 impl ContextField {
-    pub const ALL: [Self; 45] = [
+    pub const ALL: [Self; 47] = [
         Self::MemoryPressure,
         Self::MemoryPressureRaw,
         Self::CompressorPressure,
@@ -134,6 +136,8 @@ impl ContextField {
         Self::UsedRamFraction,
         Self::ThermalScore,
         Self::FluidityScore,
+        Self::PerceptualLatencyScore,
+        Self::SchedulerJitterP95Ms,
         Self::TopProcessCpu,
         Self::WindowserverCpuFraction,
         Self::SignalPressureSmooth,
@@ -183,6 +187,8 @@ impl ContextField {
             Self::UsedRamFraction => "used_ram_fraction",
             Self::ThermalScore => "thermal_score",
             Self::FluidityScore => "fluidity_score",
+            Self::PerceptualLatencyScore => "perceptual_latency_score",
+            Self::SchedulerJitterP95Ms => "scheduler_jitter_p95_ms",
             Self::TopProcessCpu => "top_process_cpu",
             Self::WindowserverCpuFraction => "windowserver_cpu_fraction",
             Self::SignalPressureSmooth => "signal_pressure_smooth",
@@ -488,6 +494,10 @@ fn validate_required_numbers(
         (ContextField::UsedRamFraction, context.used_ram_fraction),
         (ContextField::ThermalScore, context.thermal_score),
         (ContextField::FluidityScore, context.fluidity_score),
+        (
+            ContextField::PerceptualLatencyScore,
+            context.perceptual_latency_score,
+        ),
         (ContextField::TopProcessCpu, context.top_process_cpu),
         (
             ContextField::WindowserverCpuFraction,
@@ -499,10 +509,6 @@ fn validate_required_numbers(
         ),
         (ContextField::SignalPOom30s, context.signal_p_oom_30s),
         (ContextField::SignalUrgency, context.signal_urgency),
-        (
-            ContextField::SignalEntropyAnomaly,
-            context.signal_entropy_anomaly,
-        ),
         (
             ContextField::SignalTransformerAnomaly,
             context.signal_transformer_anomaly,
@@ -516,6 +522,21 @@ fn validate_required_numbers(
     for (field, value) in fractions {
         finite_range(field, value, 0.0, 1.0, reasons, diagnostics);
     }
+    // Entropy anomaly is a signed z-like novelty signal, not a fraction. Real
+    // contention routinely exceeds 1.0 and is intentionally consumed at >2.0.
+    finite(
+        ContextField::SignalEntropyAnomaly,
+        context.signal_entropy_anomaly,
+        reasons,
+        diagnostics,
+    );
+    finite_min(
+        ContextField::SchedulerJitterP95Ms,
+        context.scheduler_jitter_p95_ms,
+        0.0,
+        reasons,
+        diagnostics,
+    );
     finite_range(
         ContextField::PressureTotalBoost,
         context.pressure_total_boost,
@@ -934,6 +955,28 @@ mod tests {
         assert!(admission
             .violating_fields
             .contains(ContextField::PressureTotalBoost));
+    }
+
+    #[test]
+    fn accepts_entropy_novelty_above_fraction_range() {
+        let mut context = clean_context();
+        context.signal_entropy_anomaly = 5.0;
+
+        let admission = classify_live(&context);
+
+        assert_eq!(admission.tier, ContextTier::Gold);
+        assert!(!admission.reasons.contains(ContextReason::OutOfRange));
+    }
+
+    #[test]
+    fn rejects_invalid_latency_signals() {
+        let mut context = clean_context();
+        context.perceptual_latency_score = 1.01;
+        assert_rejected(context, ContextReason::OutOfRange);
+
+        let mut context = clean_context();
+        context.scheduler_jitter_p95_ms = -0.01;
+        assert_rejected(context, ContextReason::OutOfRange);
     }
 
     #[test]

@@ -1519,6 +1519,11 @@ fn main() -> anyhow::Result<()> {
                 apollo_engine::engine::realtime_signals::ScreenCaptureCache::new();
             // Context-switch burst detector (TDA-aware).
             let mut ctx_switch_times: VecDeque<Instant> = VecDeque::new();
+            // Direct scheduler probe samples are produced every ~10 cycles.
+            // Keep the last real sample for the responsiveness estimator and a
+            // bounded window for an explicitly-labelled scheduler p95.
+            let mut last_schedule_jitter_us: u64 = 0;
+            let mut schedule_jitter_samples_us: VecDeque<u64> = VecDeque::with_capacity(120);
             let mut last_fg_name: Option<String> = None;
             // Cached user context assertion state — assertion signals are collected
             // every N cycles (amortised); between polls, last-known values are carried
@@ -3648,6 +3653,13 @@ fn main() -> anyhow::Result<()> {
                 // If UI responsiveness is degraded, boost reactor_weight to trigger
                 // faster/more aggressive scheduling decisions.
                 let _latency_score_val = {
+                    if jitter_us > 0 {
+                        last_schedule_jitter_us = jitter_us;
+                        schedule_jitter_samples_us.push_back(jitter_us);
+                        if schedule_jitter_samples_us.len() > 120 {
+                            schedule_jitter_samples_us.pop_front();
+                        }
+                    }
                     let fg_cpu = foreground_pid
                         .and_then(|pid| {
                             proc_snaps
@@ -3669,7 +3681,7 @@ fn main() -> anyhow::Result<()> {
                         })
                         .unwrap_or(0.0);
                     let latency = latency_monitor::compute_latency(&LatencySignals {
-                        jitter_us: jitter_us as f64,
+                        jitter_us: last_schedule_jitter_us as f64,
                         windowserver_cpu: local_policy_learning::windowserver_cpu(&snapshot) as f64,
                         foreground_cpu: fg_cpu,
                         foreground_csw_per_sec: fg_csw,
@@ -3678,6 +3690,20 @@ fn main() -> anyhow::Result<()> {
                     if latency.needs_boost {
                         // Elevate reactor weight → faster tick + more aggressive decisions.
                         reactor_weight = (reactor_weight + 0.25).min(1.0);
+                    }
+                    {
+                        let mut metrics = state.metrics.lock_recover();
+                        metrics.metrics.perceptual_latency_score = latency.score;
+                        metrics.metrics.perceptual_latency_category =
+                            latency.category.as_str().to_string();
+                        metrics.metrics.perceptual_latency_source =
+                            "scheduler-windowserver-foreground-proxy".to_string();
+                        metrics.metrics.scheduler_jitter_p95_ms =
+                            apollo_engine::engine::daemon_helpers::compute_p95(
+                                schedule_jitter_samples_us.make_contiguous(),
+                            ) / 1_000.0;
+                        metrics.metrics.scheduler_jitter_samples =
+                            schedule_jitter_samples_us.len() as u64;
                     }
                     latency.score
                 };

@@ -356,6 +356,22 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
 
     lines.push(format!("Throttle {}", status.throttle_level));
     lines.push(format!("WS     {}% CPU", m.windowserver_cpu_pct as i32));
+    lines.push(format!(
+        "UX     {} {:.0}%",
+        if m.perceptual_latency_category.is_empty() {
+            "unmeasured"
+        } else {
+            m.perceptual_latency_category.as_str()
+        },
+        m.perceptual_latency_score * 100.0
+    ));
+    if m.scheduler_jitter_samples > 0 {
+        lines.push(format!(
+            "Sched  p95 {:.2}ms n{}",
+            m.scheduler_jitter_p95_ms,
+            format_number(m.scheduler_jitter_samples)
+        ));
+    }
 
     if let Some(top) = m.wakeup_vampires.first() {
         // wakeup_vampires entries are pre-formatted "name(rate/s)" strings
@@ -1032,6 +1048,29 @@ fn render_act_q(status: &DaemonStatus) -> Vec<String> {
         status.reactor_mode, status.reactor_health
     ));
 
+    if m.last_episode_id > 0 {
+        let family = m
+            .last_episode_action
+            .split_once(':')
+            .map_or(m.last_episode_action.as_str(), |(family, _)| family);
+        lines.push(format!(
+            "Ep#{} {} q{:.0}%",
+            compact_counter(m.last_episode_id),
+            m.last_episode_tier,
+            m.last_episode_quality * 100.0
+        ));
+        lines.push(format!(
+            "Did    {} -> {}",
+            family.chars().take(10).collect::<String>(),
+            m.last_episode_target.chars().take(11).collect::<String>()
+        ));
+        lines.push(format!(
+            "Gain   u{:+.1}% ux{:+.1}%",
+            m.last_episode_utility * 100.0,
+            m.last_episode_latency_improvement * 100.0
+        ));
+    }
+
     lines
 }
 
@@ -1073,13 +1112,26 @@ fn render_gates_band(status: &DaemonStatus) -> Vec<String> {
         surv, purge, post_wake
     ));
     if !m.coreaudio_probe_state.is_empty() && m.coreaudio_probe_state != "direct" {
-        lines.push(dim(&format!(
-            "audio {} · HAL samples {} cache {} fail {}",
-            m.coreaudio_probe_state,
-            m.coreaudio_probe_samples_total,
-            m.coreaudio_probe_cache_hits_total,
-            m.coreaudio_probe_failures_total
-        )));
+        if m.coreaudio_probe_state == "session-fallback" {
+            let guard =
+                if m.user_audio_active || m.user_call_in_progress || m.user_has_sleep_assertion {
+                    "media"
+                } else {
+                    "unknown-safe"
+                };
+            lines.push(dim(&format!(
+                "audio session-fallback · HAL n/a · guard {}",
+                guard
+            )));
+        } else {
+            lines.push(dim(&format!(
+                "audio {} · HAL samples {} cache {} fail {}",
+                m.coreaudio_probe_state,
+                m.coreaudio_probe_samples_total,
+                m.coreaudio_probe_cache_hits_total,
+                m.coreaudio_probe_failures_total
+            )));
+        }
     }
 
     // Maintenance purge counters
@@ -1135,7 +1187,7 @@ fn render_gates_band(status: &DaemonStatus) -> Vec<String> {
     };
 
     lines.push(dim(&format!(
-        "purge stats: {} fired · {} skipped{}",
+        "purge totals: {} fired · {} skipped{}",
         m.maintenance_purge_total, total_skipped, breakdown_str
     )));
 
@@ -1245,7 +1297,7 @@ fn render_header_v2(status: &DaemonStatus) -> Vec<String> {
         status.effective_profile.as_str()
     );
     let mut lines = vec![bold(&format!(
-        "🚀 APOLLO {} │ {} │ c:{} │ p95 {:.0}ms",
+        "🚀 APOLLO {} │ {} │ c:{} │ loop-p95 {:.0}ms",
         state,
         profile,
         format_number(m.cycles),
@@ -1371,6 +1423,59 @@ mod tests {
         let header = render_header_v2(&status);
         assert!(header[0].contains("activo ⚡ aggressive-root"));
         assert!(header.iter().all(|line| display_width(line) <= CW));
+    }
+
+    #[test]
+    fn dashboard_separates_loop_latency_and_attributed_user_gain() {
+        let mut status = dashboard_status();
+        status.metrics.p95_cycle_ms = 37.0;
+        status.metrics.perceptual_latency_score = 0.18;
+        status.metrics.perceptual_latency_category = "responsive".to_string();
+        status.metrics.scheduler_jitter_p95_ms = 0.12;
+        status.metrics.scheduler_jitter_samples = 42;
+        status.metrics.last_episode_id = 7;
+        status.metrics.last_episode_action = "boost:Editor".to_string();
+        status.metrics.last_episode_target = "Editor".to_string();
+        status.metrics.last_episode_tier = "gold".to_string();
+        status.metrics.last_episode_quality = 0.94;
+        status.metrics.last_episode_utility = 0.03;
+        status.metrics.last_episode_latency_improvement = 0.08;
+
+        assert!(render_header_v2(&status)[0].contains("loop-p95 37ms"));
+        let sense = render_sense_q(&status);
+        assert!(sense.iter().any(|line| line == "UX     responsive 18%"));
+        assert!(sense.iter().any(|line| line == "Sched  p95 0.12ms n42"));
+        let act = render_act_q(&status);
+        assert!(act.iter().any(|line| line == "Ep#7 gold q94%"));
+        assert!(act.iter().any(|line| line == "Gain   u+3.0% ux+8.0%"));
+
+        status.metrics.last_episode_id = u64::MAX;
+        status.metrics.last_episode_action = "predictive-prearm:Browser".to_string();
+        status.metrics.last_episode_target = "Chromium Helper Renderer".to_string();
+        assert!(render_act_q(&status)
+            .iter()
+            .all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_explains_root_audio_fallback_and_cumulative_purges() {
+        let mut status = dashboard_status();
+        status.metrics.coreaudio_probe_state = "session-fallback".to_string();
+        status.metrics.user_has_sleep_assertion = true;
+        status.metrics.maintenance_purge_total = 2;
+
+        let gates = render_gates_band(&status);
+        assert!(gates
+            .iter()
+            .any(|line| line.contains("HAL n/a · guard media")));
+        assert!(gates
+            .iter()
+            .any(|line| line.contains("purge totals: 2 fired")));
+
+        status.metrics.user_has_sleep_assertion = false;
+        assert!(render_gates_band(&status)
+            .iter()
+            .any(|line| line.contains("HAL n/a · guard unknown-safe")));
     }
 
     #[test]
