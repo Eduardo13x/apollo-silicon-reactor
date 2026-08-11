@@ -6,21 +6,23 @@
 //! installation. No text prompt, API response, or free-form JSON can enter the
 //! control path.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use crate::engine::installation_identity::InstallationId;
+use crate::engine::learning_hierarchy::{
+    HierarchyConsolidationOutcome, HierarchyContext, HierarchyPath, LearningHierarchy,
+    ResolvedLearningDetails,
+};
 use crate::engine::nars_belief::{ArousalState, DriftDetector, Salience};
 use crate::engine::telemetry_medallion::{
     ActuatorFamily, EvidenceTier, HardwareRegime, ResolvedActuatorEvidence,
 };
 
 const MIN_GOLD_QUALITY: f64 = 0.85;
-const UTILITY_DEADBAND: f64 = 0.005;
 const FAMILY_EMA_ALPHA: f64 = 0.20;
 const MAX_FAMILY_EVIDENCE: u32 = 256;
-const MAX_RECENT_IDS: usize = 128;
 const MAX_BELIEF_KEY_CHARS: usize = 192;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -89,7 +91,7 @@ impl FamilyReflexMemory {
         }
         self.utility_ema = ema(
             self.utility_ema,
-            evidence.net_utility_delta,
+            evidence.utility.apollo_utility,
             alpha,
             -1.0,
             1.0,
@@ -140,7 +142,8 @@ pub struct LocalConsolidator {
     installation_id: InstallationId,
     hardware_regime: HardwareRegime,
     families: BTreeMap<String, FamilyReflexMemory>,
-    recent_evidence_ids: VecDeque<u64>,
+    #[serde(default)]
+    learning_hierarchy: LearningHierarchy,
     pub total_consolidations: u64,
     pub total_improvements: u64,
     pub total_regressions: u64,
@@ -153,6 +156,52 @@ impl LocalConsolidator {
         if !installation_id.is_known() || self.installation_id != installation_id {
             *self = Self::default();
         }
+    }
+
+    /// Bind restored learning to the live machine. A copied checkpoint or a
+    /// hardware change cold-resets all installation-local consolidation.
+    pub fn restore_for_origin(
+        &mut self,
+        installation_id: InstallationId,
+        hardware_regime: HardwareRegime,
+    ) -> bool {
+        if !installation_id.is_known()
+            || !hardware_regime.is_known()
+            || self.installation_id != installation_id
+            || self.hardware_regime != hardware_regime
+        {
+            *self = Self {
+                installation_id,
+                hardware_regime,
+                learning_hierarchy: LearningHierarchy::new(installation_id, hardware_regime),
+                ..Self::default()
+            };
+            return true;
+        }
+        if self
+            .learning_hierarchy
+            .restore_for_origin(installation_id, hardware_regime)
+        {
+            *self = Self {
+                installation_id,
+                hardware_regime,
+                learning_hierarchy: LearningHierarchy::new(installation_id, hardware_regime),
+                ..Self::default()
+            };
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn checkpoint_snapshot(&self, now_unix: i64) -> Self {
+        let mut snapshot = self.clone();
+        snapshot.learning_hierarchy = self.learning_hierarchy.checkpoint_snapshot(now_unix);
+        snapshot
+    }
+
+    pub fn learning_hierarchy(&self) -> &LearningHierarchy {
+        &self.learning_hierarchy
     }
 
     pub fn consolidate(
@@ -172,29 +221,26 @@ impl LocalConsolidator {
         let mut report = LocalConsolidationReport {
             action_key: action_key.clone(),
             family: family.clone(),
-            utility: evidence.net_utility_delta,
+            utility: evidence.utility.apollo_utility,
             quality: evidence.quality,
             ..LocalConsolidationReport::default()
         };
-        if !valid_gold(evidence) {
+        let Some(details) =
+            authoritative_details(evidence, self.installation_id, self.hardware_regime)
+        else {
             return report;
-        }
-        self.bind_to_evidence_source(evidence);
-        if self.recent_evidence_ids.contains(&evidence.id) {
-            report.verdict = LocalConsolidationVerdict::Duplicate;
-            return report;
-        }
-        self.recent_evidence_ids.push_back(evidence.id);
-        while self.recent_evidence_ids.len() > MAX_RECENT_IDS {
-            self.recent_evidence_ids.pop_front();
-        }
+        };
 
-        let verdict = if evidence.effective && evidence.net_utility_delta > UTILITY_DEADBAND {
-            LocalConsolidationVerdict::Improved
-        } else if evidence.net_utility_delta < -UTILITY_DEADBAND {
-            LocalConsolidationVerdict::Worsened
-        } else {
-            LocalConsolidationVerdict::Neutral
+        let hierarchy = self.learning_hierarchy.consolidate(details);
+        let verdict = match hierarchy.outcome {
+            HierarchyConsolidationOutcome::Improved => LocalConsolidationVerdict::Improved,
+            HierarchyConsolidationOutcome::Worsened => LocalConsolidationVerdict::Worsened,
+            HierarchyConsolidationOutcome::Neutral => LocalConsolidationVerdict::Neutral,
+            HierarchyConsolidationOutcome::Duplicate => {
+                report.verdict = LocalConsolidationVerdict::Duplicate;
+                return report;
+            }
+            HierarchyConsolidationOutcome::Rejected => return report,
         };
         report.verdict = verdict;
         report.salience = local_salience(
@@ -221,38 +267,10 @@ impl LocalConsolidator {
         family_memory.observe(evidence, verdict);
         report.family_confidence = family_memory.confidence();
 
-        // Neutral outcomes still calibrate family confidence, but they do not
-        // become negative NARS evidence. Only a measured directional utility
-        // change is compiled into System 1.
-        if matches!(
-            verdict,
-            LocalConsolidationVerdict::Improved | LocalConsolidationVerdict::Worsened
-        ) {
+        if let Some(propositions) = hierarchy.propositions {
             let success = verdict == LocalConsolidationVerdict::Improved;
             let pressure = evidence.context_before.memory_pressure.clamp(0.0, 1.0);
-            let media_state = if evidence.context_before.user_call_in_progress {
-                "call"
-            } else if evidence.context_before.user_audio_active {
-                "audio"
-            } else {
-                "quiet"
-            };
-            let mut keys = vec![
-                format!("actuator:{action_key}"),
-                format!("family:{family}"),
-                format!("media:{media_state}:family:{family}"),
-            ];
-            if !evidence.target.is_empty() {
-                let target: String = evidence
-                    .target
-                    .chars()
-                    .take(MAX_BELIEF_KEY_CHARS / 2)
-                    .collect();
-                keys.push(format!("target:{family}:{target}"));
-            }
-            keys.sort();
-            keys.dedup();
-            for key in keys {
+            for key in propositions {
                 drift_detector.observe_contextual(&key, success, report.salience, pressure);
                 report.system1_updates = report.system1_updates.saturating_add(1);
             }
@@ -297,35 +315,64 @@ impl LocalConsolidator {
     pub fn family_memory(&self, family: ActuatorFamily) -> Option<&FamilyReflexMemory> {
         self.families.get(family.as_str())
     }
-
-    fn bind_to_evidence_source(&mut self, evidence: &ResolvedActuatorEvidence) {
-        if self.installation_id == evidence.installation_id
-            && self.hardware_regime == evidence.hardware_regime
-        {
-            return;
-        }
-        // Consolidated reflexes are installation-local. A copied checkpoint,
-        // hardware change, or installation-id rotation starts clean before the
-        // first new Gold result is compiled into System 1.
-        *self = Self {
-            installation_id: evidence.installation_id,
-            hardware_regime: evidence.hardware_regime,
-            ..Self::default()
-        };
-    }
 }
 
-fn valid_gold(evidence: &ResolvedActuatorEvidence) -> bool {
-    evidence.tier == EvidenceTier::Gold
+fn authoritative_details(
+    evidence: &ResolvedActuatorEvidence,
+    installation_id: InstallationId,
+    hardware_regime: HardwareRegime,
+) -> Option<&ResolvedLearningDetails> {
+    let details = evidence.learning_details.as_ref()?;
+    let expected_utility = evidence
+        .calibration_provenance
+        .predictions
+        .iter()
+        .find(|prediction| prediction.source == evidence.calibration_provenance.proposer)
+        .or_else(|| evidence.calibration_provenance.predictions.first())?
+        .expected_utility;
+    (evidence.tier == EvidenceTier::Gold
+        && evidence.calibration_provenance.local_authority_eligible
+        && match evidence.family {
+            ActuatorFamily::Coordinated => {
+                evidence.calibration_provenance.cohort_size > 0
+                    && evidence.calibration_provenance.separability
+                        == crate::engine::model_calibration::SeparabilityState::CoordinatedComposite
+            }
+            _ => evidence.calibration_provenance.cohort_size == 1,
+        }
         && evidence.quality.is_finite()
         && evidence.quality >= MIN_GOLD_QUALITY
-        && evidence.net_utility_delta.is_finite()
+        && evidence.utility.apollo_utility.is_finite()
         && evidence.context_before.valid
-        && evidence.installation_id.is_known()
-        && evidence.hardware_regime.is_known()
+        && installation_id.is_known()
+        && hardware_regime.is_known()
+        && evidence.installation_id == installation_id
+        && evidence.hardware_regime == hardware_regime
         && !evidence.action_key.is_empty()
         && evidence.action_key.len() <= 320
         && evidence.workload.len() <= 96
+        && details.is_authoritative()
+        && evidence.decision_id == Some(details.decision_id)
+        && details.installation_id == installation_id
+        && details.hardware_regime == hardware_regime
+        && details.resolved_cycle == evidence.resolved_cycle
+        && details.resolved_timestamp_unix == evidence.resolved_timestamp_unix
+        && HierarchyPath::classify(evidence.family, &evidence.action_key)
+            .is_some_and(|path| path == details.hierarchy)
+        && HierarchyContext::classify(&evidence.workload, &evidence.context_before)
+            .is_some_and(|context| context == details.context)
+        && details.alternatives == evidence.calibration_provenance.alternatives
+        && details.predictions == evidence.calibration_provenance.predictions
+        && details.adviser_contributions == evidence.calibration_provenance.adviser_contributions
+        && details.separability == evidence.calibration_provenance.separability
+        && (details.expected_utility - expected_utility).abs() <= f64::EPSILON
+        && (details.actual_utility - evidence.utility.apollo_utility).abs() <= f64::EPSILON
+        && (details.raw_utility_delta - evidence.raw_utility_delta).abs() <= f64::EPSILON
+        && (details.counterfactual_delta - evidence.counterfactual_delta).abs() <= f64::EPSILON
+        && (details.quality - evidence.quality).abs() <= f64::EPSILON
+        && (details.causal_quality - evidence.quality).abs() <= f64::EPSILON
+        && details.confounder_count == evidence.confounder_count)
+        .then_some(details)
 }
 
 fn local_salience(
@@ -334,13 +381,13 @@ fn local_salience(
     dr_zero_self_challenge: f64,
 ) -> Salience {
     let pressure = evidence.context_before.memory_pressure.clamp(0.0, 1.0);
-    let magnitude = (evidence.net_utility_delta.abs() / 0.08).clamp(0.0, 1.0);
+    let magnitude = (evidence.utility.apollo_utility.abs() / 0.08).clamp(0.0, 1.0);
     let epistemic_gate =
         (1.0 - dr_zero_self_challenge * 0.50) * if system1_struggling { 0.80 } else { 1.0 };
     let arousal =
         ((pressure * 0.55 + magnitude * 0.45) * evidence.quality.clamp(0.0, 1.0) * epistemic_gate)
             .clamp(0.0, 1.0) as f32;
-    let valence = (evidence.net_utility_delta / 0.08).clamp(-1.0, 1.0) as f32;
+    let valence = (evidence.utility.apollo_utility / 0.08).clamp(-1.0, 1.0) as f32;
     Salience { arousal, valence }
 }
 
@@ -355,6 +402,16 @@ fn halve_rounded(value: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::decision_ledger::{
+        CandidateAlternative, DecisionId, DecisionLifecycle, PredictionRecord,
+    };
+    use crate::engine::learning_hierarchy::{
+        HierarchyContext, HierarchyPath, ResolvedLearningDetails,
+    };
+    use crate::engine::model_calibration::{
+        CalibrationActionScope, CalibrationKey, CalibrationProvenance, ForecastCalibrationDelta,
+        ProducerId, SeparabilityState, TrustState,
+    };
     use crate::engine::telemetry_medallion::{
         ActuatorEpisodeContext, ActuatorObjective, HardwareRegime, WorldStateDelta,
     };
@@ -365,12 +422,16 @@ mod tests {
         utility: f64,
         effective: bool,
     ) -> ResolvedActuatorEvidence {
-        ResolvedActuatorEvidence {
+        let mut evidence = ResolvedActuatorEvidence {
             id,
-            decision_id: None,
+            decision_id: Some(DecisionId(id)),
             family,
             objective: ActuatorObjective::BalancedUtility,
-            action_key: format!("{}:Editor", family.as_str()),
+            action_key: if family == ActuatorFamily::Coordinated {
+                "coordinated:boost+throttle".to_string()
+            } else {
+                format!("{}:Editor", family.as_str())
+            },
             target: "Editor".to_string(),
             workload: "build".to_string(),
             issued_cycle: 10,
@@ -389,8 +450,36 @@ mod tests {
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
             attribution: Default::default(),
-            calibration_provenance: Default::default(),
-            utility: Default::default(),
+            calibration_provenance: CalibrationProvenance {
+                local_authority_eligible: true,
+                proposer: "world-model".to_string(),
+                alternatives: vec![CandidateAlternative {
+                    action_key: format!("{}:alternative", family.as_str()),
+                    target: "background".to_string(),
+                    expected_utility: 0.01,
+                    uncertainty: 0.2,
+                }],
+                predictions: vec![PredictionRecord {
+                    source: "world-model".to_string(),
+                    expected_utility: 0.02,
+                    uncertainty: 0.2,
+                    horizon_cycles: 10,
+                    positive_probability: None,
+                    binary_target: None,
+                }],
+                cohort_size: 1,
+                separability: if family == ActuatorFamily::Coordinated {
+                    SeparabilityState::CoordinatedComposite
+                } else {
+                    SeparabilityState::Individual
+                },
+                ..CalibrationProvenance::default()
+            },
+            learning_details: None,
+            utility: crate::engine::telemetry_medallion::UtilityDecomposition {
+                apollo_utility: utility,
+                ..Default::default()
+            },
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
             context_before: ActuatorEpisodeContext {
@@ -401,13 +490,66 @@ mod tests {
             effective,
             confounder_count: 0,
             target_present_after: Some(true),
-        }
+        };
+        sync_learning_details(&mut evidence);
+        evidence
+    }
+
+    fn sync_learning_details(evidence: &mut ResolvedActuatorEvidence) {
+        let decision_id = evidence.decision_id.expect("fixture decision id");
+        evidence.learning_details = Some(ResolvedLearningDetails {
+            decision_id,
+            lifecycle: DecisionLifecycle::Applied,
+            hierarchy: HierarchyPath::classify(evidence.family, &evidence.action_key).unwrap(),
+            context: HierarchyContext::classify(&evidence.workload, &evidence.context_before)
+                .unwrap(),
+            alternatives: evidence.calibration_provenance.alternatives.clone(),
+            predictions: evidence.calibration_provenance.predictions.clone(),
+            adviser_contributions: vec![],
+            expected_utility: 0.02,
+            actual_utility: evidence.utility.apollo_utility,
+            raw_utility_delta: evidence.raw_utility_delta,
+            counterfactual_delta: evidence.counterfactual_delta,
+            quality: evidence.quality,
+            causal_quality: evidence.quality,
+            confounder_count: evidence.confounder_count,
+            separability: evidence.calibration_provenance.separability,
+            calibration_deltas: vec![ForecastCalibrationDelta {
+                key: CalibrationKey {
+                    producer: ProducerId::WorldModel,
+                    action: CalibrationActionScope::Family(evidence.family),
+                    ..CalibrationKey::default()
+                },
+                predicted_utility: 0.02,
+                actual_utility: evidence.utility.apollo_utility,
+                signed_error: evidence.utility.apollo_utility - 0.02,
+                normalized_absolute_error: (evidence.utility.apollo_utility - 0.02).abs() / 2.0,
+                uncertainty_covered: true,
+                brier: None,
+                trust_before: TrustState::Immature,
+                trust_after: TrustState::Immature,
+            }],
+            installation_id: evidence.installation_id,
+            hardware_regime: evidence.hardware_regime,
+            resolved_cycle: evidence.resolved_cycle,
+            resolved_timestamp_unix: evidence.resolved_timestamp_unix,
+        });
+    }
+
+    fn configured(nars: &mut DriftDetector) -> LocalConsolidator {
+        let mut consolidator = LocalConsolidator::default();
+        assert!(consolidator.restore_for_origin(
+            InstallationId(7),
+            gold(999, ActuatorFamily::Boost, 0.01, true).hardware_regime
+        ));
+        nars.clear_hierarchy_beliefs();
+        consolidator
     }
 
     #[test]
     fn gold_outcome_compiles_into_system1_and_family_memory() {
-        let mut consolidator = LocalConsolidator::default();
         let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
         let mut arousal = ArousalState::default();
         let report = consolidator.consolidate(
             &gold(1, ActuatorFamily::Boost, 0.06, true),
@@ -419,33 +561,42 @@ mod tests {
 
         assert_eq!(report.verdict, LocalConsolidationVerdict::Improved);
         assert_eq!(report.system1_updates, 4);
-        assert!(nars.belief("actuator:boost:Editor").is_some());
-        assert!(nars.belief("family:boost").is_some());
-        assert!(nars.belief("media:quiet:family:boost").is_some());
+        assert!(nars.belief("goal:responsiveness").is_some());
+        assert!(nars
+            .belief("strategy:responsiveness:protect-foreground")
+            .is_some());
+        assert!(nars
+            .belief("tactic:responsiveness:protect-foreground:boost")
+            .is_some());
+        assert!(nars.belief("actuator:boost:Editor").is_none());
+        assert!(nars.belief("target:boost:Editor").is_none());
         assert_eq!(consolidator.total_consolidations, 1);
         assert_eq!(consolidator.view().families_with_evidence, 1);
     }
 
     #[test]
     fn media_context_is_compiled_into_system1_with_call_priority() {
-        let mut consolidator = LocalConsolidator::default();
         let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
         let mut arousal = ArousalState::default();
         let mut evidence = gold(91, ActuatorFamily::ThreadQos, 0.04, true);
         evidence.context_before.user_audio_active = true;
         evidence.context_before.user_call_in_progress = true;
+        evidence.context_before.foreground_app_hash = 1;
+        sync_learning_details(&mut evidence);
 
         let report = consolidator.consolidate(&evidence, &mut nars, &mut arousal, false, 0.15);
 
         assert_eq!(report.verdict, LocalConsolidationVerdict::Improved);
-        assert!(nars.belief("media:call:family:thread_qos").is_some());
-        assert!(nars.belief("media:audio:family:thread_qos").is_none());
+        assert!(nars
+            .belief("context:responsiveness:protect-foreground:thread_qos:build:moderate:cool:foreground:call")
+            .is_some());
     }
 
     #[test]
     fn duplicate_gold_is_not_replayed() {
-        let mut consolidator = LocalConsolidator::default();
         let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
         let mut arousal = ArousalState::default();
         let evidence = gold(2, ActuatorFamily::MarkovPrewarm, 0.03, true);
         let first = consolidator.consolidate(&evidence, &mut nars, &mut arousal, false, 0.0);
@@ -457,9 +608,38 @@ mod tests {
     }
 
     #[test]
-    fn bronze_or_invalid_context_never_reaches_system1() {
-        let mut consolidator = LocalConsolidator::default();
+    fn checkpoint_roundtrip_retains_aggregate_and_dedup_without_replay_queue() {
         let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
+        let mut arousal = ArousalState::default();
+        let evidence = gold(222, ActuatorFamily::Boost, 0.03, true);
+        assert_eq!(
+            consolidator
+                .consolidate(&evidence, &mut nars, &mut arousal, false, 0.0)
+                .verdict,
+            LocalConsolidationVerdict::Improved
+        );
+
+        let snapshot = consolidator.checkpoint_snapshot(evidence.resolved_timestamp_unix);
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        let mut restored: LocalConsolidator = serde_json::from_slice(&encoded).unwrap();
+        assert!(!restored.restore_for_origin(evidence.installation_id, evidence.hardware_regime));
+        let report = restored.consolidate(
+            &evidence,
+            &mut DriftDetector::new(),
+            &mut ArousalState::default(),
+            false,
+            0.0,
+        );
+        assert_eq!(report.verdict, LocalConsolidationVerdict::Duplicate);
+        assert_eq!(restored.total_consolidations, 1);
+        assert_eq!(restored.learning_hierarchy().prototype_count(), 1);
+    }
+
+    #[test]
+    fn bronze_or_invalid_context_never_reaches_system1() {
+        let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
         let beliefs_before = nars.len();
         let mut arousal = ArousalState::default();
         let mut evidence = gold(3, ActuatorFamily::Throttle, -0.04, false);
@@ -472,9 +652,154 @@ mod tests {
     }
 
     #[test]
-    fn family_scale_is_neutral_until_three_gold_outcomes() {
-        let mut consolidator = LocalConsolidator::default();
+    fn every_authority_predicate_fails_closed_independently() {
+        let base = gold(300, ActuatorFamily::Boost, 0.04, true);
+        let mut cases = Vec::new();
+
+        let mut silver = base.clone();
+        silver.tier = EvidenceTier::Silver;
+        cases.push(silver);
+
+        let mut missing_id = base.clone();
+        missing_id.decision_id = None;
+        cases.push(missing_id);
+
+        let mut missing_detail = base.clone();
+        missing_detail.learning_details = None;
+        cases.push(missing_detail);
+
+        let mut unattributed = base.clone();
+        unattributed.calibration_provenance.local_authority_eligible = false;
+        cases.push(unattributed);
+
+        let mut confounded = base.clone();
+        confounded.calibration_provenance.cohort_size = 2;
+        confounded.calibration_provenance.separability = SeparabilityState::Confounded;
+        sync_learning_details(&mut confounded);
+        cases.push(confounded);
+
+        let mut bad_origin = base.clone();
+        bad_origin.installation_id = InstallationId(8);
+        sync_learning_details(&mut bad_origin);
+        cases.push(bad_origin);
+
+        let mut bad_hardware = base.clone();
+        bad_hardware.hardware_regime.ram_gib = 32;
+        sync_learning_details(&mut bad_hardware);
+        cases.push(bad_hardware);
+
+        let mut bad_context = base.clone();
+        bad_context.context_before.valid = false;
+        cases.push(bad_context);
+
+        let mut no_calibration = base.clone();
+        no_calibration
+            .learning_details
+            .as_mut()
+            .unwrap()
+            .calibration_deltas
+            .clear();
+        cases.push(no_calibration);
+
+        let mut nonfinite = base.clone();
+        nonfinite.learning_details.as_mut().unwrap().causal_quality = f64::NAN;
+        cases.push(nonfinite);
+
+        for lifecycle in [
+            DecisionLifecycle::Proposed,
+            DecisionLifecycle::Rejected,
+            DecisionLifecycle::Vetoed,
+            DecisionLifecycle::Blocked,
+            DecisionLifecycle::Executing,
+            DecisionLifecycle::Failed,
+            DecisionLifecycle::NoOp,
+            DecisionLifecycle::Reverted,
+            DecisionLifecycle::Expired,
+            DecisionLifecycle::Settled,
+        ] {
+            let mut inactive = base.clone();
+            inactive.learning_details.as_mut().unwrap().lifecycle = lifecycle;
+            cases.push(inactive);
+        }
+
+        for evidence in cases {
+            let mut nars = DriftDetector::new();
+            let beliefs_before = nars.len();
+            let mut consolidator = configured(&mut nars);
+            let report = consolidator.consolidate(
+                &evidence,
+                &mut nars,
+                &mut ArousalState::default(),
+                false,
+                0.0,
+            );
+            assert_eq!(report.verdict, LocalConsolidationVerdict::Rejected);
+            assert_eq!(consolidator.total_consolidations, 0);
+            assert_eq!(consolidator.learning_hierarchy().prototype_count(), 0);
+            assert_eq!(nars.len(), beliefs_before);
+        }
+    }
+
+    #[test]
+    fn coordinated_gold_is_one_composite_and_never_member_credit() {
         let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
+        let mut evidence = gold(350, ActuatorFamily::Coordinated, 0.05, true);
+        evidence.calibration_provenance.cohort_size = 3;
+        sync_learning_details(&mut evidence);
+        let report = consolidator.consolidate(
+            &evidence,
+            &mut nars,
+            &mut ArousalState::default(),
+            false,
+            0.0,
+        );
+
+        assert_eq!(report.verdict, LocalConsolidationVerdict::Improved);
+        assert_eq!(report.system1_updates, 4);
+        assert_eq!(consolidator.learning_hierarchy().prototype_count(), 1);
+        assert_eq!(consolidator.view().families_with_evidence, 1);
+        assert!(nars
+            .belief("tactic:stability:recover-state:coordinated")
+            .is_some());
+        assert!(nars
+            .belief("tactic:responsiveness:protect-foreground:boost")
+            .is_none());
+    }
+
+    #[test]
+    fn origin_reset_clears_all_local_memory_and_only_hierarchy_nars() {
+        let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
+        let evidence = gold(360, ActuatorFamily::Boost, 0.05, true);
+        consolidator.consolidate(
+            &evidence,
+            &mut nars,
+            &mut ArousalState::default(),
+            false,
+            0.0,
+        );
+        nars.observe("legacy:descriptive", true);
+        assert!(consolidator.restore_for_origin(
+            InstallationId(7),
+            HardwareRegime {
+                ram_gib: 32,
+                ..evidence.hardware_regime
+            }
+        ));
+        nars.clear_hierarchy_beliefs();
+
+        assert_eq!(consolidator.total_consolidations, 0);
+        assert_eq!(consolidator.learning_hierarchy().prototype_count(), 0);
+        assert!(nars.belief("goal:responsiveness").is_none());
+        assert!(nars.belief("legacy:descriptive").is_some());
+        assert!(nars.belief("apple-owned").is_some());
+    }
+
+    #[test]
+    fn family_scale_is_neutral_until_three_gold_outcomes() {
+        let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
         let mut arousal = ArousalState::default();
         for id in 10..12 {
             consolidator.consolidate(
@@ -508,8 +833,8 @@ mod tests {
 
     #[test]
     fn copied_memory_resets_on_installation_or_hardware_change() {
-        let mut consolidator = LocalConsolidator::default();
         let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
         let mut arousal = ArousalState::default();
         consolidator.consolidate(
             &gold(20, ActuatorFamily::Boost, 0.03, true),
@@ -523,15 +848,45 @@ mod tests {
         let mut foreign = gold(21, ActuatorFamily::Throttle, -0.03, false);
         foreign.installation_id = InstallationId(8);
         foreign.hardware_regime.ram_gib = 24;
+        sync_learning_details(&mut foreign);
         consolidator.consolidate(&foreign, &mut nars, &mut arousal, false, 0.0);
 
         assert_eq!(consolidator.total_consolidations, 1);
-        assert!(consolidator.family_memory(ActuatorFamily::Boost).is_none());
+        assert!(consolidator.family_memory(ActuatorFamily::Boost).is_some());
         assert!(consolidator
             .family_memory(ActuatorFamily::Throttle)
-            .is_some());
+            .is_none());
 
         consolidator.retain_only_installation(InstallationId(7));
-        assert_eq!(consolidator.total_consolidations, 0);
+        assert_eq!(consolidator.total_consolidations, 1);
+    }
+
+    #[test]
+    fn neutral_gold_updates_prototype_without_nars_and_conflicting_identity_is_duplicate() {
+        let mut nars = DriftDetector::new();
+        let mut consolidator = configured(&mut nars);
+        let mut arousal = ArousalState::default();
+        let neutral = gold(70, ActuatorFamily::Boost, 0.0, false);
+        let beliefs_before = nars.len();
+
+        let first = consolidator.consolidate(&neutral, &mut nars, &mut arousal, false, 0.0);
+        let mut conflict = neutral.clone();
+        conflict.action_key = "boost:Other".to_string();
+        sync_learning_details(&mut conflict);
+        let duplicate = consolidator.consolidate(&conflict, &mut nars, &mut arousal, false, 0.0);
+
+        assert_eq!(first.verdict, LocalConsolidationVerdict::Neutral);
+        assert_eq!(first.system1_updates, 0);
+        assert_eq!(nars.len(), beliefs_before);
+        assert_eq!(duplicate.verdict, LocalConsolidationVerdict::Duplicate);
+        assert_eq!(consolidator.learning_hierarchy().prototype_count(), 1);
+        assert_eq!(
+            consolidator
+                .learning_hierarchy()
+                .prototype_for(neutral.learning_details.as_ref().unwrap())
+                .unwrap()
+                .observations,
+            1
+        );
     }
 }

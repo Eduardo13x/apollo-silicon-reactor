@@ -1607,6 +1607,10 @@ mod tests {
             ActuatorDecisionOutcome, CycleDecisionEvents, DecisionLedger,
         };
         use apollo_engine::engine::installation_identity::InstallationId;
+        use apollo_engine::engine::local_consolidation::{
+            LocalConsolidationVerdict, LocalConsolidator,
+        };
+        use apollo_engine::engine::nars_belief::{ArousalState, DriftDetector};
         use apollo_engine::engine::predictive_agent::Intervention;
         use apollo_engine::engine::signal_intelligence::SignalDigest;
         use apollo_engine::engine::telemetry_medallion::{
@@ -1871,6 +1875,50 @@ mod tests {
             medallion.model_calibration_metrics()
         );
         assert_eq!(medallion.model_calibration_metrics().record_count, 2);
+
+        let rich_gold = medallion.drain_new_gold_evidence();
+        assert_eq!(rich_gold.len(), 1);
+        assert!(medallion.drain_new_gold_evidence().is_empty());
+        let rich = &rich_gold[0];
+        let decision_id = rich.decision_id.expect("ledger identity");
+        assert_eq!(
+            rich.learning_details
+                .as_ref()
+                .map(|details| details.decision_id),
+            Some(decision_id)
+        );
+        assert_eq!(
+            medallion
+                .trusted_view()
+                .episodic_evidence
+                .back()
+                .and_then(|episode| episode.decision_id),
+            Some(decision_id)
+        );
+
+        let mut causal_graph = apollo_engine::engine::causal_graph::CausalGraph::default();
+        assert!(causal_graph.observe_actuator_outcome(rich, LOCAL_ID));
+        let mut local = LocalConsolidator::default();
+        assert!(local.restore_for_origin(
+            LOCAL_ID,
+            HardwareRegime {
+                p_core_count: 4,
+                e_core_count: 6,
+                ram_gib: 16,
+            }
+        ));
+        let mut nars = DriftDetector::new();
+        let mut arousal = ArousalState::default();
+        let first = local.consolidate(rich, &mut nars, &mut arousal, false, 0.0);
+        let duplicate = local.consolidate(rich, &mut nars, &mut arousal, false, 0.0);
+        assert!(matches!(
+            first.verdict,
+            LocalConsolidationVerdict::Improved
+                | LocalConsolidationVerdict::Worsened
+                | LocalConsolidationVerdict::Neutral
+        ));
+        assert_eq!(duplicate.verdict, LocalConsolidationVerdict::Duplicate);
+        assert_eq!(local.learning_hierarchy().prototype_count(), 1);
     }
 
     // ── Per-PID dedup unit tests ─────────────────────────────────────────────
@@ -2436,6 +2484,7 @@ mod tests {
                 net_utility_delta: 0.08,
                 attribution: Default::default(),
                 calibration_provenance: Default::default(),
+                learning_details: None,
                 utility: Default::default(),
                 perceptual_latency_improvement: 0.0,
                 net_state_delta: WorldStateDelta::default(),

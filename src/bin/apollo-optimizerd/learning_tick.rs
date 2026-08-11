@@ -959,7 +959,9 @@ pub fn run_learning_tick<'a>(
             Some(nested_learner.clone()),
             maintenance_state,
             LearnedStateSupplement {
-                local_consolidator: Some(local_consolidator.clone()),
+                local_consolidator: Some(
+                    local_consolidator.checkpoint_snapshot(chrono::Utc::now().timestamp()),
+                ),
                 neuro_state: Some(lctx.neuromod.snapshot()),
                 meta_cognition: Some(meta_cognition.clone()),
                 medallion_state: Some(learning_pipeline.medallion_snapshot()),

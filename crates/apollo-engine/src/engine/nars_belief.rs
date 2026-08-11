@@ -74,6 +74,23 @@ const MAX_SALIENT_OBS: u32 = 4;
 /// beliefs (~500-1000 distinct apps/contexts) while bounding the file.
 const MAX_BELIEFS: usize = 3000;
 
+const PROTECTED_SEED_KEYS: [&str; 4] = [
+    "apple-owned",
+    "active-coalition",
+    "companion-of-fg",
+    "infrastructure-owned",
+];
+
+fn is_protected_seed(key: &str) -> bool {
+    PROTECTED_SEED_KEYS.contains(&key)
+}
+
+fn is_hierarchy_proposition(key: &str) -> bool {
+    ["goal:", "strategy:", "tactic:", "context:"]
+        .iter()
+        .any(|prefix| key.starts_with(prefix))
+}
+
 /// LTI decay protection: high-arousal beliefs decay at this slower rate.
 /// Standard decay = 0.95; LTI-protected decay = 0.985 (3× slower fading).
 /// Equivalent to long-term potentiation (LTP) in neuroscience: strong stimuli
@@ -595,17 +612,22 @@ impl DriftDetector {
             self.contextual_beliefs.insert(ctx_key, entry);
         }
 
-        // Cap contextual beliefs at 200 to prevent unbounded growth
-        if self.contextual_beliefs.len() > 200 {
-            // Remove lowest-confidence entries
-            let mut entries: Vec<(String, f32)> = self
+        while self.contextual_beliefs.len() > 200 {
+            let weakest = self
                 .contextual_beliefs
                 .iter()
-                .map(|(k, v)| (k.clone(), v.tv.confidence))
-                .collect();
-            entries.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-            for (key, _) in entries.iter().take(20) {
-                self.contextual_beliefs.remove(key);
+                .min_by(|(a_key, a), (b_key, b)| {
+                    let a_relevance = a.tv.confidence * (1.0 + a.lti);
+                    let b_relevance = b.tv.confidence * (1.0 + b.lti);
+                    a_relevance
+                        .total_cmp(&b_relevance)
+                        .then_with(|| a_key.cmp(b_key))
+                })
+                .map(|(key, _)| key.clone());
+            if let Some(key) = weakest {
+                self.contextual_beliefs.remove(&key);
+            } else {
+                break;
             }
         }
 
@@ -630,6 +652,22 @@ impl DriftDetector {
     /// Number of contextual beliefs tracked.
     pub fn contextual_belief_count(&self) -> usize {
         self.contextual_beliefs.len()
+    }
+
+    /// Remove only canonical learned hierarchy propositions after an origin
+    /// reset. Legacy/imported descriptive beliefs and structural seeds remain.
+    pub fn clear_hierarchy_beliefs(&mut self) {
+        self.beliefs.retain(|key, _| !is_hierarchy_proposition(key));
+        self.contextual_beliefs
+            .retain(|key, _| !is_hierarchy_proposition(key));
+        let effective_threshold =
+            self.adaptive_threshold
+                .recommended_threshold(self.drift_threshold as f64) as f32;
+        self.drifted_count = self
+            .beliefs
+            .values()
+            .filter(|entry| entry.is_drifted(effective_threshold))
+            .count();
     }
 
     /// Current arousal-weighted drift score [0,1].
@@ -803,12 +841,13 @@ impl DriftDetector {
             let weakest = self
                 .beliefs
                 .iter()
-                .min_by(|(_, a), (_, b)| {
+                .filter(|(key, _)| !is_protected_seed(key))
+                .min_by(|(a_key, a), (b_key, b)| {
                     let a_relevance = a.tv.confidence * (1.0 + a.lti);
                     let b_relevance = b.tv.confidence * (1.0 + b.lti);
                     a_relevance
-                        .partial_cmp(&b_relevance)
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .total_cmp(&b_relevance)
+                        .then_with(|| a_key.cmp(b_key))
                 })
                 .map(|(key, _)| key.clone());
             if let Some(key) = weakest {
@@ -1288,6 +1327,9 @@ mod tests {
             "insert path must enforce the cap on its own, got {}",
             d.len()
         );
+        for key in PROTECTED_SEED_KEYS {
+            assert!(d.belief(key).is_some(), "protected seed {key} was evicted");
+        }
     }
 
     #[test]
@@ -2106,6 +2148,51 @@ mod tests {
             "contextual beliefs should be capped at 200, got {}",
             dd.contextual_belief_count()
         );
+    }
+
+    #[test]
+    fn contextual_equal_score_eviction_is_lexical_and_protected_seeds_survive() {
+        let mut detector = DriftDetector::new();
+        for index in (0..=200).rev() {
+            detector.observe_contextual(
+                &format!("equal-{index:03}"),
+                true,
+                Salience::neutral(),
+                0.80,
+            );
+        }
+
+        assert_eq!(detector.contextual_belief_count(), 200);
+        assert!(!detector.contextual_beliefs.contains_key("equal-000@High"));
+        for key in [
+            "apple-owned",
+            "active-coalition",
+            "companion-of-fg",
+            "infrastructure-owned",
+        ] {
+            assert!(detector.belief(key).is_some());
+        }
+    }
+
+    #[test]
+    fn hierarchy_cleanup_preserves_descriptive_and_seed_beliefs() {
+        let mut detector = DriftDetector::new();
+        detector.observe_contextual("goal:responsiveness", true, Salience::neutral(), 0.8);
+        detector.observe_contextual("legacy:descriptive", true, Salience::neutral(), 0.8);
+
+        detector.clear_hierarchy_beliefs();
+
+        assert!(detector.belief("goal:responsiveness").is_none());
+        assert!(!detector
+            .contextual_beliefs
+            .contains_key("goal:responsiveness@High"));
+        assert!(detector.belief("legacy:descriptive").is_some());
+        assert!(detector
+            .contextual_beliefs
+            .contains_key("legacy:descriptive@High"));
+        for key in PROTECTED_SEED_KEYS {
+            assert!(detector.belief(key).is_some());
+        }
     }
 
     // ── NARS Convergence Contract [Wang 2013 §3.3.3] ─────────────────────────

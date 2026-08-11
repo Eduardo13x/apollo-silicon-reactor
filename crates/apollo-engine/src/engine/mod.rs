@@ -75,6 +75,7 @@ pub mod journal;
 pub mod kalman;
 pub mod latency_monitor;
 pub mod learned_state;
+pub mod learning_hierarchy;
 pub mod learning_pipeline;
 pub mod llm_inference_mode;
 pub mod local_consolidation;

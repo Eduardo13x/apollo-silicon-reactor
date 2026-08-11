@@ -957,7 +957,7 @@ impl DecisionLedger {
 }
 
 impl CandidateAlternative {
-    fn bounded(mut self) -> Self {
+    pub(crate) fn bounded(mut self) -> Self {
         self.action_key = bounded_text(&self.action_key, MAX_ACTION_KEY_CHARS);
         self.target = bounded_text(&self.target, MAX_TARGET_CHARS);
         self.expected_utility = finite_unit(self.expected_utility);

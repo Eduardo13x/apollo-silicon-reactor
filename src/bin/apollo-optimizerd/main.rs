@@ -1490,7 +1490,14 @@ fn main() -> anyhow::Result<()> {
             // unchanged causal and actuator maps on the daemon hot path.
             let mut world_model = apollo_engine::engine::world_model::WorldModel::default();
             let mut local_consolidator = restored_local_consolidator.unwrap_or_default();
-            local_consolidator.retain_only_installation(installation_id);
+            let hierarchy_hardware = apollo_engine::engine::telemetry_medallion::HardwareRegime {
+                p_core_count: caps.p_core_count.unwrap_or(0),
+                e_core_count: caps.e_core_count.unwrap_or(0),
+                ram_gib: hw_ram_gb.round().clamp(0.0, u32::MAX as f64) as u32,
+            };
+            if local_consolidator.restore_for_origin(installation_id, hierarchy_hardware) {
+                outcome_tracker.drift_detector.clear_hierarchy_beliefs();
+            }
             world_model.attach_local_consolidation(
                 local_consolidator.view_for_installation(installation_id),
             );
@@ -7241,7 +7248,9 @@ fn main() -> anyhow::Result<()> {
                 Some(nested_learner.clone()),
                 &maintenance_state,
                 apollo_engine::engine::learned_state::LearnedStateSupplement {
-                    local_consolidator: Some(local_consolidator.clone()),
+                    local_consolidator: Some(
+                        local_consolidator.checkpoint_snapshot(Utc::now().timestamp()),
+                    ),
                     unfreeze_decay_tau: Some(unfreeze_decay.tau_snapshot()),
                     neuro_state: Some(neuromod.snapshot()),
                     meta_cognition: Some(cognitive_state.meta_cognition.clone()),

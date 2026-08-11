@@ -26,10 +26,11 @@ use crate::engine::execute_actions::ExecuteOutcomes;
 use crate::engine::gpu_imagination::GpuImaginationResult;
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::iokit_sensors::HardwareSnapshot;
+use crate::engine::learning_hierarchy::{HierarchyContext, HierarchyPath, ResolvedLearningDetails};
 use crate::engine::model_calibration::{
-    CalibrationObservation, CalibrationProvenance, ForegroundContext, ModelCalibrationMetrics,
-    ModelCalibrationPersisted, ModelCalibrationStore, ModelCalibrationSummary, PressureBand,
-    ProcessClass, SeparabilityState, ThermalBand,
+    CalibrationObservation, CalibrationProvenance, CalibrationUpdate, ForegroundContext,
+    ModelCalibrationMetrics, ModelCalibrationPersisted, ModelCalibrationStore,
+    ModelCalibrationSummary, PressureBand, ProcessClass, SeparabilityState, ThermalBand,
 };
 use crate::engine::predictive_agent::Intervention;
 use crate::engine::signal_intelligence::SignalDigest;
@@ -525,6 +526,10 @@ pub struct ResolvedActuatorEvidence {
     /// cannot collapse to the first prediction.
     #[serde(default)]
     pub calibration_provenance: CalibrationProvenance,
+    /// Immutable result of the one authoritative Task 3 admission. It is
+    /// present only on locally authoritative Gold evidence.
+    #[serde(default)]
+    pub learning_details: Option<ResolvedLearningDetails>,
     /// Objective-independent utility used as Apollo's top-level score.
     #[serde(default)]
     pub utility: UtilityDecomposition,
@@ -2442,6 +2447,7 @@ impl TelemetryMedallion {
             net_utility_delta: finite_or_zero(net_delta),
             attribution: pending.attribution,
             calibration_provenance: pending.calibration_provenance,
+            learning_details: None,
             utility,
             perceptual_latency_improvement: finite_or_zero(perceptual_latency_improvement),
             net_state_delta: if net_state_delta.is_finite() {
@@ -2458,7 +2464,7 @@ impl TelemetryMedallion {
         self.admit_resolved(evidence);
     }
 
-    fn admit_resolved(&mut self, evidence: ResolvedActuatorEvidence) {
+    fn admit_resolved(&mut self, mut evidence: ResolvedActuatorEvidence) {
         self.actuator_resolved_total = self.actuator_resolved_total.saturating_add(1);
         self.actuator_quality_sum += evidence.quality;
         self.actuator_utility_sum += evidence.net_utility_delta;
@@ -2480,22 +2486,25 @@ impl TelemetryMedallion {
         } else {
             self.actuator_rejected_total = self.actuator_rejected_total.saturating_add(1);
         }
-        if evidence.tier != EvidenceTier::Bronze
-            && evidence.quality >= 0.85
-            && evidence.context_before.valid
-        {
-            self.admit_episode(evidence.clone());
-        }
         if evidence.tier == EvidenceTier::Gold {
             self.actuator_gold_total = self.actuator_gold_total.saturating_add(1);
             self.update_action_model(&evidence);
             self.update_decision_source_credit(&evidence);
             let observation = calibration_observation(&evidence);
-            self.model_calibration.observe_local_gold(&observation);
+            let calibration = self.model_calibration.observe_local_gold(&observation);
+            if let CalibrationUpdate::Accepted { deltas, .. } = calibration {
+                evidence.learning_details = learning_details_for_evidence(&evidence, deltas);
+            }
             if self.new_gold_evidence.len() >= MAX_RECENT_EVIDENCE {
                 self.new_gold_evidence.pop_front();
             }
             self.new_gold_evidence.push_back(evidence.clone());
+        }
+        if evidence.tier != EvidenceTier::Bronze
+            && evidence.quality >= 0.85
+            && evidence.context_before.valid
+        {
+            self.admit_episode(evidence.clone());
         }
 
         let stats = self.family_stats.entry(evidence.family).or_default();
@@ -2517,6 +2526,7 @@ impl TelemetryMedallion {
         if self.recent_evidence.len() >= MAX_RECENT_EVIDENCE {
             self.recent_evidence.pop_front();
         }
+        evidence.learning_details = None;
         self.recent_evidence.push_back(evidence);
     }
 
@@ -2587,6 +2597,14 @@ impl TelemetryMedallion {
     }
 
     fn admit_episode(&mut self, evidence: ResolvedActuatorEvidence) {
+        if evidence.decision_id.is_some()
+            && self
+                .episodic_evidence
+                .iter()
+                .any(|existing| existing.decision_id == evidence.decision_id)
+        {
+            return;
+        }
         let family_count = self
             .episodic_evidence
             .iter()
@@ -3269,6 +3287,7 @@ impl TelemetryMedallion {
             .into_iter()
             .filter_map(|mut evidence| {
                 evidence.calibration_provenance = evidence.calibration_provenance.bounded();
+                evidence.learning_details = None;
                 (evidence.action_key.len() <= 320
                     && evidence.target.len() <= 256
                     && evidence.workload.len() <= 64
@@ -3285,11 +3304,15 @@ impl TelemetryMedallion {
             .take(MAX_RECENT_EVIDENCE)
             .collect();
         self.episodic_evidence.clear();
+        let installation_id = self.installation_id;
         for evidence in state
             .episodic_evidence
             .into_iter()
             .filter_map(|mut evidence| {
                 evidence.calibration_provenance = evidence.calibration_provenance.bounded();
+                if !valid_learning_details(&evidence, installation_id) {
+                    evidence.learning_details = None;
+                }
                 (evidence.tier != EvidenceTier::Bronze
                     && evidence.action_key.len() <= 320
                     && evidence.target.len() <= 256
@@ -3665,6 +3688,13 @@ fn calibration_provenance_for_episode(
         local_authority_eligible: episode.authority_eligible
             && episode.envelope.lifecycle == DecisionLifecycle::Applied,
         proposer,
+        alternatives: episode
+            .envelope
+            .alternatives
+            .iter()
+            .take(8)
+            .cloned()
+            .collect(),
         predictions,
         adviser_contributions,
         hierarchy: episode.envelope.hierarchy,
@@ -3672,6 +3702,97 @@ fn calibration_provenance_for_episode(
         separability,
     }
     .bounded()
+}
+
+fn learning_details_for_evidence(
+    evidence: &ResolvedActuatorEvidence,
+    calibration_deltas: Vec<crate::engine::model_calibration::ForecastCalibrationDelta>,
+) -> Option<ResolvedLearningDetails> {
+    let decision_id = evidence.decision_id?;
+    let hierarchy = HierarchyPath::classify(evidence.family, &evidence.action_key)?;
+    let context = HierarchyContext::classify(&evidence.workload, &evidence.context_before)?;
+    let expected_utility = evidence
+        .calibration_provenance
+        .predictions
+        .iter()
+        .find(|prediction| prediction.source == evidence.calibration_provenance.proposer)
+        .or_else(|| evidence.calibration_provenance.predictions.first())?
+        .expected_utility;
+    let details = ResolvedLearningDetails {
+        decision_id,
+        lifecycle: DecisionLifecycle::Applied,
+        hierarchy,
+        context,
+        alternatives: evidence.calibration_provenance.alternatives.clone(),
+        predictions: evidence.calibration_provenance.predictions.clone(),
+        adviser_contributions: evidence
+            .calibration_provenance
+            .adviser_contributions
+            .clone(),
+        expected_utility,
+        actual_utility: evidence.utility.apollo_utility,
+        raw_utility_delta: evidence.raw_utility_delta,
+        counterfactual_delta: evidence.counterfactual_delta,
+        quality: evidence.quality,
+        causal_quality: evidence.quality * (1.0 - f64::from(evidence.confounder_count) / 6.0),
+        confounder_count: evidence.confounder_count,
+        separability: evidence.calibration_provenance.separability,
+        calibration_deltas,
+        installation_id: evidence.installation_id,
+        hardware_regime: evidence.hardware_regime,
+        resolved_cycle: evidence.resolved_cycle,
+        resolved_timestamp_unix: evidence.resolved_timestamp_unix,
+    };
+    details.is_authoritative().then_some(details)
+}
+
+fn valid_learning_details(
+    evidence: &ResolvedActuatorEvidence,
+    installation_id: InstallationId,
+) -> bool {
+    let Some(details) = evidence.learning_details.as_ref() else {
+        return true;
+    };
+    let expected_utility = evidence
+        .calibration_provenance
+        .predictions
+        .iter()
+        .find(|prediction| prediction.source == evidence.calibration_provenance.proposer)
+        .or_else(|| evidence.calibration_provenance.predictions.first())
+        .map(|prediction| prediction.expected_utility);
+    details.is_authoritative()
+        && evidence.tier == EvidenceTier::Gold
+        && evidence.decision_id == Some(details.decision_id)
+        && evidence.calibration_provenance.local_authority_eligible
+        && match evidence.family {
+            ActuatorFamily::Coordinated => {
+                evidence.calibration_provenance.cohort_size > 0
+                    && evidence.calibration_provenance.separability
+                        == SeparabilityState::CoordinatedComposite
+            }
+            _ => evidence.calibration_provenance.cohort_size == 1,
+        }
+        && details.installation_id == installation_id
+        && details.installation_id == evidence.installation_id
+        && details.hardware_regime == evidence.hardware_regime
+        && details.resolved_cycle == evidence.resolved_cycle
+        && details.resolved_timestamp_unix == evidence.resolved_timestamp_unix
+        && HierarchyPath::classify(evidence.family, &evidence.action_key)
+            .is_some_and(|path| path == details.hierarchy)
+        && HierarchyContext::classify(&evidence.workload, &evidence.context_before)
+            .is_some_and(|context| context == details.context)
+        && details.alternatives == evidence.calibration_provenance.alternatives
+        && details.predictions == evidence.calibration_provenance.predictions
+        && details.adviser_contributions == evidence.calibration_provenance.adviser_contributions
+        && details.separability == evidence.calibration_provenance.separability
+        && expected_utility
+            .is_some_and(|expected| (details.expected_utility - expected).abs() <= f64::EPSILON)
+        && (details.actual_utility - evidence.utility.apollo_utility).abs() <= f64::EPSILON
+        && (details.raw_utility_delta - evidence.raw_utility_delta).abs() <= f64::EPSILON
+        && (details.counterfactual_delta - evidence.counterfactual_delta).abs() <= f64::EPSILON
+        && (details.quality - evidence.quality).abs() <= f64::EPSILON
+        && (details.causal_quality - evidence.quality).abs() <= f64::EPSILON
+        && details.confounder_count == evidence.confounder_count
 }
 
 fn calibration_observation(evidence: &ResolvedActuatorEvidence) -> CalibrationObservation<'_> {
@@ -4431,8 +4552,8 @@ mod tests {
     use crate::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
     use crate::engine::decision_ledger::{
         ActuatorDecisionEvent, ActuatorDecisionOutcome, AdviserContribution,
-        BinaryPredictionTarget, CycleDecisionEvents, DecisionId, DecisionLedger,
-        HierarchyCoordinates, PredictionRecord,
+        BinaryPredictionTarget, CandidateAlternative, CycleDecisionEvents, DecisionId,
+        DecisionLedger, HierarchyCoordinates, PredictionRecord,
     };
     use crate::engine::lotka_volterra::StabilityRegime;
     use chrono::Utc;
@@ -4679,6 +4800,21 @@ mod tests {
             parent: Some(DecisionId(77)),
             cohort: 0,
         });
+        event.proposal.alternatives = vec![
+            CandidateAlternative {
+                action_key: "predictive_threshold:hold".to_string(),
+                target: "predictive_threshold:hold".to_string(),
+                expected_utility: 0.02,
+                uncertainty: 0.20,
+            },
+            CandidateAlternative {
+                action_key: "predictive_threshold:relax".to_string(),
+                target: "predictive_threshold:relax".to_string(),
+                expected_utility: -0.01,
+                uncertainty: 0.30,
+            },
+        ];
+        let expected_alternatives = event.proposal.alternatives.clone();
         event.proposal.adviser_contributions = vec![
             AdviserContribution {
                 adviser: "gpu-model".to_string(),
@@ -4715,6 +4851,7 @@ mod tests {
             .back()
             .expect("resolved evidence");
         assert_eq!(evidence.calibration_provenance.predictions.len(), 8);
+        assert_eq!(evidence.calibration_provenance.alternatives.len(), 2);
         assert!(evidence.calibration_provenance.local_authority_eligible);
         assert_eq!(evidence.calibration_provenance.proposer, "predictive-agent");
         assert_eq!(
@@ -4739,6 +4876,30 @@ mod tests {
         );
         assert_eq!(medallion.model_calibration_metrics().record_count, 8);
         assert!(medallion.gpu_calibration_models.is_empty());
+        assert!(evidence.learning_details.is_none());
+
+        let gold = medallion.drain_new_gold_evidence();
+        assert_eq!(gold.len(), 1);
+        let rich = gold[0]
+            .learning_details
+            .as_ref()
+            .expect("Gold must be enriched before entering the drain");
+        assert_eq!(rich.decision_id, gold[0].decision_id.unwrap());
+        assert_eq!(rich.alternatives, expected_alternatives);
+        assert_eq!(rich.predictions.len(), 8);
+        assert_eq!(rich.adviser_contributions.len(), 2);
+        assert_eq!(rich.calibration_deltas.len(), 8);
+        assert!(rich.calibration_deltas.iter().all(|delta| {
+            (delta.actual_utility - gold[0].utility.apollo_utility).abs() < f64::EPSILON
+        }));
+        assert_eq!(
+            medallion
+                .episodic_evidence
+                .back()
+                .and_then(|episode| episode.learning_details.as_ref())
+                .map(|details| details.decision_id),
+            Some(rich.decision_id)
+        );
 
         let snapshot = medallion.snapshot();
         let calibration_bytes = serde_json::to_vec(
@@ -4756,10 +4917,29 @@ mod tests {
         assert!(calibration_bytes <= crate::engine::model_calibration::MAX_CALIBRATION_STATE_BYTES);
         assert!(full_growth <= 2 * 1024 * 1024);
 
+        let mut forged_snapshot = snapshot.clone();
+        forged_snapshot.episodic_evidence[0]
+            .learning_details
+            .as_mut()
+            .expect("rich episode")
+            .raw_utility_delta += 0.25;
+        let mut forged_restore = TelemetryMedallion::new(LOCAL_ID);
+        forged_restore.restore(forged_snapshot);
+        assert!(forged_restore
+            .episodic_evidence
+            .back()
+            .and_then(|episode| episode.learning_details.as_ref())
+            .is_none());
+
         let mut restored = TelemetryMedallion::new(LOCAL_ID);
         restored.restore(snapshot);
         assert_eq!(restored.model_calibration_metrics().record_count, 8);
         assert!(restored.drain_new_gold_evidence().is_empty());
+        assert!(restored
+            .episodic_evidence
+            .back()
+            .and_then(|episode| episode.learning_details.as_ref())
+            .is_some());
     }
 
     #[test]
@@ -5203,6 +5383,7 @@ mod tests {
             net_utility_delta: utility,
             attribution: DecisionAttribution::default(),
             calibration_provenance: CalibrationProvenance::default(),
+            learning_details: None,
             utility: UtilityDecomposition::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
@@ -6357,6 +6538,7 @@ mod tests {
                 net_utility_delta: 0.08,
                 attribution: DecisionAttribution::default(),
                 calibration_provenance: CalibrationProvenance::default(),
+                learning_details: None,
                 utility: UtilityDecomposition::default(),
                 perceptual_latency_improvement: 0.0,
                 net_state_delta: WorldStateDelta::default(),
@@ -6389,6 +6571,7 @@ mod tests {
             net_utility_delta: 1.0,
             attribution: DecisionAttribution::default(),
             calibration_provenance: CalibrationProvenance::default(),
+            learning_details: None,
             utility: UtilityDecomposition::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),

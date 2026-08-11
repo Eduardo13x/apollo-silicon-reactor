@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 pub use crate::engine::decision_ledger::BinaryPredictionTarget;
 use crate::engine::decision_ledger::{
-    AdviserContribution, DecisionId, HierarchyCoordinates, PredictionRecord,
+    AdviserContribution, CandidateAlternative, DecisionId, HierarchyCoordinates, PredictionRecord,
 };
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::telemetry_medallion::{ActuatorFamily, EvidenceTier, HardwareRegime};
@@ -264,6 +264,8 @@ pub struct CalibrationProvenance {
     pub local_authority_eligible: bool,
     #[serde(default, deserialize_with = "deserialize_proposer")]
     pub proposer: String,
+    #[serde(default, deserialize_with = "deserialize_alternatives")]
+    pub alternatives: Vec<CandidateAlternative>,
     #[serde(default, deserialize_with = "deserialize_predictions")]
     pub predictions: Vec<PredictionRecord>,
     #[serde(default, deserialize_with = "deserialize_advisers")]
@@ -276,6 +278,13 @@ pub struct CalibrationProvenance {
 impl CalibrationProvenance {
     pub fn bounded(mut self) -> Self {
         self.proposer = bounded_text(self.proposer.trim(), MAX_PRODUCER_CHARS);
+        self.alternatives = self
+            .alternatives
+            .into_iter()
+            .take(8)
+            .map(CandidateAlternative::bounded)
+            .filter(|alternative| !alternative.action_key.is_empty())
+            .collect();
         self.predictions = self
             .predictions
             .into_iter()
@@ -542,6 +551,13 @@ where
     D: Deserializer<'de>,
 {
     deserialize_bounded_vec::<D, PredictionRecord, 8>(deserializer)
+}
+
+fn deserialize_alternatives<'de, D>(deserializer: D) -> Result<Vec<CandidateAlternative>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, CandidateAlternative, 8>(deserializer)
 }
 
 fn deserialize_advisers<'de, D>(deserializer: D) -> Result<Vec<AdviserContribution>, D::Error>
@@ -822,9 +838,42 @@ pub enum IgnoreReason {
     MissingForecast,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct ForecastCalibrationDelta {
+    pub key: CalibrationKey,
+    pub predicted_utility: f64,
+    pub actual_utility: f64,
+    pub signed_error: f64,
+    pub normalized_absolute_error: f64,
+    pub uncertainty_covered: bool,
+    pub brier: Option<f64>,
+    pub trust_before: TrustState,
+    pub trust_after: TrustState,
+}
+
+impl Default for ForecastCalibrationDelta {
+    fn default() -> Self {
+        Self {
+            key: CalibrationKey::default(),
+            predicted_utility: 0.0,
+            actual_utility: 0.0,
+            signed_error: 0.0,
+            normalized_absolute_error: 0.0,
+            uncertainty_covered: false,
+            brier: None,
+            trust_before: TrustState::Immature,
+            trust_after: TrustState::Immature,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum CalibrationUpdate {
-    Accepted { forecasts: u8 },
+    Accepted {
+        forecasts: u8,
+        deltas: Vec<ForecastCalibrationDelta>,
+    },
     Ignored(IgnoreReason),
 }
 
@@ -937,6 +986,7 @@ impl ModelCalibrationStore {
         }
         let mut seen = BTreeSet::new();
         let mut accepted = 0_u8;
+        let mut deltas = Vec::with_capacity(8);
         for prediction in observation.provenance.predictions.iter().take(8) {
             let producer = ProducerId::canonical(&prediction.source);
             if producer == ProducerId::Other {
@@ -1007,6 +1057,10 @@ impl ModelCalibrationStore {
                 producer,
                 action: key.action.clone(),
             };
+            let trust_before = self
+                .models
+                .get(&model_key)
+                .map_or(TrustState::Immature, |model| model.trust);
             let context = context_fingerprint(&key);
             let model = self
                 .models
@@ -1027,6 +1081,38 @@ impl ModelCalibrationStore {
                     .get(&model_key)
                     .map_or(TrustState::Immature, |model| model.trust);
             }
+            let trust_after = self
+                .models
+                .get(&model_key)
+                .map_or(TrustState::Immature, |model| model.trust);
+            let signed_error =
+                (observation.actual_utility - prediction.expected_utility).clamp(-2.0, 2.0);
+            let normalized_absolute_error = (signed_error.abs() / 2.0).clamp(0.0, 1.0);
+            let uncertainty_covered = observation.actual_utility
+                >= prediction.expected_utility - prediction.uncertainty
+                && observation.actual_utility
+                    <= prediction.expected_utility + prediction.uncertainty;
+            let brier = if prediction.binary_target == Some(BinaryPredictionTarget::Effective) {
+                prediction
+                    .positive_probability
+                    .filter(|probability| {
+                        probability.is_finite() && (0.0..=1.0).contains(probability)
+                    })
+                    .map(|probability| (probability - f64::from(observation.effective)).powi(2))
+            } else {
+                None
+            };
+            deltas.push(ForecastCalibrationDelta {
+                key,
+                predicted_utility: prediction.expected_utility,
+                actual_utility: observation.actual_utility,
+                signed_error,
+                normalized_absolute_error,
+                uncertainty_covered,
+                brier,
+                trust_before,
+                trust_after,
+            });
             accepted = accepted.saturating_add(1);
         }
 
@@ -1049,6 +1135,7 @@ impl ModelCalibrationStore {
         self.refresh_record_metrics();
         CalibrationUpdate::Accepted {
             forecasts: accepted,
+            deltas,
         }
     }
 
@@ -1891,7 +1978,7 @@ fn ema(previous: f64, observation: f64, alpha: f64) -> f64 {
     alpha * observation + (1.0 - alpha) * previous
 }
 
-fn canonical_action_class(family: ActuatorFamily, action_key: &str) -> Option<String> {
+pub(crate) fn canonical_action_class(family: ActuatorFamily, action_key: &str) -> Option<String> {
     if action_key.chars().count() > 320 {
         return None;
     }
@@ -2093,10 +2180,10 @@ mod tests {
         };
         let mut store = ModelCalibrationStore::new(LOCAL_ID);
 
-        assert_eq!(
+        assert!(matches!(
             store.observe_local_gold(&observation),
-            CalibrationUpdate::Accepted { forecasts: 1 }
-        );
+            CalibrationUpdate::Accepted { forecasts: 1, .. }
+        ));
 
         let record = store.records().next().expect("one calibration record");
         assert_eq!(store.metrics().record_count, 1);
@@ -2124,10 +2211,10 @@ mod tests {
             let mut store = ModelCalibrationStore::new(LOCAL_ID);
             let observation =
                 cohort_observation(1, ActuatorFamily::Boost, "boost:Editor", &provenance);
-            assert_eq!(
+            assert!(matches!(
                 store.observe_local_gold(&observation),
-                CalibrationUpdate::Accepted { forecasts: 1 }
-            );
+                CalibrationUpdate::Accepted { forecasts: 1, .. }
+            ));
             let record = store.records().next().unwrap();
             assert_eq!(record.brier_ema, None);
             assert_eq!(record.brier_count, 0);
@@ -2138,10 +2225,10 @@ mod tests {
     fn promotion_boundaries_and_exact_error_equality_are_inclusive() {
         let mut store = ModelCalibrationStore::new(LOCAL_ID);
         for id in 1..=50 {
-            assert_eq!(
+            assert!(matches!(
                 observe_sample(&mut store, id, 0.0, 0.0, 0.2, 0.85, id as usize),
-                CalibrationUpdate::Accepted { forecasts: 1 }
-            );
+                CalibrationUpdate::Accepted { forecasts: 1, .. }
+            ));
             let key = first_key(&store);
             let expected = match id {
                 1..=9 => TrustState::Immature,
@@ -2422,7 +2509,10 @@ mod tests {
             provenance: &provenance,
         });
 
-        assert_eq!(update, CalibrationUpdate::Accepted { forecasts: 8 });
+        assert!(matches!(
+            update,
+            CalibrationUpdate::Accepted { forecasts: 8, .. }
+        ));
         assert_eq!(store.metrics().record_count, 8);
     }
 
@@ -2458,28 +2548,28 @@ mod tests {
         );
 
         provenance.separability = SeparabilityState::CoordinatedComposite;
-        assert_eq!(
+        assert!(matches!(
             store.observe_local_gold(&cohort_observation(
                 3,
                 ActuatorFamily::Coordinated,
                 "coordinated:boost+thread_qos",
                 &provenance,
             )),
-            CalibrationUpdate::Accepted { forecasts: 1 }
-        );
+            CalibrationUpdate::Accepted { forecasts: 1, .. }
+        ));
 
         provenance.separability = SeparabilityState::SeparableMember {
             decision_id: DecisionId(4),
         };
-        assert_eq!(
+        assert!(matches!(
             store.observe_local_gold(&cohort_observation(
                 4,
                 ActuatorFamily::Boost,
                 "boost:Editor",
                 &provenance
             )),
-            CalibrationUpdate::Accepted { forecasts: 1 }
-        );
+            CalibrationUpdate::Accepted { forecasts: 1, .. }
+        ));
         assert_eq!(store.metrics().record_count, 2);
     }
 
@@ -2581,10 +2671,10 @@ mod tests {
             observe_sample(&mut restored, 129, 0.0, 0.0, 0.2, 0.95, 0),
             CalibrationUpdate::Ignored(IgnoreReason::Duplicate)
         );
-        assert_eq!(
+        assert!(matches!(
             observe_sample(&mut restored, 1, 0.0, 0.0, 0.2, 0.95, 0),
-            CalibrationUpdate::Accepted { forecasts: 1 }
-        );
+            CalibrationUpdate::Accepted { forecasts: 1, .. }
+        ));
         assert_eq!(
             observe_sample(&mut restored, 1, 0.0, 0.0, 0.2, 0.95, 0),
             CalibrationUpdate::Ignored(IgnoreReason::Duplicate)
@@ -2627,10 +2717,10 @@ mod tests {
             &recovery_provenance,
         );
         recovery.hardware_regime = changed_hardware;
-        assert_eq!(
+        assert!(matches!(
             same.observe_local_gold(&recovery),
-            CalibrationUpdate::Accepted { forecasts: 1 }
-        );
+            CalibrationUpdate::Accepted { forecasts: 1, .. }
+        ));
         assert_eq!(same.model_for(&key).unwrap().trust, TrustState::Degraded);
         assert_eq!(same.model_for(&key).unwrap().authority_gold_count, 1);
 
@@ -2842,5 +2932,32 @@ mod tests {
         assert!(encoded.len() <= MAX_CALIBRATION_STATE_BYTES);
         assert!(serializations <= 3, "serializations={serializations}");
         assert!(family == 0 || exact == MAX_EXACT_CALIBRATION_KEYS);
+    }
+
+    #[test]
+    fn single_admission_returns_exact_delta_and_trust_transition() {
+        let mut store = ModelCalibrationStore::new(LOCAL_ID);
+        for id in 1..10 {
+            let _ = observe_sample(&mut store, id, 0.05, 0.08, 0.10, 0.95, id as usize);
+        }
+
+        let CalibrationUpdate::Accepted { forecasts, deltas } =
+            observe_sample(&mut store, 10, 0.05, 0.08, 0.10, 0.95, 0)
+        else {
+            panic!("tenth local Gold forecast must be accepted");
+        };
+
+        assert_eq!(forecasts, 1);
+        assert_eq!(deltas.len(), 1);
+        let delta = &deltas[0];
+        assert_eq!(delta.key.producer, ProducerId::WorldModel);
+        assert_eq!(delta.key.horizon, CalibrationHorizon::Sec5);
+        assert!((delta.predicted_utility - 0.05).abs() < f64::EPSILON);
+        assert!((delta.actual_utility - 0.08).abs() < f64::EPSILON);
+        assert!((delta.signed_error - 0.03).abs() < 1e-12);
+        assert!((delta.normalized_absolute_error - 0.015).abs() < 1e-12);
+        assert!(delta.uncertainty_covered);
+        assert_eq!(delta.trust_before, TrustState::Immature);
+        assert_eq!(delta.trust_after, TrustState::Candidate);
     }
 }
