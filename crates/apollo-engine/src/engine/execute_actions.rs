@@ -96,23 +96,6 @@ fn killall_by_name(daemon: &str, signal: i32) -> anyhow::Result<()> {
 /// `let _ = spawn()` left the Child to drop without `wait()`, accumulating
 /// zombies across the daemon's lifetime (xnu does NOT auto-reap dropped
 /// Child handles — Drop on `std::process::Child` is a no-op by design).
-fn spotlight_set_indexing(enabled: bool) -> bool {
-    let flag = if enabled { "on" } else { "off" };
-    std::thread::Builder::new()
-        .name("apollo-mdutil".to_string())
-        .spawn(move || {
-            let result = std::process::Command::new("/usr/bin/mdutil")
-                .args(["-a", "-i", flag])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            if let Err(e) = result {
-                eprintln!("[spotlight] mdutil -i {} spawn failed: {}", flag, e);
-            }
-        })
-        .is_ok()
-}
-
 fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
     if sysctl_write_with_timeout(key, value) {
         Ok(())
@@ -425,6 +408,7 @@ pub fn execute_actions(
     // set_tier / set_thread_qos calls ARE the syscall, so each guard
     // wraps exactly 1-2 FFI calls and drops immediately).
     qos_mgr: Option<&std::sync::Arc<std::sync::Mutex<MachQoSManager>>>,
+    async_commands: Option<&crate::engine::daemon_helpers::AsyncCommandQueue>,
     dry_run: bool,
     memory_pressure: f64,
     thrashing_score: f64,
@@ -551,6 +535,7 @@ pub fn execute_actions(
         // remains a successful simulation in the journal, but it must not feed
         // learning or the cross-cycle recently-applied cache.
         let mut action_applied = false;
+        let mut async_submission = None;
 
         let decision_reason = match &action {
             RootAction::BoostProcess {
@@ -1370,14 +1355,21 @@ pub fn execute_actions(
                                 out.paging_hints_applied += 1;
                             } else {
                                 out.push_skip(format!("memorystatus-send-failed:pid={}", *pid));
-                                block_reason = Some(BlockReason::MemorystatusFailed);
+                                anyhow::bail!("memorystatus pressure send failed for pid={pid}");
                             }
                         }
                     }
                 }
                 RootAction::ToggleSpotlight { enabled, .. } => {
                     if !dry_run && caps.can_mdutil {
-                        action_applied = spotlight_set_indexing(*enabled);
+                        let commands = async_commands.ok_or_else(|| {
+                            anyhow::anyhow!("asynchronous command queue unavailable")
+                        })?;
+                        async_submission = Some(
+                            commands
+                                .submit_spotlight(*enabled, "actuation-broker")
+                                .map_err(|error| anyhow::anyhow!(error.to_string()))?,
+                        );
                     }
                 }
                 RootAction::QuarantineDaemon { daemon, active, .. } => {
@@ -1401,7 +1393,8 @@ pub fn execute_actions(
                         } else {
                             libc::SIGCONT
                         };
-                        action_applied = killall_by_name(daemon, signal).is_ok();
+                        killall_by_name(daemon, signal)?;
+                        action_applied = true;
                     }
                 }
                 RootAction::SetThreadQoS {
@@ -1537,6 +1530,9 @@ pub fn execute_actions(
                                     // runtime_metrics.json.
                                     crate::engine::lse_counters::LSE_COUNTERS
                                         .inc_effect_decay_phantom_enroll_skipped();
+                                    anyhow::bail!(
+                                        "thread QoS syscall failed for pid={pid},thread={thread_index}"
+                                    );
                                 }
                                 // affinity_tag fallback handled inside
                                 // ThreadPolicyEffector::apply_raw — caller no
@@ -1578,11 +1574,15 @@ pub fn execute_actions(
             .or_else(|| out.last_skip.clone())
             .or_else(|| block_reason.map(|reason| format!("{reason:?}")))
             .unwrap_or_else(|| reason.clone());
-        out.decision_events.push(decision_event_for_root_action(
-            &action,
-            decision_outcome,
-            decision_detail,
-        ));
+        if let Some(submission) = async_submission {
+            out.decision_events.push(submission.pending_event(0));
+        } else {
+            out.decision_events.push(decision_event_for_root_action(
+                &action,
+                decision_outcome,
+                decision_detail,
+            ));
+        }
 
         out.audit_traces.push(PolicyDecisionTrace {
             t: Utc::now(),
@@ -1785,6 +1785,7 @@ mod tests {
             learned_protected,
             learned_interactive,
             None,
+            None,
             false,
             0.0,
             0.0,
@@ -1870,6 +1871,144 @@ mod tests {
     }
 
     #[test]
+    fn memorystatus_syscall_failure_is_an_exact_failed_receipt() {
+        let mut caps = make_caps();
+        caps.can_memory_pressure_send = true;
+        let journal = std::env::temp_dir().join("apollo-test-memorystatus-failure.jsonl");
+        let mut frozen = HashSet::new();
+
+        let outcomes = execute_actions(
+            vec![RootAction::SetMemorystatus {
+                pid: GHOST_PID,
+                priority: -1,
+                reason: "force missing-pid write".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+            }],
+            &caps,
+            &journal,
+            &mut frozen,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            0.8,
+            0.0,
+            None,
+            0.0,
+        );
+
+        assert_eq!(outcomes.failures, 1);
+        assert_eq!(
+            outcomes.decision_events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn quarantine_effector_failure_is_an_exact_failed_receipt() {
+        let outcomes = run(
+            vec![RootAction::QuarantineDaemon {
+                daemon: "apollo-daemon-that-does-not-exist".to_string(),
+                active: true,
+                reason: "force missing daemon".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+            }],
+            &[],
+            &[],
+        );
+
+        assert_eq!(outcomes.failures, 1);
+        assert_eq!(
+            outcomes.decision_events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn thread_qos_syscall_failure_is_an_exact_failed_receipt() {
+        let pid = std::process::id();
+        let identity = ProcessIdentity::from_pid(pid).expect("current process identity");
+        let name = process_identity::proc_name_for_pid(pid).expect("current process name");
+        let qos = std::sync::Arc::new(std::sync::Mutex::new(MachQoSManager::new()));
+        let mut caps = make_caps();
+        caps.can_taskpolicy = true;
+        let journal = std::env::temp_dir().join("apollo-test-thread-qos-failure.jsonl");
+        let mut frozen = HashSet::new();
+
+        let outcomes = execute_actions(
+            vec![RootAction::SetThreadQoS {
+                pid,
+                name,
+                thread_index: u32::MAX,
+                tier: "interactive".to_string(),
+                affinity_tag: None,
+                reason: "force invalid thread index".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+                start_sec: identity.start_sec,
+                start_usec: identity.start_usec,
+            }],
+            &caps,
+            &journal,
+            &mut frozen,
+            &[],
+            &[],
+            Some(&qos),
+            None,
+            false,
+            0.0,
+            0.0,
+            None,
+            0.0,
+        );
+
+        assert_eq!(outcomes.failures, 1);
+        assert_eq!(
+            outcomes.decision_events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn spotlight_queueing_is_pending_and_never_locally_applied() {
+        let commands = crate::engine::daemon_helpers::AsyncCommandQueue::new();
+        let mut caps = make_caps();
+        caps.can_mdutil = true;
+        let journal = std::env::temp_dir().join("apollo-test-spotlight-pending.jsonl");
+        let mut frozen = HashSet::new();
+
+        let outcomes = execute_actions(
+            vec![RootAction::ToggleSpotlight {
+                enabled: false,
+                reason: "test asynchronous completion".to_string(),
+                decision_reason: DecisionReason::PressureContext,
+            }],
+            &caps,
+            &journal,
+            &mut frozen,
+            &[],
+            &[],
+            None,
+            Some(&commands),
+            false,
+            0.0,
+            0.0,
+            None,
+            0.0,
+        );
+
+        assert_eq!(outcomes.decision_events.as_slice().len(), 1);
+        assert_eq!(
+            outcomes.decision_events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Pending
+        );
+        assert!(outcomes.decision_events.as_slice()[0]
+            .correlation_id
+            .is_some());
+        assert_eq!(outcomes.failures, 0);
+    }
+
+    #[test]
     fn boost_without_mutation_stays_auditable_without_journal_flood() {
         let journal = std::env::temp_dir().join("apollo-test-boost-no-mutation.jsonl");
         let _ = std::fs::remove_file(&journal);
@@ -1890,6 +2029,7 @@ mod tests {
             &mut frozen,
             &[],
             &[],
+            None,
             None,
             false,
             0.0,
@@ -1947,6 +2087,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             false,
             0.0,
             0.0,
@@ -1989,6 +2130,7 @@ mod tests {
             &mut frozen,
             &[],
             &[],
+            None,
             None,
             false,
             0.0,
@@ -2050,6 +2192,7 @@ mod tests {
             &mut frozen,
             &[],
             &[],
+            None,
             None,
             true, // dry_run → ghost PID succeeds without a real process
             0.0,

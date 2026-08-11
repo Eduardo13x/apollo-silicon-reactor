@@ -14,8 +14,13 @@ use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::background_collectors::PressureCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{
+    unfreeze_outcome_events, unfreeze_pids_verified_outcome, write_frozen_state,
+};
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::display_turbo::{DisplayTurbo, TurboAction};
 use apollo_engine::engine::foreground::ForegroundDetector;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -43,6 +48,29 @@ use chrono::Utc;
 /// - `stability_oracle` — Records display jank events for RL reward signal.
 /// - `is_on_battery` — If true, use shorter dwell (2s) for faster turbo activation.
 #[allow(clippy::too_many_arguments)]
+#[derive(Debug, Default)]
+pub struct TurboTickOutput {
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn turbo_freeze_event(
+    pid: u32,
+    name: &str,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: &str,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        "freeze:display_turbo",
+        format!("{name}:pid:{pid}"),
+        cycle,
+        outcome,
+        "display-turbo",
+        detail,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn run_turbo_tick(
     display_turbo: &mut DisplayTurbo,
     state: &SharedState,
@@ -52,7 +80,9 @@ pub fn run_turbo_tick(
     frozen_state_path: &Path,
     stability_oracle: &mut StabilityOracle,
     is_on_battery: bool,
-) {
+    cycle: u64,
+) -> TurboTickOutput {
+    let mut output = TurboTickOutput::default();
     // Battery-aware dwell: on battery shorten to 2s so turbo activates faster
     // → more aggressive power savings when user steps away.
     display_turbo.set_dwell_secs(if is_on_battery { 2 } else { 5 });
@@ -82,9 +112,23 @@ pub fn run_turbo_tick(
                     || name == "apollo-optimizerd"
                     || frozen_guard.contains_key(&pid_u32)
                 {
+                    output.decision_events.push(turbo_freeze_event(
+                        pid_u32,
+                        &name,
+                        cycle,
+                        ActuatorDecisionOutcome::Blocked,
+                        "foreground or protected process",
+                    ));
                     continue;
                 }
                 if turbo_frozen as usize >= max_freeze {
+                    output.decision_events.push(turbo_freeze_event(
+                        pid_u32,
+                        &name,
+                        cycle,
+                        ActuatorDecisionOutcome::Blocked,
+                        "display turbo freeze cap",
+                    ));
                     break;
                 }
                 if unsafe { libc::kill(pid_u32 as i32, libc::SIGSTOP) } == 0 {
@@ -104,6 +148,21 @@ pub fn run_turbo_tick(
                         },
                     );
                     turbo_frozen += 1;
+                    output.decision_events.push(turbo_freeze_event(
+                        pid_u32,
+                        &name,
+                        cycle,
+                        ActuatorDecisionOutcome::Applied,
+                        "SIGSTOP applied",
+                    ));
+                } else {
+                    output.decision_events.push(turbo_freeze_event(
+                        pid_u32,
+                        &name,
+                        cycle,
+                        ActuatorDecisionOutcome::Failed,
+                        "SIGSTOP failed",
+                    ));
                 }
             }
             write_frozen_state(frozen_state_path, &frozen_guard);
@@ -125,6 +184,14 @@ pub fn run_turbo_tick(
                 .filter_map(|&pid| frozen_guard.get(&pid).map(|e| (pid, e.clone())))
                 .collect();
             let outcome = unfreeze_pids_verified_outcome(&entries_to_unfreeze);
+            output
+                .decision_events
+                .extend_buffer(&unfreeze_outcome_events(
+                    "unfreeze:display_turbo",
+                    "display-turbo-recovery",
+                    cycle,
+                    &outcome,
+                ));
             for pid in outcome.forgettable_pids() {
                 frozen_guard.remove(&pid);
             }
@@ -152,5 +219,27 @@ pub fn run_turbo_tick(
         TurboAction::None => {
             stability_oracle.record_display_jank(false);
         }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
+
+    #[test]
+    fn turbo_freeze_receipt_keeps_exact_pid_and_application() {
+        let event = turbo_freeze_event(
+            77,
+            "idle-worker",
+            12,
+            ActuatorDecisionOutcome::Applied,
+            "SIGSTOP applied",
+        );
+
+        assert_eq!(event.proposal.action_key, "freeze:display_turbo");
+        assert_eq!(event.proposal.target, "idle-worker:pid:77");
+        assert_eq!(event.outcome, ActuatorDecisionOutcome::Applied);
     }
 }

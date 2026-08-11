@@ -46,6 +46,9 @@ use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 // spotlight_set_indexing import removed 2026-05-08: Apollo no longer
 // touches mdutil automatically (user-reported Finder beachball regression).
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::llm_inference_mode::{LlmInferenceDetector, LlmProcess};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
@@ -63,6 +66,7 @@ pub struct LlmInferenceOutcome {
     pub llm_boost: f64,
     /// True when the detector currently classifies an LLM workload as active.
     pub llm_active: bool,
+    pub decision_events: CycleDecisionEvents,
 }
 
 const LLM_PCORE_OWNER: &str = "llm inference: UserInitiated P-core preference";
@@ -79,7 +83,43 @@ fn llm_pcore_preference_allowed(
 /// Prefer P-cores for the current inference feeder without pinning threads or
 /// fighting macOS scheduling. The lease is refreshed only while the exact PID
 /// identity is observed; it restores to Normal automatically after five seconds.
-fn apply_llm_pcore_preference(state: &SharedState, process: &LlmProcess) {
+fn llm_policy_event(
+    pid: u32,
+    name: &str,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        "thread_qos:llm_inference",
+        format!("{name}:pid:{pid}"),
+        cycle,
+        outcome,
+        "llm-feature-gate",
+        detail,
+    )
+}
+
+fn llm_policy_error_outcome(
+    error: &apollo_engine::engine::mediator::BlockReason,
+) -> ActuatorDecisionOutcome {
+    use apollo_engine::engine::mediator::BlockReason;
+    match error {
+        BlockReason::NoOpDetected => ActuatorDecisionOutcome::NoOp,
+        BlockReason::OsError { .. } => ActuatorDecisionOutcome::Failed,
+        BlockReason::IdentityMismatch { .. }
+        | BlockReason::PreconditionViolated { .. }
+        | BlockReason::ProcessProtected { .. }
+        | BlockReason::BudgetExhausted { .. }
+        | BlockReason::GateRejected { .. } => ActuatorDecisionOutcome::Blocked,
+    }
+}
+
+fn apply_llm_pcore_preference(
+    state: &SharedState,
+    process: &LlmProcess,
+    cycle: u64,
+) -> ActuatorDecisionEvent {
     use apollo_engine::engine::effect_ledger::{
         record_global, refresh_global_if_justification, AppliedEffect,
     };
@@ -89,17 +129,35 @@ fn apply_llm_pcore_preference(state: &SharedState, process: &LlmProcess) {
     use apollo_engine::engine::process_identity::ProcessIdentity;
 
     let Some(identity) = ProcessIdentity::from_pid(process.pid) else {
-        return;
+        return llm_policy_event(
+            process.pid,
+            &process.name,
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            "process identity unavailable",
+        );
     };
     if !identity.matches(Some(&process.name), identity.start_sec, identity.start_usec) {
-        return;
+        return llm_policy_event(
+            process.pid,
+            &process.name,
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            "stale process identity",
+        );
     }
 
     let key = AppliedEffect::MachTier { pid: process.pid };
     let current_tier = state.mach_qos.lock_recover().current_tier(process.pid);
     if current_tier == Some(SchedulingTier::Foreground) {
         refresh_global_if_justification(&key, LLM_PCORE_TTL, identity.start_sec, LLM_PCORE_OWNER);
-        return;
+        return llm_policy_event(
+            process.pid,
+            &process.name,
+            cycle,
+            ActuatorDecisionOutcome::NoOp,
+            "existing Foreground tier lease refreshed",
+        );
     }
 
     let effect = Effect::SetMachPolicy {
@@ -121,14 +179,36 @@ fn apply_llm_pcore_preference(state: &SharedState, process: &LlmProcess) {
                 cpu_pct = process.cpu_usage,
                 "llm-mode: reversible UserInitiated preference applied"
             );
+            llm_policy_event(
+                process.pid,
+                &process.name,
+                cycle,
+                ActuatorDecisionOutcome::Applied,
+                "UserInitiated policy applied",
+            )
         }
-        Ok(_) => {}
-        Err(error) => tracing::debug!(
-            pid = process.pid,
-            process = process.name.as_str(),
-            ?error,
-            "llm-mode: P-core preference skipped"
+        Ok(_) => llm_policy_event(
+            process.pid,
+            &process.name,
+            cycle,
+            ActuatorDecisionOutcome::NoOp,
+            "UserInitiated policy already satisfied",
         ),
+        Err(error) => {
+            tracing::debug!(
+                pid = process.pid,
+                process = process.name.as_str(),
+                ?error,
+                "llm-mode: P-core preference skipped"
+            );
+            llm_policy_event(
+                process.pid,
+                &process.name,
+                cycle,
+                llm_policy_error_outcome(&error),
+                format!("Mach policy failed: {error:?}"),
+            )
+        }
     }
 }
 
@@ -149,6 +229,7 @@ pub fn run_llm_inference_mode_tick(
     is_root: bool,
     foreground_pid: Option<u32>,
     thermal_action: &ThermalAction,
+    cycle: u64,
 ) -> LlmInferenceOutcome {
     let llm_boost = {
         let proc_iter = snapshot
@@ -159,11 +240,23 @@ pub fn run_llm_inference_mode_tick(
         llm_detector.pressure_boost()
     };
     let llm_active = llm_detector.is_active();
-    if let Some(process) = llm_detector
-        .observed_primary()
-        .filter(|process| llm_pcore_preference_allowed(process.pid, foreground_pid, thermal_action))
-    {
-        apply_llm_pcore_preference(state, process);
+    let mut decision_events = CycleDecisionEvents::default();
+    if let Some(process) = llm_detector.observed_primary() {
+        if llm_pcore_preference_allowed(process.pid, foreground_pid, thermal_action) {
+            decision_events.push(apply_llm_pcore_preference(state, process, cycle));
+        } else {
+            decision_events.push(llm_policy_event(
+                process.pid,
+                &process.name,
+                cycle,
+                ActuatorDecisionOutcome::Blocked,
+                if Some(process.pid) == foreground_pid {
+                    "foreground feeder inherits interactive scheduling"
+                } else {
+                    "thermal crisis blocks P-core preference"
+                },
+            ));
+        }
     }
 
     // Spotlight toggle disabled (2026-05-08): user reported Finder beachball
@@ -177,6 +270,7 @@ pub fn run_llm_inference_mode_tick(
     LlmInferenceOutcome {
         llm_boost,
         llm_active,
+        decision_events,
     }
 }
 
@@ -414,6 +508,7 @@ pub fn apply_app_nap_scheduling(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
 
     fn thermal(phase: CoolingPhase) -> ThermalAction {
         ThermalAction {
@@ -442,5 +537,44 @@ mod tests {
             None,
             &thermal(CoolingPhase::Phase2Moderate)
         ));
+    }
+
+    #[test]
+    fn llm_mach_policy_receipt_keeps_exact_feeder_identity() {
+        let event = llm_policy_event(
+            91,
+            "ollama",
+            14,
+            ActuatorDecisionOutcome::Applied,
+            "UserInitiated applied",
+        );
+
+        assert_eq!(event.proposal.action_key, "thread_qos:llm_inference");
+        assert_eq!(event.proposal.target, "ollama:pid:91");
+        assert_eq!(event.outcome, ActuatorDecisionOutcome::Applied);
+    }
+
+    #[test]
+    fn llm_mach_policy_distinguishes_gate_blocks_from_syscall_failures() {
+        use apollo_engine::engine::mediator::BlockReason;
+
+        assert_eq!(
+            llm_policy_error_outcome(&BlockReason::IdentityMismatch {
+                pid: 42,
+                expected_start_sec: 7,
+            }),
+            ActuatorDecisionOutcome::Blocked
+        );
+        assert_eq!(
+            llm_policy_error_outcome(&BlockReason::OsError {
+                errno: libc::EPERM,
+                context: "task_policy_set".to_string(),
+            }),
+            ActuatorDecisionOutcome::Failed
+        );
+        assert_eq!(
+            llm_policy_error_outcome(&BlockReason::NoOpDetected),
+            ActuatorDecisionOutcome::NoOp
+        );
     }
 }

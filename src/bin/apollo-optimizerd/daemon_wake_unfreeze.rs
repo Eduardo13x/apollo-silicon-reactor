@@ -50,6 +50,39 @@ fn wake_recovery_event(
     )
 }
 
+fn wake_qos_restore_event(
+    pid: u32,
+    cycle: u64,
+    success: bool,
+    mutated: bool,
+    error: Option<&str>,
+) -> ActuatorDecisionEvent {
+    let (outcome, detail) = if mutated {
+        (
+            ActuatorDecisionOutcome::Reverted,
+            "wake recovery restored normal Mach tier".to_string(),
+        )
+    } else if success {
+        (
+            ActuatorDecisionOutcome::NoOp,
+            "wake recovery Mach tier already normal".to_string(),
+        )
+    } else {
+        (
+            ActuatorDecisionOutcome::Failed,
+            error.unwrap_or("Mach tier restore failed").to_string(),
+        )
+    };
+    ActuatorDecisionEvent::local(
+        "thread_qos:wake_recovery",
+        format!("pid:{pid}"),
+        cycle,
+        outcome,
+        "wake-recovery",
+        detail,
+    )
+}
+
 pub fn recovery_unfreeze_events(
     outcome: &UnfreezeOutcome,
     cycle: u64,
@@ -171,6 +204,14 @@ pub fn run_wake_unfreeze(
             ActuatorDecisionOutcome::Blocked,
             "stale process identity",
         ));
+        output.decision_events.push(ActuatorDecisionEvent::local(
+            "thread_qos:wake_recovery",
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            "wake-recovery",
+            "Mach tier restore skipped for stale process identity",
+        ));
     }
     for pid in &outcome.failed_pids {
         output.decision_events.push(wake_recovery_event(
@@ -178,6 +219,14 @@ pub fn run_wake_unfreeze(
             cycle,
             ActuatorDecisionOutcome::Failed,
             "SIGCONT failed and was requeued",
+        ));
+        output.decision_events.push(ActuatorDecisionEvent::local(
+            "thread_qos:wake_recovery",
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            "wake-recovery",
+            "Mach tier restore skipped because SIGCONT failed",
         ));
     }
     if applied > 0 {
@@ -203,7 +252,14 @@ pub fn run_wake_unfreeze(
     {
         let mut qos = state.mach_qos.lock_recover();
         for pid in &outcome.applied_pids {
-            let _ = qos.set_tier(*pid, SchedulingTier::Normal);
+            let qos_outcome = qos.set_tier(*pid, SchedulingTier::Normal);
+            output.decision_events.push(wake_qos_restore_event(
+                *pid,
+                cycle,
+                qos_outcome.success,
+                qos_outcome.mutated,
+                qos_outcome.error.as_deref(),
+            ));
         }
     }
 
@@ -224,6 +280,19 @@ mod tests {
         assert_eq!(event.proposal.action_key, "unfreeze:wake_recovery");
         assert_eq!(event.proposal.target, "pid:42");
         assert_eq!(event.outcome, ActuatorDecisionOutcome::Reverted);
+    }
+
+    #[test]
+    fn wake_qos_restore_has_an_independent_exact_disposition() {
+        let reverted = wake_qos_restore_event(42, 8, true, true, None);
+        let noop = wake_qos_restore_event(43, 8, true, false, None);
+        let failed = wake_qos_restore_event(44, 8, false, false, Some("mach denied"));
+
+        assert_eq!(reverted.proposal.action_key, "thread_qos:wake_recovery");
+        assert_eq!(reverted.outcome, ActuatorDecisionOutcome::Reverted);
+        assert_eq!(noop.outcome, ActuatorDecisionOutcome::NoOp);
+        assert_eq!(failed.outcome, ActuatorDecisionOutcome::Failed);
+        assert_eq!(failed.proposal.target, "pid:44");
     }
 
     #[test]

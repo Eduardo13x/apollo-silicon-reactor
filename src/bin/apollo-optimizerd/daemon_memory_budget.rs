@@ -17,6 +17,9 @@ use std::time::{Duration, Instant};
 
 use apollo_engine::engine::compressor_aware::query_memory_profile;
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::jetsam_control;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::memory_analyzer::MemoryAnalyzer;
@@ -99,6 +102,28 @@ pub fn memory_budget_enforcement_interval(zone: PressureZone) -> Duration {
 ///
 /// Includes hysteresis and rate-limiting to prevent "thrashing" syscall spam
 /// when pressure oscillates around thresholds.
+#[derive(Debug, Default)]
+pub struct MemoryBudgetTickOutput {
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn memory_budget_event(
+    pid: u32,
+    name: &str,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        "memorystatus:memory_budget",
+        format!("{name}:pid:{pid}"),
+        cycle,
+        outcome,
+        "memory-budget",
+        detail,
+    )
+}
+
 pub fn run_memory_budget(
     memory_pressure: f64,
     total_ram: u64,
@@ -107,6 +132,28 @@ pub fn run_memory_budget(
     mem_analyzer: &MemoryAnalyzer,
     budget_state: &mut MemoryBudgetState,
 ) {
+    let _ = run_memory_budget_with_decisions(
+        memory_pressure,
+        total_ram,
+        state,
+        proc_snaps,
+        mem_analyzer,
+        budget_state,
+        0,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_memory_budget_with_decisions(
+    memory_pressure: f64,
+    total_ram: u64,
+    state: &SharedState,
+    proc_snaps: &[ProcessSnapshot],
+    mem_analyzer: &MemoryAnalyzer,
+    budget_state: &mut MemoryBudgetState,
+    cycle: u64,
+) -> MemoryBudgetTickOutput {
+    let mut output = MemoryBudgetTickOutput::default();
     // 1. Update Pressure Zone with explicit hysteresis.
     let next_zone = match budget_state.current_zone {
         PressureZone::Normal => {
@@ -153,7 +200,7 @@ pub fn run_memory_budget(
 
     // Normal zone: no enforcement.
     if next_zone == PressureZone::Normal {
-        return;
+        return output;
     }
 
     // 2. Decide if we should evaluate budgets this cycle.
@@ -188,7 +235,7 @@ pub fn run_memory_budget(
     // not issue up to 30 calls on every daemon cycle. A zone edge still
     // evaluates immediately, including Critical transitions.
     if !force_eval {
-        return;
+        return output;
     }
     budget_state.last_evaluated_at = Some(now);
 
@@ -231,7 +278,7 @@ pub fn run_memory_budget(
     drop(usage_guard);
 
     if budget_inputs.is_empty() {
-        return;
+        return output;
     }
 
     // GC dead PIDs from history.
@@ -252,15 +299,32 @@ pub fn run_memory_budget(
         let significant_change = limit_delta > (last_limit.unwrap_or(0) / 7).max(50);
 
         if force_eval || significant_change {
-            let _ = jetsam_control::set_memlimit(
+            let apply_result = jetsam_control::set_memlimit(
                 budget.pid,
                 0, // active: unlimited (don't kill foreground)
                 budget.inactive_limit_mb,
             );
+            if let Err(error) = apply_result {
+                output.decision_events.push(memory_budget_event(
+                    budget.pid,
+                    &budget.name,
+                    cycle,
+                    ActuatorDecisionOutcome::Failed,
+                    format!("inactive limit apply failed: {error}"),
+                ));
+                continue;
+            }
             budget_state
                 .last_applied_limits
                 .insert(budget.pid, budget.inactive_limit_mb as u64);
             budget_state.last_applied_at = Some(now);
+            output.decision_events.push(memory_budget_event(
+                budget.pid,
+                &budget.name,
+                cycle,
+                ActuatorDecisionOutcome::Applied,
+                format!("inactive_limit_mb={}", budget.inactive_limit_mb),
+            ));
 
             // Strangler-fig (phase-2): also record the memlimit in the
             // unified EffectLedger so the periodic reconcile pass provides a
@@ -320,6 +384,10 @@ pub fn run_memory_budget(
         .collect();
     let recovered = recovered_pids(&budget_state.last_applied_limits, &over_budget_pids);
     for pid in recovered {
+        let name = budget_inputs
+            .iter()
+            .find(|input| input.pid == pid)
+            .map_or("unknown", |input| input.name.as_str());
         if jetsam_control::set_memlimit(pid, 0, 0).is_ok() {
             budget_state.last_applied_limits.remove(&pid);
             // We reverted it ourselves — drop the ledger entry without a
@@ -332,8 +400,24 @@ pub fn run_memory_budget(
                 pid,
                 "memlimit_cleared_recovered"
             );
+            output.decision_events.push(memory_budget_event(
+                pid,
+                name,
+                cycle,
+                ActuatorDecisionOutcome::Reverted,
+                "inactive limit cleared",
+            ));
+        } else {
+            output.decision_events.push(memory_budget_event(
+                pid,
+                name,
+                cycle,
+                ActuatorDecisionOutcome::Failed,
+                "inactive limit clear failed",
+            ));
         }
     }
+    output
 }
 
 /// Fight-hunt fix (2026-06-10): pids holding a kernel memlimit that are no
@@ -360,6 +444,7 @@ mod tests {
         HardwareState, MetricsState, PolicyState, ProcessState, ReactorStatus, UsageDomainState,
         UsageTrackerState,
     };
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
     use apollo_engine::engine::degradation::DegradationController;
     use apollo_engine::engine::mach_qos::MachQoSManager;
     use apollo_engine::engine::policy_store::LearnedPolicy;
@@ -607,5 +692,27 @@ mod tests {
             !state.recovering_from_critical(),
             "should NOT be recovering after 30s window"
         );
+    }
+
+    #[test]
+    fn memory_budget_receipts_distinguish_apply_and_clear_per_pid() {
+        let applied = memory_budget_event(
+            55,
+            "compiler",
+            7,
+            ActuatorDecisionOutcome::Applied,
+            "inactive limit applied",
+        );
+        let cleared = memory_budget_event(
+            55,
+            "compiler",
+            8,
+            ActuatorDecisionOutcome::Reverted,
+            "inactive limit cleared",
+        );
+
+        assert_eq!(applied.proposal.action_key, "memorystatus:memory_budget");
+        assert_eq!(applied.proposal.target, "compiler:pid:55");
+        assert_eq!(cleared.outcome, ActuatorDecisionOutcome::Reverted);
     }
 }

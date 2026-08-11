@@ -1077,6 +1077,10 @@ pub struct TelemetryMedallionPersisted {
     pub context_schema_version: u32,
     #[serde(default)]
     pub installation_id: InstallationId,
+    /// Highest locally assigned universal DecisionId observed before the
+    /// snapshot, including non-authoritative terminal outcomes.
+    #[serde(default)]
+    pub decision_id_high_water: u64,
     #[serde(default)]
     pub bronze_total: u64,
     #[serde(default)]
@@ -1166,6 +1170,7 @@ pub struct TelemetryMedallionPersisted {
 #[derive(Debug)]
 pub struct TelemetryMedallion {
     installation_id: InstallationId,
+    decision_id_high_water: u64,
     current_tier: ContextTier,
     last_admitted_live: Option<TelemetryContextSummary>,
     consecutive_gold: u32,
@@ -1227,6 +1232,7 @@ impl Default for TelemetryMedallion {
     fn default() -> Self {
         Self {
             installation_id: InstallationId::UNKNOWN,
+            decision_id_high_water: 0,
             current_tier: ContextTier::Rejected,
             last_admitted_live: None,
             consecutive_gold: 0,
@@ -1306,6 +1312,7 @@ impl TelemetryMedallion {
     pub fn new(installation_id: InstallationId) -> Self {
         Self {
             installation_id,
+            decision_id_high_water: 0,
             causal_dynamics: CausalDynamicsModel::new(installation_id),
             ..Self::default()
         }
@@ -2823,6 +2830,9 @@ impl TelemetryMedallion {
     /// matched in place so one kernel action cannot create two medallion
     /// episodes.
     pub fn stage_decision_episodes(&mut self, episodes: &[ResolvedDecisionEpisode]) {
+        for episode in episodes {
+            self.decision_id_high_water = self.decision_id_high_water.max(episode.id.0);
+        }
         let mut cohort_sizes = BTreeMap::<u64, u16>::new();
         for episode in episodes {
             if episode.envelope.lifecycle == DecisionLifecycle::Applied
@@ -2978,6 +2988,10 @@ impl TelemetryMedallion {
         &self.decision_source_stats
     }
 
+    pub fn decision_id_high_water(&self) -> u64 {
+        self.decision_id_high_water
+    }
+
     pub fn decision_credit_leader(&self) -> Option<(&str, &DecisionSourceStats)> {
         self.decision_source_stats
             .iter()
@@ -3010,6 +3024,7 @@ impl TelemetryMedallion {
             actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
             context_schema_version: TELEMETRY_CONTEXT_SCHEMA_VERSION,
             installation_id: self.installation_id,
+            decision_id_high_water: self.decision_id_high_water,
             bronze_total: self.bronze_total,
             silver_total: self.silver_total,
             gold_total: self.gold_total,
@@ -3056,6 +3071,21 @@ impl TelemetryMedallion {
     }
 
     pub fn restore(&mut self, state: TelemetryMedallionPersisted) {
+        let same_installation =
+            state.installation_id.is_known() && state.installation_id == self.installation_id;
+        let evidence_high_water = state
+            .recent_evidence
+            .iter()
+            .chain(state.episodic_evidence.iter())
+            .filter_map(|evidence| evidence.decision_id)
+            .map(|id| id.0)
+            .max()
+            .unwrap_or(0);
+        self.decision_id_high_water = if same_installation {
+            state.decision_id_high_water.max(evidence_high_water)
+        } else {
+            0
+        };
         let same_origin = state.context_schema_version == TELEMETRY_CONTEXT_SCHEMA_VERSION
             && state.installation_id.is_known()
             && state.installation_id == self.installation_id;
@@ -4474,6 +4504,39 @@ mod tests {
                 pending.cohort_size == 2
             }
         }));
+    }
+
+    #[test]
+    fn decision_id_high_water_round_trips_even_for_non_authoritative_receipts() {
+        let mut events = CycleDecisionEvents::default();
+        events.push(ActuatorDecisionEvent::local(
+            "sysctl:shutdown-rollback",
+            "kern.test=0",
+            31,
+            ActuatorDecisionOutcome::Failed,
+            "shutdown",
+            "write failed",
+        ));
+        let episodes = DecisionLedger::new().ingest_cycle_events(&mut events);
+        let prior_id = episodes[0].id.0;
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.stage_decision_episodes(&episodes);
+
+        let encoded = serde_json::to_string(&medallion.snapshot()).expect("persist medallion");
+        let persisted: TelemetryMedallionPersisted =
+            serde_json::from_str(&encoded).expect("restore persisted medallion");
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(persisted);
+        let mut restarted_ledger = DecisionLedger::new();
+        restarted_ledger.seed_high_water(restored.decision_id_high_water());
+
+        assert_eq!(restored.decision_id_high_water(), prior_id);
+        assert!(
+            restarted_ledger
+                .propose(crate::engine::decision_ledger::DecisionProposal::default())
+                .0
+                > prior_id
+        );
     }
 
     #[test]

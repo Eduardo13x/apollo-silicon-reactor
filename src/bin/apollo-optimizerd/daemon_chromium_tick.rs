@@ -75,6 +75,38 @@ fn chromium_event(
     )
 }
 
+fn chromium_qos_restore_event(
+    action: &ChromiumAction,
+    cycle: u64,
+    result: Result<bool, String>,
+) -> ActuatorDecisionEvent {
+    let ChromiumAction::ThawRenderer { pid, name } = action else {
+        unreachable!("QoS restoration only follows a renderer thaw")
+    };
+    let (outcome, detail) = match result {
+        Ok(false) => (
+            ActuatorDecisionOutcome::Reverted,
+            "renderer Mach policy restored".to_string(),
+        ),
+        Ok(true) => (
+            ActuatorDecisionOutcome::NoOp,
+            "renderer Mach policy already at default".to_string(),
+        ),
+        Err(error) => (
+            ActuatorDecisionOutcome::Failed,
+            format!("renderer Mach policy restore failed: {error}"),
+        ),
+    };
+    ActuatorDecisionEvent::local(
+        "thread_qos:chromium_recovery",
+        format!("{name}:pid:{pid}"),
+        cycle,
+        outcome,
+        "chromium-manager",
+        detail,
+    )
+}
+
 /// True when Apollo should hold off Chromium E-core demotion to protect a live
 /// Meet/call: audio is actively flowing AND memory is not in genuine crisis.
 /// Above the crisis floor (0.75) RAM placement wins over a smooth call.
@@ -666,11 +698,18 @@ pub fn run_chromium_tick(
                             start_sec: 0,
                             policy: apollo_engine::engine::mediator::MachPolicyKind::Default,
                         };
-                        let _ = apollo_engine::engine::mediator::mediate(
+                        let qos_result = apollo_engine::engine::mediator::mediate(
                             &mach_eff,
                             &apollo_engine::engine::mediator::PreCondition::default(),
                             &mach_effector,
-                        );
+                        )
+                        .map(|receipt| receipt.no_op)
+                        .map_err(|reason| format!("{reason:?}"));
+                        output.decision_events.push(chromium_qos_restore_event(
+                            action,
+                            cycle_count,
+                            qos_result,
+                        ));
                         frozen_state_changed |=
                             state.frozen_state.lock_recover().remove(pid).is_some();
                         // NARS belief update: observe whether renderer survived freeze.
@@ -681,6 +720,18 @@ pub fn run_chromium_tick(
                             alive,
                             if alive { 0.3 } else { 0.8 },
                         );
+                    } else {
+                        let ChromiumAction::ThawRenderer { pid, name } = action else {
+                            unreachable!()
+                        };
+                        output.decision_events.push(ActuatorDecisionEvent::local(
+                            "thread_qos:chromium_recovery",
+                            format!("{name}:pid:{pid}"),
+                            cycle_count,
+                            ActuatorDecisionOutcome::Blocked,
+                            "chromium-manager",
+                            "Mach policy restore skipped because SIGCONT failed",
+                        ));
                     }
                 }
                 ChromiumAction::DemoteToEcores { .. }
@@ -714,7 +765,8 @@ pub fn run_chromium_tick(
 #[cfg(test)]
 mod tests {
     use super::{
-        chromium_event, contextual_chromium_action_allowed, ecore_demote_suppressed_for_call,
+        chromium_event, chromium_qos_restore_event, contextual_chromium_action_allowed,
+        ecore_demote_suppressed_for_call,
     };
     use apollo_engine::engine::chromium_manager::ChromiumAction;
     use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
@@ -791,5 +843,23 @@ mod tests {
         );
         assert!(event.proposal.target.contains("pid:42"));
         assert_eq!(event.proposal.proposed_cycle, 12);
+    }
+
+    #[test]
+    fn chromium_thaw_audits_sigcont_and_qos_restore_separately() {
+        let action = ChromiumAction::ThawRenderer {
+            pid: 42,
+            name: "Brave Renderer".to_string(),
+        };
+
+        let reverted = chromium_qos_restore_event(&action, 12, Ok(false));
+        let noop = chromium_qos_restore_event(&action, 12, Ok(true));
+        let failed = chromium_qos_restore_event(&action, 12, Err("mach denied".to_string()));
+
+        assert_eq!(reverted.proposal.action_key, "thread_qos:chromium_recovery");
+        assert_eq!(reverted.outcome, ActuatorDecisionOutcome::Reverted);
+        assert_eq!(noop.outcome, ActuatorDecisionOutcome::NoOp);
+        assert_eq!(failed.outcome, ActuatorDecisionOutcome::Failed);
+        assert!(failed.proposal.target.contains("pid:42"));
     }
 }

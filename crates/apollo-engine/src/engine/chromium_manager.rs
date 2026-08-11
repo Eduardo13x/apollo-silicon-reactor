@@ -1350,17 +1350,33 @@ impl ChromiumManager {
         candidates
     }
 
-    /// SIGCONT all frozen renderers on daemon shutdown.
-    /// Returns the list of PIDs that were thawed.
-    pub fn shutdown_cleanup(&mut self) -> Vec<u32> {
+    /// SIGCONT all frozen renderers on daemon shutdown and retain the exact
+    /// disposition for every attempted PID.
+    pub fn shutdown_cleanup_outcome(&mut self) -> ChromiumShutdownCleanupOutcome {
         let pids: Vec<u32> = self.frozen_pids.drain().collect();
+        let mut outcome = ChromiumShutdownCleanupOutcome::default();
         for &pid in &pids {
-            Self::thaw_renderer(pid);
+            if Self::thaw_renderer(pid) {
+                outcome.applied_pids.push(pid);
+            } else {
+                outcome.failed_pids.push(pid);
+            }
             if let Some(info) = self.renderers.get_mut(&pid) {
                 info.frozen = false;
             }
         }
-        pids
+        outcome
+    }
+
+    /// Compatibility wrapper preserving the historical list of attempted
+    /// PIDs. New callers should consume `shutdown_cleanup_outcome`.
+    pub fn shutdown_cleanup(&mut self) -> Vec<u32> {
+        let outcome = self.shutdown_cleanup_outcome();
+        outcome
+            .applied_pids
+            .into_iter()
+            .chain(outcome.failed_pids)
+            .collect()
     }
 
     // ── Private helpers ────────────────────────────────────────────────────────
@@ -1568,6 +1584,12 @@ impl ChromiumManager {
             false
         }
     }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ChromiumShutdownCleanupOutcome {
+    pub applied_pids: Vec<u32>,
+    pub failed_pids: Vec<u32>,
 }
 
 // ── Unit Tests ─────────────────────────────────────────────────────────────────
@@ -2044,6 +2066,24 @@ mod tests {
             mgr.frozen_pids.is_empty(),
             "frozen_pids must be empty after cleanup"
         );
+    }
+
+    #[test]
+    fn shutdown_cleanup_outcome_accounts_for_every_pid_and_failure() {
+        let mut mgr = ChromiumManager::new();
+        mgr.frozen_pids.insert(9_999_990);
+        mgr.frozen_pids.insert(9_999_991);
+
+        let outcome = mgr.shutdown_cleanup_outcome();
+
+        assert_eq!(outcome.applied_pids.len() + outcome.failed_pids.len(), 2);
+        assert!(
+            outcome.applied_pids.contains(&9_999_990) || outcome.failed_pids.contains(&9_999_990)
+        );
+        assert!(
+            outcome.applied_pids.contains(&9_999_991) || outcome.failed_pids.contains(&9_999_991)
+        );
+        assert!(mgr.frozen_pids.is_empty());
     }
 
     // ── ChromiumMetrics ────────────────────────────────────────────────────────

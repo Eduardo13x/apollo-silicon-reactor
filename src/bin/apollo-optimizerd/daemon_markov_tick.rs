@@ -99,10 +99,43 @@ struct MarkovShadowLease {
 #[derive(Debug)]
 struct PrewarmedMember {
     pid: u32,
+    name: String,
     prior_jetsam: i32,
     jetsam_applied: bool,
     tier_applied: bool,
     task_qos_applied: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MarkovMemberEffect {
+    Jetsam,
+    MachTier,
+    TaskQos,
+    Cache,
+}
+
+fn markov_member_effect_event(
+    pid: u32,
+    name: &str,
+    effect: MarkovMemberEffect,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: impl Into<String>,
+) -> ActuatorDecisionEvent {
+    let suffix = match effect {
+        MarkovMemberEffect::Jetsam => "jetsam",
+        MarkovMemberEffect::MachTier => "mach_tier",
+        MarkovMemberEffect::TaskQos => "task_qos",
+        MarkovMemberEffect::Cache => "cache",
+    };
+    ActuatorDecisionEvent::local(
+        format!("markov_prewarm:{suffix}"),
+        format!("{name}:pid:{pid}"),
+        cycle,
+        outcome,
+        "focus-markov",
+        detail,
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,22 +338,8 @@ pub fn run_markov_tick(
                         "prediction lease reached its deadline",
                     ));
                 }
-                let release = release_markov_prewarm(lease, state);
-                decision_events.push(markov_event(
-                    target,
-                    cycle_count,
-                    if release.reverted_effects > 0 {
-                        ActuatorDecisionOutcome::Reverted
-                    } else if release.deferred_effects > 0 {
-                        ActuatorDecisionOutcome::Failed
-                    } else {
-                        ActuatorDecisionOutcome::NoOp
-                    },
-                    format!(
-                        "reverted_effects={},deferred_effects={}",
-                        release.reverted_effects, release.deferred_effects
-                    ),
-                ));
+                let release = release_markov_prewarm(lease, state, cycle_count);
+                decision_events.extend_buffer(&release.decision_events);
             }
         }
         LeaseResolution::Pending => {}
@@ -441,7 +460,7 @@ pub fn run_markov_tick(
                         .markov_shadow_superseded_total
                         .saturating_add(1);
                 }
-                let (members, cache_bytes, unfrozen_count, conflict_skips) =
+                let (members, cache_bytes, unfrozen_count, conflict_skips, member_events) =
                     acquire_coalition_prewarm(
                         pid,
                         state,
@@ -451,7 +470,9 @@ pub fn run_markov_tick(
                         cache_warmer,
                         frozen_state_path,
                         admission.allows_kernel_acceleration(),
+                        cycle_count,
                     );
+                decision_events.extend_buffer(&member_events);
                 let members_applied = members.len() as u64;
                 let kernel_members = members
                     .iter()
@@ -460,19 +481,6 @@ pub fn run_markov_tick(
                     })
                     .count();
                 let applied = !members.is_empty();
-                decision_events.push(markov_event(
-                    pred.app_name.clone(),
-                    cycle_count,
-                    if applied {
-                        ActuatorDecisionOutcome::Applied
-                    } else {
-                        ActuatorDecisionOutcome::NoOp
-                    },
-                    format!(
-                        "members={members_applied},kernel_members={kernel_members},cache_bytes={cache_bytes}"
-                    ),
-                ));
-
                 let lease_secs = contextual_prewarm_lease_secs(
                     (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0),
                     contextual_bias,
@@ -844,7 +852,9 @@ fn acquire_coalition_prewarm(
     cache_warmer: &mut CacheWarmer,
     frozen_state_path: &Path,
     allow_kernel_acceleration: bool,
-) -> (Vec<PrewarmedMember>, u64, u64, u64) {
+    cycle: u64,
+) -> (Vec<PrewarmedMember>, u64, u64, u64, CycleDecisionEvents) {
+    let mut decision_events = CycleDecisionEvents::default();
     let candidates = coalition_candidates(root_pid, collector, process_tree, coalition_tracker);
     let eligible: Vec<(u32, String, bool)> = candidates
         .into_iter()
@@ -881,6 +891,14 @@ fn acquire_coalition_prewarm(
         if !entries.is_empty() {
             write_frozen_state(frozen_state_path, &frozen_guard);
         }
+        decision_events.extend_buffer(
+            &apollo_engine::engine::daemon_helpers::unfreeze_outcome_events(
+                "unfreeze:markov_prewarm",
+                "focus-markov",
+                cycle,
+                &outcome,
+            ),
+        );
         outcome
             .applied_pids
             .into_iter()
@@ -890,7 +908,7 @@ fn acquire_coalition_prewarm(
     let mut members = Vec::with_capacity(eligible.len());
     let mut total_cache_bytes = 0u64;
     let mut conflict_skips = 0u64;
-    for (pid, _name, kernel_boost_allowed) in eligible {
+    for (pid, name, kernel_boost_allowed) in eligible {
         let kernel_boost_allowed = kernel_boost_allowed && allow_kernel_acceleration;
         let jetsam_effect =
             apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority { pid, prior: -1 };
@@ -907,17 +925,106 @@ fn acquire_coalition_prewarm(
             .saturating_add(u64::from(kernel_boost_allowed && !tier_available))
             .saturating_add(u64::from(kernel_boost_allowed && !task_available));
 
+        if kernel_boost_allowed && !jetsam_available {
+            decision_events.push(markov_member_effect_event(
+                pid,
+                &name,
+                MarkovMemberEffect::Jetsam,
+                cycle,
+                ActuatorDecisionOutcome::Blocked,
+                "effect ownership conflict",
+            ));
+        }
+        if kernel_boost_allowed && !tier_available {
+            decision_events.push(markov_member_effect_event(
+                pid,
+                &name,
+                MarkovMemberEffect::MachTier,
+                cycle,
+                ActuatorDecisionOutcome::Blocked,
+                "effect ownership conflict",
+            ));
+        }
+        if kernel_boost_allowed && !task_available {
+            decision_events.push(markov_member_effect_event(
+                pid,
+                &name,
+                MarkovMemberEffect::TaskQos,
+                cycle,
+                ActuatorDecisionOutcome::Blocked,
+                "effect ownership conflict",
+            ));
+        }
+
         let prior_jetsam = jetsam_available
             .then(|| jetsam_control::get_priority(pid).unwrap_or(-1))
             .unwrap_or(-1);
-        let jetsam_applied = jetsam_available
-            && jetsam_control::set_priority(pid, jetsam_control::priority::FOREGROUND).is_ok();
+        let jetsam_applied = if jetsam_available {
+            match jetsam_control::set_priority(pid, jetsam_control::priority::FOREGROUND) {
+                Ok(()) => {
+                    decision_events.push(markov_member_effect_event(
+                        pid,
+                        &name,
+                        MarkovMemberEffect::Jetsam,
+                        cycle,
+                        ActuatorDecisionOutcome::Applied,
+                        "foreground jetsam band applied",
+                    ));
+                    true
+                }
+                Err(error) => {
+                    decision_events.push(markov_member_effect_event(
+                        pid,
+                        &name,
+                        MarkovMemberEffect::Jetsam,
+                        cycle,
+                        ActuatorDecisionOutcome::Failed,
+                        format!("jetsam apply failed: {error}"),
+                    ));
+                    false
+                }
+            }
+        } else {
+            false
+        };
         let (tier_applied, task_qos_applied) = if tier_available || task_available {
             let mut qos = state.mach_qos.lock_recover();
             let tier = tier_available.then(|| qos.set_tier(pid, SchedulingTier::Foreground));
             let task_qos = task_available.then(|| {
                 qos.set_latency_and_throughput(pid, LatencyTier::Interactive, ThroughputTier::High)
             });
+            if let Some(outcome) = tier.as_ref() {
+                decision_events.push(markov_member_effect_event(
+                    pid,
+                    &name,
+                    MarkovMemberEffect::MachTier,
+                    cycle,
+                    if outcome.mutated {
+                        ActuatorDecisionOutcome::Applied
+                    } else if outcome.success {
+                        ActuatorDecisionOutcome::NoOp
+                    } else {
+                        ActuatorDecisionOutcome::Failed
+                    },
+                    outcome.error.as_deref().unwrap_or("Mach tier evaluated"),
+                ));
+            }
+            if let Some(outcome) = task_qos.as_ref() {
+                decision_events.push(markov_member_effect_event(
+                    pid,
+                    &name,
+                    MarkovMemberEffect::TaskQos,
+                    cycle,
+                    if outcome.mutated {
+                        ActuatorDecisionOutcome::Applied
+                    } else if outcome.success {
+                        ActuatorDecisionOutcome::NoOp
+                    } else {
+                        ActuatorDecisionOutcome::Failed
+                    },
+                    outcome.error.as_deref().unwrap_or("task QoS evaluated"),
+                ));
+            }
             (
                 tier.is_some_and(|outcome| outcome.mutated),
                 task_qos.is_some_and(|outcome| outcome.mutated),
@@ -926,6 +1033,18 @@ fn acquire_coalition_prewarm(
             (false, false)
         };
         let cache_bytes = cache_warmer.warm_pid(pid);
+        decision_events.push(markov_member_effect_event(
+            pid,
+            &name,
+            MarkovMemberEffect::Cache,
+            cycle,
+            if cache_bytes > 0 {
+                ActuatorDecisionOutcome::Applied
+            } else {
+                ActuatorDecisionOutcome::NoOp
+            },
+            format!("cache_bytes={cache_bytes}"),
+        ));
         total_cache_bytes = total_cache_bytes.saturating_add(cache_bytes);
         let unfrozen = thawed.contains(&pid);
 
@@ -961,6 +1080,7 @@ fn acquire_coalition_prewarm(
         if unfrozen || jetsam_applied || tier_applied || task_qos_applied || cache_bytes > 0 {
             members.push(PrewarmedMember {
                 pid,
+                name,
                 prior_jetsam,
                 jetsam_applied,
                 tier_applied,
@@ -974,6 +1094,7 @@ fn acquire_coalition_prewarm(
         total_cache_bytes,
         thawed.len() as u64,
         conflict_skips,
+        decision_events,
     )
 }
 
@@ -1130,19 +1251,22 @@ fn lease_resolution(
 /// Release all reversible kernel state associated with one prediction.
 /// Also used on clean daemon shutdown so a pre-warm cannot ratchet across a
 /// service restart.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Default)]
 pub struct MarkovReleaseReport {
     pub reverted_effects: u64,
     pub deferred_effects: u64,
+    pub decision_events: CycleDecisionEvents,
 }
 
 pub fn release_markov_prewarm(
     lease: MarkovPrewarmLease,
     state: &SharedState,
+    cycle: u64,
 ) -> MarkovReleaseReport {
     let mut reverted = false;
     let mut reverted_effects = 0u64;
     let mut deferred_effects = 0u64;
+    let mut decision_events = CycleDecisionEvents::default();
     let member_count = lease.members.len();
     let cache_bytes = lease.cache_bytes;
     let calibration_probe = lease.calibration_probe;
@@ -1154,18 +1278,57 @@ pub fn release_markov_prewarm(
             };
             const OWNER: &str = "markov coalition pre-warm: jetsam FOREGROUND";
             if apollo_engine::engine::effect_ledger::is_global_owner(&effect, OWNER) {
-                let ok = prewarm_jetsam_restore(member.prior_jetsam).is_none_or(|restore| {
-                    jetsam_control::set_priority(member.pid, restore).is_ok()
-                });
-                if ok {
-                    apollo_engine::engine::effect_ledger::forget_global_if_justification(
-                        &effect, OWNER,
-                    );
-                    reverted_effects += 1;
-                    reverted = true;
-                } else {
-                    deferred_effects += 1;
+                match prewarm_jetsam_restore(member.prior_jetsam) {
+                    Some(restore) => {
+                        if jetsam_control::set_priority(member.pid, restore).is_ok() {
+                            apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                                &effect, OWNER,
+                            );
+                            reverted_effects += 1;
+                            reverted = true;
+                            decision_events.push(markov_member_effect_event(
+                                member.pid,
+                                &member.name,
+                                MarkovMemberEffect::Jetsam,
+                                cycle,
+                                ActuatorDecisionOutcome::Reverted,
+                                format!("restored priority={restore}"),
+                            ));
+                        } else {
+                            deferred_effects += 1;
+                            decision_events.push(markov_member_effect_event(
+                                member.pid,
+                                &member.name,
+                                MarkovMemberEffect::Jetsam,
+                                cycle,
+                                ActuatorDecisionOutcome::Failed,
+                                "jetsam restore failed",
+                            ));
+                        }
+                    }
+                    None => {
+                        apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                            &effect, OWNER,
+                        );
+                        decision_events.push(markov_member_effect_event(
+                            member.pid,
+                            &member.name,
+                            MarkovMemberEffect::Jetsam,
+                            cycle,
+                            ActuatorDecisionOutcome::NoOp,
+                            "prior jetsam priority unavailable",
+                        ));
+                    }
                 }
+            } else {
+                decision_events.push(markov_member_effect_event(
+                    member.pid,
+                    &member.name,
+                    MarkovMemberEffect::Jetsam,
+                    cycle,
+                    ActuatorDecisionOutcome::NoOp,
+                    "effect ownership no longer held",
+                ));
             }
         }
         if member.tier_applied || member.task_qos_applied {
@@ -1177,17 +1340,57 @@ pub fn release_markov_prewarm(
                 const OWNER: &str = "markov coalition pre-warm: Foreground tier";
                 if apollo_engine::engine::effect_ledger::is_global_owner(&effect, OWNER) {
                     let outcome = qos.set_tier(member.pid, SchedulingTier::Normal);
-                    let ok = outcome.mutated
-                        || qos.current_tier(member.pid) == Some(SchedulingTier::Normal);
-                    if ok {
+                    if outcome.mutated {
                         apollo_engine::engine::effect_ledger::forget_global_if_justification(
                             &effect, OWNER,
                         );
                         reverted_effects += 1;
                         reverted = true;
+                        decision_events.push(markov_member_effect_event(
+                            member.pid,
+                            &member.name,
+                            MarkovMemberEffect::MachTier,
+                            cycle,
+                            ActuatorDecisionOutcome::Reverted,
+                            "Mach tier restored to Normal",
+                        ));
+                    } else if outcome.success
+                        || qos.current_tier(member.pid) == Some(SchedulingTier::Normal)
+                    {
+                        apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                            &effect, OWNER,
+                        );
+                        decision_events.push(markov_member_effect_event(
+                            member.pid,
+                            &member.name,
+                            MarkovMemberEffect::MachTier,
+                            cycle,
+                            ActuatorDecisionOutcome::NoOp,
+                            "Mach tier already Normal",
+                        ));
                     } else {
                         deferred_effects += 1;
+                        decision_events.push(markov_member_effect_event(
+                            member.pid,
+                            &member.name,
+                            MarkovMemberEffect::MachTier,
+                            cycle,
+                            ActuatorDecisionOutcome::Failed,
+                            outcome
+                                .error
+                                .as_deref()
+                                .unwrap_or("Mach tier restore failed"),
+                        ));
                     }
+                } else {
+                    decision_events.push(markov_member_effect_event(
+                        member.pid,
+                        &member.name,
+                        MarkovMemberEffect::MachTier,
+                        cycle,
+                        ActuatorDecisionOutcome::NoOp,
+                        "effect ownership no longer held",
+                    ));
                 }
             }
             if member.task_qos_applied {
@@ -1196,22 +1399,60 @@ pub fn release_markov_prewarm(
                 };
                 const OWNER: &str = "markov coalition pre-warm: interactive task QoS";
                 if apollo_engine::engine::effect_ledger::is_global_owner(&effect, OWNER) {
-                    let ok = qos
-                        .set_latency_and_throughput(
-                            member.pid,
-                            LatencyTier::Default,
-                            ThroughputTier::Default,
-                        )
-                        .mutated;
-                    if ok {
+                    let outcome = qos.set_latency_and_throughput(
+                        member.pid,
+                        LatencyTier::Default,
+                        ThroughputTier::Default,
+                    );
+                    if outcome.mutated {
                         apollo_engine::engine::effect_ledger::forget_global_if_justification(
                             &effect, OWNER,
                         );
                         reverted_effects += 1;
                         reverted = true;
+                        decision_events.push(markov_member_effect_event(
+                            member.pid,
+                            &member.name,
+                            MarkovMemberEffect::TaskQos,
+                            cycle,
+                            ActuatorDecisionOutcome::Reverted,
+                            "task QoS restored to defaults",
+                        ));
+                    } else if outcome.success {
+                        apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                            &effect, OWNER,
+                        );
+                        decision_events.push(markov_member_effect_event(
+                            member.pid,
+                            &member.name,
+                            MarkovMemberEffect::TaskQos,
+                            cycle,
+                            ActuatorDecisionOutcome::NoOp,
+                            "task QoS already default",
+                        ));
                     } else {
                         deferred_effects += 1;
+                        decision_events.push(markov_member_effect_event(
+                            member.pid,
+                            &member.name,
+                            MarkovMemberEffect::TaskQos,
+                            cycle,
+                            ActuatorDecisionOutcome::Failed,
+                            outcome
+                                .error
+                                .as_deref()
+                                .unwrap_or("task QoS restore failed"),
+                        ));
                     }
+                } else {
+                    decision_events.push(markov_member_effect_event(
+                        member.pid,
+                        &member.name,
+                        MarkovMemberEffect::TaskQos,
+                        cycle,
+                        ActuatorDecisionOutcome::NoOp,
+                        "effect ownership no longer held",
+                    ));
                 }
             }
         }
@@ -1232,6 +1473,7 @@ pub fn release_markov_prewarm(
     MarkovReleaseReport {
         reverted_effects,
         deferred_effects,
+        decision_events,
     }
 }
 
@@ -1262,6 +1504,7 @@ mod tests {
             acquired_at: Instant::now(),
             members: vec![PrewarmedMember {
                 pid: 42,
+                name: "Terminal Helper".to_string(),
                 prior_jetsam: 2,
                 jetsam_applied: true,
                 tier_applied: true,
@@ -1283,6 +1526,32 @@ mod tests {
         assert!(cache_warm_allowed_at(0.59));
         assert!(!cache_warm_allowed_at(0.60));
         assert!(!cache_warm_allowed_at(0.75));
+    }
+
+    #[test]
+    fn markov_member_effect_receipts_keep_pid_and_effect_identity() {
+        let jetsam = markov_member_effect_event(
+            42,
+            "Editor Helper",
+            MarkovMemberEffect::Jetsam,
+            5,
+            ActuatorDecisionOutcome::Applied,
+            "foreground band applied",
+        );
+        let qos = markov_member_effect_event(
+            43,
+            "Editor GPU",
+            MarkovMemberEffect::TaskQos,
+            5,
+            ActuatorDecisionOutcome::Failed,
+            "task QoS failed",
+        );
+
+        assert_eq!(jetsam.proposal.action_key, "markov_prewarm:jetsam");
+        assert_eq!(jetsam.proposal.target, "Editor Helper:pid:42");
+        assert_eq!(qos.proposal.action_key, "markov_prewarm:task_qos");
+        assert_eq!(qos.proposal.target, "Editor GPU:pid:43");
+        assert_eq!(qos.outcome, ActuatorDecisionOutcome::Failed);
     }
 
     #[test]

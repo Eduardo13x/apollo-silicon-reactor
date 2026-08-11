@@ -12,8 +12,11 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{
+    unfreeze_outcome_events, unfreeze_pids_verified_outcome, write_frozen_state, UnfreezeOutcome,
+};
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::CycleDecisionEvents;
 use apollo_engine::engine::display_turbo::DisplayTurbo;
 use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -56,9 +59,10 @@ pub fn run_pre_sleep_unfreeze(
     frozen_state_path: &Path,
     display_turbo: &mut DisplayTurbo,
     sleep_notifier: &SleepNotifier,
-) {
+    cycle: u64,
+) -> CycleDecisionEvents {
     if !sleep_notifier.will_sleep_pending() {
-        return;
+        return CycleDecisionEvents::default();
     }
     let mut frozen_guard = state.frozen_state.lock_recover();
     // Turbo PIDs live in frozen_guard too, so this covers both regular + turbo.
@@ -90,6 +94,11 @@ pub fn run_pre_sleep_unfreeze(
     if outcome.failed_pids.is_empty() {
         sleep_notifier.acknowledge();
     }
+    pre_sleep_unfreeze_events(cycle, &outcome)
+}
+
+fn pre_sleep_unfreeze_events(cycle: u64, outcome: &UnfreezeOutcome) -> CycleDecisionEvents {
+    unfreeze_outcome_events("unfreeze:pre_sleep", "pre-sleep-recovery", cycle, outcome)
 }
 
 /// Ghost-PID reconciliation — evict frozen_state entries whose PID is dead.
@@ -157,6 +166,7 @@ mod tests {
     use apollo_engine::engine::daemon_state::{
         HardwareState, MetricsState, PolicyState, ProcessState, UsageDomainState,
     };
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
     use apollo_engine::engine::degradation::DegradationController;
     use apollo_engine::engine::display_turbo::DisplayTurbo;
     use apollo_engine::engine::freeze_cooldown::FreezeCooldown;
@@ -285,5 +295,34 @@ mod tests {
         );
 
         assert_eq!(identity_cache.len(), 0);
+    }
+
+    #[test]
+    fn pre_sleep_recovery_preserves_all_unfreeze_dispositions() {
+        let outcome = apollo_engine::engine::daemon_helpers::UnfreezeOutcome {
+            applied_pids: vec![1],
+            stale_pids: vec![2],
+            failed_pids: vec![3],
+        };
+
+        let events = pre_sleep_unfreeze_events(22, &outcome);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            events.as_slice()[0].proposal.action_key,
+            "unfreeze:pre_sleep"
+        );
+        assert_eq!(
+            events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Reverted
+        );
+        assert_eq!(
+            events.as_slice()[1].outcome,
+            ActuatorDecisionOutcome::Blocked
+        );
+        assert_eq!(
+            events.as_slice()[2].outcome,
+            ActuatorDecisionOutcome::Failed
+        );
     }
 }

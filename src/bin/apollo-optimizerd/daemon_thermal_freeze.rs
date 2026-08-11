@@ -18,8 +18,13 @@
 use std::path::Path;
 
 use apollo_engine::collector::SystemCollector;
-use apollo_engine::engine::daemon_helpers::{unfreeze_pids_verified_outcome, write_frozen_state};
+use apollo_engine::engine::daemon_helpers::{
+    unfreeze_outcome_events, unfreeze_pids_verified_outcome, write_frozen_state,
+};
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::outcome_tracker::OutcomeTracker;
 use apollo_engine::engine::process_identity::ProcessIdentity;
@@ -41,6 +46,28 @@ use chrono::Utc;
 ///   freeze candidate skipped here is `record_blocked` so the learning
 ///   loop can later infer (counterfactually) whether the block was a
 ///   missed opportunity. SHADOW-MODE-ONLY signal.
+#[derive(Debug, Default)]
+pub struct ThermalFreezeOutput {
+    pub decision_events: CycleDecisionEvents,
+}
+
+fn thermal_freeze_event(
+    pid: u32,
+    name: &str,
+    cycle: u64,
+    outcome: ActuatorDecisionOutcome,
+    detail: &str,
+) -> ActuatorDecisionEvent {
+    ActuatorDecisionEvent::local(
+        "freeze:thermal_prethrottle",
+        format!("{name}:pid:{pid}"),
+        cycle,
+        outcome,
+        "thermal-prethrottle",
+        detail,
+    )
+}
+
 pub fn run_thermal_freeze(
     thermal_action: &ThermalAction,
     state: &SharedState,
@@ -49,7 +76,9 @@ pub fn run_thermal_freeze(
     memory_pressure: f64,
     frozen_state_path: &Path,
     outcome_tracker: &mut OutcomeTracker,
-) {
+    cycle: u64,
+) -> ThermalFreezeOutput {
+    let mut output = ThermalFreezeOutput::default();
     if thermal_action.freeze_background || thermal_action.freeze_all_non_critical {
         let policy_protected = state
             .policy
@@ -88,16 +117,48 @@ pub fn run_thermal_freeze(
             {
                 outcome_tracker.record_blocked("freeze", "is-protected-name", memory_pressure);
             }
-            if cpu > cpu_threshold
-                || Some(pid_u32) == foreground_pid
-                || is_protected_name(&name)
-                || policy_protected.iter().any(|p| name.contains(p.as_str()))
-                || name == "apollo-optimizerd"
-                || frozen_guard.contains_key(&pid_u32)
-            {
+            if cpu > cpu_threshold {
+                continue;
+            }
+            let block_detail = if Some(pid_u32) == foreground_pid {
+                Some("foreground process")
+            } else if is_protected_name(&name) {
+                Some("protected process")
+            } else if policy_protected.iter().any(|p| name.contains(p.as_str())) {
+                Some("learned protected process")
+            } else if name == "apollo-optimizerd" {
+                Some("self protection")
+            } else {
+                None
+            };
+            if let Some(detail) = block_detail {
+                output.decision_events.push(thermal_freeze_event(
+                    pid_u32,
+                    &name,
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    detail,
+                ));
+                continue;
+            }
+            if frozen_guard.contains_key(&pid_u32) {
+                output.decision_events.push(thermal_freeze_event(
+                    pid_u32,
+                    &name,
+                    cycle,
+                    ActuatorDecisionOutcome::NoOp,
+                    "already frozen",
+                ));
                 continue;
             }
             if thermal_frozen >= 80 {
+                output.decision_events.push(thermal_freeze_event(
+                    pid_u32,
+                    &name,
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    "thermal freeze cycle cap",
+                ));
                 break;
             }
             if unsafe { libc::kill(pid_u32 as i32, libc::SIGSTOP) } == 0 {
@@ -115,6 +176,21 @@ pub fn run_thermal_freeze(
                     },
                 );
                 thermal_frozen += 1;
+                output.decision_events.push(thermal_freeze_event(
+                    pid_u32,
+                    &name,
+                    cycle,
+                    ActuatorDecisionOutcome::Applied,
+                    "SIGSTOP applied",
+                ));
+            } else {
+                output.decision_events.push(thermal_freeze_event(
+                    pid_u32,
+                    &name,
+                    cycle,
+                    ActuatorDecisionOutcome::Failed,
+                    "SIGSTOP failed",
+                ));
             }
         }
         if thermal_frozen > 0 {
@@ -138,6 +214,14 @@ pub fn run_thermal_freeze(
         };
         if !thermal_frozen_entries.is_empty() {
             let outcome = unfreeze_pids_verified_outcome(&thermal_frozen_entries);
+            output
+                .decision_events
+                .extend_buffer(&unfreeze_outcome_events(
+                    "unfreeze:thermal_recovery",
+                    "thermal-recovery",
+                    cycle,
+                    &outcome,
+                ));
             let mut frozen_guard = state.frozen_state.lock_recover();
             for pid in outcome.forgettable_pids() {
                 frozen_guard.remove(&pid);
@@ -148,5 +232,27 @@ pub fn run_thermal_freeze(
             state.metrics.lock_recover().metrics.unfreezes_applied += n;
             println!("[thermal] Cooled: unfroze {} pre-throttled processes", n);
         }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
+
+    #[test]
+    fn thermal_freeze_receipt_keeps_exact_pid_and_failure() {
+        let event = thermal_freeze_event(
+            42,
+            "background-worker",
+            9,
+            ActuatorDecisionOutcome::Failed,
+            "SIGSTOP failed",
+        );
+
+        assert_eq!(event.proposal.action_key, "freeze:thermal_prethrottle");
+        assert_eq!(event.proposal.target, "background-worker:pid:42");
+        assert_eq!(event.outcome, ActuatorDecisionOutcome::Failed);
     }
 }

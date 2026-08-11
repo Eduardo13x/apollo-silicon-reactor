@@ -196,6 +196,7 @@ pub struct ResolvedDecisionEpisode {
 pub enum ActuatorDecisionOutcome {
     #[default]
     Applied,
+    Pending,
     Blocked,
     Failed,
     NoOp,
@@ -212,6 +213,13 @@ pub enum ActuatorDecisionOutcome {
 #[serde(default)]
 pub struct ActuatorDecisionEvent {
     pub proposal: DecisionProposal,
+    /// Bounded asynchronous command identity. A pending launch and its later
+    /// completion carry the same correlation so the ledger reuses one
+    /// `DecisionId` across control-loop cycles.
+    pub correlation_id: Option<u64>,
+    /// Cycle in which the terminal result became observable. This differs
+    /// from `proposal.proposed_cycle` for asynchronous completions.
+    pub observed_cycle: u64,
     pub outcome: ActuatorDecisionOutcome,
     pub attribution: ReceiptAttribution,
     pub detail: String,
@@ -233,6 +241,8 @@ impl ActuatorDecisionEvent {
                 proposed_cycle: cycle,
                 ..DecisionProposal::default()
             },
+            correlation_id: None,
+            observed_cycle: cycle,
             outcome,
             attribution: ReceiptAttribution::local(source),
             detail: bounded_text(&detail.into(), MAX_REASON_CHARS),
@@ -253,6 +263,8 @@ impl ActuatorDecisionEvent {
                 proposed_cycle: cycle,
                 ..DecisionProposal::default()
             },
+            correlation_id: None,
+            observed_cycle: cycle,
             outcome,
             attribution: ReceiptAttribution::Imported,
             detail: bounded_text(&detail.into(), MAX_REASON_CHARS),
@@ -269,6 +281,11 @@ impl ActuatorDecisionEvent {
         self
     }
 
+    pub fn with_correlation(mut self, correlation_id: u64) -> Self {
+        self.correlation_id = (correlation_id > 0).then_some(correlation_id);
+        self
+    }
+
     pub fn with_prediction(mut self, prediction: PredictionRecord) -> Self {
         if self.proposal.predictions.len() < MAX_PREDICTIONS {
             self.proposal.predictions.push(prediction);
@@ -278,6 +295,7 @@ impl ActuatorDecisionEvent {
 
     pub fn set_cycle(&mut self, cycle: u64) {
         self.proposal.proposed_cycle = cycle;
+        self.observed_cycle = cycle;
     }
 }
 
@@ -320,6 +338,40 @@ impl CycleDecisionEvents {
             event.set_cycle(cycle);
             self.push(event);
         }
+    }
+
+    /// Copy a producer's retained events while preserving its honest nested
+    /// drop count. The outer buffer may add further drops of its own.
+    pub fn extend_buffer(&mut self, source: &CycleDecisionEvents) {
+        self.dropped_total = self.dropped_total.saturating_add(source.dropped_total);
+        self.extend(source.events.iter().cloned());
+    }
+
+    pub fn extend_buffer_at_cycle(&mut self, source: &CycleDecisionEvents, cycle: u64) {
+        self.dropped_total = self.dropped_total.saturating_add(source.dropped_total);
+        self.extend_at_cycle(source.as_slice(), cycle);
+    }
+
+    /// Ensure overflow itself receives a DecisionId. When the buffer is full,
+    /// one retained event is summarized as an additional drop so the summary
+    /// always fits without allocating beyond the fixed cycle capacity.
+    pub fn seal_overflow_summary(&mut self, cycle: u64) -> bool {
+        if self.dropped_total == 0 {
+            return false;
+        }
+        if self.events.len() >= MAX_CYCLE_DECISION_EVENTS {
+            self.events.pop();
+            self.dropped_total = self.dropped_total.saturating_add(1);
+        }
+        self.events.push(ActuatorDecisionEvent::local(
+            "decision_events:overflow",
+            "cycle-buffer",
+            cycle,
+            ActuatorDecisionOutcome::Failed,
+            "decision-event-buffer",
+            format!("dropped={}", self.dropped_total),
+        ));
+        true
     }
 
     pub fn as_slice(&self) -> &[ActuatorDecisionEvent] {
@@ -413,6 +465,7 @@ pub fn coordinated_action_event(
 #[derive(Debug, Clone, Serialize)]
 pub struct DecisionLedger {
     next_id: u64,
+    pending_correlations: HashMap<u64, DecisionId>,
     pending: HashMap<DecisionId, DecisionEnvelope>,
     pending_order: VecDeque<DecisionId>,
     recent: VecDeque<ResolvedDecisionEpisode>,
@@ -426,6 +479,7 @@ pub struct DecisionLedger {
 #[serde(default)]
 struct DecisionLedgerPersisted {
     next_id: u64,
+    pending_correlations: HashMap<u64, DecisionId>,
     pending: HashMap<DecisionId, DecisionEnvelope>,
     pending_order: VecDeque<DecisionId>,
     recent: VecDeque<ResolvedDecisionEpisode>,
@@ -439,6 +493,7 @@ impl Default for DecisionLedger {
     fn default() -> Self {
         Self {
             next_id: 0,
+            pending_correlations: HashMap::with_capacity(MAX_PENDING_DECISIONS),
             pending: HashMap::with_capacity(MAX_PENDING_DECISIONS),
             pending_order: VecDeque::with_capacity(MAX_PENDING_DECISIONS),
             recent: VecDeque::with_capacity(MAX_RECENT_DECISIONS),
@@ -458,6 +513,7 @@ impl<'de> Deserialize<'de> for DecisionLedger {
         let persisted = DecisionLedgerPersisted::deserialize(deserializer)?;
         let mut ledger = Self {
             next_id: persisted.next_id,
+            pending_correlations: persisted.pending_correlations,
             pending: persisted.pending,
             pending_order: persisted.pending_order,
             recent: persisted.recent,
@@ -492,8 +548,37 @@ impl DecisionLedger {
     }
 
     fn ingest_event(&mut self, event: ActuatorDecisionEvent) -> Option<ResolvedDecisionEpisode> {
-        let settled_cycle = event.proposal.proposed_cycle;
-        let id = self.propose(event.proposal);
+        let settled_cycle = if event.observed_cycle > 0 {
+            event.observed_cycle
+        } else {
+            event.proposal.proposed_cycle
+        };
+        if event.outcome == ActuatorDecisionOutcome::Pending {
+            let id = self.propose(event.proposal);
+            if let Some(correlation_id) = event.correlation_id {
+                self.pending_correlations.insert(correlation_id, id);
+                self.begin_execution(id);
+                return None;
+            }
+            if let Some(envelope) = self.pending.get_mut(&id) {
+                envelope.terminal_attribution = Some(event.attribution.clone().bounded());
+            }
+            self.record_execution(
+                id,
+                ExecutionReceipt {
+                    receipt_id: id.0,
+                    disposition: ExecutionDisposition::Failed,
+                    observed_cycle: settled_cycle,
+                    attribution: Some(event.attribution),
+                    detail: "pending event missing correlation".to_string(),
+                },
+            );
+            return self.settle(id, settled_cycle);
+        }
+        let id = event
+            .correlation_id
+            .and_then(|correlation_id| self.pending_correlations.get(&correlation_id).copied())
+            .unwrap_or_else(|| self.propose(event.proposal));
         if let Some(envelope) = self.pending.get_mut(&id) {
             envelope.terminal_attribution = Some(event.attribution.clone().bounded());
         }
@@ -512,7 +597,8 @@ impl DecisionLedger {
                     ActuatorDecisionOutcome::Reverted => ExecutionDisposition::Reverted,
                     ActuatorDecisionOutcome::Rejected
                     | ActuatorDecisionOutcome::Vetoed
-                    | ActuatorDecisionOutcome::Expired => unreachable!(),
+                    | ActuatorDecisionOutcome::Expired
+                    | ActuatorDecisionOutcome::Pending => unreachable!(),
                 };
                 self.record_execution(
                     id,
@@ -526,13 +612,21 @@ impl DecisionLedger {
                 )
             }
         };
-        closed.then(|| self.settle(id, settled_cycle)).flatten()
+        let settled = closed.then(|| self.settle(id, settled_cycle)).flatten();
+        if settled.is_some() {
+            if let Some(correlation_id) = event.correlation_id {
+                self.pending_correlations.remove(&correlation_id);
+            }
+        }
+        settled
     }
 
     pub fn propose(&mut self, proposal: DecisionProposal) -> DecisionId {
         if self.pending.len() >= MAX_PENDING_DECISIONS {
             if let Some(evicted_id) = self.pending_order.pop_front() {
                 if let Some(mut evicted) = self.pending.remove(&evicted_id) {
+                    self.pending_correlations
+                        .retain(|_, pending_id| *pending_id != evicted_id);
                     evicted.lifecycle = DecisionLifecycle::Expired;
                     evicted.terminal_reason = "pending-capacity".to_string();
                     self.expired_total = self.expired_total.saturating_add(1);
@@ -633,6 +727,18 @@ impl DecisionLedger {
         self.pending.len()
     }
 
+    pub fn pending_for_correlation(&self, correlation_id: u64) -> Option<DecisionId> {
+        self.pending_correlations.get(&correlation_id).copied()
+    }
+
+    pub fn high_water(&self) -> u64 {
+        self.next_id
+    }
+
+    pub fn seed_high_water(&mut self, high_water: u64) {
+        self.next_id = self.next_id.max(high_water);
+    }
+
     pub fn recent(&self) -> &VecDeque<ResolvedDecisionEpisode> {
         &self.recent
     }
@@ -665,6 +771,8 @@ impl DecisionLedger {
                 continue;
             }
             if let Some(mut envelope) = self.pending.remove(&id) {
+                self.pending_correlations
+                    .retain(|_, pending_id| *pending_id != id);
                 envelope.lifecycle = DecisionLifecycle::Expired;
                 envelope.terminal_reason = "expired".to_string();
                 self.expired_total = self.expired_total.saturating_add(1);
@@ -687,6 +795,8 @@ impl DecisionLedger {
         }
         let envelope = self.pending.remove(&id)?;
         remove_pending_id(&mut self.pending_order, id);
+        self.pending_correlations
+            .retain(|_, pending_id| *pending_id != id);
         Some(self.archive(envelope, settled_cycle))
     }
 
@@ -757,6 +867,8 @@ impl DecisionLedger {
         }
         self.pending = pending;
         self.pending_order = order;
+        self.pending_correlations
+            .retain(|correlation, id| *correlation > 0 && self.pending.contains_key(id));
 
         self.recent = normalize_episodes(std::mem::take(&mut self.recent), MAX_RECENT_DECISIONS);
         self.episodic = normalize_episodes(
@@ -1627,5 +1739,96 @@ mod tests {
         );
         assert_eq!(event.outcome, ActuatorDecisionOutcome::Applied);
         assert_eq!(event.proposal.hierarchy.cohort, 12);
+    }
+
+    #[test]
+    fn pending_command_completion_reuses_one_decision_id_across_cycles() {
+        let mut ledger = DecisionLedger::new();
+        let mut launched = CycleDecisionEvents::default();
+        launched.push(
+            ActuatorDecisionEvent::local(
+                "predictive_purge:maintenance",
+                "host",
+                7,
+                ActuatorDecisionOutcome::Pending,
+                "maintenance-purge",
+                "queued for asynchronous completion",
+            )
+            .with_correlation(41),
+        );
+
+        assert!(ledger.ingest_cycle_events(&mut launched).is_empty());
+        let pending_id = ledger
+            .pending_for_correlation(41)
+            .expect("queued command must retain one pending decision");
+
+        let mut completed = CycleDecisionEvents::default();
+        completed.push(
+            ActuatorDecisionEvent::local(
+                "predictive_purge:maintenance",
+                "host",
+                9,
+                ActuatorDecisionOutcome::Applied,
+                "async-command-completion",
+                "exit status 0",
+            )
+            .with_correlation(41),
+        );
+        let episodes = ledger.ingest_cycle_events(&mut completed);
+
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].id, pending_id);
+        assert_eq!(episodes[0].envelope.proposed_cycle, 7);
+        assert_eq!(episodes[0].settled_cycle, 9);
+        assert!(episodes[0].authority_eligible);
+        assert!(ledger.pending_for_correlation(41).is_none());
+    }
+
+    #[test]
+    fn restored_high_water_seeds_ids_above_prior_process_run() {
+        let mut prior = DecisionLedger::new();
+        prior.seed_high_water(8_400);
+        let persisted = serde_json::to_string(&prior).expect("serialize ledger high water");
+        let restored: DecisionLedger = serde_json::from_str(&persisted).expect("restore ledger");
+        let mut restart = DecisionLedger::new();
+        restart.seed_high_water(restored.high_water());
+
+        let id = restart.propose(DecisionProposal::default());
+
+        assert_eq!(id, DecisionId(8_401));
+    }
+
+    #[test]
+    fn nested_drops_propagate_and_seal_one_auditable_overflow_summary() {
+        let mut producer = CycleDecisionEvents::default();
+        for index in 0..=MAX_CYCLE_DECISION_EVENTS {
+            producer.push(ActuatorDecisionEvent::local(
+                format!("freeze:producer-{index}"),
+                format!("pid:{index}"),
+                11,
+                ActuatorDecisionOutcome::Blocked,
+                "producer",
+                "bounded producer",
+            ));
+        }
+        assert_eq!(producer.dropped_total(), 1);
+
+        let mut cycle = CycleDecisionEvents::default();
+        cycle.extend_buffer(&producer);
+        assert_eq!(cycle.dropped_total(), 1);
+        assert!(cycle.seal_overflow_summary(11));
+        assert_eq!(cycle.dropped_total(), 2);
+        let summary = cycle
+            .as_slice()
+            .iter()
+            .find(|event| event.proposal.action_key == "decision_events:overflow")
+            .expect("overflow must retain one bounded audit receipt");
+        assert_eq!(summary.outcome, ActuatorDecisionOutcome::Failed);
+        assert!(summary.detail.contains("dropped=2"));
+
+        let episodes = DecisionLedger::new().ingest_cycle_events(&mut cycle);
+        assert!(episodes
+            .iter()
+            .any(|episode| episode.envelope.action_key == "decision_events:overflow"));
     }
 }

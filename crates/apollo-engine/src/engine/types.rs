@@ -542,6 +542,12 @@ pub struct RuntimeMetrics {
     pub browser_inp_p95_ms: Option<f64>,
     #[serde(default)]
     pub browser_latency_samples: u64,
+    /// Cycle-local decision events dropped by bounded producer/merge buffers.
+    #[serde(default)]
+    pub decision_event_drops_total: u64,
+    /// Auditable synthetic close receipts emitted when a bounded buffer drops.
+    #[serde(default)]
+    pub decision_event_overflow_summaries_total: u64,
     /// Latest resolved actuator episode, exported as an explanation rather
     /// than as authority. The evidence tier and quality remain the gate.
     #[serde(default)]

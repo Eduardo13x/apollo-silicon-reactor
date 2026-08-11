@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::chromium_manager::ChromiumManager;
 use apollo_engine::engine::daemon_helpers::{
-    apply_reversible_background_jetsam, spawn_reaped_purge, ReversibleJetsamOutcome,
+    apply_reversible_background_jetsam, AsyncCommandMetric, AsyncCommandQueue,
+    AsyncCommandSubmission, AsyncCommandSubmitError, ReversibleJetsamOutcome,
 };
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decision_ledger::{
@@ -55,6 +56,13 @@ fn survival_event(
     detail: impl Into<String>,
 ) -> ActuatorDecisionEvent {
     ActuatorDecisionEvent::local(action_key, target, cycle, outcome, "survival-mode", detail)
+}
+
+fn survival_pending_event(
+    submission: &AsyncCommandSubmission,
+    cycle: u64,
+) -> ActuatorDecisionEvent {
+    submission.pending_event(cycle)
 }
 
 fn apply_survival_jetsam_demotions(
@@ -147,6 +155,7 @@ pub fn run_survival_tick(
     state: &SharedState,
     chromium_mgr: &mut ChromiumManager,
     maintenance_state: &mut MaintenanceState,
+    async_commands: &AsyncCommandQueue,
 ) -> SurvivalTickOutput {
     let mut output = SurvivalTickOutput::default();
     let p_oom_escalation = cycle_count > 5
@@ -248,28 +257,38 @@ pub fn run_survival_tick(
                 .map(|t: Instant| t.elapsed() >= Duration::from_secs(600))
                 .unwrap_or(true);
             if can_purge {
-                if spawn_reaped_purge() {
-                    *local = Some(Instant::now());
-                    // Write shared timestamp so maintenance_tick yields.
-                    // Survival itself does NOT read this field — asymmetric.
-                    maintenance_state.mark_purged();
-                    maintenance_state
-                        .mark_compressor_flushing(snapshot.pressure.swap_delta_bytes_per_sec < 0.0);
-                    output.decision_events.push(survival_event(
-                        "predictive_purge:survival",
-                        "host",
-                        cycle_count,
-                        ActuatorDecisionOutcome::Applied,
-                        "survival purge spawned",
-                    ));
-                } else {
-                    output.decision_events.push(survival_event(
-                        "predictive_purge:survival",
-                        "host",
-                        cycle_count,
-                        ActuatorDecisionOutcome::Failed,
-                        "survival purge spawn failed",
-                    ));
+                match async_commands.submit_purge(
+                    "predictive_purge:survival",
+                    "host",
+                    "survival-mode",
+                    AsyncCommandMetric::SurvivalPurge,
+                ) {
+                    Ok(submission) => {
+                        *local = Some(Instant::now());
+                        // Write shared timestamp so maintenance_tick yields.
+                        // Survival itself does NOT read this field — asymmetric.
+                        maintenance_state.mark_purged();
+                        maintenance_state.mark_compressor_flushing(
+                            snapshot.pressure.swap_delta_bytes_per_sec < 0.0,
+                        );
+                        output
+                            .decision_events
+                            .push(survival_pending_event(&submission, cycle_count));
+                    }
+                    Err(error) => {
+                        output.decision_events.push(survival_event(
+                            "predictive_purge:survival",
+                            "host",
+                            cycle_count,
+                            match error {
+                                AsyncCommandSubmitError::Full => ActuatorDecisionOutcome::Blocked,
+                                AsyncCommandSubmitError::WorkerUnavailable => {
+                                    ActuatorDecisionOutcome::Failed
+                                }
+                            },
+                            format!("survival purge queue rejected: {error}"),
+                        ));
+                    }
                 }
             } else {
                 output.decision_events.push(survival_event(
@@ -321,5 +340,21 @@ mod tests {
             "chromium_jetsam:background_renderer"
         );
         assert_eq!(purge.proposal.proposed_cycle, 9);
+    }
+
+    #[test]
+    fn queued_survival_purge_remains_pending_until_completion() {
+        let submission = apollo_engine::engine::daemon_helpers::AsyncCommandSubmission {
+            correlation_id: 73,
+            action_key: "predictive_purge:survival".to_string(),
+            target: "host".to_string(),
+            source: "survival-mode".to_string(),
+            metric: apollo_engine::engine::daemon_helpers::AsyncCommandMetric::SurvivalPurge,
+        };
+
+        let event = survival_pending_event(&submission, 9);
+
+        assert_eq!(event.outcome, ActuatorDecisionOutcome::Pending);
+        assert_eq!(event.correlation_id, Some(73));
     }
 }

@@ -9,6 +9,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use crate::engine::active_coalition_envelope::CoalitionGuard;
+use crate::engine::daemon_helpers::AsyncCommandQueue;
 use crate::engine::decision_ledger::ActuatorDecisionOutcome;
 use crate::engine::execute_actions::{
     decision_event_for_root_action, execute_actions, ExecuteOutcomes,
@@ -43,6 +44,7 @@ pub struct ActuationRequest<'a> {
     pub learned_protected: &'a [String],
     pub learned_interactive: &'a [String],
     pub qos_mgr: Option<&'a Arc<Mutex<MachQoSManager>>>,
+    pub async_commands: Option<&'a AsyncCommandQueue>,
     pub memory_pressure: f64,
     pub thrashing_score: f64,
     pub coalition_guard: Option<&'a CoalitionGuard<'a>>,
@@ -126,6 +128,7 @@ impl ActuationBroker {
             request.learned_protected,
             request.learned_interactive,
             request.qos_mgr,
+            request.async_commands,
             self.mode == BrokerMode::DryRun,
             request.memory_pressure,
             request.thrashing_score,
@@ -205,6 +208,7 @@ mod tests {
             learned_protected: &[],
             learned_interactive: &[],
             qos_mgr: None,
+            async_commands: None,
             memory_pressure: 0.5,
             thrashing_score: 0.0,
             coalition_guard: None,

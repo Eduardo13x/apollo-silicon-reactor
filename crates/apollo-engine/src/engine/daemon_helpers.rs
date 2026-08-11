@@ -8,12 +8,16 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::Child;
-use std::sync::mpsc::{self, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError, TrySendError};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::engine::decision_ledger::{
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+};
 use crate::engine::policy_store::{append_jsonl, write_json, LearnedPolicy};
 use crate::engine::power_management::PowerManager;
 use crate::engine::process_identity::ProcessIdentity;
@@ -26,6 +30,7 @@ use crate::engine::types::{
 // ── Constants ───────────────────────────────────────────────────────────────
 
 pub const FREEZE_TTL_SECS: i64 = 3 * 60;
+pub const ASYNC_COMMAND_QUEUE_CAPACITY: usize = 32;
 
 /// Seed policy embedded at compile time — guarantees Brave, Claude, Warp, etc.
 /// are always in interactive_patterns even on fresh installs or corrupt disk policy.
@@ -604,6 +609,46 @@ impl UnfreezeOutcome {
     }
 }
 
+pub fn unfreeze_outcome_events(
+    action_key: &str,
+    source: &str,
+    cycle: u64,
+    outcome: &UnfreezeOutcome,
+) -> CycleDecisionEvents {
+    let mut events = CycleDecisionEvents::default();
+    for pid in &outcome.applied_pids {
+        events.push(ActuatorDecisionEvent::local(
+            action_key,
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Reverted,
+            source,
+            "verified SIGCONT applied",
+        ));
+    }
+    for pid in &outcome.stale_pids {
+        events.push(ActuatorDecisionEvent::local(
+            action_key,
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Blocked,
+            source,
+            "stale process identity",
+        ));
+    }
+    for pid in &outcome.failed_pids {
+        events.push(ActuatorDecisionEvent::local(
+            action_key,
+            format!("pid:{pid}"),
+            cycle,
+            ActuatorDecisionOutcome::Failed,
+            source,
+            "SIGCONT failed",
+        ));
+    }
+    events
+}
+
 fn send_sigcont(pid: u32, outcome: &mut UnfreezeOutcome) {
     let rc = unsafe { libc::kill(pid as i32, libc::SIGCONT) };
     if rc == 0 {
@@ -856,6 +901,280 @@ pub fn compute_p95(samples: &[u64]) -> f64 {
     *sorted.select_nth_unstable(idx).1 as f64
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncCommandMetric {
+    MaintenancePurge,
+    SurvivalPurge,
+    CliPurge,
+    Spotlight,
+    Test,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncCommandSubmission {
+    pub correlation_id: u64,
+    pub action_key: String,
+    pub target: String,
+    pub source: String,
+    pub metric: AsyncCommandMetric,
+}
+
+impl AsyncCommandSubmission {
+    pub fn pending_event(&self, cycle: u64) -> ActuatorDecisionEvent {
+        ActuatorDecisionEvent::local(
+            &self.action_key,
+            &self.target,
+            cycle,
+            ActuatorDecisionOutcome::Pending,
+            &self.source,
+            "command queued; completion pending",
+        )
+        .with_correlation(self.correlation_id)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AsyncCommandCompletionStats {
+    pub completed: u64,
+    pub failed: u64,
+    pub maintenance_purges_applied: u64,
+    pub survival_purges_applied: u64,
+    pub cli_purges_applied: u64,
+    pub spotlight_applied: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncCommandSubmitError {
+    Full,
+    WorkerUnavailable,
+}
+
+impl std::fmt::Display for AsyncCommandSubmitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Full => "asynchronous command queue full",
+            Self::WorkerUnavailable => "asynchronous command worker unavailable",
+        })
+    }
+}
+
+enum AsyncCommandKind {
+    Purge,
+    Spotlight(bool),
+    #[cfg(test)]
+    TestProgram(String),
+}
+
+struct AsyncCommandJob {
+    kind: AsyncCommandKind,
+    submission: AsyncCommandSubmission,
+}
+
+struct AsyncCommandCompletion {
+    submission: AsyncCommandSubmission,
+    success: bool,
+    detail: String,
+}
+
+/// Loop-owned, fixed-capacity command handoff. Submitting and draining use
+/// non-blocking channel operations; only the dedicated worker waits for child
+/// completion. The completion channel is also bounded, so memory cannot grow
+/// with slow or failed external commands.
+pub struct AsyncCommandQueue {
+    jobs: SyncSender<AsyncCommandJob>,
+    completions: Receiver<AsyncCommandCompletion>,
+    next_correlation_id: AtomicU64,
+}
+
+impl Default for AsyncCommandQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AsyncCommandQueue {
+    pub fn new() -> Self {
+        let (job_tx, job_rx) = mpsc::sync_channel::<AsyncCommandJob>(ASYNC_COMMAND_QUEUE_CAPACITY);
+        let (completion_tx, completion_rx) =
+            mpsc::sync_channel::<AsyncCommandCompletion>(ASYNC_COMMAND_QUEUE_CAPACITY);
+        let _ = std::thread::Builder::new()
+            .name("apollo-command-completion".to_string())
+            .spawn(move || async_command_worker(job_rx, completion_tx));
+        Self {
+            jobs: job_tx,
+            completions: completion_rx,
+            next_correlation_id: AtomicU64::new(1),
+        }
+    }
+
+    pub fn submit_purge(
+        &self,
+        action_key: &str,
+        target: &str,
+        source: &str,
+        metric: AsyncCommandMetric,
+    ) -> Result<AsyncCommandSubmission, AsyncCommandSubmitError> {
+        self.submit(AsyncCommandKind::Purge, action_key, target, source, metric)
+    }
+
+    pub fn submit_spotlight(
+        &self,
+        enabled: bool,
+        source: &str,
+    ) -> Result<AsyncCommandSubmission, AsyncCommandSubmitError> {
+        self.submit(
+            AsyncCommandKind::Spotlight(enabled),
+            "spotlight:indexing",
+            if enabled { "enabled" } else { "disabled" },
+            source,
+            AsyncCommandMetric::Spotlight,
+        )
+    }
+
+    #[cfg(test)]
+    fn submit_test_program(
+        &self,
+        program: &str,
+        action_key: &str,
+        target: &str,
+        source: &str,
+    ) -> Result<AsyncCommandSubmission, AsyncCommandSubmitError> {
+        self.submit(
+            AsyncCommandKind::TestProgram(program.to_string()),
+            action_key,
+            target,
+            source,
+            AsyncCommandMetric::Test,
+        )
+    }
+
+    fn submit(
+        &self,
+        kind: AsyncCommandKind,
+        action_key: &str,
+        target: &str,
+        source: &str,
+        metric: AsyncCommandMetric,
+    ) -> Result<AsyncCommandSubmission, AsyncCommandSubmitError> {
+        let correlation_id = self.next_correlation_id.fetch_add(1, Ordering::Relaxed);
+        let submission = AsyncCommandSubmission {
+            correlation_id: correlation_id.max(1),
+            action_key: bound_async_text(action_key, 320),
+            target: bound_async_text(target, 256),
+            source: bound_async_text(source, 48),
+            metric,
+        };
+        match self.jobs.try_send(AsyncCommandJob {
+            kind,
+            submission: submission.clone(),
+        }) {
+            Ok(()) => Ok(submission),
+            Err(TrySendError::Full(_)) => Err(AsyncCommandSubmitError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(AsyncCommandSubmitError::WorkerUnavailable),
+        }
+    }
+
+    pub fn drain_decision_events(
+        &self,
+        cycle: u64,
+        events: &mut CycleDecisionEvents,
+    ) -> AsyncCommandCompletionStats {
+        let mut stats = AsyncCommandCompletionStats::default();
+        for _ in 0..ASYNC_COMMAND_QUEUE_CAPACITY {
+            let completion = match self.completions.try_recv() {
+                Ok(completion) => completion,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            stats.completed = stats.completed.saturating_add(1);
+            stats.failed = stats.failed.saturating_add(u64::from(!completion.success));
+            if completion.success {
+                match completion.submission.metric {
+                    AsyncCommandMetric::MaintenancePurge => {
+                        stats.maintenance_purges_applied =
+                            stats.maintenance_purges_applied.saturating_add(1);
+                    }
+                    AsyncCommandMetric::SurvivalPurge => {
+                        stats.survival_purges_applied =
+                            stats.survival_purges_applied.saturating_add(1);
+                    }
+                    AsyncCommandMetric::CliPurge => {
+                        stats.cli_purges_applied = stats.cli_purges_applied.saturating_add(1);
+                    }
+                    AsyncCommandMetric::Spotlight => {
+                        stats.spotlight_applied = stats.spotlight_applied.saturating_add(1);
+                    }
+                    AsyncCommandMetric::Test => {}
+                }
+            }
+            events.push(
+                ActuatorDecisionEvent::local(
+                    completion.submission.action_key,
+                    completion.submission.target,
+                    cycle,
+                    if completion.success {
+                        ActuatorDecisionOutcome::Applied
+                    } else {
+                        ActuatorDecisionOutcome::Failed
+                    },
+                    completion.submission.source,
+                    completion.detail,
+                )
+                .with_correlation(completion.submission.correlation_id),
+            );
+        }
+        stats
+    }
+}
+
+fn async_command_worker(
+    jobs: Receiver<AsyncCommandJob>,
+    completions: SyncSender<AsyncCommandCompletion>,
+) {
+    while let Ok(job) = jobs.recv() {
+        let result = match job.kind {
+            AsyncCommandKind::Purge => std::process::Command::new("purge")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+            AsyncCommandKind::Spotlight(enabled) => std::process::Command::new("/usr/bin/mdutil")
+                .args(["-a", "-i", if enabled { "on" } else { "off" }])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+            #[cfg(test)]
+            AsyncCommandKind::TestProgram(program) => std::process::Command::new(program)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status(),
+        };
+        let (success, detail) = match result {
+            Ok(status) => (
+                status.success(),
+                format!(
+                    "exit_status={:?},success={}",
+                    status.code(),
+                    status.success()
+                ),
+            ),
+            Err(error) => (false, format!("spawn_error={error}")),
+        };
+        if completions
+            .send(AsyncCommandCompletion {
+                submission: job.submission,
+                success,
+                detail,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+fn bound_async_text(value: &str, max_chars: usize) -> String {
+    value.chars().take(max_chars).collect()
+}
+
 type ReapJob = (Child, &'static str);
 
 #[cfg(test)]
@@ -949,6 +1268,7 @@ pub fn spotlight_set_indexing(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::decision_ledger::{ActuatorDecisionOutcome, CycleDecisionEvents};
 
     #[test]
     fn compute_p95_matches_full_sort_reference() {
@@ -983,6 +1303,68 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn bounded_async_command_reports_pending_then_exact_failed_completion() {
+        let commands = AsyncCommandQueue::new();
+        let submission = commands
+            .submit_test_program(
+                "/usr/bin/false",
+                "predictive_purge:test",
+                "host",
+                "test-async-command",
+            )
+            .expect("bounded queue accepts one test command");
+        let pending = submission.pending_event(5);
+        assert_eq!(pending.outcome, ActuatorDecisionOutcome::Pending);
+        assert_eq!(pending.correlation_id, Some(submission.correlation_id));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let completion = loop {
+            let mut events = CycleDecisionEvents::default();
+            commands.drain_decision_events(6, &mut events);
+            if let Some(event) = events.as_slice().first() {
+                break event.clone();
+            }
+            assert!(std::time::Instant::now() < deadline, "completion timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        assert_eq!(completion.outcome, ActuatorDecisionOutcome::Failed);
+        assert_eq!(completion.correlation_id, pending.correlation_id);
+        assert_eq!(completion.proposal.action_key, pending.proposal.action_key);
+        assert_eq!(completion.proposal.target, pending.proposal.target);
+        assert!(completion.detail.contains("exit"));
+    }
+
+    #[test]
+    fn unfreeze_outcome_emits_exact_reverted_blocked_and_failed_receipts() {
+        let outcome = UnfreezeOutcome {
+            applied_pids: vec![11],
+            stale_pids: vec![12],
+            failed_pids: vec![13],
+        };
+
+        let events =
+            unfreeze_outcome_events("unfreeze:pre_sleep", "pre-sleep-recovery", 8, &outcome);
+
+        assert_eq!(events.len(), 3);
+        assert_eq!(events.as_slice()[0].proposal.target, "pid:11");
+        assert_eq!(
+            events.as_slice()[0].outcome,
+            ActuatorDecisionOutcome::Reverted
+        );
+        assert_eq!(events.as_slice()[1].proposal.target, "pid:12");
+        assert_eq!(
+            events.as_slice()[1].outcome,
+            ActuatorDecisionOutcome::Blocked
+        );
+        assert_eq!(events.as_slice()[2].proposal.target, "pid:13");
+        assert_eq!(
+            events.as_slice()[2].outcome,
+            ActuatorDecisionOutcome::Failed
+        );
     }
 
     #[test]

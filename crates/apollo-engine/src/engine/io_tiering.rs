@@ -192,6 +192,19 @@ pub struct IoShaper {
     pub pressure_demotions: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoPromotionDisposition {
+    Applied,
+    NoOp,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IoPromotionOutcome {
+    pub pid: u32,
+    pub disposition: IoPromotionDisposition,
+}
+
 struct TierAssignment {
     tier: IOTier,
     applied_at: Instant,
@@ -303,10 +316,21 @@ impl IoShaper {
     pub fn promote_interactive(
         &mut self,
         pids: &[u32],
-        mut qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
+        qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
     ) -> u32 {
+        self.promote_interactive_outcomes(pids, qos_mgr)
+            .into_iter()
+            .filter(|outcome| outcome.disposition == IoPromotionDisposition::Applied)
+            .count() as u32
+    }
+
+    pub fn promote_interactive_outcomes(
+        &mut self,
+        pids: &[u32],
+        mut qos_mgr: Option<&mut crate::engine::mach_qos::MachQoSManager>,
+    ) -> Vec<IoPromotionOutcome> {
         let now = Instant::now();
-        let mut changes = 0u32;
+        let mut outcomes = Vec::with_capacity(pids.len());
         for &pid in pids {
             // Only undo a demotion this shaper can prove it owns. Unknown
             // processes are already under macOS/RunningBoard control, so a
@@ -316,6 +340,10 @@ impl IoShaper {
                 .get(&pid)
                 .is_some_and(|existing| existing.tier != IOTier::Interactive)
             {
+                outcomes.push(IoPromotionOutcome {
+                    pid,
+                    disposition: IoPromotionDisposition::NoOp,
+                });
                 continue;
             }
 
@@ -326,6 +354,10 @@ impl IoShaper {
                 apply_io_tier(pid, IOTier::Interactive)
             };
             if !success {
+                outcomes.push(IoPromotionOutcome {
+                    pid,
+                    disposition: IoPromotionDisposition::Failed,
+                });
                 continue;
             }
 
@@ -347,9 +379,12 @@ impl IoShaper {
                 },
             );
             self.total_changes = self.total_changes.saturating_add(1);
-            changes = changes.saturating_add(1);
+            outcomes.push(IoPromotionOutcome {
+                pid,
+                disposition: IoPromotionDisposition::Applied,
+            });
         }
-        changes
+        outcomes
     }
 
     /// Clean up entries for PIDs that no longer exist.
@@ -412,6 +447,19 @@ mod tests {
         assert_eq!(shaper.total_changes, 0);
         assert_eq!(shaper.promote_interactive(&[43], None), 0);
         assert_eq!(shaper.total_changes, 0);
+    }
+
+    #[test]
+    fn interactive_promotion_reports_every_selected_pid_instead_of_only_a_count() {
+        let mut shaper = IoShaper::new();
+
+        let outcomes = shaper.promote_interactive_outcomes(&[42, 43], None);
+
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].pid, 42);
+        assert_eq!(outcomes[0].disposition, IoPromotionDisposition::NoOp);
+        assert_eq!(outcomes[1].pid, 43);
+        assert_eq!(outcomes[1].disposition, IoPromotionDisposition::NoOp);
     }
 
     #[test]

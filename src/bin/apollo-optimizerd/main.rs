@@ -83,9 +83,10 @@ use apollo_engine::engine::daemon_helpers::{
     learned_state_path, load_frozen_state, load_governor_state, load_wake_state, markov_path,
     merge_seed_into, metrics_path, overflow_history_path, parse_profile, pid_start_time,
     predictive_agent_path, remove_crash_sentinel, rl_threshold_path, signal_intelligence_path,
-    skills_path, socket_path, spawn_reaped_purge, telemetry_output_dir, temporal_histograms_path,
-    timeline_path, unfreeze_pids, unfreeze_pids_verified_outcome, wake_state_path,
-    write_frozen_state, write_governor_state,
+    skills_path, socket_path, telemetry_output_dir, temporal_histograms_path, timeline_path,
+    unfreeze_outcome_events, unfreeze_pids_outcome, unfreeze_pids_verified_outcome,
+    wake_state_path, write_frozen_state, write_governor_state, AsyncCommandMetric,
+    AsyncCommandQueue, AsyncCommandSubmitError,
 };
 use apollo_engine::engine::focus_markov::FocusMarkov;
 use apollo_engine::engine::foreground::{ForegroundDetector, ForegroundState};
@@ -911,6 +912,7 @@ fn main() -> anyhow::Result<()> {
                     installation_id,
                 );
             let mut decision_ledger = apollo_engine::engine::decision_ledger::DecisionLedger::new();
+            let async_commands = AsyncCommandQueue::new();
             {
                 let mut m_guard = state.metrics.lock_recover();
                 m_guard.metrics.recently_applied_restore_status =
@@ -1238,6 +1240,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 restore_monitor = RestoreQualityMonitor::new();
             }
+            decision_ledger.seed_high_water(telemetry_medallion.decision_id_high_water());
             // Temporal app predictor: time-of-day aware app launch prediction.
             // Shin et al. 2012 — temporal patterns predict app launches with ~80% accuracy.
             // Combined with Markov chain for 85% top-3 accuracy (Baeza-Yates et al. 2015).
@@ -1686,6 +1689,18 @@ fn main() -> anyhow::Result<()> {
                 lf_metrics.inc_cycles();
                 let mut cycle_decision_events =
                     apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
+                let async_completion_stats =
+                    async_commands.drain_decision_events(cycle_count, &mut cycle_decision_events);
+                if async_completion_stats.maintenance_purges_applied > 0
+                    || async_completion_stats.cli_purges_applied > 0
+                {
+                    lf_metrics.maintenance_purge_total.fetch_add(
+                        async_completion_stats
+                            .maintenance_purges_applied
+                            .saturating_add(async_completion_stats.cli_purges_applied),
+                        Ordering::Relaxed,
+                    );
+                }
 
                 // Decrement freeze cooldown counters once per cycle.
                 // [Nygard 2018] §8.5 circuit-breaker hold-down decay.
@@ -1920,13 +1935,7 @@ fn main() -> anyhow::Result<()> {
                     &frozen_state_path,
                     cycle_count,
                 );
-                cycle_decision_events.extend(
-                    wake_unfreeze_output
-                        .decision_events
-                        .as_slice()
-                        .iter()
-                        .cloned(),
-                );
+                cycle_decision_events.extend_buffer(&wake_unfreeze_output.decision_events);
 
                 // Mark reactor as stalled only if the reactor thread has sent
                 // zero pulses after 60 s — that means the thread itself died,
@@ -1994,7 +2003,7 @@ fn main() -> anyhow::Result<()> {
                 // Display-Off Turbo: Android Doze-like power management.
                 // Extracted to daemon_turbo_manager::run_turbo_tick().
                 // [Nygard 2018] bulkhead: bound blast radius of display state transitions.
-                daemon_turbo_manager::run_turbo_tick(
+                let turbo_output = daemon_turbo_manager::run_turbo_tick(
                     &mut display_turbo,
                     &state,
                     &fg_detector,
@@ -2003,7 +2012,9 @@ fn main() -> anyhow::Result<()> {
                     &frozen_state_path,
                     &mut stability_oracle,
                     power_mgr.is_on_battery(),
+                    cycle_count,
                 );
+                cycle_decision_events.extend_buffer(&turbo_output.decision_events);
 
                 let overhead_input = {
                     let metrics = state.metrics.lock_recover();
@@ -2122,7 +2133,7 @@ fn main() -> anyhow::Result<()> {
                     &frozen_state_path,
                     &world_model,
                 );
-                cycle_decision_events.extend(markov_decision_events.as_slice().iter().cloned());
+                cycle_decision_events.extend_buffer(&markov_decision_events);
                 temporal_hour = markov_temporal_hour;
                 temporal_weekday = markov_temporal_weekday;
 
@@ -2165,12 +2176,14 @@ fn main() -> anyhow::Result<()> {
                 // Pre-sleep unfreeze: release every SIGSTOP'd PID before kernel suspends.
                 // Extracted to daemon_process_collector::run_pre_sleep_unfreeze().
                 // [Saltzer & Kaashoek 2009] §3.3 A-B-A defense via unfreeze_pids_verified.
-                daemon_process_collector::run_pre_sleep_unfreeze(
+                let pre_sleep_decisions = daemon_process_collector::run_pre_sleep_unfreeze(
                     &state,
                     &frozen_state_path,
                     &mut display_turbo,
                     &sleep_notifier,
+                    cycle_count,
                 );
+                cycle_decision_events.extend_buffer(&pre_sleep_decisions);
 
                 // Ghost-PID reconciliation — evict dead PIDs from frozen_state +
                 // turbo set; GC mach_qos HashMaps every 60 cycles.
@@ -2224,14 +2237,16 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_memory_budget::run_memory_budget (Wave 28).
                 // [Fowler 2004] Strangler Fig — pure move.
                 let mem_budget_start = Instant::now();
-                daemon_memory_budget::run_memory_budget(
+                let memory_budget_output = daemon_memory_budget::run_memory_budget_with_decisions(
                     snapshot.pressure.memory_pressure,
                     snapshot.memory.total_ram,
                     &state,
                     &proc_snaps,
                     &mem_analyzer,
                     &mut memory_budget,
+                    cycle_count,
                 );
+                cycle_decision_events.extend_buffer(&memory_budget_output.decision_events);
                 lf_metrics
                     .set_memory_budget_duration_us(mem_budget_start.elapsed().as_micros() as u64);
 
@@ -2365,7 +2380,7 @@ fn main() -> anyhow::Result<()> {
                 // Extracted to daemon_thermal_freeze::run_thermal_freeze (Wave 20).
                 // Passes &mut outcome_tracker (via LearningContext) so blocked
                 // freezes feed the survival-bias closure (shadow-mode-only).
-                daemon_thermal_freeze::run_thermal_freeze(
+                let thermal_freeze_output = daemon_thermal_freeze::run_thermal_freeze(
                     &thermal_action,
                     &state,
                     &collector,
@@ -2373,7 +2388,9 @@ fn main() -> anyhow::Result<()> {
                     snapshot.pressure.memory_pressure,
                     std::path::Path::new(&frozen_state_path),
                     lctx.outcome_tracker,
+                    cycle_count,
                 );
+                cycle_decision_events.extend_buffer(&thermal_freeze_output.decision_events);
 
                 // HwPredictor: schedule hardware signals every 10 cycles (~5s at normal rate).
                 // Cache and bandwidth probes run on a dedicated worker; completed samples
@@ -2576,6 +2593,7 @@ fn main() -> anyhow::Result<()> {
                 let daemon_feature_gates::LlmInferenceOutcome {
                     llm_boost,
                     llm_active,
+                    decision_events: llm_decision_events,
                 } = daemon_feature_gates::run_llm_inference_mode_tick(
                     &snapshot,
                     &state,
@@ -2584,7 +2602,9 @@ fn main() -> anyhow::Result<()> {
                     is_root,
                     foreground_pid,
                     &thermal_action,
+                    cycle_count,
                 );
+                cycle_decision_events.extend_buffer(&llm_decision_events);
 
                 // ── Feature 3: RT Boost for Foreground ────────────────────────
                 // Apply THREAD_TIME_CONSTRAINT_POLICY to foreground UI thread.
@@ -4573,9 +4593,9 @@ fn main() -> anyhow::Result<()> {
                     &state,
                     &mut chromium_mgr,
                     &mut maintenance_state,
+                    &async_commands,
                 );
-                cycle_decision_events
-                    .extend(survival_output.decision_events.as_slice().iter().cloned());
+                cycle_decision_events.extend_buffer(&survival_output.decision_events);
 
                 // Maintenance Purge Gate (2026-05-10) — opportunistic non-crisis purge
                 // between survival_tick and dispatch_tick. Asymmetric cooldown: survival
@@ -4655,18 +4675,12 @@ fn main() -> anyhow::Result<()> {
                         build_tracker.build_active,
                         bus_saturated,
                         cycle_count,
+                        &async_commands,
                     );
-                let maintenance_fired = maintenance_output.fired;
-                cycle_decision_events.extend(
-                    maintenance_output
-                        .decision_events
-                        .as_slice()
-                        .iter()
-                        .cloned(),
-                );
-                if maintenance_fired {
+                cycle_decision_events.extend_buffer(&maintenance_output.decision_events);
+                for _ in 0..async_completion_stats.maintenance_purges_applied {
                     // Record cause for observational outcome tracking via CausalGraph.
-                    // Validation requires ≥30 samples per CLAUDE.md supervision rule.
+                    // Only a confirmed zero exit status reaches this path.
                     lctx.causal_graph.record_action_with_resources(
                         "system_maintenance_purge",
                         snapshot.pressure.memory_pressure as f32,
@@ -4978,8 +4992,11 @@ fn main() -> anyhow::Result<()> {
                                 thrashing_score: 0.0,
                                 coalition_guard: None,
                                 cpu_pegged_fraction: 0.0,
+                                async_commands: Some(&async_commands),
                             })
                             .outcomes;
+                        cycle_decision_events
+                            .extend_buffer_at_cycle(&outcomes.decision_events, cycle_count);
                         if outcomes.failures == 0 {
                             sysctl_governor.mark_reverted();
                         } else {
@@ -5094,8 +5111,7 @@ fn main() -> anyhow::Result<()> {
                         &world_model,
                         workload_mode.as_str(),
                     );
-                    cycle_decision_events
-                        .extend(chromium_output.decision_events.as_slice().iter().cloned());
+                    cycle_decision_events.extend_buffer(&chromium_output.decision_events);
                     lf_metrics.record_stage(
                         apollo_engine::engine::lse_counters::CycleStage::ReasonChromium,
                         _t_chrom_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
@@ -5467,7 +5483,7 @@ fn main() -> anyhow::Result<()> {
                             "unfreeze:deadlock_recovery",
                             "deadlock-recovery",
                         );
-                        cycle_decision_events.extend(recovery_events.as_slice().iter().cloned());
+                        cycle_decision_events.extend_buffer(&recovery_events);
                         let mut frozen_map = state.frozen_state.lock_recover();
                         for pid in outcome.forgettable_pids() {
                             frozen_map.remove(&pid);
@@ -5875,6 +5891,7 @@ fn main() -> anyhow::Result<()> {
                         unfreeze_decay: &mut unfreeze_decay,
                         collector: &collector,
                         dry_run,
+                        async_commands: Some(&async_commands),
                         lf_metrics: Some(lf_metrics),
                         coalition_guard: Some(&cg),
                         cpu_pegged_fraction: pressure_collector
@@ -5893,7 +5910,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 causal_qos_upgrades_cycle += causal_qos_upgrades;
                 cycle_decision_events
-                    .extend_at_cycle(exec_outcomes.decision_events.as_slice(), cycle_count);
+                    .extend_buffer_at_cycle(&exec_outcomes.decision_events, cycle_count);
 
                 for holdout in &counterfactual_holdouts {
                     if telemetry_medallion.issue_controlled_holdout(
@@ -6402,13 +6419,7 @@ fn main() -> anyhow::Result<()> {
                     workload_mode.as_str(),
                     cycle_count,
                 );
-                cycle_decision_events.extend(
-                    acceleration_output
-                        .decision_events
-                        .as_slice()
-                        .iter()
-                        .cloned(),
-                );
+                cycle_decision_events.extend_buffer(&acceleration_output.decision_events);
                 metrics_reporter::merge_cycle_metrics(
                     &state,
                     &exec_outcomes,
@@ -6523,8 +6534,17 @@ fn main() -> anyhow::Result<()> {
                 while let Ok(msg) = main_loop_rx.try_recv() {
                     match msg {
                         main_loop_msg::MainLoopMsg::CliPurge { response_tx } => {
-                            let (resp, decision_outcome, detail) = if maintenance_state
-                                .secs_since_cli_purge()
+                            let cli_event = |outcome, detail: String| {
+                                apollo_engine::engine::decision_ledger::ActuatorDecisionEvent::local(
+                                    "predictive_purge:cli",
+                                    "host",
+                                    cycle_count,
+                                    outcome,
+                                    "cli-maintenance-purge",
+                                    detail,
+                                )
+                            };
+                            let (resp, decision_event) = if maintenance_state.secs_since_cli_purge()
                                 < 300
                             {
                                 let wait = 300 - maintenance_state.secs_since_cli_purge();
@@ -6533,8 +6553,10 @@ fn main() -> anyhow::Result<()> {
                                         fired: false,
                                         reason: format!("rate_limited — wait {}s", wait),
                                     },
-                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
-                                    format!("rate-limited:{wait}s"),
+                                    cli_event(
+                                        apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                        format!("rate-limited:{wait}s"),
+                                    ),
                                 )
                             } else if maintenance_state.secs_since_any_purge() < 60 {
                                 (
@@ -6542,8 +6564,10 @@ fn main() -> anyhow::Result<()> {
                                         fired: false,
                                         reason: "rate_limited — auto-purge fired recently".into(),
                                     },
-                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
-                                    "recent-auto-purge".to_string(),
+                                    cli_event(
+                                        apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                        "recent-auto-purge".to_string(),
+                                    ),
                                 )
                             } else if user_context.audio_active
                                 || user_context.call_in_progress
@@ -6556,42 +6580,44 @@ fn main() -> anyhow::Result<()> {
                                         fired: false,
                                         reason: "media_active — audio/video/call running; pause media or use `sudo purge` to bypass".into(),
                                     },
-                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
-                                    "media-active".to_string(),
-                                )
-                            } else if spawn_reaped_purge() {
-                                maintenance_state.mark_cli_purged();
-                                lf_metrics
-                                    .maintenance_purge_total
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                (
-                                    apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
-                                        fired: true,
-                                        reason: "ok".into(),
-                                    },
-                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Applied,
-                                    "purge applied".to_string(),
+                                    cli_event(
+                                        apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                        "media-active".to_string(),
+                                    ),
                                 )
                             } else {
-                                (
-                                    apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
-                                        fired: false,
-                                        reason: "purge spawn failed".into(),
-                                    },
-                                    apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Failed,
-                                    "purge spawn failed".to_string(),
-                                )
-                            };
-                            cycle_decision_events.push(
-                                apollo_engine::engine::decision_ledger::ActuatorDecisionEvent::local(
+                                match async_commands.submit_purge(
                                     "predictive_purge:cli",
                                     "host",
-                                    cycle_count,
-                                    decision_outcome,
                                     "cli-maintenance-purge",
-                                    detail,
-                                ),
-                            );
+                                    AsyncCommandMetric::CliPurge,
+                                ) {
+                                    Ok(submission) => {
+                                        maintenance_state.mark_cli_purged();
+                                        (
+                                            apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                                fired: true,
+                                                reason: "queued".into(),
+                                            },
+                                            submission.pending_event(cycle_count),
+                                        )
+                                    }
+                                    Err(error) => (
+                                        apollo_engine::engine::protocol::DaemonResponse::PurgeResult {
+                                            fired: false,
+                                            reason: error.to_string(),
+                                        },
+                                        cli_event(
+                                            match error {
+                                                AsyncCommandSubmitError::Full => apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Blocked,
+                                                AsyncCommandSubmitError::WorkerUnavailable => apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Failed,
+                                            },
+                                            format!("purge queue rejected: {error}"),
+                                        ),
+                                    ),
+                                }
+                            };
+                            cycle_decision_events.push(decision_event);
                             let _ = response_tx.send(resp);
                         }
                     }
@@ -6605,11 +6631,23 @@ fn main() -> anyhow::Result<()> {
                 {
                     cycle_decision_events.push(coordinated);
                 }
-                if cycle_decision_events.dropped_total() > 0 {
+                let overflow_summary_emitted =
+                    cycle_decision_events.seal_overflow_summary(cycle_count);
+                let dropped_decision_events = cycle_decision_events.dropped_total();
+                if dropped_decision_events > 0 {
                     tracing::warn!(
-                        dropped = cycle_decision_events.dropped_total(),
+                        dropped = dropped_decision_events,
                         "decision event cycle buffer reached its bounded capacity"
                     );
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.decision_event_drops_total = metrics
+                        .metrics
+                        .decision_event_drops_total
+                        .saturating_add(dropped_decision_events);
+                    metrics.metrics.decision_event_overflow_summaries_total = metrics
+                        .metrics
+                        .decision_event_overflow_summaries_total
+                        .saturating_add(u64::from(overflow_summary_emitted));
                 }
                 let resolved_decisions =
                     decision_ledger.ingest_cycle_events(&mut cycle_decision_events);
@@ -6800,10 +6838,161 @@ fn main() -> anyhow::Result<()> {
             }
 
             // Release speculative kernel state before persisting on shutdown.
-            if let Some(lease) = last_markov_prethaw.take() {
-                daemon_markov_tick::release_markov_prewarm(lease, &state);
+            let mut shutdown_decision_events =
+                apollo_engine::engine::decision_ledger::CycleDecisionEvents::default();
+            let shutdown_completion_stats =
+                async_commands.drain_decision_events(cycle_count, &mut shutdown_decision_events);
+            if shutdown_completion_stats.maintenance_purges_applied > 0
+                || shutdown_completion_stats.cli_purges_applied > 0
+            {
+                lf_metrics.maintenance_purge_total.fetch_add(
+                    shutdown_completion_stats
+                        .maintenance_purges_applied
+                        .saturating_add(shutdown_completion_stats.cli_purges_applied),
+                    Ordering::Relaxed,
+                );
             }
-            daemon_cycle_tail::release_acceleration_lease(&mut acceleration_lease, &state);
+            if let Some(lease) = last_markov_prethaw.take() {
+                let report = daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                shutdown_decision_events.extend_buffer(&report.decision_events);
+            }
+            let acceleration_events = daemon_cycle_tail::release_acceleration_lease(
+                &mut acceleration_lease,
+                &state,
+                cycle_count,
+            );
+            shutdown_decision_events.extend_buffer(&acceleration_events);
+
+            // Revert sysctls to defaults and retain the exact broker receipts.
+            {
+                let revert_actions = sysctl_governor.revert_to_defaults();
+                if !revert_actions.is_empty() {
+                    let mut frozen_dummy = HashSet::new();
+                    let outcomes = ActuationBroker::from_runtime(&caps, dry_run)
+                        .execute(ActuationRequest {
+                            actions: revert_actions,
+                            caps: &caps,
+                            journal_path: &journal_path,
+                            frozen: &mut frozen_dummy,
+                            learned_protected: &[],
+                            learned_interactive: &[],
+                            qos_mgr: None,
+                            memory_pressure: 0.0,
+                            thrashing_score: 0.0,
+                            coalition_guard: None,
+                            cpu_pegged_fraction: 0.0,
+                            async_commands: Some(&async_commands),
+                        })
+                        .outcomes;
+                    shutdown_decision_events
+                        .extend_buffer_at_cycle(&outcomes.decision_events, cycle_count);
+                    if outcomes.failures == 0 {
+                        sysctl_governor.mark_reverted();
+                    } else {
+                        tracing::warn!(
+                            failures = outcomes.failures,
+                            "sysctl-governor: revert failures; persisted defaults retained for next startup"
+                        );
+                    }
+                } else {
+                    sysctl_governor.mark_reverted();
+                }
+            }
+
+            // Chromium renderer cleanup: exact SIGCONT disposition per PID.
+            {
+                let cleanup = chromium_mgr.shutdown_cleanup_outcome();
+                for pid in &cleanup.applied_pids {
+                    shutdown_decision_events.push(
+                        apollo_engine::engine::decision_ledger::ActuatorDecisionEvent::local(
+                            "unfreeze:chromium_shutdown",
+                            format!("pid:{pid}"),
+                            cycle_count,
+                            apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Reverted,
+                            "shutdown-recovery",
+                            "renderer SIGCONT applied",
+                        ),
+                    );
+                }
+                if !cleanup.applied_pids.is_empty() {
+                    let mut frozen_state = state.frozen_state.lock_recover();
+                    for pid in &cleanup.applied_pids {
+                        frozen_state.remove(pid);
+                    }
+                }
+                for pid in &cleanup.failed_pids {
+                    shutdown_decision_events.push(
+                        apollo_engine::engine::decision_ledger::ActuatorDecisionEvent::local(
+                            "unfreeze:chromium_shutdown",
+                            format!("pid:{pid}"),
+                            cycle_count,
+                            apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome::Failed,
+                            "shutdown-recovery",
+                            "renderer SIGCONT failed",
+                        ),
+                    );
+                }
+                if !cleanup.applied_pids.is_empty() || !cleanup.failed_pids.is_empty() {
+                    tracing::info!(
+                        applied = cleanup.applied_pids.len(),
+                        failed = cleanup.failed_pids.len(),
+                        "chromium: shutdown cleanup completed"
+                    );
+                }
+            }
+
+            // Final verified release of main-loop frozen processes.
+            {
+                let mut frozen_state = state.frozen_state.lock_recover();
+                let outcome = unfreeze_pids_verified_outcome(&frozen_state);
+                for pid in outcome.forgettable_pids() {
+                    frozen_state.remove(&pid);
+                }
+                write_frozen_state(&frozen_state_path, &frozen_state);
+                shutdown_decision_events.extend_buffer(&unfreeze_outcome_events(
+                    "unfreeze:shutdown",
+                    "shutdown-recovery",
+                    cycle_count,
+                    &outcome,
+                ));
+            }
+
+            // Resource-interrupt PIDs do not retain a FrozenEntry, but every
+            // existing direct SIGCONT still receives an exact bounded receipt.
+            {
+                let interrupt_pids: Vec<u32> = state
+                    .resource_interrupt
+                    .interrupt_frozen_pids
+                    .lock_recover()
+                    .drain()
+                    .collect();
+                let outcome = unfreeze_pids_outcome(interrupt_pids.into_iter());
+                shutdown_decision_events.extend_buffer(&unfreeze_outcome_events(
+                    "unfreeze:shutdown_interrupt",
+                    "shutdown-recovery",
+                    cycle_count,
+                    &outcome,
+                ));
+            }
+
+            let shutdown_overflow_summary =
+                shutdown_decision_events.seal_overflow_summary(cycle_count);
+            let shutdown_dropped = shutdown_decision_events.dropped_total();
+            if shutdown_dropped > 0 {
+                let mut metrics = state.metrics.lock_recover();
+                metrics.metrics.decision_event_drops_total = metrics
+                    .metrics
+                    .decision_event_drops_total
+                    .saturating_add(shutdown_dropped);
+                metrics.metrics.decision_event_overflow_summaries_total = metrics
+                    .metrics
+                    .decision_event_overflow_summaries_total
+                    .saturating_add(u64::from(shutdown_overflow_summary));
+            }
+            let shutdown_resolved =
+                decision_ledger.ingest_cycle_events(&mut shutdown_decision_events);
+            telemetry_medallion.stage_decision_episodes(&shutdown_resolved);
+
             // Persist Markov chain + Holt-Winters + SignalIntelligence state on shutdown.
             focus_markov.persist();
             holt_winters.persist(&hw_path);
@@ -6852,52 +7041,6 @@ fn main() -> anyhow::Result<()> {
                 },
             );
 
-            // Revert sysctls to defaults on shutdown.
-            {
-                let revert_actions = sysctl_governor.revert_to_defaults();
-                if !revert_actions.is_empty() {
-                    let mut frozen_dummy = HashSet::new();
-                    let outcomes = ActuationBroker::from_runtime(&caps, dry_run)
-                        .execute(ActuationRequest {
-                            actions: revert_actions,
-                            caps: &caps,
-                            journal_path: &journal_path,
-                            frozen: &mut frozen_dummy,
-                            learned_protected: &[],
-                            learned_interactive: &[],
-                            qos_mgr: None,
-                            memory_pressure: 0.0,
-                            thrashing_score: 0.0,
-                            coalition_guard: None,
-                            cpu_pegged_fraction: 0.0,
-                        })
-                        .outcomes;
-                    if outcomes.failures == 0 {
-                        sysctl_governor.mark_reverted();
-                    } else {
-                        tracing::warn!(
-                            failures = outcomes.failures,
-                            "sysctl-governor: revert failures; persisted defaults retained for next startup"
-                        );
-                    }
-                } else {
-                    // No actions to revert — clean up persisted defaults anyway.
-                    sysctl_governor.mark_reverted();
-                }
-            }
-
-            // Chromium renderer cleanup: SIGCONT all renderers frozen by ChromiumManager.
-            // These are separate from the main frozen_state (different source tracking).
-            {
-                let thawed = chromium_mgr.shutdown_cleanup();
-                if !thawed.is_empty() {
-                    tracing::info!(
-                        count = thawed.len(),
-                        "chromium: shutdown cleanup — thawed all frozen renderers"
-                    );
-                }
-            }
-
             // Phase B1.4 (Sprint 2 2026-05-07) — persist RecentlyApplied for next boot.
             // Best-effort: errors are logged but do NOT block shutdown.
             // [Inbox Pattern — 1001 patterns slide 42]
@@ -6912,29 +7055,6 @@ fn main() -> anyhow::Result<()> {
                     n = recently_applied.len(),
                     "persist on shutdown"
                 );
-            }
-
-            // BUG 19 fix: unfreeze all frozen processes on daemon shutdown so
-            // processes don't remain stopped if the daemon exits or crashes.
-            {
-                let frozen_state = state.frozen_state.lock_recover();
-                let pids: Vec<u32> = frozen_state.keys().copied().collect();
-                if !pids.is_empty() {
-                    unfreeze_pids(pids.into_iter());
-                }
-            }
-
-            // Unfreeze any PIDs held by the resource interrupt handler.
-            {
-                let interrupt_pids: Vec<u32> = state
-                    .resource_interrupt
-                    .interrupt_frozen_pids
-                    .lock_recover()
-                    .drain()
-                    .collect();
-                if !interrupt_pids.is_empty() {
-                    unfreeze_pids(interrupt_pids.into_iter());
-                }
             }
 
             // Clean shutdown: remove crash sentinel so next startup knows this was graceful.

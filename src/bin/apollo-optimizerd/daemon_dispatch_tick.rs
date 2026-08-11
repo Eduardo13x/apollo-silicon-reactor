@@ -17,7 +17,7 @@ use apollo_engine::engine::action_planner::{
 };
 use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest};
 use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
-use apollo_engine::engine::daemon_helpers::write_frozen_state;
+use apollo_engine::engine::daemon_helpers::{write_frozen_state, AsyncCommandQueue};
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decision_ledger::{ActuatorDecisionOutcome, CycleDecisionEvents};
 use apollo_engine::engine::degradation::DegradationInputs;
@@ -890,6 +890,7 @@ pub struct DispatchTickInput<'a> {
     pub unfreeze_decay: &'a mut UnfreezeDecayModel,
     pub collector: &'a SystemCollector,
     pub dry_run: bool,
+    pub async_commands: Option<&'a AsyncCommandQueue>,
     /// Lock-free metrics for per-cycle dedup_drops accounting.
     /// Optional so legacy callers and unit tests can pass `None`.
     pub lf_metrics: Option<&'a LockFreeMetrics>,
@@ -935,6 +936,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         unfreeze_decay,
         collector,
         dry_run,
+        async_commands,
         lf_metrics,
         coalition_guard,
         cpu_pegged_fraction,
@@ -1208,6 +1210,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             thrashing_score: snapshot.pressure.thrashing_score,
             coalition_guard,
             cpu_pegged_fraction,
+            async_commands,
         })
     } else {
         // Circuit Closed or HalfOpen: run normally, then report outcome.
@@ -1223,6 +1226,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             thrashing_score: snapshot.pressure.thrashing_score,
             coalition_guard,
             cpu_pegged_fraction,
+            async_commands,
         });
         // Report outcome to circuit breaker.
         {
@@ -1252,7 +1256,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     let mut outcomes = broker_execution.outcomes;
     outcomes
         .decision_events
-        .extend(dispatch_decision_events.as_slice().iter().cloned());
+        .extend_buffer(&dispatch_decision_events);
 
     // Update degradation controller with new failure count.
     if outcomes.failures > 0 {
@@ -1504,6 +1508,7 @@ mod tests {
             unfreeze_decay: &mut unfreeze_decay,
             collector: &collector,
             dry_run: true,
+            async_commands: None,
             lf_metrics: None,
             coalition_guard: None,
             cpu_pegged_fraction: 0.0,

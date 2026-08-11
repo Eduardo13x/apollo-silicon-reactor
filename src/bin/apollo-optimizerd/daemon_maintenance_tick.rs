@@ -19,7 +19,9 @@ use std::sync::atomic::Ordering;
 
 use apollo_engine::collector::SystemSnapshot;
 use apollo_engine::engine::coreaudio_active::AudioActivitySnapshot;
-use apollo_engine::engine::daemon_helpers::spawn_reaped_purge;
+use apollo_engine::engine::daemon_helpers::{
+    AsyncCommandMetric, AsyncCommandQueue, AsyncCommandSubmission, AsyncCommandSubmitError,
+};
 use apollo_engine::engine::decision_ledger::{
     ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
 };
@@ -79,6 +81,26 @@ fn maintenance_output(
     MaintenanceTickOutput {
         fired,
         decision_events,
+    }
+}
+
+fn maintenance_pending_output(
+    fired: bool,
+    cycle: u64,
+    submission: &AsyncCommandSubmission,
+) -> MaintenanceTickOutput {
+    let mut decision_events = CycleDecisionEvents::default();
+    decision_events.push(submission.pending_event(cycle));
+    MaintenanceTickOutput {
+        fired,
+        decision_events,
+    }
+}
+
+fn submit_error_outcome(error: AsyncCommandSubmitError) -> ActuatorDecisionOutcome {
+    match error {
+        AsyncCommandSubmitError::Full => ActuatorDecisionOutcome::Blocked,
+        AsyncCommandSubmitError::WorkerUnavailable => ActuatorDecisionOutcome::Failed,
     }
 }
 
@@ -158,6 +180,7 @@ pub fn run_maintenance_tick(
     build_active: bool,
     bus_saturated: bool,
 ) -> bool {
+    let async_commands = AsyncCommandQueue::new();
     run_maintenance_tick_with_audio(
         snap,
         ctx,
@@ -166,6 +189,7 @@ pub fn run_maintenance_tick(
         build_active,
         bus_saturated,
         apollo_engine::engine::coreaudio_active::audio_activity_snapshot(),
+        &async_commands,
     )
 }
 
@@ -177,6 +201,7 @@ pub fn run_maintenance_tick_with_decisions(
     build_active: bool,
     bus_saturated: bool,
     cycle: u64,
+    async_commands: &AsyncCommandQueue,
 ) -> MaintenanceTickOutput {
     run_maintenance_tick_with_audio_decisions(
         snap,
@@ -187,6 +212,7 @@ pub fn run_maintenance_tick_with_decisions(
         bus_saturated,
         apollo_engine::engine::coreaudio_active::audio_activity_snapshot(),
         cycle,
+        async_commands,
     )
 }
 
@@ -198,6 +224,7 @@ fn run_maintenance_tick_with_audio(
     build_active: bool,
     bus_saturated: bool,
     audio_snapshot: AudioActivitySnapshot,
+    async_commands: &AsyncCommandQueue,
 ) -> bool {
     run_maintenance_tick_with_audio_decisions(
         snap,
@@ -208,6 +235,7 @@ fn run_maintenance_tick_with_audio(
         bus_saturated,
         audio_snapshot,
         0,
+        async_commands,
     )
     .fired
 }
@@ -222,6 +250,7 @@ fn run_maintenance_tick_with_audio_decisions(
     bus_saturated: bool,
     audio_snapshot: AudioActivitySnapshot,
     cycle: u64,
+    async_commands: &AsyncCommandQueue,
 ) -> MaintenanceTickOutput {
     state.push_swap_delta(snap.pressure.swap_delta_bytes_per_sec);
     // B.4: advance the Schmitt trigger before should_fire reads it.
@@ -277,26 +306,27 @@ fn run_maintenance_tick_with_audio_decisions(
         snap.pressure.refault_delta_per_sec,
         physical_pressure,
     );
-    if emergency && spawn_reaped_purge() {
-        state.mark_purged();
-        state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
-        lf_metrics
-            .maintenance_purge_total
-            .fetch_add(1, Ordering::Relaxed);
-        tracing::info!(
-            thrashing = thrash as u64,
-            pressure = snap.pressure.memory_pressure,
-            "maintenance: emergency thrashing-bypass purge"
-        );
-        return maintenance_output(
-            true,
-            cycle,
+    let mut emergency_submit_error = None;
+    if emergency {
+        match async_commands.submit_purge(
+            "predictive_purge:maintenance",
             "emergency-thrashing",
-            ActuatorDecisionOutcome::Applied,
-            "emergency purge spawned",
-        );
+            "maintenance-purge",
+            AsyncCommandMetric::MaintenancePurge,
+        ) {
+            Ok(submission) => {
+                state.mark_purged();
+                state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
+                tracing::info!(
+                    thrashing = thrash as u64,
+                    pressure = snap.pressure.memory_pressure,
+                    "maintenance: emergency thrashing-bypass purge queued"
+                );
+                return maintenance_pending_output(true, cycle, &submission);
+            }
+            Err(error) => emergency_submit_error = Some(error),
+        }
     }
-    let emergency_spawn_failed = emergency;
 
     // Normal-path hard guard: a live full-duplex call blocks the background
     // purge regardless of the (possibly stale) pmset audio_active flag. The
@@ -310,16 +340,13 @@ fn run_maintenance_tick_with_audio_decisions(
             false,
             cycle,
             "high-bandwidth-workload",
-            if emergency_spawn_failed {
-                ActuatorDecisionOutcome::Failed
-            } else {
-                ActuatorDecisionOutcome::Blocked
-            },
-            if emergency_spawn_failed {
-                "emergency purge spawn failed"
-            } else {
-                "high-bandwidth workload gate"
-            },
+            emergency_submit_error
+                .map(submit_error_outcome)
+                .unwrap_or(ActuatorDecisionOutcome::Blocked),
+            emergency_submit_error.map_or_else(
+                || "high-bandwidth workload gate".to_string(),
+                |error| format!("emergency purge queue rejected: {error}"),
+            ),
         );
     }
 
@@ -332,27 +359,25 @@ fn run_maintenance_tick_with_audio_decisions(
         media_guard.active,
     ) {
         None => {
-            if spawn_reaped_purge() {
-                state.mark_purged();
-                state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
-                lf_metrics
-                    .maintenance_purge_total
-                    .fetch_add(1, Ordering::Relaxed);
-                return maintenance_output(
-                    true,
+            match async_commands.submit_purge(
+                "predictive_purge:maintenance",
+                "normal-maintenance",
+                "maintenance-purge",
+                AsyncCommandMetric::MaintenancePurge,
+            ) {
+                Ok(submission) => {
+                    state.mark_purged();
+                    state.mark_compressor_flushing(snap.pressure.swap_delta_bytes_per_sec < 0.0);
+                    maintenance_pending_output(true, cycle, &submission)
+                }
+                Err(error) => maintenance_output(
+                    false,
                     cycle,
                     "normal-maintenance",
-                    ActuatorDecisionOutcome::Applied,
-                    "maintenance purge spawned",
-                );
+                    submit_error_outcome(error),
+                    format!("purge queue rejected: {error}"),
+                ),
             }
-            maintenance_output(
-                false,
-                cycle,
-                "normal-maintenance",
-                ActuatorDecisionOutcome::Failed,
-                "purge spawn failed",
-            )
         }
         Some(reason) => {
             if reason == SkipReason::MediaActive && media_guard.active {
@@ -403,16 +428,13 @@ fn run_maintenance_tick_with_audio_decisions(
                 false,
                 cycle,
                 "normal-maintenance",
-                if emergency_spawn_failed {
-                    ActuatorDecisionOutcome::Failed
-                } else {
-                    ActuatorDecisionOutcome::Blocked
-                },
-                if emergency_spawn_failed {
-                    "emergency purge spawn failed".to_string()
-                } else {
-                    format!("{reason:?}")
-                },
+                emergency_submit_error
+                    .map(submit_error_outcome)
+                    .unwrap_or(ActuatorDecisionOutcome::Blocked),
+                emergency_submit_error.map_or_else(
+                    || format!("{reason:?}"),
+                    |error| format!("emergency purge queue rejected: {error}"),
+                ),
             )
         }
     }
@@ -628,6 +650,7 @@ mod tests {
     fn maintenance_skip_returns_a_blocked_decision_event() {
         let mut state = MaintenanceState::default();
         let metrics = LockFreeMetrics::new();
+        let async_commands = AsyncCommandQueue::new();
         let output = run_maintenance_tick_with_decisions(
             &synth_snap(0.20, 0, 4_000_000_000),
             &idle_ctx(),
@@ -636,6 +659,7 @@ mod tests {
             false,
             false,
             17,
+            &async_commands,
         );
 
         assert!(!output.fired);
@@ -648,6 +672,24 @@ mod tests {
             output.decision_events.as_slice()[0].proposal.proposed_cycle,
             17
         );
+    }
+
+    #[test]
+    fn queued_maintenance_purge_is_pending_until_exit_status_arrives() {
+        let submission = apollo_engine::engine::daemon_helpers::AsyncCommandSubmission {
+            correlation_id: 91,
+            action_key: "predictive_purge:maintenance".to_string(),
+            target: "emergency-thrashing".to_string(),
+            source: "maintenance-purge".to_string(),
+            metric: apollo_engine::engine::daemon_helpers::AsyncCommandMetric::MaintenancePurge,
+        };
+
+        let output = maintenance_pending_output(true, 41, &submission);
+
+        assert!(output.fired);
+        let event = &output.decision_events.as_slice()[0];
+        assert_eq!(event.outcome, ActuatorDecisionOutcome::Pending);
+        assert_eq!(event.correlation_id, Some(91));
     }
 
     #[test]
@@ -923,6 +965,7 @@ mod tests {
         let ctx = idle_ctx();
         let mut state = make_ready_state();
         let metrics = LockFreeMetrics::new();
+        let async_commands = AsyncCommandQueue::new();
 
         assert!(!run_maintenance_tick_with_audio(
             &snap,
@@ -932,6 +975,7 @@ mod tests {
             false,
             false,
             AudioActivitySnapshot::default(),
+            &async_commands,
         ));
         assert_eq!(metrics.maintenance_purge_total.load(Ordering::Relaxed), 0);
         assert_eq!(
