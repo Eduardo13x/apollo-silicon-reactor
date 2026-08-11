@@ -301,6 +301,10 @@ pub fn run_markov_tick(
     if let Some(ref pred) = markov_prediction {
         let elapsed = focus_markov.elapsed_dwell_secs();
         let time_to_switch = pred.avg_dwell_secs - elapsed;
+        let horizon_5s = pred.confidence_within(elapsed, 5.0);
+        let horizon_30s = pred.confidence_within(elapsed, 30.0);
+        let horizon_2m = pred.confidence_within(elapsed, 120.0);
+        let horizon_10m = pred.confidence_within(elapsed, 600.0);
         let source_app = foreground_app.unwrap_or_default();
         let admission = focus_markov.prewarm_admission_with_context(
             source_app,
@@ -338,6 +342,10 @@ pub fn run_markov_tick(
             metrics.metrics.markov_prediction_app = pred.app_name.clone();
             metrics.metrics.markov_prediction_confidence = pred.probability;
             metrics.metrics.markov_prediction_eta_secs = time_to_switch;
+            metrics.metrics.markov_prediction_5s = horizon_5s;
+            metrics.metrics.markov_prediction_30s = horizon_30s;
+            metrics.metrics.markov_prediction_2m = horizon_2m;
+            metrics.metrics.markov_prediction_10m = horizon_10m;
             metrics.metrics.markov_prediction_dwell_observations = pred.dwell_observations;
             metrics.metrics.markov_prediction_dwell_deviation_secs = pred.dwell_deviation_secs;
             metrics.metrics.markov_prewarm_eligible = prewarm_eligible;
@@ -492,6 +500,10 @@ pub fn run_markov_tick(
         metrics.metrics.markov_prediction_app.clear();
         metrics.metrics.markov_prediction_confidence = 0.0;
         metrics.metrics.markov_prediction_eta_secs = 0.0;
+        metrics.metrics.markov_prediction_5s = 0.0;
+        metrics.metrics.markov_prediction_30s = 0.0;
+        metrics.metrics.markov_prediction_2m = 0.0;
+        metrics.metrics.markov_prediction_10m = 0.0;
         metrics.metrics.markov_prediction_dwell_observations = 0;
         metrics.metrics.markov_prediction_dwell_deviation_secs = 0.0;
         metrics.metrics.markov_prewarm_eligible = false;

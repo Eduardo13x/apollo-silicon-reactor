@@ -560,6 +560,22 @@ pub struct RuntimeMetrics {
     pub last_episode_utility: f64,
     #[serde(default)]
     pub last_episode_latency_improvement: f64,
+    #[serde(default)]
+    pub last_episode_system_gain: f64,
+    #[serde(default)]
+    pub last_episode_human_gain: f64,
+    #[serde(default)]
+    pub last_episode_intervention_cost: f64,
+    #[serde(default)]
+    pub last_episode_apollo_utility: f64,
+    #[serde(default)]
+    pub last_episode_proposer: String,
+    #[serde(default)]
+    pub last_episode_supporters: Vec<String>,
+    #[serde(default)]
+    pub last_episode_vetoes: Vec<String>,
+    #[serde(default)]
+    pub last_episode_predicted_gain: f64,
     /// Adaptive self-overhead governor. Critical sensing, execution and
     /// learning remain active; only optional refresh/speculation is shed.
     #[serde(default)]
@@ -1651,6 +1667,20 @@ pub struct RuntimeMetrics {
     pub world_model_actuator_quality: f64,
     #[serde(default)]
     pub world_model_actuator_mean_utility: f64,
+    /// Objective-independent recent utility trend: human gain + system gain
+    /// minus intervention cost, all counterfactual-adjusted.
+    #[serde(default)]
+    pub world_model_apollo_utility: f64,
+    #[serde(default)]
+    pub world_model_decision_credit_sources: u64,
+    #[serde(default)]
+    pub world_model_decision_credit_leader: String,
+    #[serde(default)]
+    pub world_model_decision_credit_leader_score: f64,
+    #[serde(default)]
+    pub world_model_decision_credit_leader_accuracy: f64,
+    #[serde(default)]
+    pub world_model_decision_credit_leader_observations: u32,
     /// GPU imagination lineage. Bronze is a completed forecast, Silver means
     /// an existing specialist action consumed it, and Gold means the measured
     /// actuator outcome calibrated that forecast on this hardware regime.
@@ -1680,6 +1710,20 @@ pub struct RuntimeMetrics {
     /// compatible with this machine's hardware regime.
     #[serde(default)]
     pub world_model_actuator_ready_models: u64,
+    #[serde(default)]
+    pub world_model_readiness_no_gold: u64,
+    #[serde(default)]
+    pub world_model_readiness_immature: u64,
+    #[serde(default)]
+    pub world_model_readiness_low_quality: u64,
+    #[serde(default)]
+    pub world_model_readiness_stale: u64,
+    #[serde(default)]
+    pub world_model_readiness_foreign: u64,
+    #[serde(default)]
+    pub world_model_readiness_hardware: u64,
+    #[serde(default)]
+    pub world_model_readiness_uncertain: u64,
     #[serde(default)]
     pub world_model_family_known_models: u64,
     #[serde(default)]
@@ -2395,6 +2439,16 @@ pub struct RuntimeMetrics {
     pub markov_prediction_confidence: f64,
     #[serde(default)]
     pub markov_prediction_eta_secs: f64,
+    /// Probability that the predicted destination becomes foreground within
+    /// each intent horizon. These are context signals, not prewarm authority.
+    #[serde(default)]
+    pub markov_prediction_5s: f64,
+    #[serde(default)]
+    pub markov_prediction_30s: f64,
+    #[serde(default)]
+    pub markov_prediction_2m: f64,
+    #[serde(default)]
+    pub markov_prediction_10m: f64,
     #[serde(default)]
     pub markov_prediction_dwell_observations: u32,
     #[serde(default)]

@@ -269,6 +269,25 @@ pub struct FocusPrediction {
     pub pid: Option<u32>,
 }
 
+impl FocusPrediction {
+    /// Probability that this destination becomes foreground within `horizon`.
+    /// Destination probability and timing uncertainty remain separate: a very
+    /// likely app can still have low near-term confidence when its ETA is far.
+    pub fn confidence_within(&self, elapsed_secs: f64, horizon_secs: f64) -> f64 {
+        if !elapsed_secs.is_finite() || !horizon_secs.is_finite() || horizon_secs <= 0.0 {
+            return 0.0;
+        }
+        let eta = self.avg_dwell_secs - elapsed_secs.max(0.0);
+        let timing_scale = self
+            .dwell_deviation_secs
+            .max(self.avg_dwell_secs.abs() * 0.15)
+            .max(2.0);
+        let exponent = ((eta - horizon_secs) / timing_scale).clamp(-60.0, 60.0);
+        let timing_probability = 1.0 / (1.0 + exponent.exp());
+        (self.probability.clamp(0.0, 1.0) * timing_probability).clamp(0.0, 1.0)
+    }
+}
+
 /// Persisted state of the Markov chain.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MarkovState {
@@ -1116,6 +1135,26 @@ mod tests {
         assert!(!m
             .prewarm_admission("Finder", "Terminal")
             .allows_kernel_acceleration());
+    }
+
+    #[test]
+    fn intent_horizon_confidence_is_bounded_and_monotonic() {
+        let prediction = FocusPrediction {
+            app_name: "Terminal".to_string(),
+            probability: 0.80,
+            avg_dwell_secs: 90.0,
+            dwell_deviation_secs: 12.0,
+            dwell_observations: 40,
+            pid: Some(42),
+        };
+        let horizons =
+            [5.0, 30.0, 120.0, 600.0].map(|horizon| prediction.confidence_within(20.0, horizon));
+        assert!(horizons.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(horizons.iter().all(|value| (0.0..=0.80).contains(value)));
+        assert!(horizons[0] < 0.10);
+        assert!(horizons[3] > 0.79);
+        assert_eq!(prediction.confidence_within(f64::NAN, 30.0), 0.0);
+        assert_eq!(prediction.confidence_within(0.0, 0.0), 0.0);
     }
 
     #[test]

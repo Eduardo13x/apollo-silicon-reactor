@@ -38,6 +38,8 @@ const MAX_PENDING_CONTROLLED_HOLDOUTS: usize = 32;
 const MAX_CONTROLLED_MODELS: usize = 256;
 const MAX_GPU_PREDICTIONS: usize = 256;
 const MAX_GPU_CALIBRATION_MODELS: usize = 256;
+const MAX_DECISION_SOURCES: usize = 48;
+const MAX_STAGED_ATTRIBUTIONS: usize = 64;
 const GPU_PREDICTION_MATCH_MAX_AGE_CYCLES: u64 = 30;
 const CONTROLLED_HOLDOUT_HORIZON_CYCLES: u64 = 30;
 const ACTION_MODEL_EMA_ALPHA: f64 = 0.20;
@@ -227,6 +229,81 @@ pub struct ActionModelStats {
     pub installation_id: InstallationId,
 }
 
+/// Bounded provenance for one executed decision. The owning specialist is the
+/// proposer; other engines may support or oppose the same candidate without
+/// gaining authority to manufacture a root action.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct DecisionAttribution {
+    pub action_key: String,
+    pub proposer: String,
+    pub supporters: Vec<String>,
+    pub vetoes: Vec<String>,
+    pub predicted_gain: f64,
+    pub uncertainty: f64,
+}
+
+impl DecisionAttribution {
+    fn bounded(mut self) -> Self {
+        self.action_key = bounded_text(&self.action_key, 320);
+        self.proposer = bounded_text(&self.proposer, 48);
+        self.supporters = bounded_sources(self.supporters);
+        self.vetoes = bounded_sources(self.vetoes);
+        self.predicted_gain = finite_or_zero(self.predicted_gain).clamp(-1.0, 1.0);
+        self.uncertainty = finite_or_zero(self.uncertainty).clamp(0.0, 1.0);
+        self
+    }
+}
+
+/// Human-facing and machine-facing value remain separate so an energy win
+/// cannot hide a responsiveness regression (or vice versa).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct UtilityDecomposition {
+    pub system_gain: f64,
+    pub human_gain: f64,
+    pub intervention_cost: f64,
+    pub apollo_utility: f64,
+}
+
+impl UtilityDecomposition {
+    fn is_finite(self) -> bool {
+        [
+            self.system_gain,
+            self.human_gain,
+            self.intervention_cost,
+            self.apollo_utility,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+    }
+}
+
+/// Online calibration of one decision source (S1 specialist, World Model,
+/// GPU, causal model, etc.). Positive credit means its direction agreed with
+/// later measured Apollo utility; veto credit is inverted by construction.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(default)]
+pub struct DecisionSourceStats {
+    pub observations: u32,
+    pub supports: u32,
+    pub vetoes: u32,
+    pub correct: u32,
+    pub credit_ema: f64,
+    pub absolute_error_ema: f64,
+    pub last_cycle: u64,
+}
+
+impl DecisionSourceStats {
+    pub fn accuracy(&self) -> f64 {
+        if self.observations == 0 {
+            0.0
+        } else {
+            (self.correct as f64 / self.observations as f64).clamp(0.0, 1.0)
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct ControlledCounterfactualStats {
@@ -283,6 +360,9 @@ impl ActionModelStats {
 pub struct WorldStateDelta {
     pub pressure: f64,
     pub fluidity: f64,
+    /// Positive means perceptual latency worsened.
+    #[serde(default)]
+    pub latency: f64,
     pub energy: f64,
     pub cpu: f64,
     pub thermal: f64,
@@ -299,6 +379,7 @@ impl WorldStateDelta {
         Self {
             pressure: after.memory_pressure - before.memory_pressure,
             fluidity: after.fluidity_score - before.fluidity_score,
+            latency: after.perceptual_latency_score - before.perceptual_latency_score,
             energy,
             cpu: after.cpu_max_busy - before.cpu_max_busy,
             thermal: after.thermal_score - before.thermal_score,
@@ -312,6 +393,7 @@ impl WorldStateDelta {
         [
             self.pressure,
             self.fluidity,
+            self.latency,
             self.energy,
             self.cpu,
             self.thermal,
@@ -326,6 +408,7 @@ impl WorldStateDelta {
         Self {
             pressure: self.pressure.clamp(min, max),
             fluidity: self.fluidity.clamp(min, max),
+            latency: self.latency.clamp(min, max),
             energy: self.energy.clamp(min, max),
             cpu: self.cpu.clamp(min, max),
             thermal: self.thermal.clamp(min, max),
@@ -338,6 +421,7 @@ impl WorldStateDelta {
         Self {
             pressure: self.pressure * scale,
             fluidity: self.fluidity * scale,
+            latency: self.latency * scale,
             energy: self.energy * scale,
             cpu: self.cpu * scale,
             thermal: self.thermal * scale,
@@ -350,6 +434,7 @@ impl WorldStateDelta {
         Self {
             pressure: self.pressure + other.pressure,
             fluidity: self.fluidity + other.fluidity,
+            latency: self.latency + other.latency,
             energy: self.energy + other.energy,
             cpu: self.cpu + other.cpu,
             thermal: self.thermal + other.thermal,
@@ -370,6 +455,7 @@ impl WorldStateDelta {
         let squared = Self {
             pressure: residual.pressure * residual.pressure,
             fluidity: residual.fluidity * residual.fluidity,
+            latency: residual.latency * residual.latency,
             energy: residual.energy * residual.energy,
             cpu: residual.cpu * residual.cpu,
             thermal: residual.thermal * residual.thermal,
@@ -382,12 +468,13 @@ impl WorldStateDelta {
     pub fn mean_variance(self) -> f64 {
         (self.pressure
             + self.fluidity
+            + self.latency
             + self.energy
             + self.cpu
             + self.thermal
             + self.thrashing
             + self.stall)
-            / 7.0
+            / 8.0
     }
 }
 
@@ -413,6 +500,13 @@ pub struct ResolvedActuatorEvidence {
     pub raw_utility_delta: f64,
     pub counterfactual_delta: f64,
     pub net_utility_delta: f64,
+    /// Source-aware credit assignment captured before the action crossed the
+    /// dispatcher. Legacy evidence deserializes as unknown provenance.
+    #[serde(default)]
+    pub attribution: DecisionAttribution,
+    /// Objective-independent utility used as Apollo's top-level score.
+    #[serde(default)]
+    pub utility: UtilityDecomposition,
     /// Positive means the local responsiveness proxy improved between the
     /// episode's admitted pre/post contexts.
     #[serde(default)]
@@ -671,6 +765,8 @@ struct PendingActuatorEvidence {
     event_resolved: bool,
     #[serde(default)]
     gpu_prediction_generation: Option<u64>,
+    #[serde(default)]
+    attribution: DecisionAttribution,
     before: TelemetryContextSummary,
 }
 
@@ -919,6 +1015,11 @@ pub struct TelemetryMedallionMetrics {
     pub actuator_expired_total: u64,
     pub actuator_mean_quality: f64,
     pub actuator_mean_utility: f64,
+    pub apollo_utility_ema: f64,
+    pub decision_credit_sources: u64,
+    pub decision_credit_leader_score: f64,
+    pub decision_credit_leader_accuracy: f64,
+    pub decision_credit_leader_observations: u32,
     pub actuator_ready_models: u64,
     pub controlled_holdout_issued_total: u64,
     pub controlled_holdout_pending_total: u64,
@@ -994,6 +1095,12 @@ pub struct TelemetryMedallionPersisted {
     #[serde(default)]
     pub actuator_utility_sum: f64,
     #[serde(default)]
+    pub apollo_utility_ema: f64,
+    #[serde(default)]
+    pub apollo_utility_observations: u64,
+    #[serde(default)]
+    pub decision_source_stats: BTreeMap<String, DecisionSourceStats>,
+    #[serde(default)]
     pub no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
     #[serde(default)]
     pub no_action_state_delta_ema: WorldStateDelta,
@@ -1061,6 +1168,10 @@ pub struct TelemetryMedallion {
     actuator_expired_total: u64,
     actuator_quality_sum: f64,
     actuator_utility_sum: f64,
+    apollo_utility_ema: f64,
+    apollo_utility_observations: u64,
+    decision_source_stats: BTreeMap<String, DecisionSourceStats>,
+    staged_attributions: BTreeMap<String, VecDeque<DecisionAttribution>>,
     no_action_delta_ema: BTreeMap<ActuatorObjective, f64>,
     no_action_state_delta_ema: WorldStateDelta,
     pending_controlled_holdouts: VecDeque<PendingControlledHoldout>,
@@ -1117,6 +1228,10 @@ impl Default for TelemetryMedallion {
             actuator_expired_total: 0,
             actuator_quality_sum: 0.0,
             actuator_utility_sum: 0.0,
+            apollo_utility_ema: 0.0,
+            apollo_utility_observations: 0,
+            decision_source_stats: BTreeMap::new(),
+            staged_attributions: BTreeMap::new(),
             no_action_delta_ema: BTreeMap::new(),
             no_action_state_delta_ema: WorldStateDelta::default(),
             pending_controlled_holdouts: VecDeque::new(),
@@ -1480,6 +1595,7 @@ impl TelemetryMedallion {
             if admission.tier == ContextTier::Silver {
                 self.last_admitted_live = Some(summary);
             }
+            self.staged_attributions.clear();
             return admission;
         }
 
@@ -1735,6 +1851,7 @@ impl TelemetryMedallion {
 
         self.latest = Some(summary.clone());
         self.last_admitted_live = Some(summary);
+        self.staged_attributions.clear();
         admission
     }
 
@@ -1970,6 +2087,28 @@ impl TelemetryMedallion {
         }
         let gpu_prediction_generation =
             self.mark_gpu_prediction_used(&spec.action_key, &before.workload, cycle);
+        let mut attribution = self
+            .staged_attributions
+            .get_mut(&spec.action_key)
+            .and_then(VecDeque::pop_front)
+            .unwrap_or_else(|| DecisionAttribution {
+                action_key: spec.action_key.clone(),
+                proposer: spec.family.as_str().to_string(),
+                ..DecisionAttribution::default()
+            });
+        if attribution.proposer.is_empty() {
+            attribution.proposer = spec.family.as_str().to_string();
+        }
+        attribution.action_key = spec.action_key.clone();
+        if gpu_prediction_generation.is_some()
+            && !attribution
+                .supporters
+                .iter()
+                .any(|source| source == "gpu-model")
+        {
+            attribution.supporters.push("gpu-model".to_string());
+        }
+        attribution = attribution.bounded();
         self.next_action_id = self.next_action_id.saturating_add(1);
         self.actuator_issued_total = self.actuator_issued_total.saturating_add(1);
         let family_stats = self.family_stats.entry(spec.family).or_default();
@@ -1989,6 +2128,7 @@ impl TelemetryMedallion {
             purge_recent,
             event_resolved,
             gpu_prediction_generation,
+            attribution,
             before: before.clone(),
         });
     }
@@ -2061,9 +2201,6 @@ impl TelemetryMedallion {
         let counterfactual =
             (per_cycle_baseline * pending.horizon_cycles as f64).clamp(-0.25, 0.25);
         let net_delta = (raw_delta - counterfactual).clamp(-1.0, 1.0);
-        let perceptual_latency_improvement = (pending.before.perceptual_latency_score
-            - after.perceptual_latency_score)
-            .clamp(-1.0, 1.0);
         let raw_state_delta = WorldStateDelta::between(&pending.before, after);
         let counterfactual_state_delta = self
             .no_action_state_delta_ema
@@ -2072,6 +2209,8 @@ impl TelemetryMedallion {
         let net_state_delta = raw_state_delta
             .minus(counterfactual_state_delta)
             .clamped(-1.0, 1.0);
+        let perceptual_latency_improvement = (-net_state_delta.latency).clamp(-1.0, 1.0);
+        let utility = decompose_utility(pending.family, net_state_delta);
         let target_present_after = target_presence(&pending, snapshot);
 
         let finite = [
@@ -2160,6 +2299,8 @@ impl TelemetryMedallion {
             raw_utility_delta: finite_or_zero(raw_delta),
             counterfactual_delta: finite_or_zero(counterfactual),
             net_utility_delta: finite_or_zero(net_delta),
+            attribution: pending.attribution,
+            utility,
             perceptual_latency_improvement: finite_or_zero(perceptual_latency_improvement),
             net_state_delta: if net_state_delta.is_finite() {
                 net_state_delta
@@ -2179,6 +2320,16 @@ impl TelemetryMedallion {
         self.actuator_resolved_total = self.actuator_resolved_total.saturating_add(1);
         self.actuator_quality_sum += evidence.quality;
         self.actuator_utility_sum += evidence.net_utility_delta;
+        if evidence.tier != EvidenceTier::Bronze && evidence.utility.is_finite() {
+            let alpha = if self.apollo_utility_observations == 0 {
+                1.0
+            } else {
+                0.05
+            };
+            self.apollo_utility_ema =
+                alpha * evidence.utility.apollo_utility + (1.0 - alpha) * self.apollo_utility_ema;
+            self.apollo_utility_observations = self.apollo_utility_observations.saturating_add(1);
+        }
         if evidence.effective {
             self.actuator_effective_total = self.actuator_effective_total.saturating_add(1);
         }
@@ -2196,6 +2347,7 @@ impl TelemetryMedallion {
         if evidence.tier == EvidenceTier::Gold {
             self.actuator_gold_total = self.actuator_gold_total.saturating_add(1);
             self.update_action_model(&evidence);
+            self.update_decision_source_credit(&evidence);
             if self.new_gold_evidence.len() >= MAX_RECENT_EVIDENCE {
                 self.new_gold_evidence.pop_front();
             }
@@ -2222,6 +2374,74 @@ impl TelemetryMedallion {
             self.recent_evidence.pop_front();
         }
         self.recent_evidence.push_back(evidence);
+    }
+
+    fn update_decision_source_credit(&mut self, evidence: &ResolvedActuatorEvidence) {
+        let attribution = &evidence.attribution;
+        if attribution.proposer.is_empty() || !evidence.utility.is_finite() {
+            return;
+        }
+        let mut directed_sources =
+            Vec::with_capacity(1 + attribution.supporters.len() + attribution.vetoes.len());
+        directed_sources.push((attribution.proposer.clone(), 1.0_f64, true));
+        directed_sources.extend(
+            attribution
+                .supporters
+                .iter()
+                .cloned()
+                .map(|source| (source, 1.0, true)),
+        );
+        directed_sources.extend(
+            attribution
+                .vetoes
+                .iter()
+                .cloned()
+                .map(|source| (source, -1.0, false)),
+        );
+        directed_sources.sort_by(|left, right| left.0.cmp(&right.0));
+        directed_sources.dedup_by(|left, right| left.0 == right.0);
+
+        for (source, direction, supported) in directed_sources {
+            if source.is_empty() {
+                continue;
+            }
+            if self.decision_source_stats.len() >= MAX_DECISION_SOURCES
+                && !self.decision_source_stats.contains_key(&source)
+            {
+                if let Some(weakest) = self
+                    .decision_source_stats
+                    .iter()
+                    .min_by_key(|(_, stats)| stats.observations)
+                    .map(|(source, _)| source.clone())
+                {
+                    self.decision_source_stats.remove(&weakest);
+                }
+            }
+            let stats = self.decision_source_stats.entry(source).or_default();
+            let alpha = if stats.observations == 0 { 1.0 } else { 0.15 };
+            stats.observations = stats.observations.saturating_add(1);
+            if supported {
+                stats.supports = stats.supports.saturating_add(1);
+            } else {
+                stats.vetoes = stats.vetoes.saturating_add(1);
+            }
+            let signed_credit = (direction * evidence.utility.apollo_utility).clamp(-1.0, 1.0);
+            if signed_credit > 0.005 {
+                stats.correct = stats.correct.saturating_add(1);
+            }
+            stats.credit_ema = alpha * signed_credit + (1.0 - alpha) * stats.credit_ema;
+            let expected = if supported {
+                attribution.predicted_gain
+            } else {
+                -attribution.predicted_gain
+            };
+            let absolute_error = (expected - direction * evidence.utility.apollo_utility)
+                .abs()
+                .clamp(0.0, 2.0);
+            stats.absolute_error_ema =
+                alpha * absolute_error + (1.0 - alpha) * stats.absolute_error_ema;
+            stats.last_cycle = evidence.resolved_cycle;
+        }
     }
 
     fn admit_episode(&mut self, evidence: ResolvedActuatorEvidence) {
@@ -2393,6 +2613,15 @@ impl TelemetryMedallion {
                     / gpu_gold_weight
             }
         };
+        let decision_credit_leader = self
+            .decision_source_stats
+            .iter()
+            .filter(|(_, stats)| stats.observations > 0)
+            .max_by(|left, right| {
+                source_authority_score(left.1)
+                    .total_cmp(&source_authority_score(right.1))
+                    .then_with(|| right.0.cmp(left.0))
+            });
         TelemetryMedallionMetrics {
             bronze_total: self.bronze_total,
             silver_total: self.silver_total,
@@ -2438,6 +2667,17 @@ impl TelemetryMedallion {
             } else {
                 (self.actuator_utility_sum / self.actuator_resolved_total as f64).clamp(-1.0, 1.0)
             },
+            apollo_utility_ema: self.apollo_utility_ema.clamp(-1.0, 1.0),
+            decision_credit_sources: self.decision_source_stats.len() as u64,
+            decision_credit_leader_score: decision_credit_leader
+                .map(|(_, stats)| stats.credit_ema)
+                .unwrap_or(0.0),
+            decision_credit_leader_accuracy: decision_credit_leader
+                .map(|(_, stats)| stats.accuracy())
+                .unwrap_or(0.0),
+            decision_credit_leader_observations: decision_credit_leader
+                .map(|(_, stats)| stats.observations)
+                .unwrap_or(0),
             actuator_ready_models: self
                 .action_models
                 .iter()
@@ -2516,6 +2756,37 @@ impl TelemetryMedallion {
         self.action_models_revision
     }
 
+    pub fn stage_decision_attribution(&mut self, attribution: DecisionAttribution) {
+        let attribution = attribution.bounded();
+        if attribution.action_key.is_empty() {
+            return;
+        }
+        let staged_len: usize = self.staged_attributions.values().map(VecDeque::len).sum();
+        if staged_len >= MAX_STAGED_ATTRIBUTIONS {
+            self.staged_attributions.clear();
+        }
+        self.staged_attributions
+            .entry(attribution.action_key.clone())
+            .or_default()
+            .push_back(attribution);
+    }
+
+    pub fn decision_source_stats(&self) -> &BTreeMap<String, DecisionSourceStats> {
+        &self.decision_source_stats
+    }
+
+    pub fn decision_credit_leader(&self) -> Option<(&str, &DecisionSourceStats)> {
+        self.decision_source_stats
+            .iter()
+            .filter(|(_, stats)| stats.observations > 0)
+            .max_by(|left, right| {
+                source_authority_score(left.1)
+                    .total_cmp(&source_authority_score(right.1))
+                    .then_with(|| right.0.cmp(left.0))
+            })
+            .map(|(source, stats)| (source.as_str(), stats))
+    }
+
     pub fn recent_actuator_evidence(&self) -> &VecDeque<ResolvedActuatorEvidence> {
         &self.recent_evidence
     }
@@ -2560,6 +2831,9 @@ impl TelemetryMedallion {
             actuator_expired_total: self.actuator_expired_total,
             actuator_quality_sum: self.actuator_quality_sum,
             actuator_utility_sum: self.actuator_utility_sum,
+            apollo_utility_ema: self.apollo_utility_ema,
+            apollo_utility_observations: self.apollo_utility_observations,
+            decision_source_stats: self.decision_source_stats.clone(),
             no_action_delta_ema: self.no_action_delta_ema.clone(),
             no_action_state_delta_ema: self.no_action_state_delta_ema,
             controlled_models: self.controlled_models.clone(),
@@ -2657,6 +2931,9 @@ impl TelemetryMedallion {
                     && evidence.raw_utility_delta.is_finite()
                     && evidence.counterfactual_delta.is_finite()
                     && evidence.net_utility_delta.is_finite()
+                    && evidence.utility.is_finite()
+                    && evidence.attribution.predicted_gain.is_finite()
+                    && evidence.attribution.uncertainty.is_finite()
                     && (!evidence.context_before.valid || evidence.context_before.is_finite())
             })
             .take(MAX_RECENT_EVIDENCE)
@@ -2672,6 +2949,7 @@ impl TelemetryMedallion {
                     && evidence.workload.len() <= 64
                     && evidence.quality.is_finite()
                     && evidence.net_utility_delta.is_finite()
+                    && evidence.utility.is_finite()
                     && evidence.context_before.valid
                     && evidence.context_before.is_finite()
             })
@@ -2700,6 +2978,33 @@ impl TelemetryMedallion {
             -(self.actuator_resolved_total as f64),
             self.actuator_resolved_total as f64,
         );
+        self.apollo_utility_ema = finite_or_zero(state.apollo_utility_ema).clamp(-1.0, 1.0);
+        self.apollo_utility_observations = state.apollo_utility_observations;
+        self.decision_source_stats = if same_origin {
+            state
+                .decision_source_stats
+                .into_iter()
+                .filter_map(|(source, mut stats)| {
+                    if source.is_empty()
+                        || source.len() > 48
+                        || !stats.credit_ema.is_finite()
+                        || !stats.absolute_error_ema.is_finite()
+                    {
+                        return None;
+                    }
+                    stats.correct = stats.correct.min(stats.observations);
+                    stats.supports = stats.supports.min(stats.observations);
+                    stats.vetoes = stats.vetoes.min(stats.observations);
+                    stats.credit_ema = stats.credit_ema.clamp(-1.0, 1.0);
+                    stats.absolute_error_ema = stats.absolute_error_ema.clamp(0.0, 2.0);
+                    Some((source, stats))
+                })
+                .take(MAX_DECISION_SOURCES)
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        self.staged_attributions.clear();
         self.no_action_delta_ema = if same_origin {
             state
                 .no_action_delta_ema
@@ -2866,6 +3171,10 @@ impl TelemetryMedallion {
             self.actuator_expired_total = 0;
             self.actuator_quality_sum = 0.0;
             self.actuator_utility_sum = 0.0;
+            self.apollo_utility_ema = 0.0;
+            self.apollo_utility_observations = 0;
+            self.decision_source_stats.clear();
+            self.staged_attributions.clear();
             self.no_action_delta_ema.clear();
             self.no_action_state_delta_ema = WorldStateDelta::default();
             self.pending_controlled_holdouts.clear();
@@ -2890,6 +3199,23 @@ impl TelemetryMedallion {
 
 fn bounded_text(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn bounded_sources(sources: Vec<String>) -> Vec<String> {
+    let mut sources: Vec<String> = sources
+        .into_iter()
+        .map(|source| bounded_text(source.trim(), 48))
+        .filter(|source| !source.is_empty())
+        .collect();
+    sources.sort();
+    sources.dedup();
+    sources.truncate(8);
+    sources
+}
+
+fn source_authority_score(stats: &DecisionSourceStats) -> f64 {
+    let maturity = stats.observations as f64 / (stats.observations as f64 + 8.0);
+    stats.credit_ema * maturity * (0.5 + 0.5 * stats.accuracy())
 }
 
 fn gpu_action_matches(predicted: &str, observed: &str) -> bool {
@@ -3113,6 +3439,54 @@ fn finite_or_zero(value: f64) -> f64 {
         value
     } else {
         0.0
+    }
+}
+
+fn intervention_cost(family: ActuatorFamily) -> f64 {
+    match family {
+        ActuatorFamily::Freeze | ActuatorFamily::Quarantine => 0.020,
+        ActuatorFamily::Sysctl => 0.015,
+        ActuatorFamily::Throttle | ActuatorFamily::PredictivePreThrottle => 0.010,
+        ActuatorFamily::Memorystatus | ActuatorFamily::PredictivePurge => 0.008,
+        ActuatorFamily::Boost | ActuatorFamily::MarkovPrewarm | ActuatorFamily::ChromiumPurge => {
+            0.004
+        }
+        ActuatorFamily::ThreadQos
+        | ActuatorFamily::InteractionQos
+        | ActuatorFamily::IoShaping
+        | ActuatorFamily::ChromiumEcore
+        | ActuatorFamily::ChromiumJetsam => 0.003,
+        ActuatorFamily::Spotlight
+        | ActuatorFamily::PredictiveThreshold
+        | ActuatorFamily::PredictiveProfile
+        | ActuatorFamily::Coordinated
+        | ActuatorFamily::Unfreeze => 0.005,
+    }
+}
+
+fn decompose_utility(family: ActuatorFamily, net_state: WorldStateDelta) -> UtilityDecomposition {
+    // Positive gains are always improvements. WorldStateDelta uses positive
+    // values for worsening resource dimensions and positive fluidity for UX.
+    let system_gain = (-0.24 * net_state.pressure
+        - 0.16 * net_state.energy
+        - 0.14 * net_state.cpu
+        - 0.14 * net_state.thermal
+        - 0.16 * net_state.thrashing
+        - 0.16 * net_state.stall)
+        .clamp(-1.0, 1.0);
+    let human_gain = (0.50 * net_state.fluidity
+        - 0.30 * net_state.latency
+        - 0.15 * net_state.stall
+        - 0.05 * net_state.cpu)
+        .clamp(-1.0, 1.0);
+    let intervention_cost = intervention_cost(family);
+    let apollo_utility =
+        (0.60 * human_gain + 0.40 * system_gain - intervention_cost).clamp(-1.0, 1.0);
+    UtilityDecomposition {
+        system_gain,
+        human_gain,
+        intervention_cost,
+        apollo_utility,
     }
 }
 
@@ -3616,6 +3990,8 @@ mod tests {
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
+            attribution: DecisionAttribution::default(),
+            utility: UtilityDecomposition::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
             context_before: ActuatorEpisodeContext::default(),
@@ -3644,6 +4020,7 @@ mod tests {
             evidence.net_state_delta = WorldStateDelta {
                 pressure: -0.02,
                 fluidity: 0.04,
+                latency: -0.03,
                 energy: 0.01,
                 cpu: 0.02,
                 thermal: 0.0,
@@ -4289,6 +4666,104 @@ mod tests {
     }
 
     #[test]
+    fn executed_decision_keeps_provenance_and_calibrates_every_source() {
+        let action = RootAction::BoostProcess {
+            pid: 300,
+            name: "Editor".to_string(),
+            reason: "fixture".to_string(),
+            decision_reason: DecisionReason::InteractiveFocus,
+            start_sec: 12_345,
+            start_usec: 678,
+        };
+        let outcomes = ExecuteOutcomes {
+            audit_traces: vec![trace(action, true)],
+            ..ExecuteOutcomes::default()
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.stage_decision_attribution(DecisionAttribution {
+            action_key: "boost:Editor".to_string(),
+            proposer: "interaction-specialist".to_string(),
+            supporters: vec!["gpu-model".to_string()],
+            vetoes: vec!["noop-control".to_string()],
+            predicted_gain: 0.08,
+            uncertainty: 0.15,
+        });
+        let before = RuntimeMetrics {
+            perceptual_latency_score: 0.20,
+            ..healthy_runtime()
+        };
+        observe(&mut medallion, 1, &outcomes, &before);
+        for cycle in 2..=4 {
+            observe(
+                &mut medallion,
+                cycle,
+                &ExecuteOutcomes::default(),
+                &healthy_runtime(),
+            );
+        }
+
+        let evidence = medallion
+            .recent_actuator_evidence()
+            .back()
+            .expect("resolved action evidence");
+        assert_eq!(evidence.attribution.proposer, "interaction-specialist");
+        assert_eq!(evidence.attribution.supporters, ["gpu-model"]);
+        assert_eq!(evidence.attribution.vetoes, ["noop-control"]);
+        assert!(evidence.perceptual_latency_improvement > 0.15);
+        assert!(evidence.utility.human_gain > 0.0);
+        assert!(evidence.utility.apollo_utility > 0.0);
+
+        let sources = medallion.decision_source_stats();
+        assert!(sources["interaction-specialist"].credit_ema > 0.0);
+        assert!(sources["gpu-model"].credit_ema > 0.0);
+        assert!(sources["noop-control"].credit_ema < 0.0);
+        assert_eq!(medallion.metrics().decision_credit_sources, 3);
+
+        let persisted = medallion.snapshot();
+        let mut local = TelemetryMedallion::new(LOCAL_ID);
+        local.restore(persisted.clone());
+        assert_eq!(local.decision_source_stats().len(), 3);
+        let mut foreign = TelemetryMedallion::new(InstallationId(99));
+        foreign.restore(persisted);
+        assert!(foreign.decision_source_stats().is_empty());
+    }
+
+    #[test]
+    fn apollo_utility_keeps_human_and_system_outcomes_separate() {
+        let healthy = decompose_utility(
+            ActuatorFamily::InteractionQos,
+            WorldStateDelta {
+                pressure: -0.05,
+                fluidity: 0.10,
+                latency: -0.20,
+                energy: -0.03,
+                cpu: -0.02,
+                thermal: 0.0,
+                thrashing: -0.01,
+                stall: -0.04,
+            },
+        );
+        assert!(healthy.system_gain > 0.0);
+        assert!(healthy.human_gain > 0.0);
+        assert!(healthy.apollo_utility > 0.0);
+        assert!((healthy.intervention_cost - 0.003).abs() < f64::EPSILON);
+
+        let energy_win_but_ux_loss = decompose_utility(
+            ActuatorFamily::Throttle,
+            WorldStateDelta {
+                fluidity: -0.30,
+                latency: 0.40,
+                energy: -0.50,
+                cpu: -0.20,
+                ..WorldStateDelta::default()
+            },
+        );
+        assert!(energy_win_but_ux_loss.system_gain > 0.0);
+        assert!(energy_win_but_ux_loss.human_gain < 0.0);
+        assert!(energy_win_but_ux_loss.apollo_utility < 0.0);
+    }
+
+    #[test]
     fn uncontaminated_no_action_windows_train_causal_baseline() {
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         let runtime = healthy_runtime();
@@ -4666,6 +5141,8 @@ mod tests {
                 raw_utility_delta: 0.08,
                 counterfactual_delta: 0.0,
                 net_utility_delta: 0.08,
+                attribution: DecisionAttribution::default(),
+                utility: UtilityDecomposition::default(),
                 perceptual_latency_improvement: 0.0,
                 net_state_delta: WorldStateDelta::default(),
                 context_before: ActuatorEpisodeContext::default(),
@@ -4694,6 +5171,8 @@ mod tests {
             raw_utility_delta: 1.0,
             counterfactual_delta: 0.0,
             net_utility_delta: 1.0,
+            attribution: DecisionAttribution::default(),
+            utility: UtilityDecomposition::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta::default(),
             context_before: ActuatorEpisodeContext::default(),
@@ -4801,6 +5280,7 @@ mod tests {
             purge_recent: false,
             event_resolved: false,
             gpu_prediction_generation: None,
+            attribution: DecisionAttribution::default(),
             before: TelemetryContextSummary::default(),
         });
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);

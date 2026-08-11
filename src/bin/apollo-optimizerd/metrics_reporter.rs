@@ -97,6 +97,16 @@ fn publish_world_model_metrics(
     metrics.world_model_actuator_expired_total = context.actuator_expired_total;
     metrics.world_model_actuator_quality = context.actuator_mean_quality;
     metrics.world_model_actuator_mean_utility = context.actuator_mean_utility;
+    metrics.world_model_apollo_utility = context.apollo_utility_ema;
+    metrics.world_model_decision_credit_sources = context.decision_credit_sources;
+    metrics.world_model_decision_credit_leader = telemetry_medallion
+        .decision_credit_leader()
+        .map(|(source, _)| source.to_string())
+        .unwrap_or_default();
+    metrics.world_model_decision_credit_leader_score = context.decision_credit_leader_score;
+    metrics.world_model_decision_credit_leader_accuracy = context.decision_credit_leader_accuracy;
+    metrics.world_model_decision_credit_leader_observations =
+        context.decision_credit_leader_observations;
     if let Some(evidence) = telemetry_medallion.recent_actuator_evidence().back() {
         if evidence.resolved_cycle > metrics.last_episode_resolved_cycle {
             metrics.last_episode_id = evidence.id;
@@ -112,6 +122,14 @@ fn publish_world_model_metrics(
             metrics.last_episode_quality = evidence.quality;
             metrics.last_episode_utility = evidence.net_utility_delta;
             metrics.last_episode_latency_improvement = evidence.perceptual_latency_improvement;
+            metrics.last_episode_system_gain = evidence.utility.system_gain;
+            metrics.last_episode_human_gain = evidence.utility.human_gain;
+            metrics.last_episode_intervention_cost = evidence.utility.intervention_cost;
+            metrics.last_episode_apollo_utility = evidence.utility.apollo_utility;
+            metrics.last_episode_proposer = evidence.attribution.proposer.clone();
+            metrics.last_episode_supporters = evidence.attribution.supporters.clone();
+            metrics.last_episode_vetoes = evidence.attribution.vetoes.clone();
+            metrics.last_episode_predicted_gain = evidence.attribution.predicted_gain;
         }
     }
     metrics.world_model_gpu_bronze_total = context.gpu_prediction_bronze_total;
@@ -133,6 +151,14 @@ fn publish_world_model_metrics(
         context.controlled_holdout_mean_control_utility;
     metrics.world_model_actuator_known_models = world_model.utility_known_actions() as u64;
     metrics.world_model_actuator_ready_models = world_model.utility_ready_actions() as u64;
+    let readiness = world_model.utility_readiness_breakdown();
+    metrics.world_model_readiness_no_gold = readiness.no_current_gold;
+    metrics.world_model_readiness_immature = readiness.immature;
+    metrics.world_model_readiness_low_quality = readiness.low_quality;
+    metrics.world_model_readiness_stale = readiness.stale;
+    metrics.world_model_readiness_foreign = readiness.foreign_installation;
+    metrics.world_model_readiness_hardware = readiness.hardware_mismatch;
+    metrics.world_model_readiness_uncertain = readiness.uncertain_interval;
     metrics.world_model_family_known_models = world_model.utility_known_families() as u64;
     metrics.world_model_family_ready_models = world_model.utility_ready_families() as u64;
     metrics.world_model_actuator_families = telemetry_medallion

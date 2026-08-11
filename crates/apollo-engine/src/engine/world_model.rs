@@ -263,6 +263,21 @@ pub struct UtilityAbstention {
     pub scope: Option<UtilityEvidenceScope>,
 }
 
+/// Point-in-time inventory of every exact utility model. Unlike the event
+/// abstention counters, this explains the full `ready / known` denominator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UtilityReadinessBreakdown {
+    pub known: u64,
+    pub ready: u64,
+    pub no_current_gold: u64,
+    pub immature: u64,
+    pub low_quality: u64,
+    pub stale: u64,
+    pub foreign_installation: u64,
+    pub hardware_mismatch: u64,
+    pub uncertain_interval: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum UtilityAssessmentResult {
     Assessed(UtilityAssessment),
@@ -1301,6 +1316,54 @@ impl WorldModel {
             .count()
     }
 
+    pub fn utility_readiness_breakdown(&self) -> UtilityReadinessBreakdown {
+        let now_unix = self
+            .latest_context
+            .as_ref()
+            .map(|context| context.timestamp_unix)
+            .unwrap_or(0);
+        let mut breakdown = UtilityReadinessBreakdown::default();
+        for (key, stats) in &self.utility_predicted {
+            if !actionable_utility_key(key) {
+                continue;
+            }
+            breakdown.known = breakdown.known.saturating_add(1);
+            match utility_model_status(
+                stats,
+                now_unix,
+                self.latest_context.as_ref(),
+                self.current_installation_id,
+                true,
+            ) {
+                Ok(()) => breakdown.ready = breakdown.ready.saturating_add(1),
+                Err(UtilityAbstentionReason::NoCurrentGold) => {
+                    breakdown.no_current_gold = breakdown.no_current_gold.saturating_add(1)
+                }
+                Err(UtilityAbstentionReason::ImmatureEvidence) => {
+                    breakdown.immature = breakdown.immature.saturating_add(1)
+                }
+                Err(UtilityAbstentionReason::LowQuality) => {
+                    breakdown.low_quality = breakdown.low_quality.saturating_add(1)
+                }
+                Err(UtilityAbstentionReason::StaleEvidence) => {
+                    breakdown.stale = breakdown.stale.saturating_add(1)
+                }
+                Err(UtilityAbstentionReason::ForeignInstallation) => {
+                    breakdown.foreign_installation =
+                        breakdown.foreign_installation.saturating_add(1)
+                }
+                Err(UtilityAbstentionReason::HardwareMismatch) => {
+                    breakdown.hardware_mismatch = breakdown.hardware_mismatch.saturating_add(1)
+                }
+                Err(UtilityAbstentionReason::UncertainInterval) => {
+                    breakdown.uncertain_interval = breakdown.uncertain_interval.saturating_add(1)
+                }
+                Err(UtilityAbstentionReason::UnknownAction) => {}
+            }
+        }
+        breakdown
+    }
+
     pub fn utility_known_families(&self) -> usize {
         self.utility_predicted
             .keys()
@@ -1654,6 +1717,8 @@ mod tests {
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,
             net_utility_delta: utility,
+            attribution: Default::default(),
+            utility: Default::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: Default::default(),
             context_before: ActuatorEpisodeContext::from_telemetry(context),
@@ -2117,6 +2182,69 @@ mod tests {
             assert_ne!(model.authority_phase(), ModelAuthorityPhase::Trusted);
             assert_eq!(model.utility_ready_actions(), 0);
         }
+    }
+
+    #[test]
+    fn readiness_inventory_accounts_for_every_known_utility_model() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let mut ready = mature_model(now, LOCAL_ID);
+        ready.utility_ema = 0.12;
+        let mut immature = mature_model(now, LOCAL_ID);
+        immature.evidence_mass = 2.0;
+        let mut low_quality = mature_model(now, LOCAL_ID);
+        low_quality.quality_ema = 0.40;
+        let mut stale = mature_model(now, LOCAL_ID);
+        stale.observations = 256;
+        stale.evidence_mass = 256.0;
+        stale.last_observed_unix = now - UTILITY_MAX_AGE_SECS - 1;
+        let foreign = mature_model(now, InstallationId(99));
+        let mut hardware = mature_model(now, LOCAL_ID);
+        hardware.hardware_regime = HardwareRegime {
+            p_core_count: 8,
+            e_core_count: 2,
+            ram_gib: 64,
+        };
+        let mut uncertain = mature_model(now, LOCAL_ID);
+        uncertain.utility_ema = 0.0;
+        uncertain.utility_variance_ema = 1.0;
+        let models = BTreeMap::from([
+            ("boost:Ready".to_string(), ready),
+            ("boost:Immature".to_string(), immature),
+            ("boost:LowQuality".to_string(), low_quality),
+            ("boost:Stale".to_string(), stale),
+            ("boost:Foreign".to_string(), foreign),
+            ("boost:Hardware".to_string(), hardware),
+            ("boost:Uncertain".to_string(), uncertain),
+        ]);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &models, 1);
+
+        let breakdown = model.utility_readiness_breakdown();
+        assert_eq!(breakdown.known, 7);
+        assert_eq!(breakdown.ready, 1);
+        assert_eq!(breakdown.immature, 1);
+        assert_eq!(breakdown.low_quality, 1);
+        assert_eq!(breakdown.stale, 1);
+        assert_eq!(breakdown.foreign_installation, 1);
+        assert_eq!(breakdown.hardware_mismatch, 1);
+        assert_eq!(breakdown.uncertain_interval, 1);
+        assert_eq!(
+            breakdown.ready
+                + breakdown.no_current_gold
+                + breakdown.immature
+                + breakdown.low_quality
+                + breakdown.stale
+                + breakdown.foreign_installation
+                + breakdown.hardware_mismatch
+                + breakdown.uncertain_interval,
+            breakdown.known
+        );
+
+        let mut no_context = WorldModel::default();
+        attach_view(&mut no_context, None, &models, 1);
+        let no_context = no_context.utility_readiness_breakdown();
+        assert_eq!(no_context.no_current_gold, no_context.known);
     }
 
     fn model_with(key: &str, delta: f64, quality: f32, evidence: u32, drift: f64) -> WorldModel {

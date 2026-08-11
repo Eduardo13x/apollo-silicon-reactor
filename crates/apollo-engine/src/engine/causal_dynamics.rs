@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::engine::installation_identity::InstallationId;
 use crate::engine::telemetry_medallion::{
@@ -20,8 +20,10 @@ use crate::engine::telemetry_medallion::{
 };
 
 const SCHEMA_VERSION: u32 = 1;
-const STATE_DIM: usize = 7;
-const FEATURE_DIM: usize = 12;
+const LEGACY_STATE_DIM: usize = 7;
+const STATE_DIM: usize = 8;
+const LEGACY_FEATURE_DIM: usize = 12;
+const FEATURE_DIM: usize = 13;
 const ENSEMBLE_SIZE: usize = 5;
 const MAX_ACTION_MODELS: usize = 256;
 const MAX_BASELINE_MODELS: usize = 16;
@@ -75,6 +77,7 @@ impl DynamicsState {
             values: [
                 context.memory_pressure.clamp(0.0, 1.0),
                 context.fluidity_score.clamp(0.0, 1.0),
+                context.perceptual_latency_score.clamp(0.0, 1.0),
                 (context.package_watts.unwrap_or(0.0) / 50.0).clamp(0.0, 1.0),
                 context.cpu_max_busy.clamp(0.0, 1.0),
                 context.thermal_score.clamp(0.0, 1.0),
@@ -100,9 +103,10 @@ impl DynamicsState {
     }
 
     pub(crate) fn utility(self) -> f64 {
-        let [pressure, fluidity, energy, cpu, thermal, thrashing, stall] = self.values;
-        (0.24 * (1.0 - pressure)
-            + 0.25 * fluidity
+        let [pressure, fluidity, latency, energy, cpu, thermal, thrashing, stall] = self.values;
+        (0.22 * (1.0 - pressure)
+            + 0.22 * fluidity
+            + 0.05 * (1.0 - latency)
             + 0.12 * (1.0 - energy)
             + 0.08 * (1.0 - cpu)
             + 0.11 * (1.0 - thermal)
@@ -153,8 +157,75 @@ pub struct CausalDynamicsMetrics {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 struct EnsembleMember {
+    #[serde(
+        default = "default_weights",
+        deserialize_with = "deserialize_state_weights"
+    )]
     weights: [[f64; FEATURE_DIM]; STATE_DIM],
     updates: u32,
+}
+
+fn default_weights() -> [[f64; FEATURE_DIM]; STATE_DIM] {
+    [[0.0; FEATURE_DIM]; STATE_DIM]
+}
+
+fn deserialize_state_weights<'de, D>(
+    deserializer: D,
+) -> Result<[[f64; FEATURE_DIM]; STATE_DIM], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let rows = Vec::<Vec<f64>>::deserialize(deserializer)?;
+    if !matches!(rows.len(), LEGACY_STATE_DIM | STATE_DIM) {
+        return Err(serde::de::Error::custom(format!(
+            "expected {LEGACY_STATE_DIM} or {STATE_DIM} state rows, got {}",
+            rows.len()
+        )));
+    }
+    let mut weights = default_weights();
+    let legacy = rows.len() == LEGACY_STATE_DIM;
+    for (output, row) in rows.into_iter().enumerate() {
+        if !matches!(row.len(), LEGACY_FEATURE_DIM | FEATURE_DIM) {
+            return Err(serde::de::Error::custom(format!(
+                "expected {LEGACY_FEATURE_DIM} or {FEATURE_DIM} features in state row, got {}",
+                row.len()
+            )));
+        }
+        // Latency was inserted after fluidity. Preserve all historical output
+        // meanings and initialize the new latency row/feature at zero.
+        let migrated_output = if legacy && output >= 2 {
+            output + 1
+        } else {
+            output
+        };
+        weights[migrated_output][..row.len()].copy_from_slice(&row);
+    }
+    Ok(weights)
+}
+
+fn default_state_variance() -> [f64; STATE_DIM] {
+    [0.0; STATE_DIM]
+}
+
+fn deserialize_state_variance<'de, D>(deserializer: D) -> Result<[f64; STATE_DIM], D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<f64>::deserialize(deserializer)?;
+    if !matches!(values.len(), LEGACY_STATE_DIM | STATE_DIM) {
+        return Err(serde::de::Error::custom(format!(
+            "expected {LEGACY_STATE_DIM} or {STATE_DIM} state variances, got {}",
+            values.len()
+        )));
+    }
+    let mut migrated = default_state_variance();
+    if values.len() == LEGACY_STATE_DIM {
+        migrated[..2].copy_from_slice(&values[..2]);
+        migrated[3..].copy_from_slice(&values[2..]);
+    } else {
+        migrated.copy_from_slice(&values);
+    }
+    Ok(migrated)
 }
 
 impl Default for EnsembleMember {
@@ -222,6 +293,10 @@ struct DynamicsRegressor {
     validation_samples: u32,
     validation_mae_ema: f64,
     validation_coverage_ema: f64,
+    #[serde(
+        default = "default_state_variance",
+        deserialize_with = "deserialize_state_variance"
+    )]
     residual_variance_ema: [f64; STATE_DIM],
     mean_horizon_cycles: f64,
     last_observed_unix: i64,
@@ -768,7 +843,7 @@ impl CausalDynamicsModel {
 }
 
 fn encode(context: &TelemetryContextSummary, state: DynamicsState) -> [f64; FEATURE_DIM] {
-    let [pressure, fluidity, energy, cpu, thermal, thrashing, stall] = state.values;
+    let [pressure, fluidity, latency, energy, cpu, thermal, thrashing, stall] = state.values;
     [
         1.0,
         pressure * 2.0 - 1.0,
@@ -788,6 +863,7 @@ fn encode(context: &TelemetryContextSummary, state: DynamicsState) -> [f64; FEAT
         } else {
             0.0
         },
+        latency * 2.0 - 1.0,
     ]
 }
 
@@ -842,6 +918,7 @@ fn delta_to_array(delta: WorldStateDelta) -> [f64; STATE_DIM] {
     [
         delta.pressure,
         delta.fluidity,
+        delta.latency,
         delta.energy,
         delta.cpu,
         delta.thermal,
@@ -854,11 +931,12 @@ fn array_to_delta(values: [f64; STATE_DIM]) -> WorldStateDelta {
     WorldStateDelta {
         pressure: values[0],
         fluidity: values[1],
-        energy: values[2],
-        cpu: values[3],
-        thermal: values[4],
-        thrashing: values[5],
-        stall: values[6],
+        latency: values[2],
+        energy: values[3],
+        cpu: values[4],
+        thermal: values[5],
+        thrashing: values[6],
+        stall: values[7],
     }
 }
 
@@ -898,6 +976,66 @@ mod tests {
             cpu: pressure * 0.4,
             ..WorldStateDelta::default()
         }
+    }
+
+    #[test]
+    fn legacy_seven_dimensional_models_migrate_without_relabeling_outputs() {
+        let legacy_weights: Vec<Vec<f64>> = (0..LEGACY_STATE_DIM)
+            .map(|output| {
+                (0..LEGACY_FEATURE_DIM)
+                    .map(|feature| output as f64 * 100.0 + feature as f64)
+                    .collect()
+            })
+            .collect();
+        let member: EnsembleMember = serde_json::from_value(serde_json::json!({
+            "weights": legacy_weights,
+            "updates": 17
+        }))
+        .expect("legacy member must migrate");
+
+        assert_eq!(member.updates, 17);
+        assert_eq!(member.weights[0][11], 11.0);
+        assert_eq!(member.weights[1][11], 111.0);
+        assert!(member.weights[2].iter().all(|weight| *weight == 0.0));
+        assert_eq!(member.weights[3][0], 200.0, "energy row stays energy");
+        assert_eq!(member.weights[7][11], 611.0, "stall row stays stall");
+        assert!(member
+            .weights
+            .iter()
+            .all(|row| row[LEGACY_FEATURE_DIM] == 0.0));
+
+        let regressor: DynamicsRegressor = serde_json::from_value(serde_json::json!({
+            "residual_variance_ema": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]
+        }))
+        .expect("legacy variance must migrate");
+        assert_eq!(
+            regressor.residual_variance_ema,
+            [0.1, 0.2, 0.0, 0.3, 0.4, 0.5, 0.6, 0.7]
+        );
+    }
+
+    #[test]
+    fn latency_is_a_first_class_dynamics_dimension() {
+        let delta = WorldStateDelta {
+            pressure: -0.02,
+            fluidity: 0.04,
+            latency: -0.12,
+            energy: 0.01,
+            cpu: -0.03,
+            thermal: 0.0,
+            thrashing: -0.01,
+            stall: -0.02,
+        };
+        assert_eq!(array_to_delta(delta_to_array(delta)), delta);
+
+        let mut responsive = context(1, 0.30, "coding");
+        responsive.perceptual_latency_score = 0.10;
+        let mut sluggish = responsive.clone();
+        sluggish.perceptual_latency_score = 0.80;
+        assert!(
+            DynamicsState::from_context(&responsive).utility()
+                > DynamicsState::from_context(&sluggish).utility()
+        );
     }
 
     #[test]

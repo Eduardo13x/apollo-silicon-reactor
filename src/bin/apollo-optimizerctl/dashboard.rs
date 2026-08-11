@@ -523,11 +523,43 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.world_model_actuator_known_models)
         ));
     }
+    let readiness_reasons = [
+        ("no-gold", m.world_model_readiness_no_gold),
+        ("immature", m.world_model_readiness_immature),
+        ("quality", m.world_model_readiness_low_quality),
+        ("stale", m.world_model_readiness_stale),
+        ("origin", m.world_model_readiness_foreign),
+        ("hardware", m.world_model_readiness_hardware),
+        ("uncertain", m.world_model_readiness_uncertain),
+    ]
+    .into_iter()
+    .filter(|(_, count)| *count > 0)
+    .map(|(reason, count)| format!("{reason}{}", compact_counter(count)))
+    .collect::<Vec<_>>();
+    for (index, reasons) in readiness_reasons.chunks(3).enumerate() {
+        lines.push(format!(
+            "{}{}",
+            if index == 0 { "WM wait " } else { "        " },
+            reasons.join(" ")
+        ));
+    }
     if m.world_model_utility_vetoes_total > 0 || m.world_model_utility_promotions_total > 0 {
         lines.push(format!(
             "WM-U+  V{} P{}",
             format_number(m.world_model_utility_vetoes_total),
             format_number(m.world_model_utility_promotions_total)
+        ));
+    }
+    if m.world_model_decision_credit_sources > 0 {
+        lines.push(format!(
+            "AU {:+.1}% {} {:+.1}% n{}",
+            m.world_model_apollo_utility * 100.0,
+            m.world_model_decision_credit_leader
+                .chars()
+                .take(9)
+                .collect::<String>(),
+            m.world_model_decision_credit_leader_score * 100.0,
+            compact_counter(u64::from(m.world_model_decision_credit_leader_observations)),
         ));
     }
     if m.world_model_counterfactual_issued_total > 0
@@ -882,6 +914,13 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             }
         ));
         lines.push(format!(
+            "Mk-H 5s{:.0} 30s{:.0} 2m{:.0} 10m{:.0}",
+            m.markov_prediction_5s * 100.0,
+            m.markov_prediction_30s * 100.0,
+            m.markov_prediction_2m * 100.0,
+            m.markov_prediction_10m * 100.0,
+        ));
+        lines.push(format!(
             "Warm   M{}/{} H{}/{} T{} C{}",
             format_number(m.markov_prewarm_applied),
             format_number(m.markov_prewarm_attempts),
@@ -1065,10 +1104,18 @@ fn render_act_q(status: &DaemonStatus) -> Vec<String> {
             m.last_episode_target.chars().take(11).collect::<String>()
         ));
         lines.push(format!(
-            "Gain   u{:+.1}% ux{:+.1}%",
-            m.last_episode_utility * 100.0,
-            m.last_episode_latency_improvement * 100.0
+            "Gain   S{:+.1} H{:+.1} AU{:+.1}%",
+            m.last_episode_system_gain * 100.0,
+            m.last_episode_human_gain * 100.0,
+            m.last_episode_apollo_utility * 100.0,
         ));
+        if !m.last_episode_proposer.is_empty() {
+            lines.push(format!(
+                "By     {} p{:+.1}%",
+                m.last_episode_proposer.chars().take(15).collect::<String>(),
+                m.last_episode_predicted_gain * 100.0,
+            ));
+        }
     }
 
     lines
@@ -1297,7 +1344,7 @@ fn render_header_v2(status: &DaemonStatus) -> Vec<String> {
         status.effective_profile.as_str()
     );
     let mut lines = vec![bold(&format!(
-        "🚀 APOLLO {} │ {} │ c:{} │ loop-p95 {:.0}ms",
+        "🚀 APOLLO {} │ {} │ c:{} │ c-p95 {:.0}ms",
         state,
         profile,
         format_number(m.cycles),
@@ -1440,14 +1487,22 @@ mod tests {
         status.metrics.last_episode_quality = 0.94;
         status.metrics.last_episode_utility = 0.03;
         status.metrics.last_episode_latency_improvement = 0.08;
+        status.metrics.last_episode_system_gain = 0.02;
+        status.metrics.last_episode_human_gain = 0.08;
+        status.metrics.last_episode_apollo_utility = 0.05;
+        status.metrics.last_episode_proposer = "interaction-specialist".to_string();
+        status.metrics.last_episode_predicted_gain = 0.04;
 
-        assert!(render_header_v2(&status)[0].contains("loop-p95 37ms"));
+        assert!(render_header_v2(&status)[0].contains("c-p95 37ms"));
         let sense = render_sense_q(&status);
         assert!(sense.iter().any(|line| line == "UX     responsive 18%"));
         assert!(sense.iter().any(|line| line == "Sched  p95 0.12ms n42"));
         let act = render_act_q(&status);
         assert!(act.iter().any(|line| line == "Ep#7 gold q94%"));
-        assert!(act.iter().any(|line| line == "Gain   u+3.0% ux+8.0%"));
+        assert!(act.iter().any(|line| line == "Gain   S+2.0 H+8.0 AU+5.0%"));
+        assert!(act
+            .iter()
+            .any(|line| line == "By     interaction-spe p+4.0%"));
 
         status.metrics.last_episode_id = u64::MAX;
         status.metrics.last_episode_action = "predictive-prearm:Browser".to_string();
@@ -1455,6 +1510,29 @@ mod tests {
         assert!(render_act_q(&status)
             .iter()
             .all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_explains_world_model_waits_and_markov_horizons() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_actuator_known_models = 7;
+        status.metrics.world_model_actuator_ready_models = 1;
+        status.metrics.world_model_context_authority_phase = "trusted".to_string();
+        status.metrics.world_model_readiness_immature = 4;
+        status.metrics.world_model_readiness_uncertain = 2;
+        status.metrics.markov_prediction_app = "Terminal".to_string();
+        status.metrics.markov_prediction_5s = 0.05;
+        status.metrics.markov_prediction_30s = 0.25;
+        status.metrics.markov_prediction_2m = 0.70;
+        status.metrics.markov_prediction_10m = 0.80;
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line == "WM-U   trusted 1/7"));
+        assert!(think
+            .iter()
+            .any(|line| line == "WM wait immature4 uncertain2"));
+        assert!(think.iter().any(|line| line == "Mk-H 5s5 30s25 2m70 10m80"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
     #[test]

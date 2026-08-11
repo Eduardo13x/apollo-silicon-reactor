@@ -16,7 +16,7 @@ use apollo_engine::engine::action_planner::{
     plan_actions, GpuRankInfluence, IntentEvidence, PlanReport, PlanningContext,
 };
 use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest};
-use apollo_engine::engine::audit_types::PolicyDecisionTrace;
+use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
 use apollo_engine::engine::daemon_helpers::write_frozen_state;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::degradation::DegradationInputs;
@@ -28,6 +28,7 @@ use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 use apollo_engine::engine::swap_reclaim::SwapRisk;
+use apollo_engine::engine::telemetry_medallion::DecisionAttribution;
 use apollo_engine::engine::types::{FreezeSource, FrozenEntry, RootAction};
 use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
 
@@ -260,6 +261,97 @@ impl WorldModelInfluence {
             quality: assessment.quality,
             margin,
         }
+    }
+}
+
+fn decision_proposer(action: &RootAction) -> String {
+    if action.reason().contains("predictive-agent") {
+        return "predictive-agent".to_string();
+    }
+    match action.decision_reason() {
+        DecisionReason::CausalInference => "causal-specialist",
+        DecisionReason::InteractiveFocus
+        | DecisionReason::MLWorkload
+        | DecisionReason::DisplayPipeline
+        | DecisionReason::CompositorPriority
+        | DecisionReason::ThreadQoSRouting => "interaction-specialist",
+        DecisionReason::WaitGraphBlocker => "wait-graph",
+        DecisionReason::OutcomeIneffective => "outcome-model",
+        DecisionReason::AnomalyDetected
+        | DecisionReason::IoBurst
+        | DecisionReason::WakeupVampire
+        | DecisionReason::DramBandwidth => "signal-intelligence",
+        DecisionReason::MemoryBudget => "memory-budget",
+        DecisionReason::SwarmThrottling | DecisionReason::GraduatedIdle => "adaptive-governor",
+        DecisionReason::PressureContext
+        | DecisionReason::CriticalBypass
+        | DecisionReason::HysteresisRecovery => "pressure-specialist",
+        DecisionReason::IpcProtected
+        | DecisionReason::UserActiveSkip
+        | DecisionReason::HrpoSkip => "safety-policy",
+        DecisionReason::Other(_) => "specialist",
+    }
+    .to_string()
+}
+
+fn decision_attribution(
+    action: &RootAction,
+    key: String,
+    world_model: &apollo_engine::engine::world_model::WorldModel,
+    workload: &str,
+    evidence: IntentEvidence,
+    temporal_gain: Option<f64>,
+    gpu_support: Option<f64>,
+) -> DecisionAttribution {
+    use apollo_engine::engine::world_model::{Imagined, UtilityImagined};
+
+    let mut supporters = Vec::with_capacity(6);
+    let mut vetoes = Vec::with_capacity(4);
+    if let Some(assessment) = world_model.assess_utility(&key, workload) {
+        match assessment.verdict {
+            UtilityImagined::ActWins { .. } => supporters.push("world-model".to_string()),
+            UtilityImagined::DoNothingDominates { .. } => vetoes.push("world-model".to_string()),
+            UtilityImagined::Unknown => {}
+        }
+        if assessment.counterfactual_support > f64::EPSILON {
+            supporters.push("noop-control".to_string());
+        } else if assessment.counterfactual_support < -f64::EPSILON {
+            vetoes.push("noop-control".to_string());
+        }
+        if assessment.episodic_support > f64::EPSILON {
+            supporters.push("episodic-memory".to_string());
+        } else if assessment.episodic_support < -f64::EPSILON {
+            vetoes.push("episodic-memory".to_string());
+        }
+    } else if world_model.assess_family_prior(&key).is_some() {
+        supporters.push("family-prior".to_string());
+    }
+    match world_model.imagine(&key) {
+        Imagined::ActWins { .. } => supporters.push("causal-model".to_string()),
+        Imagined::DoNothingDominates { .. } => vetoes.push("causal-model".to_string()),
+        Imagined::Unknown => {}
+    }
+    if let Some(gain) = temporal_gain {
+        if gain > f64::EPSILON {
+            supporters.push("world-sequence".to_string());
+        } else if gain < -f64::EPSILON {
+            vetoes.push("world-sequence".to_string());
+        }
+    }
+    if let Some(support) = gpu_support {
+        if support > f64::EPSILON {
+            supporters.push("gpu-model".to_string());
+        } else if support < -f64::EPSILON {
+            vetoes.push("gpu-model".to_string());
+        }
+    }
+    DecisionAttribution {
+        action_key: key,
+        proposer: decision_proposer(action),
+        supporters,
+        vetoes,
+        predicted_gain: evidence.expected_benefit.clamp(-1.0, 1.0),
+        uncertainty: evidence.uncertainty.clamp(0.0, 1.0),
     }
 }
 
@@ -646,6 +738,34 @@ fn plan_action_intents_inner(
         evidence.uncertainty = evidence.uncertainty.max(uncertainty);
     }
     let (planned, mut report) = plan_actions(actions, &context);
+    report.decision_attributions = planned
+        .iter()
+        .filter_map(|action| {
+            let key = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)?;
+            let evidence = context
+                .utility_evidence
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            let temporal_gain = temporal_plan
+                .action_scores
+                .get(&key)
+                .map(|score| score.expected_gain);
+            let gpu_support = gpu_supported_actions
+                .iter()
+                .find(|influence| influence.action_key == key)
+                .map(|influence| influence.support);
+            Some(decision_attribution(
+                action,
+                key,
+                world_model,
+                workload,
+                evidence,
+                temporal_gain,
+                gpu_support,
+            ))
+        })
+        .collect();
     report.evidence_ranked = exact_positive_evidence;
     report.family_priors_used = family_priors_used;
     report.counterfactual_ranked = counterfactual_ranked;
@@ -1878,6 +1998,8 @@ mod tests {
                 raw_utility_delta: 0.08,
                 counterfactual_delta: 0.0,
                 net_utility_delta: 0.08,
+                attribution: Default::default(),
+                utility: Default::default(),
                 perceptual_latency_improvement: 0.0,
                 net_state_delta: WorldStateDelta::default(),
                 context_before: ActuatorEpisodeContext::from_telemetry(&context),
@@ -2174,5 +2296,30 @@ mod tests {
         assert!(keys.contains("predictive_profile:aggressive"));
         assert!(keys.contains("predictive_purge:kernel"));
         assert_eq!(keys.len(), candidates.len());
+    }
+
+    #[test]
+    fn decision_attribution_names_owner_and_advisory_gpu_support() {
+        let model = apollo_engine::engine::world_model::WorldModel::default();
+        let attribution = decision_attribution(
+            &boost(100),
+            "boost:p100".to_string(),
+            &model,
+            "build",
+            IntentEvidence {
+                expected_benefit: 0.04,
+                uncertainty: 0.20,
+            },
+            Some(0.03),
+            Some(0.02),
+        );
+
+        assert_eq!(attribution.proposer, "pressure-specialist");
+        assert_eq!(attribution.predicted_gain, 0.04);
+        assert!(attribution
+            .supporters
+            .contains(&"world-sequence".to_string()));
+        assert!(attribution.supporters.contains(&"gpu-model".to_string()));
+        assert!(attribution.vetoes.is_empty());
     }
 }

@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::engine::action_types::RootAction;
 use crate::engine::gpu_imagination::GpuImaginationResult;
-use crate::engine::telemetry_medallion::actuator_action_key;
+use crate::engine::telemetry_medallion::{actuator_action_key, DecisionAttribution};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct IntentEvidence {
@@ -77,6 +77,9 @@ pub struct PlanReport {
     pub temporal_authoritative_best_second: Option<String>,
     pub temporal_abstention_reason: Option<String>,
     pub last_resolution: Option<String>,
+    /// Per-admitted-action provenance. Execution later filters this list by
+    /// confirmed audit traces before the medallion can consume it.
+    pub decision_attributions: Vec<DecisionAttribution>,
 }
 
 /// A root-planner ranking that was measurably tilted by a fresh GPU forecast.

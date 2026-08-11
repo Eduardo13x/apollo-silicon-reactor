@@ -1554,6 +1554,8 @@ mod tests {
             raw_utility_delta: 0.08,
             counterfactual_delta: 0.01,
             net_utility_delta: 0.07,
+            attribution: Default::default(),
+            utility: Default::default(),
             perceptual_latency_improvement: 0.0,
             net_state_delta: WorldStateDelta {
                 pressure: -0.05,

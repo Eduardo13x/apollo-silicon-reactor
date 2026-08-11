@@ -6029,6 +6029,30 @@ fn main() -> anyhow::Result<()> {
                 // actuator independently of the cognitive learning gate.
                 // A recovery-mode pause must not erase what Apollo or macOS
                 // did; it only pauses downstream parameter updates.
+                let mut attribution_by_key: HashMap<_, VecDeque<_>> = HashMap::new();
+                for attribution in plan_report.decision_attributions.iter().cloned() {
+                    attribution_by_key
+                        .entry(attribution.action_key.clone())
+                        .or_default()
+                        .push_back(attribution);
+                }
+                for trace in exec_outcomes
+                    .audit_traces
+                    .iter()
+                    .filter(|trace| trace.applied)
+                {
+                    let Some(key) = apollo_engine::engine::telemetry_medallion::actuator_action_key(
+                        &trace.intended_action,
+                    ) else {
+                        continue;
+                    };
+                    if let Some(attribution) = attribution_by_key
+                        .get_mut(&key)
+                        .and_then(VecDeque::pop_front)
+                    {
+                        telemetry_medallion.stage_decision_attribution(attribution);
+                    }
+                }
                 let causal_runtime_context = state.metrics.lock_recover().metrics.clone();
                 telemetry_medallion.observe(
                     apollo_engine::engine::telemetry_medallion::TelemetryObservation {
