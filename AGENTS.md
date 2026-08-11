@@ -2,6 +2,91 @@
 
 This file provides guidance to Codex (Codex.ai/code) when working with code in this repository.
 
+## Development execution protocol — scenario-first, single-pass (active 2026-08-11)
+
+This section is the highest-priority development workflow for Apollo. It overrides any older
+process guidance that would cause requirements to be discovered late, repeated broad builds,
+or open-ended review/fix rounds. Safety, deployment, and production-evidence rules elsewhere in
+this file still apply.
+
+### 1. Discover the whole task before editing
+
+Before changing production source for a task:
+
+1. Read the plan, current implementation, persistence schema, production call sites, and tests.
+2. Query `graphify-out/` when available to map callers, consumers, fanout, and bypass paths.
+3. Enumerate the complete scenario matrix up front, including:
+   - every enum/action/family variant and no-op/reject/error outcome;
+   - startup, shutdown, restart, pause/kill-switch, timeout, and concurrent completion;
+   - legacy/imported state, schema migration, corrupt/non-finite/oversized input, and origin changes;
+   - capacity limits, deduplication, eviction/decay, ordering, and complexity bounds;
+   - all actuation bypasses, safety gates, protected processes, and root/non-root behavior.
+4. Read-only agents may audit independent dimensions in parallel, but they must write disjoint
+   reports, must not edit production source, and must not run Cargo.
+
+Do not begin implementation until these findings are consolidated into one frozen contract and
+one acceptance-test matrix for the task.
+
+### 2. Freeze the contract once
+
+The frozen contract is the task's single source of truth. It must specify ownership, data flow,
+bounds, compatibility, failure behavior, exact tests, and explicitly deferred scope. Resolve
+conflicts between audits before coding.
+
+After implementation starts, do not casually expand the task. Newly noticed cosmetic or optional
+work goes to a later task. Amend the frozen contract only for a mechanically demonstrated safety
+or correctness gap that would make the current implementation invalid.
+
+### 3. Implement in one coherent pass
+
+- Keep one active production-code owner for shared APIs and persistence types.
+- Parallel work is allowed only for genuinely disjoint write sets.
+- Finish the complete task contract on the same branch/worktree before starting source edits for
+  the next task. The next task may be audited and frozen in parallel.
+- Batch related implementation and tests into a coherent change. Do not compile every small edit
+  or create a chain of speculative fix commits.
+- Preserve existing architecture and safety behavior unless the frozen contract explicitly changes
+  it. No opportunistic refactors.
+
+### 4. One Cargo lane, staged verification
+
+The repository has one shared `target/`. Never run Cargo concurrently, including from agents.
+Reuse that target directory and follow this verification budget:
+
+1. **During implementation:** run only focused tests for the module or named behavior being changed.
+   Prefer one filtered invocation covering a batch of cases over one invocation per case.
+2. **At task end:** run one affected-crate/binary test pass, then `cargo fmt --all -- --check` and
+   `git diff --check` once.
+3. **At integration Task 7:** run the workspace release suite, Clippy, release build, E2E, and
+   benchmarks once after all feature tasks are integrated.
+4. Do not repeat an unchanged broad command to obtain reassurance. Re-run it only when a subsequent
+   edit can affect its result.
+
+### 5. One batched adversarial review
+
+After the task implementation and focused tests are complete, perform one comprehensive review
+against the frozen scenario matrix. Ask, in the same pass:
+
+- Which variants or call sites are missing?
+- Which lifecycle event invalidates this state?
+- Which path bypasses this guard or attribution?
+- Can restore, concurrency, capacity, or failure handling violate an invariant?
+
+Batch all findings into one fix pass, then run the task-end verification once. Do not start
+round 2/3/4 review loops for style, speculation, or already-covered scenarios. An additional review
+is justified only by a new P0/P1 safety or correctness defect demonstrated by code or a failing test.
+
+### 6. Keep progress observable without interrupting work
+
+Maintain the task ledger under `.superpowers/sdd/<plan>/progress.md` with the current task, phase,
+active write scope, last completed verification, and next gate. Update it at phase transitions, not
+through repeated status polling. Do not interrupt an active implementation agent merely to ask what
+it is doing; inspect at the agreed checkpoint.
+
+Commits should represent complete task-level behavior or one necessary correctness fix, not every
+intermediate compile. Deployment remains a separate final phase after the integrated verification
+gate and explicit user approval.
+
 ## Critical lesson — NotebookLM is NOT a final gatekeeper (2026-05-07)
 
 NotebookLM peer-review (notebook `8344b94c-a014-4803-abea-076a55753cfd`) is a research librarian, not a senior engineer. It paraphrases and elaborates with confidence; it does NOT catch logic gaps in your diff, calibrate severity honestly, or push back when you're wrong.
