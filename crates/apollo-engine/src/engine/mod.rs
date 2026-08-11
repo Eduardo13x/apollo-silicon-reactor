@@ -38,6 +38,7 @@ pub mod daemon_metrics_history;
 pub mod daemon_state;
 pub mod data_medallion;
 pub mod decide_actions;
+pub mod decision_ledger;
 pub mod degradation;
 pub mod display_turbo;
 pub mod effect_decay;
