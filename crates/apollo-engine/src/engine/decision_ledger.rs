@@ -1,4 +1,5 @@
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -7,6 +8,8 @@ pub const MAX_RECENT_DECISIONS: usize = 64;
 pub const MAX_EPISODIC_DECISIONS: usize = 128;
 pub const MAX_CANDIDATE_ALTERNATIVES: usize = 8;
 pub const MAX_ADVISER_CONTRIBUTIONS: usize = 8;
+const MAX_RETAINED_DECISION_IDS: usize =
+    MAX_PENDING_DECISIONS + MAX_RECENT_DECISIONS + MAX_EPISODIC_DECISIONS;
 
 const MAX_PREDICTIONS: usize = 8;
 const MAX_ACTION_KEY_CHARS: usize = 320;
@@ -437,35 +440,42 @@ impl DecisionLedger {
     }
 
     fn allocate_id(&mut self) -> DecisionId {
-        for _ in 0..=MAX_PENDING_DECISIONS {
+        let mut occupied = HashSet::with_capacity(MAX_RETAINED_DECISION_IDS);
+        occupied.extend(self.pending.keys().copied());
+        occupied.extend(self.recent.iter().map(|episode| episode.id));
+        occupied.extend(self.episodic.iter().map(|episode| episode.id));
+        for _ in 0..=MAX_RETAINED_DECISION_IDS {
             self.next_id = self.next_id.wrapping_add(1);
             if self.next_id == 0 {
                 continue;
             }
             let id = DecisionId(self.next_id);
-            if !self.pending.contains_key(&id) {
+            if !occupied.contains(&id) {
                 return id;
             }
         }
-        unreachable!("the bounded pending ledger must leave an unused decision id");
+        unreachable!("the bounded ledger must leave an unused decision id");
     }
 
     fn normalize_restored_state(&mut self) {
-        let mut restored: Vec<_> = std::mem::take(&mut self.pending).into_iter().collect();
-        restored.sort_by(|(left_id, left), (right_id, right)| {
-            left.proposed_cycle
-                .cmp(&right.proposed_cycle)
-                .then_with(|| left_id.cmp(right_id))
-        });
+        let mut restored = std::mem::take(&mut self.pending);
         let mut pending = HashMap::with_capacity(MAX_PENDING_DECISIONS);
         let mut order = VecDeque::with_capacity(MAX_PENDING_DECISIONS);
-        self.pending_order.clear();
-        for (id, _) in &restored {
+        for id in restored.keys() {
             self.next_id = self.next_id.max(id.0);
         }
-        let retained_start = restored.len().saturating_sub(MAX_PENDING_DECISIONS);
-        for (id, envelope) in restored.into_iter().skip(retained_start) {
-            self.insert_restored_pending(id, envelope, &mut pending, &mut order);
+        if pending_order_is_valid(&self.pending_order, &restored) {
+            for id in std::mem::take(&mut self.pending_order) {
+                let envelope = restored
+                    .remove(&id)
+                    .expect("validated pending order must reference a pending envelope");
+                self.insert_restored_pending(id, envelope, &mut pending, &mut order);
+            }
+        } else {
+            self.pending_order.clear();
+            for (id, envelope) in select_reconstructed_pending(restored) {
+                self.insert_restored_pending(id, envelope, &mut pending, &mut order);
+            }
         }
         self.pending = pending;
         self.pending_order = order;
@@ -604,6 +614,69 @@ fn push_bounded<T>(queue: &mut VecDeque<T>, value: T, limit: usize) {
     queue.push_back(value);
 }
 
+fn pending_order_is_valid(
+    order: &VecDeque<DecisionId>,
+    pending: &HashMap<DecisionId, DecisionEnvelope>,
+) -> bool {
+    if order.len() != pending.len() || order.len() > MAX_PENDING_DECISIONS {
+        return false;
+    }
+    let mut seen = HashSet::with_capacity(order.len());
+    order
+        .iter()
+        .all(|id| pending.contains_key(id) && seen.insert(*id))
+}
+
+struct RestoredPending {
+    id: DecisionId,
+    envelope: DecisionEnvelope,
+}
+
+impl PartialEq for RestoredPending {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.envelope.proposed_cycle == other.envelope.proposed_cycle
+    }
+}
+
+impl Eq for RestoredPending {}
+
+impl PartialOrd for RestoredPending {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RestoredPending {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.envelope
+            .proposed_cycle
+            .cmp(&other.envelope.proposed_cycle)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+fn select_reconstructed_pending(
+    pending: HashMap<DecisionId, DecisionEnvelope>,
+) -> Vec<(DecisionId, DecisionEnvelope)> {
+    let mut selected = BinaryHeap::with_capacity(MAX_PENDING_DECISIONS + 1);
+    for (id, envelope) in pending {
+        selected.push(Reverse(RestoredPending { id, envelope }));
+        if selected.len() > MAX_PENDING_DECISIONS {
+            selected.pop();
+        }
+    }
+    let mut reconstructed: Vec<_> = selected
+        .into_iter()
+        .map(|Reverse(candidate)| (candidate.id, candidate.envelope))
+        .collect();
+    reconstructed.sort_by(|(left_id, left), (right_id, right)| {
+        left.proposed_cycle
+            .cmp(&right.proposed_cycle)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    reconstructed
+}
+
 fn normalize_episodes(
     episodes: VecDeque<ResolvedDecisionEpisode>,
     limit: usize,
@@ -633,9 +706,10 @@ fn episode_authority_eligible(envelope: &DecisionEnvelope) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AdviserContribution, CandidateAlternative, DecisionId, DecisionLedger, DecisionLifecycle,
-        DecisionProposal, ExecutionDisposition, ExecutionReceipt, ReceiptAttribution,
-        MAX_ADVISER_CONTRIBUTIONS, MAX_CANDIDATE_ALTERNATIVES, MAX_PENDING_DECISIONS,
+        select_reconstructed_pending, AdviserContribution, CandidateAlternative, DecisionEnvelope,
+        DecisionId, DecisionLedger, DecisionLifecycle, DecisionProposal, ExecutionDisposition,
+        ExecutionReceipt, ReceiptAttribution, ResolvedDecisionEpisode, MAX_ADVISER_CONTRIBUTIONS,
+        MAX_CANDIDATE_ALTERNATIVES, MAX_PENDING_DECISIONS,
     };
 
     #[test]
@@ -721,6 +795,31 @@ mod tests {
             ledger.recent().front().unwrap().envelope.lifecycle,
             DecisionLifecycle::Expired
         );
+    }
+
+    #[test]
+    fn round_trip_preserves_valid_serialized_fifo_order() {
+        let mut ledger = DecisionLedger::new();
+        let first = ledger.propose(DecisionProposal {
+            action_key: "first".to_string(),
+            proposed_cycle: 100,
+            ..DecisionProposal::default()
+        });
+        let second = ledger.propose(DecisionProposal {
+            action_key: "second".to_string(),
+            proposed_cycle: 0,
+            ..DecisionProposal::default()
+        });
+        for _ in 2..MAX_PENDING_DECISIONS {
+            ledger.propose(DecisionProposal::default());
+        }
+        let serialized = serde_json::to_string(&ledger).unwrap();
+        let mut restored: DecisionLedger = serde_json::from_str(&serialized).unwrap();
+
+        restored.propose(DecisionProposal::default());
+
+        assert!(restored.pending(first).is_none());
+        assert!(restored.pending(second).is_some());
     }
 
     #[test]
@@ -995,6 +1094,53 @@ mod tests {
     }
 
     #[test]
+    fn oversized_reconstruction_selects_a_bounded_recent_window_before_ordering() {
+        let mut pending = std::collections::HashMap::new();
+        for raw_id in 1..=(MAX_PENDING_DECISIONS as u64 + 1) {
+            pending.insert(
+                DecisionId(raw_id),
+                DecisionEnvelope {
+                    id: DecisionId(raw_id),
+                    proposed_cycle: raw_id,
+                    ..DecisionEnvelope::default()
+                },
+            );
+        }
+
+        let reconstructed = select_reconstructed_pending(pending);
+
+        assert_eq!(reconstructed.len(), MAX_PENDING_DECISIONS);
+        assert_eq!(reconstructed.first().unwrap().0, DecisionId(2));
+        assert_eq!(
+            reconstructed.last().unwrap().0,
+            DecisionId(MAX_PENDING_DECISIONS as u64 + 1)
+        );
+    }
+
+    #[test]
+    fn oversized_restore_retains_only_the_newest_bounded_pending_window() {
+        let mut pending = serde_json::Map::new();
+        for raw_id in 1..=(MAX_PENDING_DECISIONS as u64 + 1) {
+            pending.insert(
+                raw_id.to_string(),
+                serde_json::json!({
+                    "id": raw_id,
+                    "proposed_cycle": raw_id,
+                }),
+            );
+        }
+        let serialized = serde_json::json!({ "pending": pending }).to_string();
+
+        let restored: DecisionLedger = serde_json::from_str(&serialized).unwrap();
+
+        assert_eq!(restored.pending_len(), MAX_PENDING_DECISIONS);
+        assert!(restored.pending(DecisionId(1)).is_none());
+        assert!(restored
+            .pending(DecisionId(MAX_PENDING_DECISIONS as u64 + 1))
+            .is_some());
+    }
+
+    #[test]
     fn exhausted_id_high_water_mark_does_not_overwrite_a_live_decision() {
         let max_id = u64::MAX;
         let serialized = serde_json::json!({
@@ -1020,5 +1166,23 @@ mod tests {
             "existing"
         );
         assert_eq!(restored.pending(new_id).unwrap().action_key, "new");
+    }
+
+    #[test]
+    fn wrapped_allocation_skips_recent_and_episodic_decision_ids() {
+        let mut ledger = DecisionLedger::new();
+        ledger.next_id = u64::MAX;
+        ledger.recent.push_back(ResolvedDecisionEpisode {
+            id: DecisionId(1),
+            ..ResolvedDecisionEpisode::default()
+        });
+        ledger.episodic.push_back(ResolvedDecisionEpisode {
+            id: DecisionId(2),
+            ..ResolvedDecisionEpisode::default()
+        });
+
+        let new_id = ledger.propose(DecisionProposal::default());
+
+        assert_eq!(new_id, DecisionId(3));
     }
 }
