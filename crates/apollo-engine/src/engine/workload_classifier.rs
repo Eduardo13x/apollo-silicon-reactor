@@ -1,7 +1,7 @@
 //! ML Ligero — Lightweight local Bayesian workload classifier.
 //!
 //! Combines:
-//!   1. LLM-learned pattern weights (updated via `update_learned_policy`)
+//!   1. Locally consolidated pattern weights (via `update_learned_policy`)
 //!   2. Foreground app matching
 //!   3. Hour-of-day prior from UserProfile
 //!   4. App recency from UserProfile
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{
     hw_bayes::{HwBayesClassifier, HwFeatures},
-    llm::LearnedPolicy,
+    policy_store::LearnedPolicy,
     user_profile::{workload_signatures, AppStats, HourProfile, WorkloadType},
 };
 
@@ -102,7 +102,7 @@ pub enum ClassifierSource {
     HourPrior,
     AppRecency(String),
     ProcessMix(u32), // # of matching process names
-    LlmLearned,
+    LocalPolicy,
     MemoryLayout(MemoryLayoutHint),
 }
 
@@ -124,14 +124,14 @@ impl WorkloadClassification {
                 ClassifierSource::HourPrior => "hour-prior".to_string(),
                 ClassifierSource::AppRecency(app) => format!("recency:{}", app),
                 ClassifierSource::ProcessMix(n) => format!("process-mix:{}", n),
-                ClassifierSource::LlmLearned => "llm-learned".to_string(),
+                ClassifierSource::LocalPolicy => "local-policy".to_string(),
                 ClassifierSource::MemoryLayout(hint) => format!("memory-layout:{:?}", hint),
             })
             .collect()
     }
 }
 
-/// A pattern learned from the LLM teacher, mapped to a workload type.
+/// A pattern consolidated from local outcomes, mapped to a workload type.
 struct PatternWeight {
     pattern: String,
     workload: WorkloadType,
@@ -153,7 +153,7 @@ impl WorkloadClassifier {
         }
     }
 
-    /// Call this whenever LearnedPolicy is updated (LLM retraining result).
+    /// Call this whenever local consolidation updates LearnedPolicy.
     pub fn update_learned_policy(&mut self, policy: &LearnedPolicy) {
         self.learned_weights.clear();
         let sigs = workload_signatures();
@@ -240,11 +240,11 @@ impl WorkloadClassifier {
                     break;
                 }
             }
-            // LLM-learned boost for foreground
+            // Locally learned boost for foreground.
             for pw in &self.learned_weights {
                 if fg.contains(pw.pattern.as_str()) {
                     *scores.entry(pw.workload).or_insert(0.0) += pw.weight;
-                    sources.push(ClassifierSource::LlmLearned);
+                    sources.push(ClassifierSource::LocalPolicy);
                 }
             }
         }
@@ -358,14 +358,14 @@ impl WorkloadClassifier {
 
         // D2: Evidence depth — count of distinct source types.
         let n_source_types = {
-            let mut seen = [false; 6]; // ForegroundApp, HourPrior, AppRecency, ProcessMix, LlmLearned, MemoryLayout
+            let mut seen = [false; 6]; // ForegroundApp, HourPrior, AppRecency, ProcessMix, LocalPolicy, MemoryLayout
             for s in &sources {
                 match s {
                     ClassifierSource::ForegroundApp => seen[0] = true,
                     ClassifierSource::HourPrior => seen[1] = true,
                     ClassifierSource::AppRecency(_) => seen[2] = true,
                     ClassifierSource::ProcessMix(_) => seen[3] = true,
-                    ClassifierSource::LlmLearned => seen[4] = true,
+                    ClassifierSource::LocalPolicy => seen[4] = true,
                     ClassifierSource::MemoryLayout(_) => seen[5] = true,
                 }
             }

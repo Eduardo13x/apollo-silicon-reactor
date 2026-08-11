@@ -18,12 +18,8 @@ from datetime import datetime, timezone
 STATE = "/var/lib/apollo/learned_state.json"
 METRICS = "/var/lib/apollo/runtime_metrics.json"
 POLICY = "/var/lib/apollo/learned_policy.json"
-LLM = "/var/lib/apollo/llm_state.json"
 LOG = "/var/lib/apollo/audit.log"
 FLAG = "/var/run/apollo-audit-alert"  # presence = HIGH finding pending
-
-# Teacher is considered dead if enabled but no SUCCESSFUL call in this long.
-LLM_STALE_DAYS = 2.0
 
 
 def load(path):
@@ -34,32 +30,7 @@ def load(path):
         return {"__error__": str(e)}
 
 
-def teacher_config_disabled():
-    """True iff the [llm] config explicitly sets enabled=false. Mirrors the
-    regression probe's check (de1a2cd): the llm_state.json `enabled` flag can be
-    stale-true after the teacher is deliberately disabled in config, so the
-    llm-stale detector must consult the config (the source of truth the daemon
-    reads per-tick), not just the runtime state. Stdlib line parse (no tomllib on
-    py3.9). Conservative: returns False on any read failure so a genuinely-dead
-    teacher is never masked."""
-    try:
-        with open("/etc/apollo-optimizer/config.toml") as f:
-            in_llm = False
-            for line in f:
-                s = line.strip()
-                if s.startswith("#"):
-                    continue
-                if s.startswith("[") and s.endswith("]"):
-                    in_llm = s == "[llm]"
-                    continue
-                if in_llm and s.replace(" ", "").startswith("enabled="):
-                    return "false" in s.lower()
-    except Exception:
-        pass
-    return False
-
-
-def audit(state, metrics, policy, llm):
+def audit(state, metrics, policy):
     findings = []  # (severity, code, detail)
 
     # The learned policy lists. A futile weight is only DANGEROUS when the
@@ -164,35 +135,6 @@ def audit(state, metrics, policy, llm):
     if "__error__" in state:
         findings.append(("HIGH", "state-unreadable", state["__error__"]))
 
-    # ── P6: teacher LLM silently dead ─────────────────────────────────────
-    # The 2026-06-14 incident: the teacher had not made a SUCCESSFUL call for
-    # 11 days (metal-oom gate permanently tripped, then thinking truncated the
-    # JSON), yet `calls_today` / `trigger_events` kept advancing on every
-    # attempt — so it LOOKED alive. Trust only ground truth: `last_call_at`
-    # (set sole­ly on success) and `consecutive_failures`. Never `calls_today`.
-    if "__error__" not in llm and llm.get("enabled") and not teacher_config_disabled():
-        cf = llm.get("consecutive_failures", 0)
-        last_call = llm.get("last_call_at")
-        age_days = None
-        if last_call:
-            try:
-                lc = datetime.fromisoformat(last_call.replace("Z", "+00:00"))
-                age_days = (datetime.now(timezone.utc) - lc).total_seconds() / 86400.0
-            except Exception:
-                age_days = None
-        if age_days is None or age_days > LLM_STALE_DAYS:
-            shown = "never" if age_days is None else f"{age_days:.1f}d ago"
-            findings.append((
-                "HIGH", "llm-stale",
-                f"teacher enabled but last SUCCESSFUL call {shown} "
-                f"(consecutive_failures={cf}, last_error={llm.get('last_error')}) "
-                f"— ignore calls_today/triggers, they advance on failed attempts"))
-        elif cf >= 10:
-            findings.append((
-                "MED", "llm-failing",
-                f"teacher calling but failing: consecutive_failures={cf}, "
-                f"last_error={llm.get('last_error')}"))
-
     return findings
 
 
@@ -200,8 +142,7 @@ def main():
     state = load(STATE)
     metrics = load(METRICS)
     policy = load(POLICY)
-    llm = load(LLM)
-    findings = audit(state, metrics, policy, llm)
+    findings = audit(state, metrics, policy)
 
     ts = datetime.now(timezone.utc).isoformat()
     high = [f for f in findings if f[0] == "HIGH"]

@@ -8,7 +8,7 @@ use crate::engine::usage_model::{UsageEntrySummary, UsageTopReport};
 
 /// Centralized utility for hardened file system operations to prevent TOCTOU and symlink attacks.
 ///
-/// Cross-crate visibility: required by apollo-optimizerd (main.rs, llm_daemon.rs) and
+/// Cross-crate visibility: required by apollo-optimizerd and
 /// apollo-optimizerctl for secure path validation. Audited 2026-05-09 during Sprint 5
 /// Mes 0 workspace split.
 pub struct HardPath;
@@ -562,12 +562,17 @@ pub struct RuntimeMetrics {
     pub wake_events: u64,
     pub post_wake_grace_entries: u64,
     pub post_wake_defensive_unfreezes: u64,
-    /// Teacher consolidation events (Gemma outcomes compiled into S1).
+    /// Universal Gold outcomes locally consolidated from System 2 into S1.
     #[serde(default)]
-    pub teacher_consolidations: u64,
-    /// Subset that IMPROVED pressure (positive valence).
+    pub local_consolidations: u64,
     #[serde(default)]
-    pub teacher_improvements: u64,
+    pub local_consolidation_improvements: u64,
+    #[serde(default)]
+    pub local_consolidation_regressions: u64,
+    #[serde(default)]
+    pub local_consolidation_neutral: u64,
+    #[serde(default)]
+    pub local_consolidation_system1_updates: u64,
     pub post_wake_throttle_suppressed: u64,
     pub post_wake_freeze_suppressed: u64,
     pub swap_used_bytes: u64,
@@ -1293,6 +1298,16 @@ pub struct RuntimeMetrics {
     /// True when audio is actively being output (coreaudiod assertion).
     #[serde(default)]
     pub user_audio_active: bool,
+    /// Direct CoreAudio source health. Root LaunchDaemons normally report
+    /// `session-fallback` and rely on pmset/process/capture context instead.
+    #[serde(default)]
+    pub coreaudio_probe_state: String,
+    #[serde(default)]
+    pub coreaudio_probe_samples_total: u64,
+    #[serde(default)]
+    pub coreaudio_probe_cache_hits_total: u64,
+    #[serde(default)]
+    pub coreaudio_probe_failures_total: u64,
 
     // ── Chromium Renderer Manager ────────────────────────────────────────────
     /// Total renderer processes tracked (across all Chromium/Electron apps).
@@ -1742,6 +1757,19 @@ pub struct RuntimeMetrics {
     pub gpu_imagination_wall_time_ns_total: u64,
     #[serde(default)]
     pub gpu_imagination_support_uses_total: u64,
+    /// Root-planner rankings that consumed a fresh GPU forecast.
+    #[serde(default)]
+    pub gpu_imagination_root_rank_uses_total: u64,
+    /// Specialist decisions whose contextual World Model bias included a fresh
+    /// GPU forecast. This is advisory use, not an independent GPU action.
+    #[serde(default)]
+    pub gpu_imagination_contextual_uses_total: u64,
+    #[serde(default)]
+    pub gpu_imagination_last_influence_scope: String,
+    #[serde(default)]
+    pub gpu_imagination_last_influence_action: String,
+    #[serde(default)]
+    pub gpu_imagination_last_influence_support: f64,
     #[serde(default)]
     pub gpu_imagination_last_submit_outcome: String,
     #[serde(default)]
@@ -1752,6 +1780,36 @@ pub struct RuntimeMetrics {
     pub gpu_imagination_last_positive_probability: f64,
     #[serde(default)]
     pub gpu_imagination_last_p10_gain: f64,
+    /// Local, non-LLM synthesis of System 1, Dr Zero, World Model, medallion
+    /// and GPU evidence. It only scales existing advisory paths.
+    #[serde(default)]
+    pub system_deliberation_mode: String,
+    #[serde(default)]
+    pub system_deliberation_confidence: f64,
+    #[serde(default)]
+    pub system_deliberation_advisory_support_scale: f64,
+    #[serde(default)]
+    pub system_deliberation_gpu_support_scale: f64,
+    #[serde(default)]
+    pub system_deliberation_dr_zero_challenge: f64,
+    #[serde(default)]
+    pub system_deliberation_system1_struggling: bool,
+    #[serde(default)]
+    pub system_deliberation_local_gold: u64,
+    #[serde(default)]
+    pub system_deliberation_gpu_forecasts: u32,
+    #[serde(default)]
+    pub system_deliberation_local_confidence: f64,
+    #[serde(default)]
+    pub system_deliberation_local_families: u32,
+    #[serde(default)]
+    pub local_consolidation_last_family: String,
+    #[serde(default)]
+    pub local_consolidation_last_action: String,
+    #[serde(default)]
+    pub local_consolidation_last_verdict: String,
+    #[serde(default)]
+    pub local_consolidation_last_utility: f64,
     #[serde(default)]
     pub world_model_sequence_best_first: String,
     #[serde(default)]
@@ -2475,6 +2533,31 @@ impl RuntimeMetrics {
         )
     }
 
+    /// Record a bounded GPU forecast that changed only a root-planner rank.
+    /// This is intentionally separate from a successful root action: the
+    /// usual safety and capability gates still decide whether it can execute.
+    pub fn record_gpu_root_rank_influence(&mut self, action_key: &str, support: f64) {
+        self.gpu_imagination_support_uses_total =
+            self.gpu_imagination_support_uses_total.saturating_add(1);
+        self.gpu_imagination_root_rank_uses_total =
+            self.gpu_imagination_root_rank_uses_total.saturating_add(1);
+        self.gpu_imagination_last_influence_scope = "root-ranking".to_string();
+        self.gpu_imagination_last_influence_action = action_key.chars().take(96).collect();
+        self.gpu_imagination_last_influence_support = support.clamp(-0.005, 0.005);
+    }
+
+    /// Record an existing specialist decision that consumed GPU-derived World
+    /// Model context. It does not imply that the GPU initiated or executed it.
+    pub fn record_gpu_contextual_influence(&mut self, scope: &str, action_key: &str, support: f64) {
+        self.gpu_imagination_support_uses_total =
+            self.gpu_imagination_support_uses_total.saturating_add(1);
+        self.gpu_imagination_contextual_uses_total =
+            self.gpu_imagination_contextual_uses_total.saturating_add(1);
+        self.gpu_imagination_last_influence_scope = scope.chars().take(48).collect();
+        self.gpu_imagination_last_influence_action = action_key.chars().take(96).collect();
+        self.gpu_imagination_last_influence_support = support.clamp(-0.08, 0.08);
+    }
+
     /// True iff survival mode was entered at least once during this session.
     ///
     /// **Cumulative semantic** — once true, stays true until daemon restart,
@@ -2535,36 +2618,9 @@ pub struct DaemonStatus {
     pub reactor_mode: String,
     pub reactor_health: String,
     pub metrics: RuntimeMetrics,
-    #[serde(default)]
-    pub llm: Option<LlmStatus>,
     /// Currently frozen processes. Empty if none.
     #[serde(default)]
     pub frozen_processes: Vec<FrozenProcessInfo>,
-}
-
-/// Cross-crate visibility: embedded in DaemonStatus.llm; read by apollo-optimizerctl and
-/// apollo-menubar via the DaemonResponse IPC path. Audited 2026-05-09 during Sprint 5
-/// Mes 0 workspace split.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmStatus {
-    pub enabled: bool,
-    pub training_active: bool,
-    pub training_expires_at: Option<DateTime<Utc>>,
-    pub has_api_key: bool,
-    pub mode: LlmRunMode,
-    pub last_call_at: Option<DateTime<Utc>>,
-    pub last_attempt_at: Option<DateTime<Utc>>,
-    pub last_http_status: Option<u16>,
-    pub last_error: Option<String>,
-    pub last_trigger_reason: Option<String>,
-    pub calls_in_current_window: u32,
-    pub min_confidence: f64,
-    pub calls_today: u32,
-    pub daily_budget: u32,
-    pub daily_budget_remaining: u32,
-    pub last_suggestion_confidence: Option<f64>,
-    pub last_suggestion_rationale: Option<String>,
-    pub learned_policy: LearnedPolicyStatus,
 }
 
 /// Demoted to pub(crate): no bin imports or uses this type; no pub function takes it as
@@ -2582,28 +2638,6 @@ pub(crate) struct UsageStatus {
 pub enum UsageResponse {
     Top(UsageTopReport),
     Explain(UsageEntrySummary),
-}
-
-/// Cross-crate visibility: embedded in LlmStatus and returned via DaemonResponse; accessed by
-/// apollo-optimizerctl and apollo-menubar. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct LearnedPolicyStatus {
-    pub interactive_patterns: usize,
-    pub noise_patterns: usize,
-    pub protected_patterns: usize,
-    pub learned_at: Option<DateTime<Utc>>,
-}
-
-/// Cross-crate visibility: used by apollo-optimizerd llm_daemon.rs and returned in LlmStatus
-/// over IPC to monitoring clients. Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-#[derive(Default)]
-pub enum LlmRunMode {
-    #[default]
-    Sensitive,
-    Strict,
-    Off,
 }
 
 /// Summary of circuit breaker and degradation state, returned by `GetHealth`.

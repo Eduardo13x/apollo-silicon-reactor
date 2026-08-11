@@ -22,6 +22,7 @@ use crate::engine::causal_graph::{CausalEdge, CausalGraph};
 use crate::engine::companion_graph::CompanionGraph;
 use crate::engine::data_medallion::DataMedallionPersisted;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
+use crate::engine::local_consolidation::LocalConsolidator;
 use crate::engine::maintenance_state::MaintenanceState;
 use crate::engine::meta_cognition::MetaCognition;
 use crate::engine::nars_belief::{ArousalState, DriftDetector};
@@ -35,7 +36,6 @@ use crate::engine::overflow_guard::OverflowHistory;
 use crate::engine::predictive_agent::SpecialistAccuracyTracker;
 use crate::engine::process_baseline::ProcessBaselineMap;
 use crate::engine::signal_intelligence::{SignalIntelligence, SignalIntelligencePersisted};
-use crate::engine::teacher_consolidation::TeacherConsolidator;
 use crate::engine::telemetry_medallion::TelemetryMedallionPersisted;
 use crate::engine::types::FrozenStatePersisted;
 use crate::engine::unfreeze_decay::TauEstimate;
@@ -501,14 +501,10 @@ pub struct LearnedState {
     #[serde(default)]
     pub nested_learner: Option<NestedLearner>,
 
-    /// GemmaTrust EMA per suggestion category (Interactive / Noise / Protected /
-    /// Profile / Latency) + total consolidations + improvement count.  Without
-    /// this, trust resets to 0.5 neutral on every daemon restart and the
-    /// is_reliable() gate needs ≥3 fresh observations before Apollo re-accepts
-    /// advice it already proved reliable pre-restart.  [McGaugh 2004] long-term
-    /// consolidation; [Gray & Reuter 1992] atomic persistence of learned state.
+    /// Local System 2 -> System 1 memory compiled exclusively from universal
+    /// Gold actuator outcomes and preserved across daemon restarts.
     #[serde(default)]
-    pub teacher_consolidator: Option<TeacherConsolidator>,
+    pub local_consolidator: Option<LocalConsolidator>,
 
     /// Per-app learned τ for the unfreeze-decay ODE.  Without this, a daemon
     /// restart cold-starts every app's decay model and the predictive thaw
@@ -589,6 +585,7 @@ pub struct LearnedState {
 /// rewriting, and fsyncing the complete state for each field.
 #[derive(Debug, Clone, Default)]
 pub struct LearnedStateSupplement {
+    pub local_consolidator: Option<LocalConsolidator>,
     pub unfreeze_decay_tau: Option<HashMap<String, TauEstimate>>,
     pub neuro_state: Option<NeuroState>,
     pub meta_cognition: Option<MetaCognition>,
@@ -692,8 +689,8 @@ impl LearnedState {
         if self.process_baselines.is_none() {
             self.process_baselines = previous.process_baselines;
         }
-        if self.teacher_consolidator.is_none() {
-            self.teacher_consolidator = previous.teacher_consolidator;
+        if self.local_consolidator.is_none() {
+            self.local_consolidator = previous.local_consolidator;
         }
         if self.unfreeze_decay_tau.is_none() {
             self.unfreeze_decay_tau = previous.unfreeze_decay_tau;
@@ -754,7 +751,7 @@ impl LearnedState {
             process_baselines,
             learnable_params,
             nested_learner,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -1139,6 +1136,7 @@ impl LearnedState {
         state.persist_generations = prev_generations.saturating_add(1);
         state.last_restore_quality = last_quality;
         state.pending_trial_skill = pending_trial_skill;
+        state.local_consolidator = supplement.local_consolidator;
         state.unfreeze_decay_tau = supplement.unfreeze_decay_tau;
         state.neuro_state = supplement.neuro_state;
         state.meta_cognition = supplement.meta_cognition;
@@ -1184,7 +1182,9 @@ impl LearnedState {
         // the parent directory. It never falls back to truncate-in-place.
         // [Gray & Reuter 1992 §10 — durability requires fsync, not just
         // atomic rename].
-        if let Err(error) = crate::engine::llm::write_json_transactional(path, self, Some(0o600)) {
+        if let Err(error) =
+            crate::engine::policy_store::write_json_transactional(path, self, Some(0o600))
+        {
             tracing::error!(path = %path.display(), %error, "learned-state checkpoint failed");
         }
     }
@@ -1200,21 +1200,8 @@ impl LearnedState {
         state.persist(path);
     }
 
-    /// Patch only the `teacher_consolidator` field of an existing persisted file.
-    /// Same rationale as `patch_process_baselines` — persist_improved() does not
-    /// thread the TeacherConsolidator through its signature; callers invoke this
-    /// after persist_improved() to snapshot Gemma trust EMA + consolidation totals.
-    /// No-op if file is missing (cold start is safe).
-    pub fn patch_teacher_consolidator(path: &Path, tc: TeacherConsolidator) {
-        let Some(mut state) = Self::load(path) else {
-            return;
-        };
-        state.teacher_consolidator = Some(tc);
-        state.persist(path);
-    }
-
     /// Patch only the `unfreeze_decay_tau` field of an existing persisted file.
-    /// Same pattern as `patch_teacher_consolidator` — persist_improved() does
+    /// Same pattern as the other bounded learned-state snapshots: persist_improved() does
     /// not thread the UnfreezeDecayModel through its signature; callers invoke
     /// this after persist_improved() to snapshot learned τ per app.
     /// No-op if file is missing (cold start is safe).
@@ -1307,11 +1294,9 @@ impl LearnedState {
         state.persist(path);
     }
 
-    /// Load only the `teacher_consolidator` field from disk (cold-start safe).
-    /// Returns `None` if the file is missing, unreadable, malformed, or the
-    /// field is absent (old file format pre-dating GemmaTrust persistence).
-    pub fn load_teacher_consolidator(path: &Path) -> Option<TeacherConsolidator> {
-        Self::load(path)?.teacher_consolidator
+    /// Load only the local consolidation memory from disk (cold-start safe).
+    pub fn load_local_consolidator(path: &Path) -> Option<LocalConsolidator> {
+        Self::load(path)?.local_consolidator
     }
 
     /// Load from disk. Returns None on any error (cold start is safe).
@@ -1949,7 +1934,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -1987,7 +1972,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2023,7 +2008,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2078,7 +2063,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2128,7 +2113,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2181,7 +2166,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2482,7 +2467,7 @@ mod tests {
     }
 
     #[test]
-    fn teacher_consolidator_default_absent_on_collect() {
+    fn local_consolidator_default_absent_on_collect() {
         use crate::engine::effectiveness_tracker::EffectivenessTracker;
         use crate::engine::optimization_skills::SkillRegistry;
         use crate::engine::outcome_tracker::OutcomeTracker;
@@ -2499,8 +2484,8 @@ mod tests {
             &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None, &maint,
         );
         assert!(
-            state.teacher_consolidator.is_none(),
-            "collect() leaves teacher_consolidator None; callers must patch post-persist"
+            state.local_consolidator.is_none(),
+            "collect() leaves local consolidation to the live supplement"
         );
     }
 
@@ -2521,7 +2506,7 @@ mod tests {
         let mut previous = LearnedState::collect(
             &si, &ot, &sa, &sr, &et, None, None, None, None, None, None, None, &maint,
         );
-        previous.teacher_consolidator = Some(TeacherConsolidator::new());
+        previous.local_consolidator = Some(LocalConsolidator::default());
         previous.policy_aggregator_mode = Some("ds".to_string());
         previous.meta_cognition = Some(MetaCognition::new());
 
@@ -2533,16 +2518,14 @@ mod tests {
         checkpoint.meta_cognition = Some(live_meta);
         checkpoint.preserve_uncollected_fields(previous);
 
-        assert!(checkpoint.teacher_consolidator.is_some());
+        assert!(checkpoint.local_consolidator.is_some());
         assert_eq!(checkpoint.policy_aggregator_mode.as_deref(), Some("ds"));
         assert!(checkpoint.meta_cognition.unwrap().humble_mode);
     }
 
     #[test]
-    fn patch_teacher_consolidator_roundtrip() {
-        use crate::engine::teacher_consolidation::{SuggestionCategory, TeacherConsolidator};
-        let tmp = std::env::temp_dir().join(format!("apollo_tc_patch_{}.json", std::process::id()));
-        // Seed a minimal file so load() succeeds.
+    fn local_consolidator_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("apollo_local_s2_{}.json", std::process::id()));
         let seed = LearnedState {
             version: 1,
             signal_intelligence: None,
@@ -2562,7 +2545,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: Some(LocalConsolidator::default()),
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2572,56 +2555,29 @@ mod tests {
             policy_aggregator_mode: None,
         };
         seed.persist(&tmp);
-
-        let mut tc = TeacherConsolidator::new();
-        // Drive one IMPROVED observation on Noise so trust > 0.5.
-        tc.gemma_trust.update(SuggestionCategory::Noise, 1.0);
-        tc.total_consolidations = 7;
-        tc.total_improvements = 5;
-
-        LearnedState::patch_teacher_consolidator(&tmp, tc.clone());
-
-        let loaded = LearnedState::load_teacher_consolidator(&tmp)
-            .expect("patched field must survive round-trip");
-        assert_eq!(loaded.total_consolidations, 7);
-        assert_eq!(loaded.total_improvements, 5);
-        assert_eq!(loaded.gemma_trust.count(SuggestionCategory::Noise), 1);
-        assert!(loaded.gemma_trust.trust(SuggestionCategory::Noise) > 0.5);
-        // Untouched categories fall back to the neutral 0.5 default.
-        assert!((loaded.gemma_trust.trust(SuggestionCategory::Interactive) - 0.5).abs() < 1e-9);
+        let loaded = LearnedState::load_local_consolidator(&tmp)
+            .expect("local consolidation memory must survive round-trip");
+        assert_eq!(loaded.total_consolidations, 0);
 
         let _ = std::fs::remove_file(&tmp);
     }
 
     #[test]
-    fn load_teacher_consolidator_missing_file_returns_none() {
+    fn load_local_consolidator_missing_file_returns_none() {
         let tmp =
-            std::env::temp_dir().join(format!("apollo_tc_missing_{}.json", std::process::id()));
+            std::env::temp_dir().join(format!("apollo_local_missing_{}.json", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
-        assert!(LearnedState::load_teacher_consolidator(&tmp).is_none());
+        assert!(LearnedState::load_local_consolidator(&tmp).is_none());
     }
 
     #[test]
-    fn patch_teacher_consolidator_noop_when_file_missing() {
-        use crate::engine::teacher_consolidation::TeacherConsolidator;
-        let tmp = std::env::temp_dir().join(format!("apollo_tc_noop_{}.json", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
-        // Must not panic, must not create the file.
-        LearnedState::patch_teacher_consolidator(&tmp, TeacherConsolidator::new());
-        assert!(
-            !tmp.exists(),
-            "patch is no-op when the state file is absent"
-        );
-    }
-
-    #[test]
-    fn teacher_consolidator_serde_backward_compat_missing_field() {
-        // Old file format: no teacher_consolidator key. Must deserialize cleanly
-        // with the field defaulting to None, so upgrades do not erase state.
-        let old_json = r#"{"version":1}"#;
-        let state: LearnedState = serde_json::from_str(old_json)
-            .expect("missing teacher_consolidator must default to None");
-        assert!(state.teacher_consolidator.is_none());
+    fn local_consolidator_serde_backward_compat_and_teacher_retirement() {
+        // Legacy prompt-teacher memory is deliberately ignored. The local
+        // path starts from measured evidence on this installation.
+        let old_json = r#"{"version":1,"teacher_consolidator":{"total_consolidations":99}}"#;
+        let state: LearnedState =
+            serde_json::from_str(old_json).expect("legacy teacher data must not prevent restore");
+        assert!(state.local_consolidator.is_none());
     }
 
     // ── Schema versioning tests ─────────────────────────────────────────────
@@ -2660,7 +2616,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2703,7 +2659,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2800,7 +2756,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,
@@ -2955,7 +2911,7 @@ mod tests {
             process_baselines: None,
             learnable_params: None,
             nested_learner: None,
-            teacher_consolidator: None,
+            local_consolidator: None,
             unfreeze_decay_tau: None,
             neuro_state: None,
             meta_cognition: None,

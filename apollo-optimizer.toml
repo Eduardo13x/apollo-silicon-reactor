@@ -1,62 +1,11 @@
-# Apollo Optimizer — Configuración local
-# Copia a /etc/apollo-optimizer/config.toml con:
+# Apollo Optimizer - local configuration
+# Install with:
 #   sudo mkdir -p /etc/apollo-optimizer
 #   sudo cp apollo-optimizer.toml /etc/apollo-optimizer/config.toml
 
 [history]
-# ── Per-cycle telemetry archive (Phase 1.5a, 2026-06-27) ────────────────────
-# Writes /var/lib/apollo/runtime_metrics_history.jsonl — one compact JSON
-# line per daemon cycle containing a 16-d feature vector + world-model
-# snapshot + NARS belief + learned-policy hash. Unblocks the MLP router PR
-# (Phase 1 CV collapsed to 0.4990 because runtime_metrics.json is a single
-# snapshot, not a time series). See .plan/PR-feature-MLP-router.md §4a.
-enabled              = true
-# Rotate the live file to runtime_metrics_history.jsonl.1 once it exceeds
-# this size. Default 100 MB. At ~22 MB/day steady state this rotates ~1×/day.
-rotation_max_bytes   = 104857600
-# Keep at most this many rotated files (current + N-1 rotated). Default 2.
-# 2 × 100 MB = 200 MB worst-case disk usage; bounded no matter the daemon lifetime.
-rotation_max_files   = 2
-
-[llm]
-# ── Conexión a Gemma 4 local via MLX (mlx_lm.server, Metal/GPU) ────────────
-# Servido por LaunchAgent com.eduardocortez.gemma4 → mlx_lm server en :8080.
-# MLX corre en la GPU (Metal) y libera la CPU; el llama-server previo corría
-# CPU-only (--n-gpu-layers 0). Modelo QAT-4bit oficial de Google: mejor
-# calidad a 4bit que el Q4_K_M genérico anterior.
-# DISABLED 2026-06-20: the teacher did not earn its keep — measured outcomes
-# within noise (best delta ~-0.003), one real regression (+0.346 aggressive-
-# root), only ~6% of actions, and it imposed a "defend against its mistakes"
-# tax (boost-loop, noise-shadow guards). Net wash-with-overhead. Apollo's S1
-# heuristics drive 94% of behavior. Flip back to true (+ re-bootstrap the
-# com.eduardocortez.gemma4 MLX LaunchAgent) to re-run as a measured experiment.
-enabled    = false
-endpoint   = "http://127.0.0.1:8080/v1/chat/completions"
-model      = "mlx-community/gemma-4-E2B-it-qat-4bit"
-
-# Sin gate de training TTL — Gemma 4 es local, sin costo por llamada.
-always_on  = false
-
-# Modelo de razonamiento: emite thinking en `reasoning` y el JSON en `content`
-# (a veces en fence ```json). El parser extrae el primer objeto {…} de
-# cualquiera de los dos. response_format json_object no garantizado — manual.
-force_json = false
-
-# Gemma 4 es modelo de RAZONAMIENTO: con thinking ON gasta 700+ tokens en el
-# trace y trunca ANTES del JSON (medido 2026-06-14: finish=length, content
-# vacío, parse falla). Apagar el thinking → emite el JSON directo en ~116 tok,
-# 9s (vs 76s y truncado). Manda chat_template_kwargs:{enable_thinking:false}.
-disable_thinking = true
-
-# Con thinking apagado el JSON cabe de sobra en 320. (Default en código 320.)
-max_tokens = 320
-
-# Timeouts más holgados para inferencia local en M1 8GB.
-timeout_ms          = 180000
-# E2B es local/gratis — 1 llamada/hora desperdiciaba el teacher. Subido a 4/h
-# con piso de 15 min: más señal de aprendizaje, gateada por world-model/scorer.
-min_interval_secs   = 900     # 15 min mínimo entre llamadas
-max_calls_per_hour  = 4
-
-# Umbral de confianza más bajo para modelo local (menor calibración que GPT).
-min_confidence = 0.60
+# Per-cycle telemetry archive used by the local World Model and router.
+enabled = true
+# Rotate the live file near 100 MB and keep disk usage bounded.
+rotation_max_bytes = 104857600
+rotation_max_files = 2

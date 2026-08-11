@@ -99,19 +99,6 @@ policy = "aggressive-controlled"
 # Values: "error" | "warn" | "info" | "debug" | "trace"
 #log_level = "info"
 
-# ── LLM teacher mode ──────────────────────────────────────────────────────────
-# Requires: apollo-optimizerctl llm set-key <key>
-# The API key is stored encrypted in /var/lib/apollo/; this section only
-# controls model behaviour.
-#[llm]
-#enabled = false
-#model = "gpt-4.1-mini"
-#endpoint = "https://api.openai.com/v1/chat/completions"
-#min_confidence = 0.85
-#max_calls_per_hour = 2
-#min_interval_secs = 900
-#timeout_ms = 10000
-#force_json = true
 CFG
 fi
 

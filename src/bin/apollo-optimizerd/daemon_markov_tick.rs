@@ -361,6 +361,13 @@ pub fn run_markov_tick(
                 metrics.metrics.world_model_contextual_last_action =
                     "markov_prewarm:predicted_app".to_string();
                 metrics.metrics.world_model_contextual_last_bias = contextual_bias.score;
+                if contextual_bias.has_gpu_influence() {
+                    metrics.metrics.record_gpu_contextual_influence(
+                        "markov-prewarm",
+                        "markov_prewarm:predicted_app",
+                        contextual_bias.gpu_context_support,
+                    );
+                }
             }
             if base_eligible && admission == PrewarmAdmission::Quarantined {
                 metrics.metrics.markov_prewarm_quarantine_skips_total = metrics

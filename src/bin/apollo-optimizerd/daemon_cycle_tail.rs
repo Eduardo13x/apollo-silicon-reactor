@@ -780,6 +780,13 @@ fn acquire_acceleration_lease(
             metrics.metrics.world_model_contextual_last_action =
                 "io_shaping:interactive_release".to_string();
             metrics.metrics.world_model_contextual_last_bias = io_bias.score;
+            if io_bias.has_gpu_influence() {
+                metrics.metrics.record_gpu_contextual_influence(
+                    "io-shaping",
+                    "io_shaping:interactive_release",
+                    io_bias.gpu_context_support,
+                );
+            }
         }
         if member_count > 0 || io_promotions > 0 {
             metrics.metrics.acceleration_lease_last_family = selection.family.as_str().to_string();
@@ -962,6 +969,13 @@ pub fn update_acceleration_lease(
                 metrics.metrics.world_model_contextual_last_action =
                     "interaction_qos:foreground".to_string();
                 metrics.metrics.world_model_contextual_last_bias = interaction_bias.score;
+                if interaction_bias.has_gpu_influence() {
+                    metrics.metrics.record_gpu_contextual_influence(
+                        "interaction-qos",
+                        "interaction_qos:foreground",
+                        interaction_bias.gpu_context_support,
+                    );
+                }
             }
             acquire_acceleration_lease(
                 state,

@@ -155,15 +155,15 @@ mod tests {
     use apollo_engine::engine::circuit_breaker::CircuitBreaker;
     use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
     use apollo_engine::engine::daemon_state::{
-        HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState, UsageDomainState,
+        HardwareState, MetricsState, PolicyState, ProcessState, UsageDomainState,
     };
     use apollo_engine::engine::degradation::DegradationController;
     use apollo_engine::engine::display_turbo::DisplayTurbo;
     use apollo_engine::engine::freeze_cooldown::FreezeCooldown;
     use apollo_engine::engine::identity_cache_manager::IdentityCacheManager;
-    use apollo_engine::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
     use apollo_engine::engine::lse_counters::LockFreeMetrics;
     use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::policy_store::LearnedPolicy;
     use apollo_engine::engine::process_identity::ProcessIdentity;
     use apollo_engine::engine::profile_governor::ProfileGovernor;
     use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
@@ -191,6 +191,8 @@ mod tests {
                 latency_target: LatencyTarget::Normal,
                 governor: ProfileGovernor::new(OptimizationProfile::BalancedRoot),
                 learned_policy: LearnedPolicy::default(),
+                learned_policy_path: PathBuf::from("/tmp/apollo_test_lp"),
+                feedback_path: PathBuf::from("/tmp/apollo_test_feedback"),
                 adaptive_governor: AdaptiveGovernor::new(),
                 timeline: std::collections::VecDeque::new(),
                 circuit_breaker: CircuitBreaker::default(),
@@ -228,27 +230,6 @@ mod tests {
                     fs_consecutive_low: 0,
                 },
             })),
-            llm: Arc::new(Mutex::new(LlmDomainState {
-                llm_cfg: LlmConfig {
-                    enabled: None,
-                    endpoint: None,
-                    model: None,
-                    min_confidence: None,
-                    max_calls_per_hour: None,
-                    min_interval_secs: None,
-                    timeout_ms: None,
-                    force_json: None,
-                    always_on: None,
-                    max_tokens: None,
-                    disable_thinking: None,
-                },
-                llm_state: LlmState::default(),
-                llm_state_path: PathBuf::from("/tmp/apollo_test_llm_state"),
-                llm_key_path: PathBuf::from("/tmp/apollo_test_llm_key"),
-                learned_policy_path: PathBuf::from("/tmp/apollo_test_lp"),
-                feedback_path: PathBuf::from("/tmp/apollo_test_feedback"),
-                suggestions_path: PathBuf::from("/tmp/apollo_test_suggestions"),
-            })),
             usage: Arc::new(Mutex::new(UsageDomainState {
                 usage_model: UsageModel::default(),
                 usage_model_path: PathBuf::from("/tmp/apollo_test_um"),
@@ -266,7 +247,6 @@ mod tests {
             cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),
             resource_interrupt: Arc::new(ResourceInterruptState::new()),
             subscribers: Arc::new(Mutex::new(Vec::new())),
-            config_path: PathBuf::from("/tmp/apollo_test_config"),
             user_profile_path: PathBuf::from("/tmp/apollo_test_user_profile"),
         }
     }

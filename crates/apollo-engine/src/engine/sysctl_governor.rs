@@ -1285,7 +1285,7 @@ fn defaults_path(is_root: bool) -> &'static str {
 ///
 /// Best-effort: failures are logged but do not panic.
 fn persist_defaults(path: &str, defaults: &HashMap<String, String>) {
-    crate::engine::llm::write_json(std::path::Path::new(path), defaults, None);
+    crate::engine::policy_store::write_json(std::path::Path::new(path), defaults, None);
 }
 
 /// Load previously persisted sysctl defaults from disk.

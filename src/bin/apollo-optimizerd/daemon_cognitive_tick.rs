@@ -264,10 +264,17 @@ fn apply_contextual_world_model_bias(
     votes: &mut [SpecialistVote],
     world_model: &WorldModel,
     workload: &str,
-) -> (u64, Option<(Intervention, f64)>) {
+) -> (
+    u64,
+    u64,
+    Option<(Intervention, f64)>,
+    Option<(Intervention, f64)>,
+) {
     let mut cache: [Option<ContextualActionBias>; 4] = [None; 4];
     let mut modulated = 0_u64;
+    let mut gpu_modulated = 0_u64;
     let mut strongest = None::<(Intervention, f64)>;
+    let mut strongest_gpu = None::<(Intervention, f64)>;
     for vote in votes {
         let Some(key) = intervention_action_key(vote.intervention) else {
             continue;
@@ -290,11 +297,19 @@ fn apply_contextual_world_model_bias(
             continue;
         }
         modulated = modulated.saturating_add(1);
+        if bias.has_gpu_influence() {
+            gpu_modulated = gpu_modulated.saturating_add(1);
+            if strongest_gpu
+                .is_none_or(|(_, support)| bias.gpu_context_support.abs() > support.abs())
+            {
+                strongest_gpu = Some((vote.intervention, bias.gpu_context_support));
+            }
+        }
         if strongest.is_none_or(|(_, score)| bias.score.abs() > score.abs()) {
             strongest = Some((vote.intervention, bias.score));
         }
     }
-    (modulated, strongest)
+    (modulated, gpu_modulated, strongest, strongest_gpu)
 }
 
 /// Super Learner specialist voting + accuracy feedback.
@@ -570,7 +585,7 @@ pub fn apply_specialist_voting(
     // The World Model may only tilt confidence on interventions specialists
     // already proposed. It cannot add a vote, choose a new intervention, or
     // bypass the physical gates below.
-    let (contextual_modulations, strongest_contextual) =
+    let (contextual_modulations, gpu_contextual_modulations, strongest_contextual, strongest_gpu) =
         apply_contextual_world_model_bias(&mut votes, world_model, workload_mode.as_str());
     if contextual_modulations > 0 {
         let mut metrics = state.metrics.lock_recover();
@@ -584,6 +599,15 @@ pub fn apply_specialist_voting(
                     .unwrap_or_default()
                     .to_string();
             metrics.metrics.world_model_contextual_last_bias = score;
+        }
+        if let Some((intervention, support)) = strongest_gpu {
+            for _ in 0..gpu_contextual_modulations {
+                metrics.metrics.record_gpu_contextual_influence(
+                    "predictive",
+                    intervention_action_key(intervention).unwrap_or_default(),
+                    support,
+                );
+            }
         }
     }
 

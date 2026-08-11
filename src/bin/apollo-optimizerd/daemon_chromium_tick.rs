@@ -78,6 +78,13 @@ fn record_chromium_context(
         .saturating_add(u64::from(suppressed));
     metrics.metrics.world_model_contextual_last_action = action_key.to_string();
     metrics.metrics.world_model_contextual_last_bias = bias.score;
+    if bias.has_gpu_influence() {
+        metrics.metrics.record_gpu_contextual_influence(
+            "chromium",
+            action_key,
+            bias.gpu_context_support,
+        );
+    }
 }
 
 /// Per-cycle Chromium renderer management tick.

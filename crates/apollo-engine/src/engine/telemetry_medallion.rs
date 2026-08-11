@@ -532,6 +532,8 @@ pub struct ActuatorEpisodeContext {
     pub foreground_idle: bool,
     pub user_call_in_progress: bool,
     pub user_audio_active: bool,
+    pub coreaudio_direct_probe_available: bool,
+    pub coreaudio_session_fallback: bool,
     pub markov_prewarm_active: bool,
     pub predictive_agent_active: bool,
 }
@@ -568,6 +570,8 @@ impl ActuatorEpisodeContext {
             foreground_idle: context.foreground_idle,
             user_call_in_progress: context.user_call_in_progress,
             user_audio_active: context.user_audio_active,
+            coreaudio_direct_probe_available: context.coreaudio_direct_probe_available,
+            coreaudio_session_fallback: context.coreaudio_session_fallback,
             markov_prewarm_active: context.markov_prewarm_active,
             predictive_agent_active: context.predictive_agent_active,
         };
@@ -783,6 +787,8 @@ pub struct TelemetryContextSummary {
     pub user_idle_secs: f64,
     pub user_call_in_progress: bool,
     pub user_audio_active: bool,
+    pub coreaudio_direct_probe_available: bool,
+    pub coreaudio_session_fallback: bool,
     pub user_has_sleep_assertion: bool,
     pub effective_profile: String,
     pub pressure_total_boost: f64,
@@ -3269,6 +3275,11 @@ fn summarize(observation: &TelemetryObservation<'_>) -> TelemetryContextSummary 
         user_idle_secs: runtime.user_idle_secs.max(0.0),
         user_call_in_progress: runtime.user_call_in_progress,
         user_audio_active: runtime.user_audio_active,
+        coreaudio_direct_probe_available: matches!(
+            runtime.coreaudio_probe_state.as_str(),
+            "direct" | "degraded"
+        ),
+        coreaudio_session_fallback: runtime.coreaudio_probe_state == "session-fallback",
         user_has_sleep_assertion: runtime.user_has_sleep_assertion,
         effective_profile: runtime.effective_profile.as_str().to_string(),
         pressure_total_boost: runtime.pressure_total_boost,
@@ -3409,6 +3420,22 @@ mod tests {
             cumulative_stress: 0.0,
             hw_seasonal_anomaly: 1.0,
         }
+    }
+
+    #[test]
+    fn coreaudio_source_provenance_enters_actuator_episode_context() {
+        let context = TelemetryContextSummary {
+            user_audio_active: true,
+            coreaudio_direct_probe_available: false,
+            coreaudio_session_fallback: true,
+            ..TelemetryContextSummary::default()
+        };
+
+        let episode = ActuatorEpisodeContext::from_telemetry(&context);
+
+        assert!(episode.user_audio_active);
+        assert!(!episode.coreaudio_direct_probe_available);
+        assert!(episode.coreaudio_session_fallback);
     }
 
     fn healthy_runtime() -> RuntimeMetrics {

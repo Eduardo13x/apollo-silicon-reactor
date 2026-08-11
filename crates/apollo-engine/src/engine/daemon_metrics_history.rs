@@ -93,7 +93,7 @@ fn should_sync_history(cycle: u64) -> bool {
 /// Mirrors the `[history]` section in `apollo-optimizer.toml`. All fields
 /// are `Option<…>` so the section is fully optional; missing values fall
 /// back to the defaults above. Reads via `load_repo_config` in
-/// [`crate::engine::llm`].
+/// [`crate::engine::policy_store`].
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default)]
 pub struct HistoryConfig {

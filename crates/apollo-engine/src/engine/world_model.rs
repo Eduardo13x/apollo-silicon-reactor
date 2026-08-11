@@ -34,6 +34,7 @@ use crate::engine::causal_dynamics::{CausalDynamicsMetrics, CausalDynamicsModel}
 use crate::engine::causal_graph::CausalGraph;
 use crate::engine::gpu_imagination::{GpuCandidateAdvice, GpuImaginationResult};
 use crate::engine::installation_identity::InstallationId;
+use crate::engine::local_consolidation::LocalConsolidationView;
 use crate::engine::outcome_tracker::OutcomeTracker;
 use crate::engine::telemetry_medallion::{
     gpu_calibration_key, ActionModelStats, ActuatorEpisodeContext, ControlledCounterfactualStats,
@@ -74,6 +75,9 @@ const EPISODIC_MIN_SIMILARITY: f64 = 0.55;
 const EPISODIC_NEIGHBORS: usize = 8;
 const EPISODIC_MAX_RANK_SUPPORT: f64 = 0.012;
 const GPU_ADVICE_MAX_AGE_CYCLES: u64 = 30;
+/// Keep enough overlapping batches for asynchronous specialists to consume
+/// their own advice, without turning the World Model into an unbounded cache.
+const MAX_GPU_ADVICE_ENTRIES: usize = 96;
 const GPU_COLD_START_TRUST: f64 = 0.25;
 const GPU_MAX_RANK_SUPPORT: f64 = 0.005;
 type EpisodicNeighbor = (f64, f64, f64, bool, f64);
@@ -163,6 +167,8 @@ pub struct ContextualActionBias {
     pub model_observations: u32,
     pub episodic_observations: u32,
     pub gpu_predictions: u32,
+    /// The bounded portion of `score` contributed by the fresh GPU forecast.
+    pub gpu_context_support: f64,
     pub gpu_calibration_trust: f64,
     /// True only when a mature exact/workload utility model contributed.
     pub authoritative: bool,
@@ -175,6 +181,46 @@ impl ContextualActionBias {
                 || self.episodic_observations > 0
                 || self.gpu_predictions > 0)
     }
+
+    /// True when the bounded GPU forecast contributed to this bias. This is
+    /// distinct from a generic World Model contribution so consumers can make
+    /// the source visible without treating it as action authority.
+    pub fn has_gpu_influence(self) -> bool {
+        self.gpu_predictions > 0 && self.gpu_context_support.abs() > f64::EPSILON
+    }
+}
+
+/// Compact evidence package used by the local deliberator. It describes the
+/// evidence available to existing decision lanes; it is not a policy
+/// recommendation and cannot authorize an action on its own.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DeliberationEvidence {
+    pub workload: String,
+    pub authority_phase: String,
+    pub local_gold: u64,
+    pub data_quality: f64,
+    pub utility_ready_actions: u64,
+    pub local_consolidation_confidence: f64,
+    pub local_consolidation_families: u32,
+    pub gpu_fresh_predictions: u32,
+    pub gpu_top_action: String,
+    pub gpu_top_context_support: f64,
+    pub gpu_top_rank_support: f64,
+    pub gpu_calibration_trust: f64,
+}
+
+/// Local replacement for the former prompt/JSON teacher. It fuses System 1's
+/// self-assessment, Dr Zero calibration, medallion quality and fresh GPU
+/// forecasts into a bounded confidence scale for existing World Model advice.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SystemDeliberation {
+    pub mode: String,
+    pub confidence: f64,
+    pub advisory_support_scale: f64,
+    pub gpu_support_scale: f64,
+    pub system1_struggling: bool,
+    pub dr_zero_self_challenge: f64,
+    pub evidence: DeliberationEvidence,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -272,6 +318,7 @@ pub struct WorldModel {
     context_bronze: u64,
     context_silver: u64,
     context_gold: u64,
+    context_local_gold: u64,
     context_quality: f64,
     latest_context: Option<TelemetryContextSummary>,
     current_installation_id: InstallationId,
@@ -299,9 +346,28 @@ pub struct WorldModel {
     gpu_advice_generation: Option<u64>,
     gpu_calibration: HashMap<String, GpuCalibrationStats>,
     gpu_calibration_revision: Option<u64>,
+    local_consolidation_confidence: f64,
+    local_consolidation_families: u32,
+    local_family_scales: HashMap<String, f64>,
+    deliberation_advisory_support_scale: f64,
+    deliberation_gpu_support_scale: f64,
+    deliberation_active: bool,
 }
 
 impl WorldModel {
+    /// Attach the bounded reflex memory compiled from universal Gold outcomes.
+    /// This affects ranking and parameter tuning only; model verdicts and
+    /// actuator admission remain owned by their existing safety paths.
+    pub fn attach_local_consolidation(&mut self, view: LocalConsolidationView) {
+        self.local_consolidation_confidence = view.confidence.clamp(0.0, 1.0);
+        self.local_consolidation_families = view.families_with_evidence;
+        self.local_family_scales = view
+            .family_scales
+            .into_iter()
+            .map(|(family, scale)| (family, scale.clamp(0.75, 1.0)))
+            .collect();
+    }
+
     /// Snapshot the live learned state into a query-cheap model.
     ///
     /// `prediction_debias` is the MetaCognition multiplier for the
@@ -474,6 +540,7 @@ impl WorldModel {
         self.context_bronze = view.metrics.bronze_total;
         self.context_silver = view.metrics.silver_total;
         self.context_gold = view.metrics.gold_total;
+        self.context_local_gold = view.metrics.local_gold_total;
         self.context_quality = view.metrics.mean_quality;
         self.latest_context = view.current.cloned();
         self.current_installation_id = view.installation_id;
@@ -562,7 +629,13 @@ impl WorldModel {
         {
             return 0;
         }
-        self.gpu_advice.clear();
+        // Batches overlap in time: the next batch often contains a different
+        // specialist portfolio. Clearing here used to erase a still-fresh
+        // Markov/Chromium/root forecast before its owning lane could read it.
+        // Retain only the same short horizon used by the consumer below.
+        self.gpu_advice.retain(|_, entry| {
+            result.generation.saturating_sub(entry.generation) <= GPU_ADVICE_MAX_AGE_CYCLES
+        });
         for advice in &result.candidates {
             if advice.action_key.is_empty()
                 || ![
@@ -587,6 +660,21 @@ impl WorldModel {
                     advice: advice.clone(),
                 },
             );
+        }
+        if self.gpu_advice.len() > MAX_GPU_ADVICE_ENTRIES {
+            let mut stale_keys: Vec<_> = self
+                .gpu_advice
+                .iter()
+                .map(|(key, entry)| (key.clone(), entry.generation))
+                .collect();
+            stale_keys
+                .sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+            for (key, _) in stale_keys
+                .into_iter()
+                .take(self.gpu_advice.len() - MAX_GPU_ADVICE_ENTRIES)
+            {
+                self.gpu_advice.remove(&key);
+            }
         }
         self.gpu_advice_generation = Some(result.generation);
         self.gpu_advice.len() as u64
@@ -620,7 +708,7 @@ impl WorldModel {
             .clamp(GPU_COLD_START_TRUST, 1.0)
     }
 
-    fn gpu_context_support(&self, action_key: &str, workload: &str) -> Option<(f64, f64)> {
+    fn fresh_gpu_advice(&self, action_key: &str, workload: &str) -> Option<&GpuAdviceEntry> {
         let context = self.latest_context.as_ref()?;
         let entry = self
             .gpu_advice
@@ -631,14 +719,167 @@ impl WorldModel {
         {
             return None;
         }
+        Some(entry)
+    }
+
+    fn gpu_context_support(&self, action_key: &str, workload: &str) -> Option<(f64, f64)> {
+        let context = self.latest_context.as_ref()?;
+        let entry = self.fresh_gpu_advice(action_key, workload)?;
         let trust = self.gpu_calibration_trust(action_key, workload);
         let correction = self
             .gpu_calibration_for(action_key, workload)
             .filter(|stats| stats.trust(context, self.current_installation_id) > 0.0)
             .map_or(0.0, |stats| stats.signed_error_ema * 0.10);
-        let support = ((entry.advice.context_score + correction).clamp(-0.08, 0.08) * trust)
-            .clamp(-0.08, 0.08);
+        let support = ((entry.advice.context_score + correction).clamp(-0.08, 0.08)
+            * trust
+            * self.deliberation_gpu_support_scale()
+            * self.deliberation_advisory_scale_for(action_key))
+        .clamp(-0.08, 0.08);
         Some((support, trust))
+    }
+
+    /// Return the calibrated, ranking-only support for a still-fresh GPU
+    /// forecast. Callers must already own and admit the action independently.
+    pub fn gpu_rank_support_for(&self, action_key: &str, workload: &str) -> Option<f64> {
+        let entry = self.fresh_gpu_advice(action_key, workload)?;
+        let support =
+            self.calibrate_gpu_rank_support(action_key, workload, entry.advice.rank_support);
+        (support.abs() > f64::EPSILON).then_some(support)
+    }
+
+    /// Summarize current causal and GPU evidence for local deliberation.
+    pub fn deliberation_evidence(&self, workload: &str) -> DeliberationEvidence {
+        let mut evidence = DeliberationEvidence {
+            workload: workload.to_string(),
+            authority_phase: self.authority_phase.as_str().to_string(),
+            local_gold: self.context_local_gold,
+            data_quality: self.context_quality.clamp(0.0, 1.0),
+            utility_ready_actions: self.utility_ready_actions() as u64,
+            local_consolidation_confidence: self.local_consolidation_confidence,
+            local_consolidation_families: self.local_consolidation_families,
+            ..DeliberationEvidence::default()
+        };
+        let Some(context) = self.latest_context.as_ref() else {
+            return evidence;
+        };
+        let mut candidates: Vec<_> = self
+            .gpu_advice
+            .iter()
+            .filter_map(|(key, entry)| {
+                (entry.workload == workload
+                    && context.cycle >= entry.generation
+                    && context.cycle.saturating_sub(entry.generation) <= GPU_ADVICE_MAX_AGE_CYCLES)
+                    .then_some((key, entry))
+            })
+            .collect();
+        candidates.sort_by(|left, right| {
+            right
+                .1
+                .advice
+                .context_score
+                .abs()
+                .total_cmp(&left.1.advice.context_score.abs())
+                .then_with(|| left.0.cmp(right.0))
+        });
+        evidence.gpu_fresh_predictions = candidates.len().min(u32::MAX as usize) as u32;
+        if let Some((_, entry)) = candidates.first() {
+            evidence.gpu_top_action = entry.advice.action_key.clone();
+            if let Some((support, trust)) =
+                self.gpu_context_support(&entry.advice.action_key, workload)
+            {
+                evidence.gpu_top_context_support = support;
+                evidence.gpu_calibration_trust = trust;
+            }
+            evidence.gpu_top_rank_support = self
+                .gpu_rank_support_for(&entry.advice.action_key, workload)
+                .unwrap_or(0.0);
+        }
+        evidence
+    }
+
+    /// Fuse local model health into every bounded World Model advisory path.
+    /// This replaces the former prompt/JSON teacher: it never proposes or
+    /// authorizes an action, and cannot change an authoritative model verdict.
+    pub fn synthesize_deliberation(
+        &mut self,
+        workload: &str,
+        system1_struggling: bool,
+        dr_zero_self_challenge: f64,
+    ) -> SystemDeliberation {
+        let evidence = self.deliberation_evidence(workload);
+        let medallion_maturity = evidence.local_gold as f64 / (evidence.local_gold as f64 + 20.0);
+        let gpu_confidence = if evidence.gpu_fresh_predictions > 0 {
+            0.50 + evidence.gpu_calibration_trust * 0.50
+        } else {
+            0.50
+        };
+        let self_check = 1.0 - dr_zero_self_challenge.clamp(0.0, 1.0);
+        let local_confidence = if evidence.local_consolidation_families > 0 {
+            evidence.local_consolidation_confidence
+        } else {
+            0.50
+        };
+        let confidence = (evidence.data_quality * 0.25
+            + medallion_maturity * 0.25
+            + self_check * 0.20
+            + local_confidence * 0.20
+            + gpu_confidence * 0.10)
+            * if system1_struggling { 0.85 } else { 1.0 };
+        let confidence = confidence.clamp(0.0, 1.0);
+        let advisory_support_scale = (0.80 + confidence * 0.20).clamp(0.80, 1.0);
+        let gpu_support_scale = (0.35 + confidence * 0.65).clamp(0.35, 1.0);
+        self.deliberation_advisory_support_scale = advisory_support_scale;
+        self.deliberation_gpu_support_scale = gpu_support_scale;
+        self.deliberation_active = true;
+        let mode = if evidence.authority_phase == "trusted"
+            && evidence.data_quality >= MIN_UTILITY_DATA_QUALITY
+            && evidence.local_gold >= MIN_UTILITY_EVIDENCE as u64
+            && self_check >= 0.70
+        {
+            "grounded"
+        } else if evidence.local_gold > 0
+            || evidence.gpu_fresh_predictions > 0
+            || evidence.local_consolidation_families > 0
+        {
+            "calibrating"
+        } else {
+            "observing"
+        };
+        SystemDeliberation {
+            mode: mode.to_string(),
+            confidence,
+            advisory_support_scale,
+            gpu_support_scale,
+            system1_struggling,
+            dr_zero_self_challenge: dr_zero_self_challenge.clamp(0.0, 1.0),
+            evidence,
+        }
+    }
+
+    fn deliberation_gpu_support_scale(&self) -> f64 {
+        if self.deliberation_active {
+            self.deliberation_gpu_support_scale.clamp(0.35, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    fn deliberation_advisory_scale_for(&self, action_key: &str) -> f64 {
+        if !self.deliberation_active {
+            return 1.0;
+        }
+        let global = self.deliberation_advisory_support_scale.clamp(0.80, 1.0);
+        let family = action_key
+            .split_once(':')
+            .map(|(family, _)| family)
+            .unwrap_or(action_key);
+        let family_scale = self
+            .local_family_scales
+            .get(family)
+            .copied()
+            .unwrap_or(1.0)
+            .clamp(0.75, 1.0);
+        (global * family_scale).clamp(0.60, 1.0)
     }
 
     /// Calibrate the GPU's tiny central-planner ranking support against
@@ -653,7 +894,9 @@ impl WorldModel {
             return 0.0;
         }
         (raw_support.clamp(-GPU_MAX_RANK_SUPPORT, GPU_MAX_RANK_SUPPORT)
-            * self.gpu_calibration_trust(action_key, workload))
+            * self.gpu_calibration_trust(action_key, workload)
+            * self.deliberation_gpu_support_scale()
+            * self.deliberation_advisory_scale_for(action_key))
         .clamp(-GPU_MAX_RANK_SUPPORT, GPU_MAX_RANK_SUPPORT)
     }
 
@@ -756,6 +999,7 @@ impl WorldModel {
         } else {
             UtilityImagined::Unknown
         };
+        let advisory_scale = self.deliberation_advisory_scale_for(action_key);
         let (counterfactual_support, counterfactual_observations) = self
             .counterfactual_rank_support(action_key, workload, now_unix)
             .unwrap_or((0.0, 0));
@@ -770,9 +1014,9 @@ impl WorldModel {
             upper_bound: upper,
             effective_evidence,
             quality: stats.quality_ema,
-            counterfactual_support,
+            counterfactual_support: counterfactual_support * advisory_scale,
             counterfactual_observations,
-            episodic_support: episodic.rank_support,
+            episodic_support: episodic.rank_support * advisory_scale,
             episodic_observations: episodic.observations,
         })
     }
@@ -920,7 +1164,7 @@ impl WorldModel {
                     (predicted_utility / 0.03).clamp(-1.0, 0.0)
                 }
                 UtilityImagined::Unknown => 0.0,
-            };
+            } * self.deliberation_advisory_scale_for(action_key);
             let model_weight = if assessment.verdict == UtilityImagined::Unknown {
                 0.0
             } else {
@@ -953,7 +1197,9 @@ impl WorldModel {
             }
         } else if let Some(episodic) = self.recall_similar_episodes(action_key, workload) {
             ContextualActionBias {
-                score: (episodic.rank_support / EPISODIC_MAX_RANK_SUPPORT).clamp(-1.0, 1.0),
+                score: ((episodic.rank_support / EPISODIC_MAX_RANK_SUPPORT)
+                    * self.deliberation_advisory_scale_for(action_key))
+                .clamp(-1.0, 1.0),
                 model_observations: 0,
                 episodic_observations: episodic.observations,
                 authoritative: false,
@@ -965,6 +1211,7 @@ impl WorldModel {
         if let Some((support, trust)) = self.gpu_context_support(action_key, workload) {
             bias.score = (bias.score + support).clamp(-1.0, 1.0);
             bias.gpu_predictions = 1;
+            bias.gpu_context_support = support;
             bias.gpu_calibration_trust = trust;
         }
         bias
@@ -1231,6 +1478,16 @@ fn episode_similarity(left: ActuatorEpisodeContext, right: ActuatorEpisodeContex
         ),
         (left.user_audio_active, right.user_audio_active, 0.50),
         (
+            left.coreaudio_direct_probe_available,
+            right.coreaudio_direct_probe_available,
+            0.10,
+        ),
+        (
+            left.coreaudio_session_fallback,
+            right.coreaudio_session_fallback,
+            0.10,
+        ),
+        (
             left.markov_prewarm_active,
             right.markov_prewarm_active,
             0.50,
@@ -1329,6 +1586,24 @@ mod tests {
             collector_pressure_alive: true,
             ..TelemetryContextSummary::default()
         }
+    }
+
+    #[test]
+    fn coreaudio_provenance_gently_discounts_cross_session_evidence() {
+        let direct = ActuatorEpisodeContext {
+            valid: true,
+            coreaudio_direct_probe_available: true,
+            ..ActuatorEpisodeContext::default()
+        };
+        let fallback = ActuatorEpisodeContext {
+            valid: true,
+            coreaudio_session_fallback: true,
+            ..ActuatorEpisodeContext::default()
+        };
+
+        let similarity = episode_similarity(direct, fallback);
+        assert!(similarity < 1.0);
+        assert!(similarity > 0.98, "provenance must remain a weak feature");
     }
 
     fn mature_model(now_unix: i64, installation_id: InstallationId) -> ActionModelStats {
@@ -1476,6 +1751,69 @@ mod tests {
         assert_eq!(bias.gpu_predictions, 1);
         assert_eq!(bias.gpu_calibration_trust, GPU_COLD_START_TRUST);
         assert!(!bias.authoritative);
+    }
+
+    #[test]
+    fn fresh_gpu_batches_coexist_until_their_short_advice_window_expires() {
+        use crate::engine::gpu_imagination::{
+            GpuCandidateAdvice, GpuImaginationBackend, GpuImaginationResult,
+        };
+
+        let context = m4_context(Utc::now().timestamp());
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &BTreeMap::new(), 3);
+        let result = |generation: u64, action_key: &str, context_score: f64| GpuImaginationResult {
+            generation,
+            workload: "build".to_string(),
+            backend: GpuImaginationBackend::Metal,
+            device_name: "Apple M4".to_string(),
+            samples: 4_096,
+            gpu_time_ns: 8_000,
+            wall_time_ns: 20_000,
+            candidates: vec![GpuCandidateAdvice {
+                action_key: action_key.to_string(),
+                expected_gain: 0.04,
+                uncertainty: 0.20,
+                mean_gain: 0.035,
+                p10_gain: 0.01,
+                positive_probability: 0.80,
+                rank_support: 0.003,
+                context_score,
+            }],
+            error: None,
+        };
+
+        model.attach_gpu_imagination(&result(98, "markov_prewarm:predicted_app", 0.06));
+        model.attach_gpu_imagination(&result(99, "chromium_ecore:background_renderer", 0.03));
+
+        let markov = model.contextual_action_bias("markov_prewarm:predicted_app", "build");
+        assert!(markov.has_gpu_influence());
+        assert!(model
+            .gpu_rank_support_for("markov_prewarm:predicted_app", "build")
+            .is_some());
+        let evidence = model.deliberation_evidence("build");
+        assert_eq!(evidence.gpu_fresh_predictions, 2);
+        assert_eq!(evidence.gpu_top_action, "markov_prewarm:predicted_app");
+        assert!(evidence.gpu_top_context_support > 0.0);
+        assert!(evidence.gpu_top_rank_support > 0.0);
+        assert_eq!(evidence.local_gold, 3);
+    }
+
+    #[test]
+    fn local_deliberation_scales_gpu_advice_without_authorizing_an_action() {
+        let context = m4_context(Utc::now().timestamp());
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &BTreeMap::new(), 2);
+
+        let deliberation = model.synthesize_deliberation("build", true, 0.80);
+
+        assert_eq!(deliberation.mode, "calibrating");
+        assert!(deliberation.system1_struggling);
+        assert_eq!(deliberation.dr_zero_self_challenge, 0.80);
+        assert!(deliberation.confidence > 0.0);
+        assert!(deliberation.gpu_support_scale >= 0.35);
+        assert!(deliberation.gpu_support_scale < 1.0);
+        assert_eq!(model.authority_phase(), ModelAuthorityPhase::Calibrating);
     }
 
     #[test]
@@ -2333,6 +2671,67 @@ mod tests {
             }),
             "family evidence must not become exact-action veto authority"
         );
+    }
+
+    #[test]
+    fn local_consolidation_scales_advice_without_changing_authoritative_verdict() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let models = BTreeMap::from([(
+            "build|boost:Editor".to_string(),
+            mature_model(now, LOCAL_ID),
+        )]);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &models, 24);
+
+        let before_assessment = model
+            .assess_utility("boost:Editor", "build")
+            .expect("mature local utility model");
+        let before_bias = model.contextual_action_bias("boost:Editor", "build");
+        model.attach_local_consolidation(LocalConsolidationView {
+            confidence: 0.40,
+            families_with_evidence: 1,
+            total_consolidations: 12,
+            family_scales: BTreeMap::from([("boost".to_string(), 0.75)]),
+        });
+        let deliberation = model.synthesize_deliberation("build", false, 0.20);
+        let after_assessment = model
+            .assess_utility("boost:Editor", "build")
+            .expect("authority must survive local advisory calibration");
+        let after_bias = model.contextual_action_bias("boost:Editor", "build");
+
+        assert_eq!(before_assessment.verdict, after_assessment.verdict);
+        assert_eq!(before_assessment.lower_bound, after_assessment.lower_bound);
+        assert_eq!(before_assessment.upper_bound, after_assessment.upper_bound);
+        assert!(before_bias.authoritative && after_bias.authoritative);
+        assert!(after_bias.score > 0.0 && after_bias.score < before_bias.score);
+        assert_eq!(deliberation.evidence.local_consolidation_families, 1);
+        assert!(deliberation.advisory_support_scale <= 1.0);
+    }
+
+    #[test]
+    fn dr_zero_and_system1_struggle_reduce_local_deliberation_confidence() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let models = BTreeMap::from([(
+            "build|boost:Editor".to_string(),
+            mature_model(now, LOCAL_ID),
+        )]);
+        let mut grounded = WorldModel::default();
+        attach_view(&mut grounded, Some(&context), &models, 24);
+        grounded.attach_local_consolidation(LocalConsolidationView {
+            confidence: 0.90,
+            families_with_evidence: 1,
+            total_consolidations: 24,
+            family_scales: BTreeMap::from([("boost".to_string(), 0.95)]),
+        });
+        let mut challenged = grounded.clone();
+
+        let healthy = grounded.synthesize_deliberation("build", false, 0.0);
+        let guarded = challenged.synthesize_deliberation("build", true, 1.0);
+        assert!(guarded.confidence < healthy.confidence);
+        assert!(guarded.advisory_support_scale < healthy.advisory_support_scale);
+        assert!(guarded.gpu_support_scale < healthy.gpu_support_scale);
     }
 
     #[test]

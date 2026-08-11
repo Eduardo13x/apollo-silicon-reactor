@@ -45,7 +45,6 @@ mod daemon_socket_handler;
 mod daemon_stale_apps;
 mod daemon_survival_tick;
 mod daemon_swap_reclaim_tick;
-mod daemon_teacher_tick;
 mod daemon_thermal_freeze;
 mod daemon_thermal_tick;
 mod daemon_turbo_manager;
@@ -53,7 +52,7 @@ mod daemon_wake_handler;
 mod daemon_wake_unfreeze;
 mod daemon_warn_limits;
 mod learning_tick;
-mod llm_daemon;
+mod local_policy_learning;
 mod main_loop_msg;
 mod metrics_reporter;
 mod process_enrichment;
@@ -98,17 +97,17 @@ use apollo_engine::engine::iokit_sensors::{HardwareSnapshot, ThermalState};
 use apollo_engine::engine::kqueue_pressure;
 use apollo_engine::engine::latency_monitor::{self, LatencySignals};
 use apollo_engine::engine::learned_state::{LearnableParams, LearnedState, RestoreQualityMonitor};
-use apollo_engine::engine::llm::{
-    feedback_path_root, load_repo_config, pending_trial_path, policy_path_root, read_json,
-    state_paths_root, suggestions_path_root, write_json, LearnedPolicy, LlmAdvisor, LlmConfig,
-    LlmState,
-};
+use apollo_engine::engine::local_consolidation::{LocalConsolidationVerdict, LocalConsolidator};
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::mach_qos::{MachQoSManager, SchedulingTier};
 use apollo_engine::engine::overflow_guard::{is_build_tool_name, OverflowGuard};
 use apollo_engine::engine::pipeline::decision_stage::{DecisionStage, PolicyContext};
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
+use apollo_engine::engine::policy_store::{
+    delete_file_best_effort, feedback_path_root, legacy_teacher_paths, load_repo_config,
+    pending_trial_path, policy_path_root, read_json, write_json, LearnedPolicy,
+};
 use apollo_engine::engine::power_management::detect_battery_status;
 use apollo_engine::engine::predictive_agent::{
     AgentContext, Intervention, PredictiveAgent, SpecialistVote,
@@ -143,8 +142,8 @@ use clap::{Parser, Subcommand};
 
 // v0.9.0: canonical SharedState — all domain groups live in daemon_state.rs
 use apollo_engine::engine::daemon_state::{
-    HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState,
-    ReactorStatus as DomainReactorStatus, SharedState, UsageDomainState, UsageTrackerState,
+    HardwareState, MetricsState, PolicyState, ProcessState, ReactorStatus as DomainReactorStatus,
+    SharedState, UsageDomainState, UsageTrackerState,
 };
 
 // FREEZE_TTL_SECS → daemon_helpers
@@ -188,7 +187,7 @@ enum Commands {
 // WakeStatePersisted, WakeRuntimeState → daemon_helpers
 
 // ThrashState → process_enrichment
-// LlmReactiveCounters → llm_daemon
+// Local policy outcome counters
 
 // parse_profile, write_metrics → daemon_helpers
 
@@ -388,6 +387,25 @@ fn main() -> anyhow::Result<()> {
             let is_root = unsafe { libc::geteuid() } == 0;
             let caps = detect_capabilities();
 
+            // One-way migration: the local S2 -> Dr Zero -> S1 circuit owns
+            // learning now. Retire persisted prompt state and API credentials
+            // so an upgrade cannot accidentally revive the external Teacher.
+            let (legacy_teacher_state, legacy_teacher_key) = legacy_teacher_paths(is_root);
+            for path in [&legacy_teacher_state, &legacy_teacher_key] {
+                let existed = path.exists();
+                delete_file_best_effort(path);
+                if existed {
+                    if path.exists() {
+                        tracing::warn!(
+                            path = %path.display(),
+                            "retired Teacher state could not be removed safely"
+                        );
+                    } else {
+                        tracing::info!(path = %path.display(), "removed retired Teacher state");
+                    }
+                }
+            }
+
             tracing::info!(
                 version = env!("CARGO_PKG_VERSION"),
                 profile = profile.as_str(),
@@ -396,24 +414,8 @@ fn main() -> anyhow::Result<()> {
             );
             let config_path = PathBuf::from("/etc/apollo-optimizer/config.toml");
             let repo_cfg = load_repo_config(&config_path);
-            let llm_cfg = repo_cfg.llm.unwrap_or(LlmConfig {
-                enabled: Some(false),
-                endpoint: None,
-                model: None,
-                min_confidence: None,
-                max_calls_per_hour: None,
-                min_interval_secs: None,
-                timeout_ms: None,
-                force_json: None,
-                always_on: None,
-                max_tokens: None,
-                disable_thinking: None,
-            });
-
-            let (llm_state_path, llm_key_path) = state_paths_root(is_root);
             let learned_policy_path = policy_path_root(is_root);
             let feedback_path = feedback_path_root(is_root);
-            let suggestions_path = suggestions_path_root(is_root);
 
             let usage_model_path = usage_model_path_root(is_root);
             let mut usage_model = UsageModel::load(&usage_model_path);
@@ -430,8 +432,6 @@ fn main() -> anyhow::Result<()> {
             } else {
                 PathBuf::from("/tmp/apollo-usage_events.jsonl")
             };
-
-            let llm_state = read_json::<LlmState>(&llm_state_path).unwrap_or_default();
 
             let learned_policy = {
                 let disk_policy = read_json::<LearnedPolicy>(&learned_policy_path);
@@ -456,7 +456,7 @@ fn main() -> anyhow::Result<()> {
                     );
                 }
                 // Sanitize (2026-06-20): drop any NOISE pattern that shadows an
-                // interactive or safety-protected process. The teacher
+                // interactive or safety-protected process. A legacy policy
                 // noise-classified `language_server` (the LSP) — a noise+
                 // interactive conflict that could throttle a protected process.
                 // Truncation-aware. Self-heals on every daemon start.
@@ -511,6 +511,8 @@ fn main() -> anyhow::Result<()> {
                     latency_target: LatencyTarget::Normal,
                     governor,
                     learned_policy,
+                    learned_policy_path: learned_policy_path.clone(),
+                    feedback_path,
                     adaptive_governor: AdaptiveGovernor::new(),
                     timeline: VecDeque::new(),
                     circuit_breaker:
@@ -544,18 +546,6 @@ fn main() -> anyhow::Result<()> {
                     wake_state,
                 })),
                 stop: Arc::new(AtomicBool::new(false)),
-
-                llm: Arc::new(Mutex::new(LlmDomainState {
-                    llm_cfg,
-                    llm_state,
-                    llm_state_path,
-                    llm_key_path,
-                    learned_policy_path,
-                    feedback_path,
-                    suggestions_path,
-                })),
-
-                config_path,
 
                 usage: Arc::new(Mutex::new(UsageDomainState {
                     usage_model,
@@ -618,9 +608,9 @@ fn main() -> anyhow::Result<()> {
                     UserProfile::from_persisted(persisted);
             }
 
-            // Scrub learned policy: remove patterns that should never be interactive.
-            // This list is curated by LLM Teacher analysis of usage_model data.
-            let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
+            // Scrub learned policy: remove identities that can never be interactive.
+            // The local learner may refine weights but cannot override this safety seed.
+            let learned_policy_path = state.policy.lock_recover().learned_policy_path.clone();
             {
                 let mut policy = state.policy.lock_recover().learned_policy.clone();
                 let bad_interactive: Vec<&str> = vec![
@@ -684,7 +674,7 @@ fn main() -> anyhow::Result<()> {
                 let before = policy.interactive_patterns.len();
                 std::sync::Arc::make_mut(&mut policy.interactive_patterns)
                     .retain(|p| !bad_interactive.iter().any(|bad| p.contains(bad)));
-                // Add noise patterns from LLM Teacher analysis.
+                // Preserve a conservative background-only seed.
                 if !policy.noise_patterns.contains(&"apsd".to_string()) {
                     std::sync::Arc::make_mut(&mut policy.noise_patterns).push("apsd".to_string());
                 }
@@ -849,7 +839,6 @@ fn main() -> anyhow::Result<()> {
             );
             let mut collector = SystemCollector::new();
             let mut thrash = process_enrichment::ThrashState::default();
-            let mut llm_counters = llm_daemon::LlmReactiveCounters::default();
             let journal_path = PathBuf::from(journal_path());
             let metrics_path = PathBuf::from(metrics_path());
             // Phase 1.5a — per-cycle telemetry archive (MLP router unblock).
@@ -864,7 +853,6 @@ fn main() -> anyhow::Result<()> {
             let mut critical_failure_timestamps: Vec<Instant> = Vec::new();
             let mut override_was_active = false;
             let daemon_start = Instant::now();
-            let mut llm_advisor = LlmAdvisor::new(state.llm.lock_recover().llm_cfg.clone());
 
             // Secondary optimization modules — all run each cycle without locks.
             // Constructed via daemon_init::DaemonSubsystems::new() to keep this
@@ -1113,10 +1101,12 @@ fn main() -> anyhow::Result<()> {
             let mut restored_meta_cognition: Option<
                 apollo_engine::engine::meta_cognition::MetaCognition,
             > = None;
+            let mut restored_local_consolidator: Option<LocalConsolidator> = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
+                restored_local_consolidator = learned.local_consolidator.clone();
                 if let Some(medallion_state) = learned.medallion_state.clone() {
                     let bronze_total = medallion_state.bronze_total;
                     let gold_total = medallion_state.gold_total;
@@ -1431,6 +1421,11 @@ fn main() -> anyhow::Result<()> {
             // Reused across cycles. Its internal revisions avoid rebuilding
             // unchanged causal and actuator maps on the daemon hot path.
             let mut world_model = apollo_engine::engine::world_model::WorldModel::default();
+            let mut local_consolidator = restored_local_consolidator.unwrap_or_default();
+            local_consolidator.retain_only_installation(installation_id);
+            world_model.attach_local_consolidation(
+                local_consolidator.view_for_installation(installation_id),
+            );
             let mut gpu_imagination =
                 apollo_engine::engine::gpu_imagination::GpuImaginationWorker::spawn_metal_only();
             let mut overhead_governor = adaptive_overhead::AdaptiveOverheadGovernor::default();
@@ -1563,14 +1558,6 @@ fn main() -> anyhow::Result<()> {
             // Restored from learned_state.json if available — preserves crisis context
             // across restarts. [Yerkes & Dodson 1908]
             let mut arousal_state = restored_arousal.unwrap_or_default();
-            // Teacher consolidation: compiles Gemma 4 suggestions into S1
-            // pattern_weights + NARS beliefs via dopamine/acetylcholine modulation.
-            // [McGaugh 2004, Yerkes-Dodson 1908, Kahneman 2011]
-            let mut teacher_consolidator =
-                apollo_engine::engine::teacher_consolidation::TeacherConsolidator::new();
-            // Tracks the last resolved outcome's applied_at so we only
-            // consolidate each outcome exactly once.
-            let mut last_consolidated_at: Option<chrono::DateTime<chrono::Utc>> = None;
             // Neurocognitive state: 8-module cognitive pipeline wired into hot loop.
             // [CognitiveRewardBus, MetaCognition, SelfRewardingEvaluator, EpistemicUncertainty,
             //  ReptileMeta, AdversarialProbe, ProactiveDrift, CognitiveHealthScore]
@@ -1673,17 +1660,6 @@ fn main() -> anyhow::Result<()> {
 
             let mut decision_stage = DecisionStage::new();
             let mut ais_worker = metrics_reporter::AisRuntimeWorker::spawn();
-            // LlmConfig live-reload: polls /etc/apollo-optimizer/config.toml every 100
-            // cycles for mtime changes, applies whitelisted diffs only.
-            // Guard: only reload when pending_trial_skill.is_none() to prevent
-            // corrupting BUG-01 WAL outcome attribution during an active experiment.
-            // [Gray & Reuter 1992 §11 — stable params during causal observation window]
-            let mut llm_cfg_reloader =
-                apollo_engine::engine::config_reloader::LlmConfigReloader::new(
-                    PathBuf::from("/etc/apollo-optimizer/config.toml"),
-                    pending_trial_path(is_root),
-                );
-
             // Sprint 12 perf-fix (2026-05-30). Cross-cycle memoization
             // slot for `companion_of_fg_pids`. See [`CompanionFgCache`]
             // for the invalidation contract. Stays None until the first
@@ -2450,43 +2426,58 @@ fn main() -> anyhow::Result<()> {
 
                 // Online usage learning (root-only, no UI sensors): infer frequently-used apps
                 // and processes correlated with jank, then promote patterns conservatively.
-                llm_daemon::usage_learning_tick(
+                local_policy_learning::usage_learning_tick(
                     &state,
                     &snapshot,
                     !foreground_idle && foreground_app.is_some(),
                     &cpu_wall_ratios,
                 );
 
-                // LLM teacher mode (cloud) - optional, rate-limited, and guarded.
-                // This runs before governor evaluation so a high-confidence suggestion can set a
-                // short-lived manual override during the training window.
-                //
-                // Arousal gate [Kahneman 2011] S1/S2 dual-path: Gemma (System 2, ~124s latency)
-                // must not be consulted during a memory crisis — by the time it responds, the
-                // crisis is over or the OOM already fired. Suppress calls when arousal_state is
-                // high (system under stress) so the fast reactive path (System 1) operates
-                // uncontested. Gemma runs during calm periods and compiles insights into
-                // SkillRegistry / pattern_weights for future fast-path use.
-                let llm_calm_gate = arousal_state.level <= 0.70;
-                if llm_calm_gate {
-                    llm_daemon::llm_reactive_tick(
-                        &state,
-                        &mut llm_advisor,
-                        &snapshot,
-                        &mut llm_counters,
-                        lctx.outcome_tracker.heuristic_is_struggling(),
-                    );
-                }
-
-                // Teacher consolidation: S2 → S1 memory transfer.
-                // Extracted to daemon_teacher_tick::run_teacher_consolidation (Wave 34).
-                daemon_teacher_tick::run_teacher_consolidation(
-                    &state,
-                    lctx.outcome_tracker,
-                    &mut teacher_consolidator,
-                    &mut last_consolidated_at,
-                    &mut arousal_state,
+                // Local deliberation replaces the former prompt/JSON teacher.
+                // It fuses System 1, Dr Zero, universal medallion, World Model
+                // and GPU evidence, then scales only advisory paths owned by
+                // specialists that already passed their own safety gates.
+                world_model.attach_local_consolidation(
+                    local_consolidator.view_for_installation(installation_id),
                 );
+                let deliberation_workload = world_model
+                    .latest_context()
+                    .map(|context| context.workload.clone())
+                    .unwrap_or_else(|| "unknown".to_string());
+                let deliberation = world_model.synthesize_deliberation(
+                    &deliberation_workload,
+                    lctx.outcome_tracker.heuristic_is_struggling(),
+                    lctx.outcome_tracker.self_challenge_score(),
+                );
+                {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.system_deliberation_mode = deliberation.mode;
+                    metrics.metrics.system_deliberation_confidence = deliberation.confidence;
+                    metrics.metrics.system_deliberation_advisory_support_scale =
+                        deliberation.advisory_support_scale;
+                    metrics.metrics.system_deliberation_gpu_support_scale =
+                        deliberation.gpu_support_scale;
+                    metrics.metrics.system_deliberation_dr_zero_challenge =
+                        deliberation.dr_zero_self_challenge;
+                    metrics.metrics.system_deliberation_system1_struggling =
+                        deliberation.system1_struggling;
+                    metrics.metrics.system_deliberation_local_gold =
+                        deliberation.evidence.local_gold;
+                    metrics.metrics.system_deliberation_gpu_forecasts =
+                        deliberation.evidence.gpu_fresh_predictions;
+                    metrics.metrics.system_deliberation_local_confidence =
+                        deliberation.evidence.local_consolidation_confidence;
+                    metrics.metrics.system_deliberation_local_families =
+                        deliberation.evidence.local_consolidation_families;
+                    metrics.metrics.local_consolidations = local_consolidator.total_consolidations;
+                    metrics.metrics.local_consolidation_improvements =
+                        local_consolidator.total_improvements;
+                    metrics.metrics.local_consolidation_regressions =
+                        local_consolidator.total_regressions;
+                    metrics.metrics.local_consolidation_neutral = local_consolidator.total_neutral;
+                    metrics.metrics.local_consolidation_system1_updates =
+                        local_consolidator.total_system1_updates;
+                }
 
                 let mut reactor_weight = apollo_engine::engine::lse_counters::LSE_COUNTERS
                     .snapshot()
@@ -3679,7 +3670,7 @@ fn main() -> anyhow::Result<()> {
                         .unwrap_or(0.0);
                     let latency = latency_monitor::compute_latency(&LatencySignals {
                         jitter_us: jitter_us as f64,
-                        windowserver_cpu: llm_daemon::windowserver_cpu(&snapshot) as f64,
+                        windowserver_cpu: local_policy_learning::windowserver_cpu(&snapshot) as f64,
                         foreground_cpu: fg_cpu,
                         foreground_csw_per_sec: fg_csw,
                         has_foreground: foreground_pid.is_some(),
@@ -4023,9 +4014,15 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.user_has_sleep_assertion = user_context.has_sleep_assertion;
                     metrics.metrics.user_call_in_progress = user_context.call_in_progress;
                     metrics.metrics.user_audio_active = user_context.audio_active;
+                    let audio_probe =
+                        apollo_engine::engine::coreaudio_active::audio_activity_snapshot();
+                    metrics.metrics.coreaudio_probe_state = audio_probe.probe_state().to_string();
+                    metrics.metrics.coreaudio_probe_samples_total = audio_probe.direct_samples;
+                    metrics.metrics.coreaudio_probe_cache_hits_total = audio_probe.cache_hits;
+                    metrics.metrics.coreaudio_probe_failures_total = audio_probe.failures;
                 }
 
-                // Apply any locally learned policy patterns (and keep them even after LLM is disabled).
+                // Apply locally consolidated policy patterns across restart cycles.
                 // Read-only cross-cycle state-memory filter. The final dispatch
                 // chokepoint is the sole writer; recording here made every
                 // admitted decision look duplicate when it reached that second
@@ -4061,7 +4058,7 @@ fn main() -> anyhow::Result<()> {
                 };
                 let initial_filtered = {
                     let policy = state.policy.lock_recover().learned_policy.clone();
-                    llm_daemon::apply_learned_policy_actions(
+                    local_policy_learning::apply_learned_policy_actions(
                         &snapshot,
                         &policy,
                         initial_filtered,
@@ -5512,13 +5509,17 @@ fn main() -> anyhow::Result<()> {
                 if let Some(result) = plan_report.gpu_imagination_result.as_ref() {
                     world_model.attach_gpu_imagination(result);
                     telemetry_medallion.observe_gpu_imagination(result, cycle_count);
-                    for action_key in &plan_report.gpu_imagination_supported_actions {
-                        telemetry_medallion.mark_gpu_prediction_consumed(
-                            action_key,
-                            workload_mode.as_str(),
-                            cycle_count,
-                        );
-                    }
+                }
+                // A root rank commonly consumes advice cached from an earlier
+                // async batch, so consumption cannot be nested under "a job
+                // completed this cycle". Record it independently for the
+                // Bronze → Silver → Gold calibration lifecycle.
+                for influence in &plan_report.gpu_imagination_supported_actions {
+                    telemetry_medallion.mark_gpu_prediction_consumed(
+                        &influence.action_key,
+                        workload_mode.as_str(),
+                        cycle_count,
+                    );
                 }
                 {
                     let mut metrics = state.metrics.lock_recover();
@@ -5631,10 +5632,12 @@ fn main() -> anyhow::Result<()> {
                         }
                         _ => {}
                     }
-                    metrics.metrics.gpu_imagination_support_uses_total = metrics
-                        .metrics
-                        .gpu_imagination_support_uses_total
-                        .saturating_add(plan_report.gpu_imagination_support_uses);
+                    for influence in &plan_report.gpu_imagination_supported_actions {
+                        metrics.metrics.record_gpu_root_rank_influence(
+                            &influence.action_key,
+                            influence.support,
+                        );
+                    }
                     if plan_report.gpu_imagination_completed {
                         if let Some(error) = plan_report.gpu_imagination_error.as_ref() {
                             metrics.metrics.gpu_imagination_jobs_failed_total = metrics
@@ -6021,11 +6024,63 @@ fn main() -> anyhow::Result<()> {
                     },
                 );
                 let mut causal_actuator_gold = 0_u64;
-                for evidence in telemetry_medallion.drain_new_gold_evidence() {
+                let new_gold_evidence = telemetry_medallion.drain_new_gold_evidence();
+                let system1_struggling = lctx.outcome_tracker.heuristic_is_struggling();
+                let dr_zero_self_challenge = lctx.outcome_tracker.self_challenge_score();
+                for evidence in &new_gold_evidence {
                     causal_actuator_gold = causal_actuator_gold.saturating_add(u64::from(
                         lctx.causal_graph
-                            .observe_actuator_outcome(&evidence, installation_id),
+                            .observe_actuator_outcome(evidence, installation_id),
                     ));
+                    if !cognitive_pause {
+                        let report = local_consolidator.consolidate(
+                            evidence,
+                            &mut lctx.outcome_tracker.drift_detector,
+                            &mut arousal_state,
+                            system1_struggling,
+                            dr_zero_self_challenge,
+                        );
+                        if !matches!(
+                            report.verdict,
+                            LocalConsolidationVerdict::Rejected
+                                | LocalConsolidationVerdict::Duplicate
+                        ) {
+                            let mut metrics = state.metrics.lock_recover();
+                            metrics.metrics.local_consolidations =
+                                metrics.metrics.local_consolidations.saturating_add(1);
+                            match report.verdict {
+                                LocalConsolidationVerdict::Improved => {
+                                    metrics.metrics.local_consolidation_improvements = metrics
+                                        .metrics
+                                        .local_consolidation_improvements
+                                        .saturating_add(1);
+                                }
+                                LocalConsolidationVerdict::Worsened => {
+                                    metrics.metrics.local_consolidation_regressions = metrics
+                                        .metrics
+                                        .local_consolidation_regressions
+                                        .saturating_add(1);
+                                }
+                                LocalConsolidationVerdict::Neutral => {
+                                    metrics.metrics.local_consolidation_neutral = metrics
+                                        .metrics
+                                        .local_consolidation_neutral
+                                        .saturating_add(1);
+                                }
+                                LocalConsolidationVerdict::Duplicate
+                                | LocalConsolidationVerdict::Rejected => {}
+                            }
+                            metrics.metrics.local_consolidation_system1_updates = metrics
+                                .metrics
+                                .local_consolidation_system1_updates
+                                .saturating_add(u64::from(report.system1_updates));
+                            metrics.metrics.local_consolidation_last_family = report.family;
+                            metrics.metrics.local_consolidation_last_action = report.action_key;
+                            metrics.metrics.local_consolidation_last_verdict =
+                                report.verdict.as_str().to_string();
+                            metrics.metrics.local_consolidation_last_utility = report.utility;
+                        }
+                    }
                 }
                 if causal_actuator_gold > 0 {
                     let mut metrics = state.metrics.lock_recover();
@@ -6038,6 +6093,9 @@ fn main() -> anyhow::Result<()> {
                 // dashboard consume this cycle's context and any outcomes that
                 // just matured. Dispatch already used the prior-cycle model.
                 world_model.attach_context(telemetry_medallion.trusted_view());
+                world_model.attach_local_consolidation(
+                    local_consolidator.view_for_installation(installation_id),
+                );
 
                 // NARS belief routing for newly-frozen non-chromium PIDs
                 // (Sprint A 2026-05-10). chromium_mgr already routes its own
@@ -6124,6 +6182,7 @@ fn main() -> anyhow::Result<()> {
                         ode_t_sat_urgency,
                         &maintenance_state,
                         &cognitive_state.meta_cognition,
+                        &local_consolidator,
                     );
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.
@@ -6156,23 +6215,6 @@ fn main() -> anyhow::Result<()> {
                     _t_neuro_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                 );
                 prev_cog_decision = Some(cog_decision);
-                // LlmConfig live-reload: whitelisted fields only; skip if trial active
-                // to avoid corrupting GemmaTrust outcome attribution. [Gray & Reuter 1992]
-                if cycle_count.is_multiple_of(100) && pending_trial_skill.is_none() {
-                    use apollo_engine::engine::pipeline::periodic_stage::maybe_reload_llm_config;
-                    let current_cfg = state.llm.lock_recover().llm_cfg.clone();
-                    if let Some(outcome) =
-                        maybe_reload_llm_config(cycle_count, &mut llm_cfg_reloader, &current_cfg)
-                    {
-                        if let Some(new_cfg) = outcome.new_cfg {
-                            state.llm.lock_recover().llm_cfg = new_cfg;
-                            tracing::info!("llm config live-reloaded from disk");
-                        }
-                        for rejected in &outcome.rejected {
-                            tracing::warn!(field = %rejected.field, "llm config reload: field rejected (not in whitelist)");
-                        }
-                    }
-                }
                 // Autonomous rule induction every 100 cycles.
                 // Extracted to daemon_skill_tick::run_rule_induction (Wave 22).
                 if cycle_count.is_multiple_of(100) {
@@ -6633,6 +6675,7 @@ fn main() -> anyhow::Result<()> {
                 Some(nested_learner.clone()),
                 &maintenance_state,
                 apollo_engine::engine::learned_state::LearnedStateSupplement {
+                    local_consolidator: Some(local_consolidator.clone()),
                     unfreeze_decay_tau: Some(unfreeze_decay.tau_snapshot()),
                     neuro_state: Some(neuromod.snapshot()),
                     meta_cognition: Some(cognitive_state.meta_cognition.clone()),

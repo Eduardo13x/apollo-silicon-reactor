@@ -4,7 +4,6 @@
 //! - `run_socket_server()` — bind, listen, spawn per-client threads
 //! - `handle_client()` — read request, auth, dispatch
 //! - `process_request()` — the 22-arm command dispatcher
-//! - `build_llm_status()` — LLM status builder
 //! - `broadcast_current_status()` — push updates to subscribers
 //! - `is_peer_root()` — peer credential check
 
@@ -21,26 +20,20 @@ use std::sync::Arc;
 use std::thread;
 
 use anyhow::Context;
-use chrono::{Duration as ChronoDuration, Local, Utc};
+use chrono::Utc;
 
-use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::capabilities::{
     detect_capabilities, detect_capabilities_with_write_probes,
 };
 use apollo_engine::engine::daemon_helpers::{
-    frozen_state_path, kill_switch_path, merge_seed_into, metrics_path, socket_path,
-    unfreeze_pids_verified_outcome, write_frozen_state,
-};
-use apollo_engine::engine::llm::{
-    append_jsonl, delete_file_best_effort, load_repo_config, write_json, write_secret,
-    FeedbackEntry, LlmAdvisor,
+    frozen_state_path, kill_switch_path, metrics_path, socket_path, unfreeze_pids_verified_outcome,
+    write_frozen_state,
 };
 use apollo_engine::engine::lock_ext::LockRecover;
+use apollo_engine::engine::policy_store::{append_jsonl, FeedbackEntry};
 use apollo_engine::engine::protocol::{DaemonRequest, DaemonResponse};
-use apollo_engine::engine::safety::pattern_conflicts_with_protected;
 use apollo_engine::engine::types::{
-    DaemonStatus, FrozenProcessInfo, HardPath, HealthReport, LearnedPolicyStatus, LlmRunMode,
-    LlmStatus, RuntimeMetrics, UsageResponse,
+    DaemonStatus, FrozenProcessInfo, HardPath, HealthReport, RuntimeMetrics, UsageResponse,
 };
 
 use super::{SharedState, STOP_REQUESTED};
@@ -194,7 +187,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             let blockers = state.process.lock_recover().last_blockers.clone();
             let thermal_state = state.metrics.lock_recover().thermal_state.clone();
             let throttle_level = state.metrics.lock_recover().throttle_level.clone();
-            // Snapshot governor + wake_state, then DROP locks before build_llm_status.
+            // Snapshot governor + wake_state, then drop locks before I/O.
             let (
                 auto_profile_enabled,
                 base_profile,
@@ -229,7 +222,6 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     m.reactor_status.health.clone(),
                 )
             };
-            let llm = build_llm_status(state);
             let frozen_processes: Vec<FrozenProcessInfo> = {
                 let fs = state.frozen_state.lock_recover();
                 fs.iter()
@@ -269,7 +261,6 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 reactor_mode,
                 reactor_health,
                 metrics,
-                llm: Some(llm),
                 frozen_processes,
             };
             DaemonResponse::Status(status)
@@ -460,7 +451,6 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             ];
             DaemonResponse::Doctor { checks }
         }
-        DaemonRequest::GetLlmStatus => DaemonResponse::LlmStatus(build_llm_status(state)),
         DaemonRequest::UsageTop { limit } => {
             let limit = limit.unwrap_or(10).clamp(3, 30);
             let model = state.usage.lock_recover();
@@ -476,304 +466,9 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 },
             }
         }
-        DaemonRequest::LlmSetKey { api_key, ttl_days } => {
-            let now = Utc::now();
-            let ttl_clamped = ttl_days.clamp(1, 365);
-            let expires = now + ChronoDuration::days(ttl_clamped as i64);
-            let (llm_key_path, llm_state_path) = {
-                let llm = state.llm.lock_recover();
-                (llm.llm_key_path.clone(), llm.llm_state_path.clone())
-            };
-            if write_secret(&llm_key_path, api_key.trim()).is_err() {
-                return DaemonResponse::Error {
-                    message: "failed to write llm key".to_string(),
-                };
-            }
-            {
-                let mut guard = state.llm.lock_recover();
-                guard.llm_state.enabled = true;
-                guard.llm_state.training_started_at = Some(now);
-                guard.llm_state.training_expires_at = Some(expires);
-                guard.llm_state.last_call_at = None;
-                guard.llm_state.last_attempt_at = None;
-                guard.llm_state.last_http_status = None;
-                guard.llm_state.last_error = None;
-                guard.llm_state.last_trigger_reason = None;
-                guard.llm_state.consecutive_failures = 0;
-                guard.llm_state.calls_in_window = 0;
-                guard.llm_state.hour_window_started_at = Some(now);
-                guard.llm_state.calls_today_day = None;
-                guard.llm_state.calls_today = 0;
-                guard.llm_state.mode = LlmRunMode::Sensitive;
-                guard.llm_state.last_trigger_at = None;
-                guard.llm_state.trigger_events.clear();
-                guard.llm_state.no_trigger_since = Some(now);
-                guard.llm_state.last_suggestion = None;
-                guard.llm_state.policy_updates_day = None;
-                guard.llm_state.policy_updates_today = 0;
-                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
-            }
-            DaemonResponse::Ok
-        }
-        DaemonRequest::LlmDisable => {
-            let (llm_key_path, llm_state_path) = {
-                let llm = state.llm.lock_recover();
-                (llm.llm_key_path.clone(), llm.llm_state_path.clone())
-            };
-            delete_file_best_effort(&llm_key_path);
-            {
-                let mut guard = state.llm.lock_recover();
-                guard.llm_state.enabled = false;
-                guard.llm_state.training_expires_at = None;
-                guard.llm_state.last_suggestion = None;
-                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
-            }
-            DaemonResponse::Ok
-        }
-        DaemonRequest::LlmTest => {
-            let now = Utc::now();
-            let (llm_key_path, llm_state_path, llm_cfg_default) = {
-                let llm = state.llm.lock_recover();
-                (
-                    llm.llm_key_path.clone(),
-                    llm.llm_state_path.clone(),
-                    llm.llm_cfg.clone(),
-                )
-            };
-            let llm_cfg = load_repo_config(&state.config_path)
-                .llm
-                .unwrap_or(llm_cfg_default);
-            if !llm_cfg.enabled() {
-                return DaemonResponse::LlmTestResult {
-                    ok: false,
-                    http_status: None,
-                    error: Some("llm disabled in config".to_string()),
-                    suggestion: None,
-                };
-            }
-            if !llm_key_path.exists() {
-                return DaemonResponse::LlmTestResult {
-                    ok: false,
-                    http_status: None,
-                    error: Some("missing llm api key".to_string()),
-                    suggestion: None,
-                };
-            }
-            {
-                let guard = state.llm.lock_recover();
-                if !guard.llm_state.training_active() {
-                    return DaemonResponse::LlmTestResult {
-                        ok: false,
-                        http_status: None,
-                        error: Some("training not active (enable + ttl)".to_string()),
-                        suggestion: None,
-                    };
-                }
-            }
-
-            let api_key = match HardPath::read_to_string_limited(&llm_key_path, 4096) {
-                Ok(v) => v,
-                Err(_) => {
-                    return DaemonResponse::LlmTestResult {
-                        ok: false,
-                        http_status: None,
-                        error: Some("cannot read llm key".to_string()),
-                        suggestion: None,
-                    }
-                }
-            };
-
-            // Collect a one-off snapshot for this test.
-            let mut collector = SystemCollector::new();
-            let (mut snapshot, _) = collector.collect_snapshot();
-            snapshot.pressure.thermal_level =
-                state.metrics.lock_recover().thermal_level_real.clone();
-
-            // Record attempt immediately.
-            {
-                let mut guard = state.llm.lock_recover();
-                if guard.llm_state.training_started_at.is_none() {
-                    guard.llm_state.training_started_at = Some(now);
-                }
-                guard.llm_state.last_attempt_at = Some(now);
-                guard.llm_state.last_trigger_reason = Some("manual-test".to_string());
-                guard.llm_state.last_error = None;
-                guard.llm_state.last_http_status = None;
-
-                // Count this as a call attempt for observability/budget.
-                let today = Local::now().date_naive().to_string();
-                if guard.llm_state.calls_today_day.as_deref() != Some(&today) {
-                    guard.llm_state.calls_today_day = Some(today);
-                    guard.llm_state.calls_today = 0;
-                }
-                guard.llm_state.calls_today += 1;
-                if guard
-                    .llm_state
-                    .hour_window_started_at
-                    .map(|t| now - t > ChronoDuration::hours(1))
-                    .unwrap_or(true)
-                {
-                    guard.llm_state.hour_window_started_at = Some(now);
-                    guard.llm_state.calls_in_window = 0;
-                }
-                guard.llm_state.calls_in_window += 1;
-
-                write_json(&llm_state_path, &guard.llm_state, Some(0o600));
-            }
-
-            let mut advisor = LlmAdvisor::new(llm_cfg.clone());
-            let current_policy = state.policy.lock_recover().learned_policy.clone();
-            match advisor.call_raw(&snapshot, &api_key, Some(&current_policy), None) {
-                Ok(suggestion) => {
-                    {
-                        let mut guard = state.llm.lock_recover();
-                        guard.llm_state.last_call_at = Some(now);
-                        guard.llm_state.last_http_status = Some(200);
-                        guard.llm_state.last_suggestion = Some(suggestion.clone());
-                        guard.llm_state.last_error = None;
-                        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
-                    }
-                    DaemonResponse::LlmTestResult {
-                        ok: true,
-                        http_status: Some(200),
-                        error: None,
-                        suggestion: Some(suggestion),
-                    }
-                }
-                Err(err) => {
-                    let (http_status, msg) = match err {
-                        apollo_engine::engine::llm::LlmCallError::Cooldown => {
-                            (None, "cooldown".to_string())
-                        }
-                        apollo_engine::engine::llm::LlmCallError::HttpStatus {
-                            code,
-                            body_excerpt,
-                        } => (
-                            Some(code),
-                            format!("http {} {}", code, body_excerpt.unwrap_or_default()),
-                        ),
-                        apollo_engine::engine::llm::LlmCallError::Transport(e) => {
-                            (None, format!("transport {}", e))
-                        }
-                        apollo_engine::engine::llm::LlmCallError::Parse(e) => {
-                            (None, format!("parse {}", e))
-                        }
-                        apollo_engine::engine::llm::LlmCallError::Rejected(e) => {
-                            (None, format!("rejected {}", e))
-                        }
-                    };
-                    {
-                        let mut guard = state.llm.lock_recover();
-                        guard.llm_state.last_http_status = http_status;
-                        guard.llm_state.last_error = Some(msg.clone());
-                        write_json(&llm_state_path, &guard.llm_state, Some(0o600));
-                    }
-                    DaemonResponse::LlmTestResult {
-                        ok: false,
-                        http_status,
-                        error: Some(msg),
-                        suggestion: None,
-                    }
-                }
-            }
-        }
         DaemonRequest::GetLearnedPolicy => {
             let policy = state.policy.lock_recover().learned_policy.clone();
             DaemonResponse::LearnedPolicy(policy)
-        }
-        DaemonRequest::SetLearnedPolicy { policy: new_policy } => {
-            // Validate size limits to prevent OOM attacks
-            const MAX_PATTERNS: usize = 500;
-            if new_policy.interactive_patterns.len() > MAX_PATTERNS
-                || new_policy.noise_patterns.len() > MAX_PATTERNS
-                || new_policy.protected_patterns.len() > MAX_PATTERNS
-            {
-                DaemonResponse::Error {
-                    message: format!(
-                        "Policy too large: max {} patterns per category",
-                        MAX_PATTERNS
-                    ),
-                }
-            } else {
-                // Validate individual pattern lengths.
-                //
-                // 2026-05-31 (post-MatchEngine refactor 29f09e0): lowered
-                // MIN_PATTERN_LEN 4→3. Previously the 4-char floor was the
-                // ONLY defense against ambiguous short patterns like "vi"
-                // substring-matching "preview"/"navigator". MatchEngine now
-                // provides tier-based runtime defense:
-                //   Exact       (conf 1.00) → only matches EXACT name
-                //   WordBoundary (conf 0.85) → \bneedle\b, ≥3 chars
-                //   Substring   (conf 0.30) → degraded fallback, below
-                //                              freeze floor 0.35
-                // 2026-07-04: lowered MIN 3→2. The hardcoded safety.rs
-                // protected list already names "TV" (a 2-char process).
-                // Keeping MIN=3 means the apply path rejects the same
-                // pattern that safety.rs accepts — pointless friction.
-                // MatchEngine's tier-based runtime defense still applies
-                // (any 2-char pattern is 1 typo away from matching a real
-                // process; the high-confidence floor + hardcoded protection
-                // list are the real defenses, not the validator).
-                const MAX_PATTERN_LEN: usize = 256;
-                const MIN_PATTERN_LEN: usize = 2;
-                let has_invalid_pattern = new_policy
-                    .interactive_patterns
-                    .iter()
-                    .chain(new_policy.noise_patterns.iter())
-                    .chain(new_policy.protected_patterns.iter())
-                    .any(|p| {
-                        p.len() > MAX_PATTERN_LEN
-                            || p.len() < MIN_PATTERN_LEN
-                            || p.trim().is_empty()
-                            || p.chars().any(|c| {
-                                // Reject control chars and glob/regex metacharacters.
-                                // Parentheses are intentionally allowed: macOS process
-                                // names use them legitimately, e.g. "Helper (GPU)".
-                                // Patterns are matched with str::contains(), not regex.
-                                c.is_control()
-                                    || c == '*'
-                                    || c == '['
-                                    || c == ']'
-                                    || c == '|'
-                                    || c == '\\'
-                                    || c == '{'
-                                    || c == '}'
-                            })
-                    });
-                if has_invalid_pattern {
-                    return DaemonResponse::Error {
-                        message: format!(
-                            "pattern length must be {}-{} chars, non-empty",
-                            MIN_PATTERN_LEN, MAX_PATTERN_LEN
-                        ),
-                    };
-                }
-
-                // Sanitize: strip any patterns that could match a
-                // hardcoded protected or critical-background process.
-                // Uses bidirectional prefix/suffix overlap (75% threshold)
-                // to block evasion attempts like "kernel_tas" for "kernel_task".
-                let mut sanitized = new_policy;
-                std::sync::Arc::make_mut(&mut sanitized.noise_patterns)
-                    .retain(|pat| !pattern_conflicts_with_protected(pat));
-                std::sync::Arc::make_mut(&mut sanitized.interactive_patterns)
-                    .retain(|pat| !pattern_conflicts_with_protected(pat));
-                std::sync::Arc::make_mut(&mut sanitized.protected_patterns)
-                    .retain(|pat| !pattern_conflicts_with_protected(pat));
-                let learned_policy_path = state.llm.lock_recover().learned_policy_path.clone();
-                let lp_snap = {
-                    let mut pg = state.policy.lock_recover();
-                    pg.learned_policy = sanitized;
-                    // Re-merge seed as floor — seed patterns can never be removed.
-                    merge_seed_into(&mut pg.learned_policy);
-                    pg.learned_policy.learned_at = Some(Utc::now());
-                    let snap = pg.learned_policy.clone();
-                    pg.adaptive_governor.update_learned_policy(&snap);
-                    snap
-                };
-                write_json(&learned_policy_path, &lp_snap, Some(0o600));
-                DaemonResponse::Ok
-            }
         }
         DaemonRequest::Feedback { rating, note } => {
             if rating.len() > 256 {
@@ -793,7 +488,8 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 rating,
                 note,
             };
-            append_jsonl(&state.llm.lock_recover().feedback_path, &entry);
+            let feedback_path = state.policy.lock_recover().feedback_path.clone();
+            append_jsonl(&feedback_path, &entry);
             DaemonResponse::Ok
         }
         DaemonRequest::GetSysctlGovernor => {
@@ -884,77 +580,6 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
     }
 }
 
-// ── LLM Status Builder ─────────────────────────────────────────────────────
-
-pub fn build_llm_status(state: &SharedState) -> LlmStatus {
-    let (llm_cfg_default, llm_state, llm_key_path) = {
-        let llm = state.llm.lock_recover();
-        (
-            llm.llm_cfg.clone(),
-            llm.llm_state.clone(),
-            llm.llm_key_path.clone(),
-        )
-    };
-    let llm_cfg = load_repo_config(&state.config_path)
-        .llm
-        .unwrap_or(llm_cfg_default);
-    let enabled_from_disk = llm_cfg.enabled();
-    let policy = state.policy.lock_recover().learned_policy.clone();
-
-    let has_key = llm_key_path.exists();
-    let enabled = enabled_from_disk && llm_state.enabled;
-    let training_active = enabled && llm_state.training_active() && has_key;
-
-    let now_local = Local::now();
-    let today = now_local.date_naive().to_string();
-
-    // Backward compatible: older persisted state may not have `training_started_at`.
-    // Use the first observed call/attempt as a proxy.
-    let training_started = llm_state
-        .training_started_at
-        .or(llm_state.last_call_at)
-        .or(llm_state.last_attempt_at);
-    let bootcamp = training_started
-        .map(|t| Utc::now() - t < ChronoDuration::days(5))
-        .unwrap_or(false);
-    let daily_budget: u32 = if bootcamp { 24 } else { 8 };
-    let calls_today = if llm_state.calls_today_day.as_deref() == Some(&today) {
-        llm_state.calls_today
-    } else {
-        0
-    };
-    let daily_budget_remaining = daily_budget.saturating_sub(calls_today);
-
-    LlmStatus {
-        enabled,
-        training_active,
-        training_expires_at: llm_state.training_expires_at,
-        has_api_key: has_key,
-        mode: llm_state.mode,
-        last_call_at: llm_state.last_call_at,
-        last_attempt_at: llm_state.last_attempt_at,
-        last_http_status: llm_state.last_http_status,
-        last_error: llm_state.last_error.clone(),
-        last_trigger_reason: llm_state.last_trigger_reason.clone(),
-        calls_in_current_window: llm_state.calls_in_window,
-        min_confidence: llm_cfg.min_confidence(),
-        calls_today,
-        daily_budget,
-        daily_budget_remaining,
-        last_suggestion_confidence: llm_state.last_suggestion.as_ref().map(|s| s.confidence),
-        last_suggestion_rationale: llm_state
-            .last_suggestion
-            .as_ref()
-            .map(|s| s.rationale.clone()),
-        learned_policy: LearnedPolicyStatus {
-            interactive_patterns: policy.interactive_patterns.len(),
-            noise_patterns: policy.noise_patterns.len(),
-            protected_patterns: policy.protected_patterns.len(),
-            learned_at: policy.learned_at,
-        },
-    }
-}
-
 // ── Socket Server ──────────────────────────────────────────────────────────
 
 /// Wrapper that signals bind success/failure via `tx` before entering the accept loop.
@@ -1013,7 +638,7 @@ pub fn run_socket_server(state: SharedState) -> anyhow::Result<()> {
     println!("Socket server listening on: {:?}", socket_path);
     // Socket permissions: 0o660 root:staff — all human users (staff group, GID 20)
     // can connect for read-only queries (status, metrics, subscribe).
-    // Mutating commands (SetProfile, SetLearnedPolicy, etc.) require root via getpeereid.
+    // Mutating commands (SetProfile, Feedback, etc.) require root via getpeereid.
     if unsafe { libc::getuid() } == 0 {
         let _ = fs::set_permissions(socket_path, fs::Permissions::from_mode(0o660));
         if let Ok(c_path) = CString::new(socket_path.as_os_str().as_encoded_bytes()) {

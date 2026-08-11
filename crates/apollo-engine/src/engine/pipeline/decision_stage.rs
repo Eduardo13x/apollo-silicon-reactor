@@ -7,7 +7,7 @@
 //!
 //! **PARTIAL** — the `decide_actions` call and its grouping inputs are
 //! extracted.  Post-processing that touches binary-local state (`SharedState`,
-//! `llm_daemon`, `skill_registry` trials, coordinated-cluster logic) remains
+//! local policy learning, `skill_registry` trials, coordinated-cluster logic) remains
 //! in the main daemon loop and operates on the returned [`DecisionStageOutput`].
 //!
 //! ## What is extracted
@@ -21,7 +21,7 @@
 //! - `state.last_blockers` / `state.thermal_state` mutations: require
 //!   `SharedState`, which is binary-local and cannot be imported from a library
 //!   crate module.
-//! - `llm_daemon::apply_learned_policy_actions`: binary-local module.
+//! - `local_policy_learning::apply_learned_policy_actions`: binary-local module.
 //! - Skill-registry trial loop: depends on `pending_trial_skill` (binary-local
 //!   mutable state), `foreground_pid`, and `collector` — too many disparate
 //!   binary-local borrows for a clean library extraction.
@@ -58,7 +58,7 @@ use crate::engine::user_context::UserContext;
 /// These 6 parameters map 1-to-1 onto the `learned_*`, `outcome_*`, and
 /// `*_pids` parameters of [`decide_actions`].
 pub struct PolicyContext<'a> {
-    /// Names of processes learned to be interactive (from [`crate::engine::llm::LearnedPolicy`]).
+    /// Names learned to be interactive (from [`crate::engine::policy_store::LearnedPolicy`]).
     pub decide_interactive: &'a [String],
 
     /// Names of processes learned to be low-value background noise.

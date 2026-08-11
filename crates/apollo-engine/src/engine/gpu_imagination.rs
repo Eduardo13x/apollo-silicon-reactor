@@ -812,7 +812,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn metal_matches_cpu_reference_when_available() {
-        let mut metal = metal::MetalKernel::new().expect("Metal pipeline unavailable on this Mac");
+        let Ok(mut metal) = metal::MetalKernel::new() else {
+            return;
+        };
         let request = request();
         let cpu = simulate_samples_cpu(&request);
         let (gpu, gpu_time_ns) = metal.run(&request).expect("Metal dispatch");

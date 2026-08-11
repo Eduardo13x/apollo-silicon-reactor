@@ -227,6 +227,19 @@ fn format_number(n: u64) -> String {
     }
 }
 
+/// Fixed-width counter for the 32-column dashboard quadrants.
+fn compact_counter(n: u64) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.0}B", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.0}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 // ── Box drawing ──
 
 fn render_blockers(blockers: &[BlockerScore]) -> Vec<String> {
@@ -373,16 +386,13 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         m.nars_drifted_beliefs, m.nars_beliefs_total, m.nars_drift_score, drift_emoji
     ));
 
-    // Bayesian outcome tracker (LLM teacher patterns proxy)
-    let interactive = status
-        .llm
-        .as_ref()
-        .map_or(0, |l| l.learned_policy.interactive_patterns);
-    let noise = status
-        .llm
-        .as_ref()
-        .map_or(0, |l| l.learned_policy.noise_patterns);
-    lines.push(format!("Bayes  {}int {}noise", interactive, noise));
+    // Local Gold outcomes are compiled into fast System 1 reflexes.
+    lines.push(format!(
+        "Learn  G{} F{} S1+{}",
+        compact_counter(m.system_deliberation_local_gold),
+        m.system_deliberation_local_families,
+        compact_counter(m.local_consolidation_system1_updates),
+    ));
 
     if m.ais_score > 0.0 {
         lines.push(format!(
@@ -708,6 +718,38 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 m.gpu_imagination_last_p10_gain * 100.0
             ));
         }
+        let gpu_influence = if m.gpu_imagination_last_influence_scope.is_empty() {
+            "awaiting-consumer".to_string()
+        } else {
+            let scope = match m.gpu_imagination_last_influence_scope.as_str() {
+                "root-ranking" => "root",
+                "markov-prewarm" => "markov",
+                "interaction-qos" => "iqos",
+                "io-shaping" => "io",
+                "chromium" => "chromium",
+                "predictive" => "predict",
+                _ => "other",
+            };
+            let action = m
+                .gpu_imagination_last_influence_action
+                .split_once(':')
+                .map_or(
+                    m.gpu_imagination_last_influence_action.as_str(),
+                    |(family, _)| family,
+                );
+            format!(
+                "{}:{} {:+.2}%",
+                scope,
+                action.chars().take(5).collect::<String>(),
+                m.gpu_imagination_last_influence_support * 100.0
+            )
+        };
+        lines.push(format!(
+            "GPU-U  R{} C{} {}",
+            compact_counter(m.gpu_imagination_root_rank_uses_total),
+            compact_counter(m.gpu_imagination_contextual_uses_total),
+            gpu_influence
+        ));
         if m.world_model_gpu_bronze_total > 0 {
             lines.push(format!(
                 "GPU-M  B{} S{} G{} P{} M{} q{:.0}% e{:.1}%",
@@ -720,6 +762,37 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 m.world_model_gpu_calibration_mae * 100.0
             ));
         }
+    }
+    if !m.system_deliberation_mode.is_empty() {
+        let mode = match m.system_deliberation_mode.as_str() {
+            "grounded" => "ground",
+            "calibrating" => "cal",
+            "observing" => "obs",
+            _ => "other",
+        };
+        let system1 = if m.system_deliberation_system1_struggling {
+            "S1?"
+        } else {
+            "S1"
+        };
+        lines.push(format!(
+            "Delib  {} {} c{:.0}% G{} g{} F{}",
+            mode,
+            system1,
+            m.system_deliberation_confidence * 100.0,
+            compact_counter(m.system_deliberation_local_gold),
+            m.system_deliberation_gpu_forecasts,
+            m.system_deliberation_local_families,
+        ));
+        lines.push(format!(
+            "S2>S1  G{} +{}/-{} n{} s{} c{:.0}%",
+            compact_counter(m.local_consolidations),
+            compact_counter(m.local_consolidation_improvements),
+            compact_counter(m.local_consolidation_regressions),
+            compact_counter(m.local_consolidation_neutral),
+            compact_counter(m.local_consolidation_system1_updates),
+            m.system_deliberation_local_confidence * 100.0,
+        ));
     }
     lines.push(format!(
         // This is the pressure-causal imagination model, not the universal
@@ -866,17 +939,6 @@ fn render_decide_q(status: &DaemonStatus) -> Vec<String> {
     ));
     lines.push(format!("Motivo  {}", profile_activity_reason(status)));
 
-    // Teacher (Gemma 4 local LLM) — daily teach-call budget
-    if let Some(l) = &status.llm {
-        let state = if l.enabled { "✅" } else { "❌" };
-        lines.push(format!(
-            "Teach calls {} {}/{}",
-            state, l.calls_today, l.daily_budget
-        ));
-    } else {
-        lines.push("Teach calls ❌ off".to_string());
-    }
-
     // Sprint Coalition — guard tower visibility (2026-05-10).
     // Guard% = mean over-protection signal across mature blocked patterns.
     // Coalitions = recently-fg apps protected by 5-min envelope.
@@ -1010,6 +1072,15 @@ fn render_gates_band(status: &DaemonStatus) -> Vec<String> {
         "survival {} · purge {} · freeze 🟢 · wake {}",
         surv, purge, post_wake
     ));
+    if !m.coreaudio_probe_state.is_empty() && m.coreaudio_probe_state != "direct" {
+        lines.push(dim(&format!(
+            "audio {} · HAL samples {} cache {} fail {}",
+            m.coreaudio_probe_state,
+            m.coreaudio_probe_samples_total,
+            m.coreaudio_probe_cache_hits_total,
+            m.coreaudio_probe_failures_total
+        )));
+    }
 
     // Maintenance purge counters
     let total_skipped = m.maintenance_purge_skipped_pressure_total
@@ -1273,7 +1344,6 @@ mod tests {
             reactor_mode: "normal".to_string(),
             reactor_health: "ok".to_string(),
             metrics: RuntimeMetrics::default(),
-            llm: None,
             frozen_processes: Vec::new(),
         }
     }
@@ -1417,6 +1487,23 @@ mod tests {
         status.metrics.gpu_imagination_last_best_action = "boost:Editor".to_string();
         status.metrics.gpu_imagination_last_positive_probability = 0.82;
         status.metrics.gpu_imagination_last_p10_gain = 0.012;
+        status.metrics.gpu_imagination_root_rank_uses_total = 4;
+        status.metrics.gpu_imagination_contextual_uses_total = 9;
+        status.metrics.gpu_imagination_last_influence_scope = "markov-prewarm".to_string();
+        status.metrics.gpu_imagination_last_influence_action =
+            "markov_prewarm:predicted_app".to_string();
+        status.metrics.gpu_imagination_last_influence_support = 0.012;
+        status.metrics.system_deliberation_mode = "calibrating".to_string();
+        status.metrics.system_deliberation_confidence = 0.78;
+        status.metrics.system_deliberation_local_gold = 24;
+        status.metrics.system_deliberation_gpu_forecasts = 3;
+        status.metrics.system_deliberation_local_confidence = 0.66;
+        status.metrics.system_deliberation_local_families = 1;
+        status.metrics.local_consolidations = 12;
+        status.metrics.local_consolidation_improvements = 8;
+        status.metrics.local_consolidation_regressions = 2;
+        status.metrics.local_consolidation_neutral = 2;
+        status.metrics.local_consolidation_system1_updates = 20;
         status.metrics.world_model_actuator_families =
             vec![apollo_engine::engine::types::ActuatorEvidenceStatus {
                 family: "boost".to_string(),
@@ -1464,6 +1551,15 @@ mod tests {
             .iter()
             .any(|line| line == "GPU-I  metal J3 S196,608 t0.42ms"));
         assert!(think.iter().any(|line| line == "GPU+   boost p82% d+1.2%"));
+        assert!(think
+            .iter()
+            .any(|line| line == "GPU-U  R4 C9 markov:marko +1.20%"));
+        assert!(think
+            .iter()
+            .any(|line| line == "Delib  cal S1 c78% G24 g3 F1"));
+        assert!(think
+            .iter()
+            .any(|line| line == "S2>S1  G12 +8/-2 n2 s20 c66%"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -1600,7 +1696,6 @@ mod tests {
             reactor_mode: "normal".to_string(),
             reactor_health: "ok".to_string(),
             metrics,
-            llm: None,
             frozen_processes: Vec::new(),
         };
 

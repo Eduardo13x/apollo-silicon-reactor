@@ -13,7 +13,7 @@ use std::path::Path;
 
 use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 use apollo_engine::engine::action_planner::{
-    plan_actions, IntentEvidence, PlanReport, PlanningContext,
+    plan_actions, GpuRankInfluence, IntentEvidence, PlanReport, PlanningContext,
 };
 use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest};
 use apollo_engine::engine::audit_types::PolicyDecisionTrace;
@@ -545,27 +545,33 @@ fn plan_action_intents_inner(
     let mut gpu_supported_actions = Vec::new();
     if let Some(runtime) = gpu.as_mut() {
         gpu_completed = runtime.worker.take_completed();
-        if let Some(result) = runtime.worker.latest().cloned() {
-            if result.is_fresh_for(runtime.cycle, workload) {
-                let mut supported_keys = HashSet::new();
-                for key in &action_keys {
-                    if !supported_keys.insert(key) {
-                        continue;
-                    }
-                    let Some(raw_support) = result.support_for(key) else {
-                        continue;
-                    };
-                    let support =
-                        world_model.calibrate_gpu_rank_support(key, workload, raw_support);
-                    if support.abs() <= f64::EPSILON {
-                        continue;
-                    }
-                    let evidence = context.utility_evidence.entry(key.clone()).or_default();
-                    evidence.expected_benefit += support;
-                    gpu_support_uses = gpu_support_uses.saturating_add(1);
-                    gpu_supported_actions.push(key.clone());
-                }
+        let latest_result = runtime.worker.latest().cloned();
+        let mut supported_keys = HashSet::new();
+        for key in &action_keys {
+            if !supported_keys.insert(key) {
+                continue;
             }
+            // Prefer the World Model's bounded cache: the async worker may
+            // have already moved on to another specialist portfolio, while
+            // this root action still has fresh advice from its own batch.
+            let support = world_model.gpu_rank_support_for(key, workload).or_else(|| {
+                latest_result
+                    .as_ref()
+                    .filter(|result| result.is_fresh_for(runtime.cycle, workload))
+                    .and_then(|result| result.support_for(key))
+                    .map(|raw| world_model.calibrate_gpu_rank_support(key, workload, raw))
+                    .filter(|support| support.abs() > f64::EPSILON)
+            });
+            let Some(support) = support else {
+                continue;
+            };
+            let evidence = context.utility_evidence.entry(key.clone()).or_default();
+            evidence.expected_benefit += support;
+            gpu_support_uses = gpu_support_uses.saturating_add(1);
+            gpu_supported_actions.push(GpuRankInfluence {
+                action_key: key.clone(),
+                support,
+            });
         }
         let mut gpu_candidates: Vec<_> = temporal_plan
             .action_scores
@@ -576,6 +582,24 @@ fn plan_action_intents_inner(
                 uncertainty: score.uncertainty,
             })
             .collect();
+        let temporal_keys: HashSet<_> = gpu_candidates
+            .iter()
+            .map(|candidate| candidate.action_key.clone())
+            .collect();
+        // Cold root actions do not yet have a temporal score. They still need
+        // a chance to be imagined, otherwise the only GPU work is the
+        // cross-engine portfolio and a root ranking can never get evidence.
+        for key in &action_keys {
+            if !temporal_keys.contains(key) {
+                gpu_candidates.push(gpu_portfolio_candidate(
+                    world_model,
+                    workload,
+                    key,
+                    0.0,
+                    1.0,
+                ));
+            }
+        }
         gpu_candidates.sort_by(|left, right| {
             right
                 .expected_gain
@@ -835,7 +859,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     // ── Per-PID dedup chokepoint ─────────────────────────────────────────────
     // Single consolidation pass before execute_actions. 14 upstream emission
     // paths (decide_actions, daemon_paging_hints, daemon_agent_actions,
-    // process_enrichment, llm_daemon, freeze-confirmation, etc.) push freely;
+    // process_enrichment, local policy, freeze-confirmation, etc.) push freely;
     // here we collapse duplicate (pid, kind) pairs. Without this, pid 65808
     // received SetMemorystatus 8× in the same second (prod observation).
     // [Saltzer & Schroeder 1975] Economy of Mechanism.
@@ -1114,11 +1138,11 @@ mod tests {
     use apollo_engine::engine::circuit_breaker::{CircuitBreaker, CircuitState};
     use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
     use apollo_engine::engine::daemon_state::{
-        HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState, UsageDomainState,
+        HardwareState, MetricsState, PolicyState, ProcessState, UsageDomainState,
     };
     use apollo_engine::engine::degradation::DegradationController;
-    use apollo_engine::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
     use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::policy_store::LearnedPolicy;
     use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
     use apollo_engine::engine::types::{
         CapabilityReport, LatencyTarget, OptimizationProfile, RuntimeMetrics,
@@ -1138,6 +1162,8 @@ mod tests {
                     OptimizationProfile::BalancedRoot,
                 ),
                 learned_policy: LearnedPolicy::default(),
+                learned_policy_path: PathBuf::from("/tmp/apollo_test_lp"),
+                feedback_path: PathBuf::from("/tmp/apollo_test_feedback"),
                 adaptive_governor: AdaptiveGovernor::new(),
                 timeline: std::collections::VecDeque::new(),
                 circuit_breaker: CircuitBreaker::default(),
@@ -1166,28 +1192,6 @@ mod tests {
                 },
             })),
             stop: Arc::new(AtomicBool::new(false)),
-            llm: Arc::new(Mutex::new(LlmDomainState {
-                llm_cfg: LlmConfig {
-                    enabled: None,
-                    endpoint: None,
-                    model: None,
-                    min_confidence: None,
-                    max_calls_per_hour: None,
-                    min_interval_secs: None,
-                    timeout_ms: None,
-                    force_json: None,
-                    always_on: None,
-                    max_tokens: None,
-                    disable_thinking: None,
-                },
-                llm_state: LlmState::default(),
-                llm_state_path: PathBuf::from("/tmp/apollo_test_llm_state"),
-                llm_key_path: PathBuf::from("/tmp/apollo_test_llm_key"),
-                learned_policy_path: PathBuf::from("/tmp/apollo_test_lp"),
-                feedback_path: PathBuf::from("/tmp/apollo_test_feedback"),
-                suggestions_path: PathBuf::from("/tmp/apollo_test_suggestions"),
-            })),
-            config_path: PathBuf::from("/tmp/apollo_test_config"),
             user_profile_path: PathBuf::from("/tmp/apollo_test_user_profile"),
             usage: Arc::new(Mutex::new(UsageDomainState {
                 usage_model: UsageModel::default(),

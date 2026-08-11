@@ -3,7 +3,7 @@
 
 use apollo_engine::engine::{
     adaptive_governor::AdaptiveGovernor,
-    llm::LearnedPolicy,
+    policy_store::LearnedPolicy,
     user_profile::{UserProfile, UserProfilePersisted, WorkloadType},
     workload_classifier::{ClassifierSource, WorkloadClassification, WorkloadClassifier},
 };

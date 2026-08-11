@@ -542,7 +542,7 @@ pub fn execute_actions(
                     // no-op tautology (verify always accepted, counter was
                     // perma-zero across 59 675 cycles). Producers populate
                     // start_sec at all Boost emit sites — see
-                    // decide_actions.rs / llm_daemon.rs sweep.
+                    // decide_actions.rs / local_policy_learning.rs sweep.
                     if !ProcessIdentity::verify(*pid, Some(name), *start_sec, *start_usec) {
                         crate::engine::lse_counters::LSE_COUNTERS.inc_pid_recycle_block();
                         block_reason = Some(BlockReason::PidRecycled);

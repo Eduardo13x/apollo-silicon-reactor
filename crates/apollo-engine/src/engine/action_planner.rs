@@ -66,7 +66,7 @@ pub struct PlanReport {
     pub gpu_imagination_gpu_time_ns: u64,
     pub gpu_imagination_wall_time_ns: u64,
     pub gpu_imagination_support_uses: u64,
-    pub gpu_imagination_supported_actions: Vec<String>,
+    pub gpu_imagination_supported_actions: Vec<GpuRankInfluence>,
     pub gpu_imagination_best_action: Option<String>,
     pub gpu_imagination_best_positive_probability: f64,
     pub gpu_imagination_best_p10_gain: f64,
@@ -77,6 +77,15 @@ pub struct PlanReport {
     pub temporal_authoritative_best_second: Option<String>,
     pub temporal_abstention_reason: Option<String>,
     pub last_resolution: Option<String>,
+}
+
+/// A root-planner ranking that was measurably tilted by a fresh GPU forecast.
+/// The planner still owns admission and ordering; this record exists solely
+/// for calibration and source-aware observability.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GpuRankInfluence {
+    pub action_key: String,
+    pub support: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

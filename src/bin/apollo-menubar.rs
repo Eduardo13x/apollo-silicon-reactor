@@ -413,24 +413,18 @@ fn build_menu(status: &Option<DaemonStatus>, updated_secs_ago: u64) -> tray_icon
         fmt_num(m.freezes_applied)
     )));
 
-    if let Some(llm) = &s.llm {
-        let _ = detail.append(&PredefinedMenuItem::separator());
-        let estado = if llm.enabled && llm.training_active {
-            "🟢 Activo"
-        } else if llm.enabled {
-            "🟡 Standby"
-        } else {
-            "⬜ Desactivado"
-        };
-        let _ = detail.append(&di(&format!(
-            "🤖  LLM Teacher: {}  Budget: {}/{}",
-            estado, llm.daily_budget_remaining, llm.daily_budget
-        )));
-        let _ = detail.append(&di(&format!(
-            "   Patrones: {} inter / {} ruido",
-            llm.learned_policy.interactive_patterns, llm.learned_policy.noise_patterns
-        )));
-    }
+    let _ = detail.append(&PredefinedMenuItem::separator());
+    let _ = detail.append(&di(&format!(
+        "System 2: {}  confianza {:.0}%",
+        m.system_deliberation_mode,
+        m.system_deliberation_confidence * 100.0
+    )));
+    let _ = detail.append(&di(&format!(
+        "   S2>S1: {} Gold  {} familias  {} reflejos",
+        m.system_deliberation_local_gold,
+        m.system_deliberation_local_families,
+        m.local_consolidation_system1_updates
+    )));
 
     let _ = menu.append(&detail);
     let _ = menu.append(&sep());

@@ -30,6 +30,7 @@ use apollo_engine::engine::learned_state::{
     LearnableParams, LearnedState, LearnedStateSupplement, RestoreQualityMonitor,
 };
 use apollo_engine::engine::learning_pipeline::{ActionKind, LearningObservation, LearningPipeline};
+use apollo_engine::engine::local_consolidation::LocalConsolidator;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::meta_cognition::MetaCognition;
@@ -179,6 +180,7 @@ pub fn run_learning_tick<'a>(
     ode_t_sat_urgency: f64,
     maintenance_state: &MaintenanceState,
     meta_cognition: &MetaCognition,
+    local_consolidator: &LocalConsolidator,
 ) {
     // Live context and universal actuator evidence are observed by the daemon
     // before this function so cognitive learning pauses cannot create holes in
@@ -957,6 +959,7 @@ pub fn run_learning_tick<'a>(
             Some(nested_learner.clone()),
             maintenance_state,
             LearnedStateSupplement {
+                local_consolidator: Some(local_consolidator.clone()),
                 neuro_state: Some(lctx.neuromod.snapshot()),
                 meta_cognition: Some(meta_cognition.clone()),
                 medallion_state: Some(learning_pipeline.medallion_snapshot()),

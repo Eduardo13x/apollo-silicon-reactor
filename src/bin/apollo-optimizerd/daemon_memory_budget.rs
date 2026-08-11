@@ -56,7 +56,7 @@ impl MemoryBudgetState {
     /// Returns true when the system is in a hysteresis recovery window:
     /// exited Critical zone within the last 30 seconds.
     /// [Hellerstein 2004 §9] — recovery markers preserve regime context
-    /// for downstream consumers (audit log, LLM teacher).
+    /// for downstream consumers (audit log, World Model, local learner).
     pub fn recovering_from_critical(&self) -> bool {
         self.last_critical_exit_at
             .map(|t| t.elapsed() <= Duration::from_secs(30))
@@ -357,12 +357,12 @@ mod tests {
     use apollo_engine::engine::circuit_breaker::CircuitBreaker;
     use apollo_engine::engine::daemon_helpers::WakeRuntimeState;
     use apollo_engine::engine::daemon_state::{
-        HardwareState, LlmDomainState, MetricsState, PolicyState, ProcessState, ReactorStatus,
-        UsageDomainState, UsageTrackerState,
+        HardwareState, MetricsState, PolicyState, ProcessState, ReactorStatus, UsageDomainState,
+        UsageTrackerState,
     };
     use apollo_engine::engine::degradation::DegradationController;
-    use apollo_engine::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
     use apollo_engine::engine::mach_qos::MachQoSManager;
+    use apollo_engine::engine::policy_store::LearnedPolicy;
     use apollo_engine::engine::profile_governor::ProfileGovernor;
     use apollo_engine::engine::sysctl_governor::SysctlGovernorStatus;
     use apollo_engine::engine::thermal_interrupt::ResourceInterruptState;
@@ -391,6 +391,8 @@ mod tests {
                 profile: OptimizationProfile::BalancedRoot,
                 governor: ProfileGovernor::new(OptimizationProfile::BalancedRoot),
                 learned_policy: LearnedPolicy::default(),
+                learned_policy_path: PathBuf::from("/tmp/apollo_mock_lp"),
+                feedback_path: PathBuf::from("/tmp/apollo_mock_feedback"),
                 adaptive_governor: AdaptiveGovernor::new(),
                 latency_target: LatencyTarget::Normal,
                 timeline: VecDeque::new(),
@@ -429,15 +431,6 @@ mod tests {
                     fs_consecutive_low: 0,
                 },
             })),
-            llm: Arc::new(Mutex::new(LlmDomainState {
-                llm_cfg: LlmConfig::default(),
-                llm_state: LlmState::default(),
-                llm_state_path: PathBuf::from("/tmp/apollo_mock_llm_state"),
-                llm_key_path: PathBuf::from("/tmp/apollo_mock_llm_key"),
-                learned_policy_path: PathBuf::from("/tmp/apollo_mock_lp"),
-                feedback_path: PathBuf::from("/tmp/apollo_mock_feedback"),
-                suggestions_path: PathBuf::from("/tmp/apollo_mock_suggestions"),
-            })),
             usage: Arc::new(Mutex::new(UsageDomainState {
                 usage_model: UsageModel::default(),
                 usage_tracker: UsageTrackerState::default(),
@@ -457,7 +450,6 @@ mod tests {
             cycle_condvar: Arc::new((Mutex::new(false), Condvar::new())),
             resource_interrupt: Arc::new(ResourceInterruptState::new()),
             subscribers: Arc::new(Mutex::new(Vec::new())),
-            config_path: PathBuf::from("/tmp/apollo_mock_config"),
             user_profile_path: PathBuf::from("/tmp/apollo_mock_user_profile"),
         }
     }

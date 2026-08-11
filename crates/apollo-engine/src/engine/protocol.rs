@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::engine::llm::{LearnedPolicy, LlmSuggestion};
+use crate::engine::policy_store::LearnedPolicy;
 
 /// Wire protocol version.  Bump when adding variants that older clients/daemons
 /// cannot understand.  Both apollo-optimizerd and apollo-optimizerctl expose
@@ -8,10 +8,10 @@ use crate::engine::llm::{LearnedPolicy, LlmSuggestion};
 ///
 /// Cross-crate visibility: read by apollo-optimizerctl to detect daemon version mismatches.
 /// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 use crate::engine::types::{
-    BlockerScore, CapabilityReport, DaemonStatus, HealthReport, LatencyTarget, LlmStatus,
-    OptimizationProfile, ProfileTransition, RuntimeMetrics, UsageResponse,
+    BlockerScore, CapabilityReport, DaemonStatus, HealthReport, LatencyTarget, OptimizationProfile,
+    ProfileTransition, RuntimeMetrics, UsageResponse,
 };
 
 /// IPC request type.
@@ -41,14 +41,7 @@ pub enum DaemonRequest {
     Restore,
     PanicRestore,
     Doctor,
-    GetLlmStatus,
     GetLearnedPolicy,
-    LlmSetKey {
-        api_key: String,
-        ttl_days: u64,
-    },
-    LlmDisable,
-    LlmTest,
     UsageTop {
         limit: Option<usize>,
     },
@@ -58,9 +51,6 @@ pub enum DaemonRequest {
     Feedback {
         rating: String,
         note: Option<String>,
-    },
-    SetLearnedPolicy {
-        policy: LearnedPolicy,
     },
     GetSysctlGovernor,
     /// Revert all sysctl changes made by the daemon to their startup defaults.
@@ -86,7 +76,6 @@ impl DaemonRequest {
             | Self::GetCapabilities
             | Self::GetProfileTimeline
             | Self::Doctor
-            | Self::GetLlmStatus
             | Self::UsageTop { .. }
             | Self::UsageExplain { .. }
             | Self::GetLearnedPolicy
@@ -101,11 +90,7 @@ impl DaemonRequest {
             | Self::ClearProfileOverride
             | Self::Restore
             | Self::PanicRestore
-            | Self::LlmSetKey { .. }
-            | Self::LlmDisable
-            | Self::LlmTest
             | Self::Feedback { .. }
-            | Self::SetLearnedPolicy { .. }
             | Self::RevertSysctls
             | Self::Purge => true,
         }
@@ -113,9 +98,6 @@ impl DaemonRequest {
 
     pub fn sanitize(&mut self) {
         match self {
-            Self::LlmSetKey { api_key, .. } if api_key.len() > 1024 => {
-                api_key.truncate(1024);
-            }
             Self::UsageExplain { name } if name.len() > 256 => {
                 name.truncate(256);
             }
@@ -152,14 +134,7 @@ pub enum DaemonResponse {
     Doctor {
         checks: Vec<String>,
     },
-    LlmStatus(LlmStatus),
     LearnedPolicy(LearnedPolicy),
-    LlmTestResult {
-        ok: bool,
-        http_status: Option<u16>,
-        error: Option<String>,
-        suggestion: Option<LlmSuggestion>,
-    },
     Usage(UsageResponse),
     SysctlGovernor(crate::engine::sysctl_governor::SysctlGovernorStatus),
     /// Evento push enviado por el daemon a los suscriptores en cada ciclo.
@@ -237,22 +212,6 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_llm_set_key_fields() {
-        let req = DaemonRequest::LlmSetKey {
-            api_key: "sk-test".to_string(),
-            ttl_days: 7,
-        };
-        let rt = roundtrip(&req);
-        match rt {
-            DaemonRequest::LlmSetKey { api_key, ttl_days } => {
-                assert_eq!(api_key, "sk-test");
-                assert_eq!(ttl_days, 7);
-            }
-            other => panic!("unexpected variant: {:?}", other),
-        }
-    }
-
-    #[test]
     fn roundtrip_usage_explain_fields() {
         let req = DaemonRequest::UsageExplain {
             name: "Brave".to_string(),
@@ -303,11 +262,6 @@ mod tests {
     }
 
     #[test]
-    fn privileged_llm_disable() {
-        assert!(DaemonRequest::LlmDisable.is_privileged());
-    }
-
-    #[test]
     fn privileged_panic_restore() {
         assert!(DaemonRequest::PanicRestore.is_privileged());
     }
@@ -323,42 +277,24 @@ mod tests {
 
     // ── sanitize tests ────────────────────────────────────────────────────────
 
-    #[test]
-    fn sanitize_llm_set_key_does_not_panic() {
-        let mut req = DaemonRequest::LlmSetKey {
-            api_key: "sk-test".to_string(),
-            ttl_days: 7,
-        };
-        req.sanitize();
-        match req {
-            DaemonRequest::LlmSetKey { api_key, .. } => {
-                assert!(!api_key.is_empty());
-            }
-            other => panic!("unexpected variant: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn sanitize_truncates_overlong_api_key() {
-        let long_key = "x".repeat(2000);
-        let mut req = DaemonRequest::LlmSetKey {
-            api_key: long_key,
-            ttl_days: 1,
-        };
-        req.sanitize();
-        match req {
-            DaemonRequest::LlmSetKey { api_key, .. } => {
-                assert!(api_key.len() <= 1024);
-            }
-            other => panic!("unexpected variant: {:?}", other),
-        }
-    }
-
     // ── PROTOCOL_VERSION test ─────────────────────────────────────────────────
 
     #[test]
     fn protocol_version_is_positive() {
         assert!(PROTOCOL_VERSION > 0);
+    }
+
+    #[test]
+    fn retired_teacher_requests_are_rejected_by_protocol_v2() {
+        for request in [
+            r#"{"type":"GetLlmStatus"}"#,
+            r#"{"type":"LlmDisable"}"#,
+            r#"{"type":"LlmTest"}"#,
+            r#"{"type":"LlmSetKey","payload":{"api_key":"secret","ttl_days":7}}"#,
+            r#"{"type":"SetLearnedPolicy","payload":{"policy":{}}}"#,
+        ] {
+            assert!(serde_json::from_str::<DaemonRequest>(request).is_err());
+        }
     }
 
     #[test]

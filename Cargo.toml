@@ -16,7 +16,6 @@ anyhow = "1.0"
 libc = "0.2"
 ctrlc = "3.4"
 toml = "0.8"
-ureq = "2.12"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tempfile = "3"
@@ -55,7 +54,6 @@ anyhow.workspace = true
 libc.workspace = true
 ctrlc = { workspace = true, features = ["termination"] }
 toml.workspace = true
-ureq = { workspace = true, features = ["json"] }
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
 aho-corasick.workspace = true

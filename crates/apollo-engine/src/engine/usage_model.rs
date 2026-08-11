@@ -139,7 +139,7 @@ impl UsageModel {
     }
 
     pub fn persist(&self, path: &Path) {
-        crate::engine::llm::write_json(path, &self.persisted, Some(0o600));
+        crate::engine::policy_store::write_json(path, &self.persisted, Some(0o600));
     }
 
     pub fn update_from_snapshot(

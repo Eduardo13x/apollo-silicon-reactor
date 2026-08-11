@@ -5,7 +5,7 @@
 //! Si no bajó: el heurístico está gastando budget en algo inútil.
 //!
 //! Los resultados alimentan pesos Bayesianos por proceso (`PatternWeight`),
-//! que a su vez informan al LLM cuándo el heurístico está fallando.
+//! que a su vez informan al deliberador local cuándo el heurístico está fallando.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -91,7 +91,7 @@ impl PatternWeight {
     // Honest reads for class-reclassification consumers: return `None` (or
     // `false`) for hard-protected processes so downstream code never promotes
     // them based on the structurally-degraded throttle signal. RL penalty,
-    // skip-future-throttles, and LLM-struggling consumers retain the raw
+    // skip-future-throttles, and System-1-struggling consumers retain the raw
     // `effectiveness()` / `is_low_value*` semantics — the waste signal is
     // genuinely informative for those paths.
 
@@ -1171,7 +1171,7 @@ impl OutcomeTracker {
         // action, NOT a signal that they don't cause pressure. Excluding
         // them from the `low_value_names` reclassification signal prevents
         // the documented Boost-loop (110 boosts on Brave per 200 actions).
-        // RL penalty + LLM-struggling continue to consume the raw
+        // RL penalty + System-1-struggling continue to consume the raw
         // `is_low_value_vs_baseline` signal — they want to see the waste.
         let threshold = self.calibrated_threshold();
         let low_value_names: Vec<String> = self
@@ -1206,7 +1206,7 @@ impl OutcomeTracker {
     }
 
     /// Efectividad global del heurístico [0,1].
-    /// < 0.40 indica que el heurístico está fallando y conviene llamar al LLM.
+    /// < 0.40 indica que System 1 está fallando y conviene deliberar localmente.
     pub fn overall_effectiveness(&self) -> f64 {
         if self.total_resolved < 5 {
             return 0.5; // sin datos suficientes, asumir neutral
@@ -1401,7 +1401,7 @@ impl OutcomeTracker {
     }
 
     /// True si el heurístico tiene patrones confirmados como low-value
-    /// y la efectividad global es baja — señal para llamar al LLM.
+    /// y la efectividad global es baja — señal para activar System 2 local.
     pub fn heuristic_is_struggling(&self) -> bool {
         self.total_resolved >= 10
             && self.overall_effectiveness() < 0.35

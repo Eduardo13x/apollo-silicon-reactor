@@ -8,7 +8,6 @@
 //! - PolicyState: optimization profile, governor, learned policy
 //! - ProcessState: frozen processes, blockers, wake state
 //! - HardwareState: hardware snapshots, QoS, sysctl governor
-//! - LlmDomainState: LLM config/state and associated paths
 //! - UsageDomainState: usage model and tracker
 
 use std::collections::{HashMap, VecDeque};
@@ -25,8 +24,8 @@ use crate::engine::circuit_breaker::CircuitBreaker;
 use crate::engine::daemon_helpers::WakeRuntimeState;
 use crate::engine::degradation::DegradationController;
 use crate::engine::iokit_sensors::HardwareSnapshot;
-use crate::engine::llm::{LearnedPolicy, LlmConfig, LlmState};
 use crate::engine::mach_qos::MachQoSManager;
+use crate::engine::policy_store::LearnedPolicy;
 use crate::engine::profile_governor::ProfileGovernor;
 use crate::engine::sysctl_governor::SysctlGovernorStatus;
 use crate::engine::thermal_interrupt::ResourceInterruptState;
@@ -457,10 +456,13 @@ pub struct PolicyState {
     pub profile: OptimizationProfile,
     pub governor: ProfileGovernor,
     pub learned_policy: LearnedPolicy,
+    /// Immutable local persistence paths owned by the policy domain.
+    pub learned_policy_path: PathBuf,
+    pub feedback_path: PathBuf,
     pub adaptive_governor: AdaptiveGovernor,
     pub latency_target: LatencyTarget,
     pub timeline: VecDeque<ProfileTransition>,
-    /// Resilience: circuit breaker for external calls (LLM, sysctl, etc.).
+    /// Resilience: circuit breaker for privileged system operations.
     pub circuit_breaker: CircuitBreaker,
     /// Resilience: graceful degradation controller for policy quality tiers.
     pub degradation: DegradationController,
@@ -488,24 +490,6 @@ pub struct ProcessState {
 pub struct HardwareState {
     pub last_hw_snapshot: Option<HardwareSnapshot>,
     pub sysctl_governor_status: SysctlGovernorStatus,
-}
-
-// ── LLM Domain ──────────────────────────────────────────────────────────────
-
-/// LLM configuration, state, and associated file paths.
-///
-/// Cross-crate visibility: constructed in apollo-optimizerd main.rs and daemon tests;
-/// accessed by daemon_skill_tick.rs and llm_daemon.rs. Audited 2026-05-09 during Sprint 5
-/// Mes 0 workspace split.
-pub struct LlmDomainState {
-    pub llm_cfg: LlmConfig,
-    pub llm_state: LlmState,
-    /// Paths are immutable after initialization.
-    pub llm_state_path: PathBuf,
-    pub llm_key_path: PathBuf,
-    pub learned_policy_path: PathBuf,
-    pub feedback_path: PathBuf,
-    pub suggestions_path: PathBuf,
 }
 
 // ── Usage Domain ────────────────────────────────────────────────────────────
@@ -607,7 +591,6 @@ pub struct SharedState {
     pub policy: Arc<Mutex<PolicyState>>,
     pub process: Arc<Mutex<ProcessState>>,
     pub hardware: Arc<Mutex<HardwareState>>,
-    pub llm: Arc<Mutex<LlmDomainState>>,
     pub usage: Arc<Mutex<UsageDomainState>>,
 
     // Sentinel-coupled fields (kept flat — see doc comment above)
@@ -636,6 +619,5 @@ pub struct SharedState {
     pub subscribers: Arc<Mutex<Vec<UnixStream>>>,
 
     // Read-only paths (set once at init)
-    pub config_path: PathBuf,
     pub user_profile_path: PathBuf,
 }

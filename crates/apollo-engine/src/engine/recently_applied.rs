@@ -84,7 +84,7 @@ pub enum RestoreStatus {
 
 /// Action kind for cache keying — broader than GovernorDecision because
 /// it covers paths that emit RootAction directly (paging_hints, deep-scan,
-/// llm_daemon, decide_actions) without going through the heuristic governor.
+/// local policy learning, decide_actions) without going through the heuristic governor.
 ///
 /// Distinct from `GovernorDecision` because:
 /// - SetMemorystatus has no GovernorDecision equivalent (it's an OS-level hint)

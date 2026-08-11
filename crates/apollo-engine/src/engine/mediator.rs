@@ -813,7 +813,7 @@ impl Effector for PurgeableEffector {
 }
 
 /// Effector for atomic file writes (journal, learned_state, runtime_metrics).
-/// Writes go through `crate::engine::llm::write_json_fsync` style temp+rename
+/// Writes go through `crate::engine::policy_store::write_json_fsync` style temp+rename
 /// semantics in the switch-over sprint. The Phase F implementation here is
 /// the typed surface that production writers will adopt; concrete bytes
 /// arrive via a follow-up that threads the payload through.
@@ -839,7 +839,7 @@ impl Effector for FileWriteEffector {
         };
         // Phase F: typed surface only — no actual write. The switch-over
         // sprint plumbs the payload through and replaces this stub with
-        // `llm::write_json_fsync` semantics.
+        // `policy_store::write_json_fsync` semantics.
         let _ = path;
         Ok(Receipt {
             timestamp_unix: std::time::SystemTime::now()

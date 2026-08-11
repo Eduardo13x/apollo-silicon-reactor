@@ -9,12 +9,148 @@
 //! the default output device. This is the canonical macOS API for "is anyone
 //! using this output". True iff at least one IOProc on the device is active.
 //!
-//! Cost: ~50µs per call (two `AudioObjectGetPropertyData` round-trips).
-//! Cached at the same 3-cycle cadence as the existing pmset poll, so net
-//! cost in the daemon hot path is negligible.
+//! Direct HAL queries are cached process-wide. Successful probes have a short
+//! TTL; unavailable devices use exponential backoff. Root LaunchDaemons skip
+//! the direct probe entirely because their system bootstrap session has no
+//! per-user default device. The daemon still keeps the independent pmset,
+//! process, and screen-capture signals in that environment.
 
 #[cfg(target_os = "macos")]
 use std::mem;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+const SUCCESS_CACHE_TTL: Duration = Duration::from_secs(1);
+const FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(15);
+const FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AudioActivitySnapshot {
+    pub output_active: bool,
+    pub input_active: bool,
+    pub output_probe_available: bool,
+    pub input_probe_available: bool,
+    pub session_supported: bool,
+    pub direct_samples: u64,
+    pub cache_hits: u64,
+    pub failures: u64,
+}
+
+impl AudioActivitySnapshot {
+    #[inline]
+    pub fn realtime_call_active(self) -> bool {
+        self.output_active && self.input_active
+    }
+
+    pub fn probe_state(self) -> &'static str {
+        if !self.session_supported {
+            "session-fallback"
+        } else if self.output_probe_available && self.input_probe_available {
+            "direct"
+        } else if self.output_probe_available || self.input_probe_available {
+            "degraded"
+        } else {
+            "backoff"
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DeviceReading {
+    active: bool,
+    available: bool,
+}
+
+#[derive(Debug, Default)]
+struct DeviceProbeCache {
+    reading: DeviceReading,
+    next_probe_at: Option<Instant>,
+    failure_backoff: Option<Duration>,
+}
+
+impl DeviceProbeCache {
+    fn read_with(
+        &mut self,
+        now: Instant,
+        probe: impl FnOnce() -> DeviceReading,
+    ) -> (DeviceReading, bool, bool) {
+        if self.next_probe_at.is_some_and(|next| now < next) {
+            return (self.reading, true, false);
+        }
+
+        let reading = probe();
+        self.reading = reading;
+        if reading.available {
+            self.failure_backoff = None;
+            self.next_probe_at = Some(now + SUCCESS_CACHE_TTL);
+        } else {
+            let backoff = self
+                .failure_backoff
+                .unwrap_or(FAILURE_BACKOFF_INITIAL)
+                .min(FAILURE_BACKOFF_MAX);
+            self.next_probe_at = Some(now + backoff);
+            self.failure_backoff = Some((backoff * 2).min(FAILURE_BACKOFF_MAX));
+        }
+        (reading, false, !reading.available)
+    }
+}
+
+#[derive(Debug, Default)]
+struct AudioProbeCache {
+    output: DeviceProbeCache,
+    input: DeviceProbeCache,
+    direct_samples: u64,
+    cache_hits: u64,
+    failures: u64,
+}
+
+impl AudioProbeCache {
+    fn sample_with(
+        &mut self,
+        now: Instant,
+        session_supported: bool,
+        output_probe: impl FnOnce() -> DeviceReading,
+        input_probe: impl FnOnce() -> DeviceReading,
+    ) -> AudioActivitySnapshot {
+        if !session_supported {
+            return AudioActivitySnapshot {
+                session_supported: false,
+                direct_samples: self.direct_samples,
+                cache_hits: self.cache_hits,
+                failures: self.failures,
+                ..AudioActivitySnapshot::default()
+            };
+        }
+
+        let (output, output_cached, output_failed) = self.output.read_with(now, output_probe);
+        let (input, input_cached, input_failed) = self.input.read_with(now, input_probe);
+        self.direct_samples = self
+            .direct_samples
+            .saturating_add(u64::from(!output_cached) + u64::from(!input_cached));
+        self.cache_hits = self
+            .cache_hits
+            .saturating_add(u64::from(output_cached) + u64::from(input_cached));
+        self.failures = self
+            .failures
+            .saturating_add(u64::from(output_failed) + u64::from(input_failed));
+
+        AudioActivitySnapshot {
+            output_active: output.active,
+            input_active: input.active,
+            output_probe_available: output.available,
+            input_probe_available: input.available,
+            session_supported: true,
+            direct_samples: self.direct_samples,
+            cache_hits: self.cache_hits,
+            failures: self.failures,
+        }
+    }
+}
+
+fn audio_probe_cache() -> &'static Mutex<AudioProbeCache> {
+    static CACHE: OnceLock<Mutex<AudioProbeCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AudioProbeCache::default()))
+}
 
 #[cfg(target_os = "macos")]
 type AudioObjectID = u32;
@@ -60,15 +196,9 @@ extern "C" {
     ) -> OSStatus;
 }
 
-/// True when audio is actively flowing through the default output device.
-///
-/// Returns `false` on any error (no default output, query failure, non-macOS).
-/// Errors are silent because this signal is OR'd with other media indicators
-/// — a missed detection only weakens the gate; never falsely fires it.
 #[cfg(target_os = "macos")]
-pub fn is_audio_running_somewhere() -> bool {
+fn probe_output_device() -> DeviceReading {
     unsafe {
-        // Step 1: resolve default output device id.
         let default_out_addr = AudioObjectPropertyAddress {
             selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
             scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
@@ -85,10 +215,9 @@ pub fn is_audio_running_somewhere() -> bool {
             &mut device_id as *mut _ as *mut std::ffi::c_void,
         );
         if status != 0 || device_id == 0 {
-            return false;
+            return DeviceReading::default();
         }
 
-        // Step 2: query is-running-somewhere on that device.
         let running_addr = AudioObjectPropertyAddress {
             selector: K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_RUNNING_SOMEWHERE,
             scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
@@ -105,15 +234,18 @@ pub fn is_audio_running_somewhere() -> bool {
             &mut running as *mut _ as *mut std::ffi::c_void,
         );
         if status2 != 0 {
-            return false;
+            return DeviceReading::default();
         }
-        running != 0
+        DeviceReading {
+            active: running != 0,
+            available: true,
+        }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn is_audio_running_somewhere() -> bool {
-    false
+fn probe_output_device() -> DeviceReading {
+    DeviceReading::default()
 }
 
 /// True when the default INPUT device (microphone) is actively capturing.
@@ -133,9 +265,8 @@ pub fn is_audio_running_somewhere() -> bool {
 /// video on the user's call. `is_realtime_call_active()` gates both branches
 /// from re-firing during a live full-duplex call.
 #[cfg(target_os = "macos")]
-pub fn is_audio_input_active() -> bool {
+fn probe_input_device() -> DeviceReading {
     unsafe {
-        // Step 1: resolve default input device id.
         let default_in_addr = AudioObjectPropertyAddress {
             selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_INPUT_DEVICE,
             scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
@@ -152,10 +283,9 @@ pub fn is_audio_input_active() -> bool {
             &mut device_id as *mut _ as *mut std::ffi::c_void,
         );
         if status != 0 || device_id == 0 {
-            return false;
+            return DeviceReading::default();
         }
 
-        // Step 2: query is-running-somewhere on that input device.
         let running_addr = AudioObjectPropertyAddress {
             selector: K_AUDIO_DEVICE_PROPERTY_DEVICE_IS_RUNNING_SOMEWHERE,
             scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
@@ -172,15 +302,71 @@ pub fn is_audio_input_active() -> bool {
             &mut running as *mut _ as *mut std::ffi::c_void,
         );
         if status2 != 0 {
-            return false;
+            return DeviceReading::default();
         }
-        running != 0
+        DeviceReading {
+            active: running != 0,
+            available: true,
+        }
     }
 }
 
 #[cfg(not(target_os = "macos"))]
+fn probe_input_device() -> DeviceReading {
+    DeviceReading::default()
+}
+
+#[inline]
+fn direct_session_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // A root LaunchDaemon lives in the system bootstrap namespace. HAL's
+        // default-device selectors are per-login-session and emit an error on
+        // every query from that namespace. Apollo's pmset/process/capture
+        // fallbacks remain active, so skipping a known-invalid direct source
+        // is both cheaper and semantically honest.
+        unsafe { libc::geteuid() != 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Cached direct CoreAudio state and probe diagnostics.
+///
+/// All callers share this snapshot, so maintenance, Chromium, sysctl, policy,
+/// and user-context paths cannot independently hammer HAL in the same cycle.
+pub fn audio_activity_snapshot() -> AudioActivitySnapshot {
+    if !direct_session_supported() {
+        return AudioActivitySnapshot {
+            session_supported: false,
+            ..AudioActivitySnapshot::default()
+        };
+    }
+    let mut cache = audio_probe_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.sample_with(
+        Instant::now(),
+        true,
+        probe_output_device,
+        probe_input_device,
+    )
+}
+
+/// True when audio is actively flowing through the default output device.
+///
+/// Returns `false` when the direct source is unavailable. Callers combine it
+/// with pmset, process, screen-capture, and workload signals as appropriate.
+#[inline]
+pub fn is_audio_running_somewhere() -> bool {
+    audio_activity_snapshot().output_active
+}
+
+#[inline]
 pub fn is_audio_input_active() -> bool {
-    false
+    audio_activity_snapshot().input_active
 }
 
 /// True when BOTH default output AND default input devices are running.
@@ -198,7 +384,7 @@ pub fn is_audio_input_active() -> bool {
 /// or input-only background ASR.
 #[inline]
 pub fn is_realtime_call_active() -> bool {
-    is_audio_running_somewhere() && is_audio_input_active()
+    audio_activity_snapshot().realtime_call_active()
 }
 
 /// Provisional fault-in storm threshold (pages/sec). Phase 0 baseline on M1
@@ -241,12 +427,125 @@ pub fn is_high_bw_workload_active(refault_pages_per_sec: f64, physical_pressure:
     if physical_pressure >= SURVIVAL_PRESSURE_FLOOR {
         return false; // drowning — relief wins, never suppress.
     }
-    is_realtime_call_active() || refault_pages_per_sec > STORM_REFAULT_PAGES_PER_SEC
+    if refault_pages_per_sec > STORM_REFAULT_PAGES_PER_SEC {
+        return true;
+    }
+    audio_activity_snapshot().realtime_call_active()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
+
+    fn available(active: bool) -> DeviceReading {
+        DeviceReading {
+            active,
+            available: true,
+        }
+    }
+
+    #[test]
+    fn shared_cache_samples_each_device_once_inside_success_ttl() {
+        let mut cache = AudioProbeCache::default();
+        let now = Instant::now();
+        let output_calls = Cell::new(0_u32);
+        let input_calls = Cell::new(0_u32);
+        let first = cache.sample_with(
+            now,
+            true,
+            || {
+                output_calls.set(output_calls.get() + 1);
+                available(true)
+            },
+            || {
+                input_calls.set(input_calls.get() + 1);
+                available(false)
+            },
+        );
+        let second = cache.sample_with(
+            now + Duration::from_millis(500),
+            true,
+            || {
+                output_calls.set(output_calls.get() + 1);
+                available(false)
+            },
+            || {
+                input_calls.set(input_calls.get() + 1);
+                available(true)
+            },
+        );
+
+        assert_eq!(output_calls.get(), 1);
+        assert_eq!(input_calls.get(), 1);
+        assert!(first.output_active);
+        assert_eq!(first.output_active, second.output_active);
+        assert_eq!(first.input_active, second.input_active);
+        assert_eq!(second.direct_samples, 2);
+        assert_eq!(second.cache_hits, 2);
+    }
+
+    #[test]
+    fn failed_device_uses_backoff_without_hiding_healthy_device() {
+        let mut cache = AudioProbeCache::default();
+        let now = Instant::now();
+        let output_calls = Cell::new(0_u32);
+        let input_calls = Cell::new(0_u32);
+        let _ = cache.sample_with(
+            now,
+            true,
+            || {
+                output_calls.set(output_calls.get() + 1);
+                available(true)
+            },
+            || {
+                input_calls.set(input_calls.get() + 1);
+                DeviceReading::default()
+            },
+        );
+        let next = cache.sample_with(
+            now + Duration::from_secs(2),
+            true,
+            || {
+                output_calls.set(output_calls.get() + 1);
+                available(true)
+            },
+            || {
+                input_calls.set(input_calls.get() + 1);
+                available(true)
+            },
+        );
+
+        assert_eq!(output_calls.get(), 2, "healthy output keeps its short TTL");
+        assert_eq!(input_calls.get(), 1, "failed input stays in backoff");
+        assert!(next.output_probe_available);
+        assert!(!next.input_probe_available);
+        assert_eq!(next.failures, 1);
+        assert_eq!(next.probe_state(), "degraded");
+    }
+
+    #[test]
+    fn unsupported_session_never_calls_hal() {
+        let mut cache = AudioProbeCache::default();
+        let called = Cell::new(false);
+        let snapshot = cache.sample_with(
+            Instant::now(),
+            false,
+            || {
+                called.set(true);
+                available(true)
+            },
+            || {
+                called.set(true);
+                available(true)
+            },
+        );
+
+        assert!(!called.get());
+        assert!(!snapshot.session_supported);
+        assert_eq!(snapshot.probe_state(), "session-fallback");
+        assert_eq!(snapshot.direct_samples, 0);
+    }
 
     #[test]
     fn query_does_not_panic() {

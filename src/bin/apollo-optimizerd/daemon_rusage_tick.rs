@@ -10,7 +10,7 @@
 //! - Update rusage_cpu_prev for the next cycle
 //!
 //! ## Ordering invariant
-//! Must run AFTER snapshot is collected and BEFORE llm_daemon::usage_learning_tick
+//! Must run AFTER snapshot is collected and BEFORE local_policy_learning::usage_learning_tick
 //! which consumes cpu_wall_ratios.
 
 use std::collections::HashMap;

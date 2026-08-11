@@ -5,15 +5,15 @@ apollo-silicon-reactor (macOS optimization daemon, M1 8GB).
 WHAT IT IS
 ==========
 A cheap, deterministic, READ-ONLY probe that reads live production state
-(runtime_metrics.json + journal.jsonl + learned_state.json + llm_state.json +
-live sysctls) and detects the runtime/journal/sysctl SIGNATURES of the
+(runtime_metrics.json + journal.jsonl + learned_state.json + live sysctls)
+and detects the runtime/journal/sysctl SIGNATURES of the
 regressions fixed THIS SESSION. It NEVER edits state — detection only; the fix
 is reasoned on-demand (supervision doctrine: the human is the gatekeeper).
 
 It is COMPLEMENTARY to scripts/apollo-learned-state-audit.py, which already
 covers the learned_state-pathology side (boost-loop-risk via weights,
 debias-saturated, humble-latched, restore-quality, weight-futile, ais-degraded,
-daemon-failures, llm-stale, purge-strangled). THIS probe focuses on the
+daemon-failures and purge-strangled). THIS probe focuses on the
 runtime+journal+sysctl BEHAVIORAL signatures and, crucially, a CYCLE-OVER-CYCLE
 TREND LOG so p95 / thrashing / refault / ais can be watched evolving over time.
 
@@ -37,9 +37,6 @@ SCARS GUARDED (each detector guards one regression fixed this session)
 - meet-scheduler/boost   4b0753e / 4ae0f27
     a single process name dominates BoostProcess in the recent journal (node was
     boosted 54x), OR boost churn on one pid.
-- llm-stale              d6c659b / 4b6da93 / 3df9235
-    teacher enabled but last SUCCESSFUL call >2d, OR consecutive_failures>=10,
-    OR last_error indicates metal-oom/parse failure.
 - complete-mediation     03472d7 / 6e0e1ce / a98b33a
     a hard-protected/Apple/dev-runtime process is the TARGET of
     FreezeProcess/ThrottleProcess/SetMemorystatus in the journal.
@@ -81,7 +78,6 @@ STATE_DIR = "/var/lib/apollo"
 METRICS = STATE_DIR + "/runtime_metrics.json"
 JOURNAL = STATE_DIR + "/journal.jsonl"
 LEARNED_STATE = STATE_DIR + "/learned_state.json"
-LLM = STATE_DIR + "/llm_state.json"
 
 # Trend log = the cycle-over-cycle metric history (one JSON line per probe run).
 TREND = STATE_DIR + "/regression-metrics.jsonl"
@@ -200,27 +196,6 @@ def fresh_entries(journal_tail, minutes):
 FRESH_WINDOW_MIN = 30
 
 
-def teacher_config_disabled():
-    """True iff the [llm] config explicitly sets enabled=false. Stdlib line
-    parse (no tomllib on python 3.9). Conservative: returns False on any read
-    failure so a genuinely-dead teacher is never masked."""
-    try:
-        with open("/etc/apollo-optimizer/config.toml") as f:
-            in_llm = False
-            for line in f:
-                s = line.strip()
-                if s.startswith("#"):
-                    continue
-                if s.startswith("[") and s.endswith("]"):
-                    in_llm = s == "[llm]"
-                    continue
-                if in_llm and s.replace(" ", "").startswith("enabled="):
-                    return "false" in s.lower()
-    except Exception:
-        pass
-    return False
-
-
 def read_sysctls():
     """Read the 4 critical sysctls via subprocess. Returns a dict
     {key: int-value}; a key maps to None on read/parse failure. Never raises."""
@@ -310,17 +285,16 @@ def _name_from_payload(kind, payload):
 
 
 # ── Detectors (common signature) ──────────────────────────────────────────────
-# Every detector: detect_x(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend)
+# Every detector: detect_x(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend)
 #   rt           : runtime_metrics.json dict (may be {} or {'__error__':..})
 #   journal_tail : list of recent journal entry dicts
-#   llm          : llm_state.json dict
 #   ls_size_mb   : float | None  (learned_state.json size in MB)
 #   ls_beliefs   : int   | None  (drift_detector.beliefs count)
 #   sysctls      : dict {key: int|None}
 #   trend        : list of prior metric dicts (chronological), for trend logic
 # Returns: list of (severity, code, detail) tuples. Never raises.
 
-def detect_purge_strangled(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
+def detect_purge_strangled(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend):
     """f770478 / 44266d8 / c041d88 — suppression strangling memory relief.
 
     Signature requires ALL THREE (prevents false positives on transient storms
@@ -399,7 +373,7 @@ def detect_purge_strangled(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctl
     return findings
 
 
-def detect_cycle_inflation(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
+def detect_cycle_inflation(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend):
     """22eb524 — belief store bloat -> learned_state.json size climb -> p95 degrade.
 
     HIGH: beliefs > 3000 (cap broken), OR ls_size_mb > 5.0 (regression magnitude),
@@ -484,7 +458,7 @@ def detect_cycle_inflation(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctl
     return findings
 
 
-def detect_refault_storm(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
+def detect_refault_storm(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend):
     """667f7d1 / dcba17e — refault microstutter storms.
 
     Healthy: refault_delta ~2-8k pages/s, peak <100k. Storms: 150k-476k
@@ -551,7 +525,7 @@ def detect_refault_storm(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls,
     return findings
 
 
-def detect_meet_network_tamper(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
+def detect_meet_network_tamper(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend):
     """da7df34 / 5802c89 — any of the 4 TCP/IPC sysctls != macOS default.
 
     ZERO tolerance: post-fix Apollo hard-blocks writing these at the emit_sysctl
@@ -585,7 +559,7 @@ def detect_meet_network_tamper(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sy
     return findings
 
 
-def detect_boost_loop(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
+def detect_boost_loop(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend):
     """4b0753e / 4ae0f27 — a single process name dominates BoostProcess.
 
     Healthy: 2-5 boosts per process per window. Regression: node boosted 54x.
@@ -663,72 +637,7 @@ def detect_boost_loop(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, tr
     return findings
 
 
-def detect_llm_stale(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
-    """d6c659b / 4b6da93 / 3df9235 — teacher silently dead.
-
-    Trusts ground truth only: last_call_at (set SOLELY on success) and
-    consecutive_failures. Ignores calls_today/triggers (they advance on failed
-    attempts and masked the 2026-06-14 outage for 11 days).
-    HIGH: enabled AND (last_call_at missing OR > 2 days old).
-    MED:  enabled AND (consecutive_failures >= 10, OR last_error has a metal-oom
-          / parse / json structural marker).
-    LOW:  enabled AND consecutive_failures in [5,10).
-    """
-    findings = []
-    if not isinstance(llm, dict) or "__error__" in llm:
-        return findings
-    if not llm.get("enabled"):
-        return findings
-    # The teacher can be turned off via config without the persisted
-    # llm_state.enabled flipping (2026-06-20: disabled because it was a net
-    # wash-with-overhead). A deliberately-off teacher is NOT "silently dead" —
-    # respect the config so this detector doesn't false-flag it.
-    if teacher_config_disabled():
-        return findings
-
-    cf = llm.get("consecutive_failures", 0)
-    if not isinstance(cf, int):
-        cf = 0
-    last_call = llm.get("last_call_at")
-    last_err = llm.get("last_error")
-
-    age_days = None
-    if last_call:
-        try:
-            lc = datetime.fromisoformat(str(last_call).replace("Z", "+00:00"))
-            age_days = (datetime.now(timezone.utc) - lc).total_seconds() / 86400.0
-        except Exception:
-            age_days = None
-
-    if age_days is None or age_days > 2.0:
-        shown = "never" if age_days is None else "{:.1f}d ago".format(age_days)
-        findings.append((
-            "HIGH", "llm-stale",
-            "teacher enabled but last SUCCESSFUL call {} (consecutive_failures="
-            "{}, last_error={}) — ignore calls_today/triggers, they advance on "
-            "failed attempts.".format(shown, cf, last_err)))
-    else:
-        if cf >= 10:
-            findings.append((
-                "MED", "llm-failing",
-                "teacher calling but failing: consecutive_failures={}, "
-                "last_error={} — check metal-oom gate (4b6da93) / thinking "
-                "truncation (3df9235).".format(cf, last_err)))
-        elif cf >= 5:
-            findings.append((
-                "LOW", "llm-elevated-failures",
-                "teacher at {} consecutive failures — elevated, monitor.".format(cf)))
-        le = last_err.lower() if isinstance(last_err, str) else ""
-        if le and ("metal-oom" in le or "parse" in le or "json" in le):
-            findings.append((
-                "MED", "llm-structural-fail",
-                "last_error has a structural marker: {} — not transient; check "
-                "metal-oom swap ceiling (4b6da93) / disable_thinking "
-                "(3df9235).".format(last_err)))
-    return findings
-
-
-def detect_complete_mediation(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
+def detect_complete_mediation(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend):
     """03472d7 / 6e0e1ce / a98b33a — a protected process is the TARGET of a
     Freeze/Throttle/SetMemorystatus action.
 
@@ -810,7 +719,7 @@ def detect_complete_mediation(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sys
     return findings
 
 
-def detect_performance_baseline(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend):
+def detect_performance_baseline(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend):
     """General baseline: ais_score<80, failures>0, last_error set.
 
     HIGH: failures>0, OR last_error is a non-empty string, OR 0<ais<80.
@@ -864,14 +773,13 @@ DETECTORS = [
     detect_refault_storm,
     detect_meet_network_tamper,
     detect_boost_loop,
-    detect_llm_stale,
     detect_complete_mediation,
     detect_performance_baseline,
 ]
 
 
 # ── Metrics (cycle-over-cycle trend row) ──────────────────────────────────────
-def build_metrics(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls):
+def build_metrics(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls):
     """Build the metrics dict appended to the trend JSONL each run."""
     def num(v, default=None):
         return v if isinstance(v, (int, float)) else default
@@ -918,10 +826,6 @@ def build_metrics(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls):
         if isinstance(v, int) and v != expected:
             nondefault += 1
 
-    cf = llm.get("consecutive_failures", 0) if isinstance(llm, dict) else 0
-    if not isinstance(cf, int):
-        cf = 0
-
     return {
         "ts": datetime.now(timezone.utc).isoformat(),
         "ais_score": num(rt.get("ais_score")),
@@ -936,7 +840,6 @@ def build_metrics(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls):
         "max_boost_single_name": max_boost,
         "protected_action_count": protected_actions,
         "protected_nominated_count": protected_nominated,
-        "llm_consecutive_failures": cf,
         "tcp_sysctls_nondefault_count": nondefault,
         "failures": num(rt.get("failures"), 0),
         "cycle_count": num(rt.get("cycle_count")),
@@ -986,7 +889,6 @@ def main(argv):
         return 0
 
     rt = load(METRICS)
-    llm = load(LLM)
     journal_tail = read_journal_tail(JOURNAL, JOURNAL_TAIL_LINES)
     sysctls = read_sysctls()
     ls_size_mb, ls_beliefs = learned_state_stats(LEARNED_STATE)
@@ -996,13 +898,13 @@ def main(argv):
     findings = []
     for det in DETECTORS:
         try:
-            findings.extend(det(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls, trend))
+            findings.extend(det(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls, trend))
         except Exception as e:
             findings.append(("LOW", "detector-error",
                              "{} raised {}".format(det.__name__, str(e)[:120])))
 
     # Build + append the metrics row (the cycle-over-cycle history).
-    metrics = build_metrics(rt, journal_tail, llm, ls_size_mb, ls_beliefs, sysctls)
+    metrics = build_metrics(rt, journal_tail, ls_size_mb, ls_beliefs, sysctls)
     # Record this run's finding codes so the NEXT run can detect persistence:
     # a MED present across 2 consecutive runs is actionable (the loop escalates
     # it), whereas a one-shot MED (e.g. pre-deploy residue) self-clears.

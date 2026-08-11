@@ -14,7 +14,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::llm::{append_jsonl, write_json, LearnedPolicy};
+use crate::engine::policy_store::{append_jsonl, write_json, LearnedPolicy};
 use crate::engine::power_management::PowerManager;
 use crate::engine::process_identity::ProcessIdentity;
 use crate::engine::profile_governor::{GovernorPersisted, ProfileGovernor};

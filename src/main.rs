@@ -32,8 +32,6 @@ enum Commands {
     Daemon,
     /// [DEPRECATED] Use: ./scripts/install-root-daemon.sh
     Startup,
-    /// [DEPRECATED] Use: apollo-optimizerctl profile set llm-boost
-    Llm,
     /// [DEPRECATED] Use: apollo-optimizerctl restore
     Restore,
 }
@@ -83,11 +81,6 @@ fn main() {
         Some(Commands::Turbo) => {
             eprintln!("apollo-optimizer turbo esta deprecado.");
             eprintln!("Usa: apollo-optimizerctl profile set performance");
-            std::process::exit(1);
-        }
-        Some(Commands::Llm) => {
-            eprintln!("apollo-optimizer llm esta deprecado.");
-            eprintln!("Usa: apollo-optimizerctl profile set llm-boost");
             std::process::exit(1);
         }
         Some(Commands::Restore) => {

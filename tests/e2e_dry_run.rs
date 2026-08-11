@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use apollo_engine::engine::protocol::PROTOCOL_VERSION;
+
 // ── Test harness ─────────────────────────────────────────────────────────────
 
 const DAEMON_BIN: &str = env!("CARGO_BIN_EXE_apollo-optimizerd");
@@ -185,7 +187,10 @@ fn e2e_version_protocol() {
     let resp = send_request(&guard.socket, r#"{"type":"GetVersion"}"#);
     let v = parse(&resp);
     assert_eq!(v["type"], "VersionInfo", "expected VersionInfo, got: {v}");
-    assert_eq!(v["payload"]["protocol"], 1, "protocol version must be 1");
+    assert_eq!(
+        v["payload"]["protocol"], PROTOCOL_VERSION,
+        "daemon and test client must agree on protocol version"
+    );
     let build = v["payload"]["build"].as_str().unwrap_or("");
     assert!(!build.is_empty(), "build string must be non-empty");
 }

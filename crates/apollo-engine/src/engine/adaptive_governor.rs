@@ -9,7 +9,7 @@
 
 use crate::engine::{
     hw_bayes::HwFeatures,
-    llm::LearnedPolicy,
+    policy_store::LearnedPolicy,
     process_classifier::{
         score_utility, waste_score, ProcessClassifier, ProcessSnapshot, ProcessTier,
     },
@@ -807,7 +807,7 @@ impl AdaptiveGovernor {
 
     // ── ML Ligero methods ─────────────────────────────────────────────────
 
-    /// Call when the LLM teacher delivers an updated LearnedPolicy.
+    /// Compile an updated local LearnedPolicy into the fast classifier.
     pub fn update_learned_policy(&mut self, policy: &LearnedPolicy) {
         self.workload_classifier.update_learned_policy(policy);
     }

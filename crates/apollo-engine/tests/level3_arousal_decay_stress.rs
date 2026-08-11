@@ -116,7 +116,7 @@ fn fresh_state(ot: OutcomeTrackerPersisted, arousal: Option<ArousalState>) -> Le
         // than the fallback default (also 0.95 but masks the wire bug).
         learnable_params: Some(Default::default()),
         nested_learner: None,
-        teacher_consolidator: None,
+        local_consolidator: None,
         unfreeze_decay_tau: None,
         neuro_state: None,
         meta_cognition: None,
