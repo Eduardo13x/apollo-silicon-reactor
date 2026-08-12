@@ -273,6 +273,19 @@ test_deploy_rejects_future_learned_state() (
         "daemon after rejected future state"
 )
 
+test_deploy_waits_for_transient_runtime_readiness() (
+    set -eu
+    new_fixture
+    printf '%s\n' 2 > "$root/runtime-failures-remaining"
+
+    deploy_fixture
+
+    assert_file_content "$root/runtime-failures-remaining" 0 \
+        "transient runtime readiness attempts"
+    assert_file_content "$root/usr/local/libexec/apollo-optimizerd" daemon-new \
+        "deployed daemon after transient readiness"
+)
+
 test_rollback_rejects_malformed_manifest() (
     set -eu
     new_fixture
@@ -320,6 +333,8 @@ run_test "rollback rejects an intermediate directory symlink" \
     test_rollback_rejects_intermediate_directory_symlink
 run_test "deploy rejects a future learned-state schema" \
     test_deploy_rejects_future_learned_state
+run_test "deploy waits for transient runtime readiness" \
+    test_deploy_waits_for_transient_runtime_readiness
 run_test "rollback rejects a malformed manifest" \
     test_rollback_rejects_malformed_manifest
 

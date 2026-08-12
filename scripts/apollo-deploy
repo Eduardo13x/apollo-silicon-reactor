@@ -122,10 +122,19 @@ service_bootstrap() {
     fi
 }
 
-verify_runtime() {
+verify_runtime_once() {
     if [ "$TEST_MODE" -eq 1 ]; then
-        [ ! -e "$ROOT/fail-runtime" ]
-        return
+        [ ! -e "$ROOT/fail-runtime" ] || return 1
+        readiness_failures="$ROOT/runtime-failures-remaining"
+        if regular "$readiness_failures"; then
+            remaining=$(/bin/cat "$readiness_failures")
+            case "$remaining" in ''|*[!0-9]*) return 1 ;; esac
+            if [ "$remaining" -gt 0 ]; then
+                echo $((remaining - 1)) > "$readiness_failures"
+                return 1
+            fi
+        fi
+        return 0
     fi
     [ -x "$CTL_STATUS" ] || return 1
     first=$("$CTL_STATUS" status 2>/dev/null | /usr/bin/python3 -c \
@@ -134,6 +143,15 @@ verify_runtime() {
     second=$("$CTL_STATUS" status 2>/dev/null | /usr/bin/python3 -c \
         'import json,sys; print(int(json.load(sys.stdin).get("metrics",{}).get("cycles",0)))') || return 1
     [ "$second" -gt "$first" ]
+}
+
+verify_runtime() {
+    attempt=1
+    while ! verify_runtime_once; do
+        [ "$attempt" -lt 15 ] || return 1
+        attempt=$((attempt + 1))
+        [ "$TEST_MODE" -eq 1 ] || /bin/sleep 1
+    done
 }
 
 manifest_value() {
