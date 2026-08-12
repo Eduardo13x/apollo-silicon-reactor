@@ -67,25 +67,28 @@ Expected: all selected tests pass.
 
 **Interfaces:**
 - Consumes: `RuntimeMetrics::decision_ledger_unattributed_applied_total`
-- Produces: fourth learning-band line `Ledger huérfanos N`
+- Produces: fourth learning-band line `Ledger huérfanos N` for schema 2+, or
+  `Ledger huérfanos n/d` for older/uninitialized metrics
 
 - [ ] **Step 1: Write the failing dashboard test**
 
-Set the counter to literal `3`, render the learning band, and assert its fourth
-line is `Ledger huérfanos 3` and every line has display width at most `CW`.
+Cover schema 1 as unavailable, schema 2 with literal `3`, and `u64::MAX`; assert
+the fourth line has the expected value and every line has display width at most
+`CW`.
 
 - [ ] **Step 2: Run the focused dashboard test and verify RED**
 
 Run:
-`cargo test --bin apollo-optimizerctl unified_learning_band_reports_ledger_orphans`
+`cargo test --bin apollo-optimizerctl unified_learning_band_`
 
-Expected: compilation fails because the runtime field does not exist or the
-fourth line is absent.
+Expected: the fourth line is absent or reports a false numeric zero for schema
+1 metrics.
 
 - [ ] **Step 3: Add the bounded audit line**
 
-Append `format!("Ledger huérfanos {}", metrics.decision_ledger_unattributed_applied_total)`
-before applying `bounded_learning_line`.
+Gate on `unified_learning_schema_version`: render the scalar only for schema 2+
+and render `Ledger huérfanos n/d` otherwise, before applying
+`bounded_learning_line`.
 
 - [ ] **Step 4: Run dashboard tests**
 
