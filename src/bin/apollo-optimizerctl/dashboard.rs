@@ -1374,10 +1374,18 @@ fn render_learning_band(status: &DaemonStatus) -> Vec<String> {
             latest.scope,
         )
     };
-    vec![primary, worst, latest]
-        .into_iter()
-        .map(bounded_learning_line)
-        .collect()
+    vec![
+        primary,
+        worst,
+        latest,
+        format!(
+            "Ledger huérfanos {}",
+            metrics.decision_ledger_unattributed_applied_total
+        ),
+    ]
+    .into_iter()
+    .map(bounded_learning_line)
+    .collect()
 }
 
 // ── 📋 VERDICT band (cognitive) ──────────────────────────────────────────────
@@ -1600,6 +1608,17 @@ mod tests {
             lines[0],
             "Learn  trusted 1 active 1 closure -- cal 88% causal 77%"
         );
+        assert!(lines.iter().all(|line| display_width(line) <= CW));
+    }
+
+    #[test]
+    fn unified_learning_band_reports_ledger_orphans() {
+        let mut status = dashboard_status();
+        status.metrics.decision_ledger_unattributed_applied_total = 3;
+
+        let lines = render_learning_band(&status);
+
+        assert_eq!(lines[3], "Ledger huérfanos 3");
         assert!(lines.iter().all(|line| display_width(line) <= CW));
     }
 
