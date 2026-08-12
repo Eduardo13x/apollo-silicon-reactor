@@ -49,6 +49,38 @@ pub struct MarkovTickOutput {
     pub decision_events: CycleDecisionEvents,
 }
 
+fn reverify_member_identity(identity: &ProcessIdentity) -> bool {
+    ProcessIdentity::from_pid(identity.pid).is_some_and(|current| {
+        current.matches(
+            Some(&identity.name),
+            identity.start_sec,
+            identity.start_usec,
+        )
+    })
+}
+
+fn markov_target_gates(
+    mut gates: ExplorationGates,
+    pid: Option<u32>,
+    name: &str,
+    identity: Option<&ProcessIdentity>,
+    quarantined: bool,
+) -> ExplorationGates {
+    gates.markov_quarantined = quarantined;
+    gates.identity_present = identity.is_some();
+    gates.identity_start_nonzero =
+        identity.is_some_and(|identity| identity.start_sec > 0 || identity.start_usec > 0);
+    gates.identity_recheck_ok = pid.zip(identity).is_some_and(|(pid, identity)| {
+        ProcessIdentity::verify(pid, Some(name), identity.start_sec, identity.start_usec)
+    });
+    gates.identity_recycled = !gates.identity_recheck_ok;
+    gates.target_protected = pid.is_none_or(|pid| {
+        hard_protected_contains(name) || apollo_engine::engine::apple_owned::is_apple_owned(pid)
+    });
+    gates.target_apple_owned = pid.is_none_or(apollo_engine::engine::apple_owned::is_apple_owned);
+    gates
+}
+
 fn markov_event(
     target: impl Into<String>,
     cycle: u64,
@@ -203,8 +235,7 @@ pub fn run_markov_tick(
     frozen_state_path: &Path,
     world_model: &WorldModel,
     exploration_scheduler: &mut ExplorationScheduler,
-    exploration_gates: ExplorationGates,
-    exploration_now: TimePoint,
+    exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
 ) -> MarkovTickOutput {
     let mut decision_events = CycleDecisionEvents::default();
     // Fight-hunt fix (2026-06-10): prefetch is a luxury. Under pressure the
@@ -408,31 +439,15 @@ pub fn run_markov_tick(
             probability_floor,
         );
         let predicted_pid = find_running_pid(collector, &pred.app_name);
-        let mut gates = exploration_gates;
-        gates.markov_quarantined = admission == PrewarmAdmission::Quarantined;
         let identity = predicted_pid.and_then(ProcessIdentity::from_pid);
-        gates.identity_present = identity.is_some();
-        gates.identity_start_nonzero = identity
-            .as_ref()
-            .is_some_and(|identity| identity.start_sec > 0 || identity.start_usec > 0);
-        gates.identity_recheck_ok =
-            predicted_pid
-                .zip(identity.as_ref())
-                .is_some_and(|(pid, identity)| {
-                    ProcessIdentity::verify(
-                        pid,
-                        Some(&pred.app_name),
-                        identity.start_sec,
-                        identity.start_usec,
-                    )
-                });
-        gates.identity_recycled = !gates.identity_recheck_ok;
-        gates.target_protected = predicted_pid.is_none_or(|pid| {
-            hard_protected_contains(&pred.app_name)
-                || apollo_engine::engine::apple_owned::is_apple_owned(pid)
-        });
-        gates.target_apple_owned =
-            predicted_pid.is_none_or(apollo_engine::engine::apple_owned::is_apple_owned);
+        let (request_gates, request_now) = exploration_environment();
+        let gates = markov_target_gates(
+            request_gates,
+            predicted_pid,
+            &pred.app_name,
+            identity.as_ref(),
+            admission == PrewarmAdmission::Quarantined,
+        );
         let mut exploration_approval = if admission == PrewarmAdmission::Probe && base_eligible {
             ExplorationCandidate::new(
                 ActuatorFamily::MarkovPrewarm,
@@ -444,27 +459,25 @@ pub fn run_markov_tick(
             )
             .ok()
             .and_then(|candidate| {
+                let matched_natural = world_model
+                    .assess_utility("markov_prewarm:predicted_app", &workload)
+                    .is_some_and(|assessment| assessment.counterfactual_observations > 0);
+                let mut candidates = Vec::with_capacity(2);
+                if matched_natural {
+                    candidates.push(candidate.natural_observation());
+                }
+                candidates.push(candidate);
                 exploration_scheduler
-                    .request(&candidate, &gates, exploration_now)
+                    .select(&candidates, &gates, request_now)
                     .ok()
+                    .filter(|approval| approval.metadata.arm != ExplorationArm::NaturalObservation)
             })
         } else {
             None
         };
-        if exploration_approval
-            .as_ref()
-            .is_some_and(|approval| exploration_scheduler.recheck(approval, &gates).is_err())
-        {
-            if let Some(approval) = exploration_approval.take() {
-                exploration_scheduler.cancel(
-                    approval.metadata.correlation,
-                    apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
-                );
-            }
-        }
         let (specialist_allowed, allow_kernel_acceleration) =
             markov_exploration_admission(admission, exploration_approval.is_some());
-        let prewarm_eligible = base_eligible && specialist_allowed;
+        let mut prewarm_eligible = base_eligible && specialist_allowed;
         // Cache-only probes may test a cold/new context. Reversible acceleration
         // remains reserved for mature transition evidence.
         markov_acceleration_allowed = allow_kernel_acceleration && cache_warm_allowed;
@@ -528,6 +541,29 @@ pub fn run_markov_tick(
             }
         }
 
+        let late_recheck_failed = exploration_approval.as_ref().is_some_and(|approval| {
+            let (fresh_gates, _) = exploration_environment();
+            let fresh_gates = markov_target_gates(
+                fresh_gates,
+                predicted_pid,
+                &pred.app_name,
+                identity.as_ref(),
+                admission == PrewarmAdmission::Quarantined,
+            );
+            exploration_scheduler
+                .recheck(approval, &fresh_gates)
+                .is_err()
+        });
+        if late_recheck_failed {
+            if let Some(approval) = exploration_approval.take() {
+                exploration_scheduler.cancel(
+                    approval.metadata.correlation,
+                    apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                );
+            }
+            prewarm_eligible = false;
+        }
+
         if markov_prewarm.is_none() && prewarm_eligible {
             if let Some(pid) = predicted_pid {
                 if markov_shadow.active.take().is_some() {
@@ -538,18 +574,24 @@ pub fn run_markov_tick(
                         .markov_shadow_superseded_total
                         .saturating_add(1);
                 }
-                let (members, cache_bytes, unfrozen_count, conflict_skips, member_events) =
-                    acquire_coalition_prewarm(
-                        pid,
-                        state,
-                        collector,
-                        process_tree,
-                        coalition_tracker,
-                        cache_warmer,
-                        frozen_state_path,
-                        allow_kernel_acceleration,
-                        cycle_count,
-                    );
+                let (
+                    members,
+                    cache_bytes,
+                    unfrozen_count,
+                    conflict_skips,
+                    identity_recheck_failed,
+                    member_events,
+                ) = acquire_coalition_prewarm(
+                    pid,
+                    state,
+                    collector,
+                    process_tree,
+                    coalition_tracker,
+                    cache_warmer,
+                    frozen_state_path,
+                    allow_kernel_acceleration,
+                    cycle_count,
+                );
                 decision_events.extend_buffer(&member_events);
                 let members_applied = members.len() as u64;
                 let kernel_members = members
@@ -564,22 +606,33 @@ pub fn run_markov_tick(
                     contextual_bias,
                 );
                 let acquired_at = Instant::now();
-                let exploration = exploration_approval.and_then(|approval| {
+                let mut exploration = exploration_approval.and_then(|approval| {
                     if applied {
                         exploration_scheduler.commit_metadata(
                             approval.metadata.correlation,
-                            exploration_now,
+                            exploration_environment().1,
                             CommitEvidence::MutationApplied,
                         )
                     } else {
                         exploration_scheduler.commit(
                             approval.metadata.correlation,
-                            exploration_now,
-                            CommitEvidence::NoOp,
+                            exploration_environment().1,
+                            if identity_recheck_failed {
+                                CommitEvidence::StaleIdentity
+                            } else {
+                                CommitEvidence::NoOp
+                            },
                         );
                         None
                     }
                 });
+                if identity_recheck_failed {
+                    if let Some(metadata) = exploration.as_mut() {
+                        metadata.cancelled = Some(
+                            apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                        );
+                    }
+                }
                 *markov_prewarm = Some(MarkovPrewarmLease {
                     source_app: foreground_app.unwrap_or_default().to_string(),
                     predicted_app: pred.app_name.clone(),
@@ -605,6 +658,12 @@ pub fn run_markov_tick(
                         .with_exploration(metadata),
                     );
                 }
+                if identity_recheck_failed {
+                    if let Some(lease) = markov_prewarm.take() {
+                        let release = release_markov_prewarm(lease, state, cycle_count);
+                        decision_events.extend_buffer(&release.decision_events);
+                    }
+                }
                 let mut metrics = state.metrics.lock_recover();
                 metrics.metrics.markov_prewarm_attempts += 1;
                 metrics.metrics.markov_prewarm_probes_total +=
@@ -616,8 +675,12 @@ pub fn run_markov_tick(
                     .metrics
                     .markov_prewarm_conflict_skips_total
                     .saturating_add(conflict_skips);
-                metrics.metrics.markov_prewarm_active = true;
-                metrics.metrics.markov_prewarm_members = members_applied as u32;
+                metrics.metrics.markov_prewarm_active = markov_prewarm.is_some();
+                metrics.metrics.markov_prewarm_members = if markov_prewarm.is_some() {
+                    members_applied as u32
+                } else {
+                    0
+                };
                 metrics.metrics.markov_prewarm_members_applied += members_applied;
                 metrics.metrics.markov_prewarm_cache_bytes = metrics
                     .metrics
@@ -969,10 +1032,17 @@ fn acquire_coalition_prewarm(
     frozen_state_path: &Path,
     allow_kernel_acceleration: bool,
     cycle: u64,
-) -> (Vec<PrewarmedMember>, u64, u64, u64, CycleDecisionEvents) {
+) -> (
+    Vec<PrewarmedMember>,
+    u64,
+    u64,
+    u64,
+    bool,
+    CycleDecisionEvents,
+) {
     let mut decision_events = CycleDecisionEvents::default();
     let candidates = coalition_candidates(root_pid, collector, process_tree, coalition_tracker);
-    let eligible: Vec<(u32, String, bool)> = candidates
+    let eligible: Vec<(u32, String, bool, ProcessIdentity)> = candidates
         .into_iter()
         .filter_map(|(pid, name, _)| {
             let (user_target, kernel_boost_allowed) = prewarm_target_modes(
@@ -981,7 +1051,8 @@ fn acquire_coalition_prewarm(
                 apollo_engine::engine::process_identity::is_apple_platform_process(pid),
                 apollo_engine::engine::safety::is_boost_forbidden(&name),
             );
-            user_target.then_some((pid, name, kernel_boost_allowed))
+            let identity = ProcessIdentity::from_pid(pid)?;
+            user_target.then_some((pid, name, kernel_boost_allowed, identity))
         })
         .collect();
 
@@ -993,7 +1064,7 @@ fn acquire_coalition_prewarm(
             if allow_kernel_acceleration {
                 eligible
                     .iter()
-                    .filter_map(|(pid, _, _)| {
+                    .filter_map(|(pid, _, _, _)| {
                         frozen_guard.get(pid).map(|entry| (*pid, entry.clone()))
                     })
                     .collect()
@@ -1024,7 +1095,20 @@ fn acquire_coalition_prewarm(
     let mut members = Vec::with_capacity(eligible.len());
     let mut total_cache_bytes = 0u64;
     let mut conflict_skips = 0u64;
-    for (pid, name, kernel_boost_allowed) in eligible {
+    let mut identity_recheck_failed = false;
+    for (pid, name, kernel_boost_allowed, identity) in eligible {
+        if !reverify_member_identity(&identity) {
+            identity_recheck_failed = true;
+            decision_events.push(markov_member_effect_event(
+                pid,
+                &name,
+                MarkovMemberEffect::Cache,
+                cycle,
+                ActuatorDecisionOutcome::Blocked,
+                "process identity changed before prewarm mutation",
+            ));
+            continue;
+        }
         let kernel_boost_allowed = kernel_boost_allowed && allow_kernel_acceleration;
         let jetsam_effect =
             apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority { pid, prior: -1 };
@@ -1210,6 +1294,7 @@ fn acquire_coalition_prewarm(
         total_cache_bytes,
         thawed.len() as u64,
         conflict_skips,
+        identity_recheck_failed,
         decision_events,
     )
 }

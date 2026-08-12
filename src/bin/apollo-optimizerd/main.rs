@@ -77,6 +77,100 @@ fn wait_for_cycle_signal(cycle_condvar: &Arc<(Mutex<bool>, Condvar)>, timeout: D
     was_triggered
 }
 
+fn current_exploration_time() -> apollo_engine::engine::exploration_scheduler::TimePoint {
+    let (boot_id, monotonic_secs) =
+        apollo_engine::engine::daemon_helpers::system_boot_session().unwrap_or((0, 0));
+    apollo_engine::engine::exploration_scheduler::TimePoint {
+        wall_unix_secs: Utc::now().timestamp(),
+        monotonic_secs,
+        boot_id,
+    }
+}
+
+fn capture_exploration_environment(
+    state: &SharedState,
+    memory_pressure: f64,
+    build_phase: apollo_engine::engine::build_tracker::BuildPhase,
+    cognitive_paused: bool,
+    fluidity_degraded_threshold: f32,
+) -> (
+    apollo_engine::engine::exploration_scheduler::ExplorationGates,
+    apollo_engine::engine::exploration_scheduler::TimePoint,
+) {
+    let audio = apollo_engine::engine::coreaudio_active::audio_activity_snapshot();
+    let hazard = apollo_engine::engine::shadow_signals::get_p_oom_30s();
+    let (
+        metric_audio,
+        metric_call,
+        metric_sleep,
+        media_probe_state,
+        app_launching,
+        window_operation,
+        fluidity_degraded,
+        predicted,
+        thermal,
+        speculation_allowed,
+    ) = {
+        let metrics = state.metrics.lock_recover();
+        (
+            metrics.metrics.user_audio_active,
+            metrics.metrics.user_call_in_progress,
+            metrics.metrics.user_has_sleep_assertion,
+            metrics.metrics.coreaudio_probe_state.clone(),
+            metrics.metrics.app_launching,
+            metrics.metrics.window_op_active,
+            metrics.metrics.fluidity_degraded,
+            metrics.metrics.fluidity_predicted_3s,
+            metrics.thermal_level_real.clone(),
+            metrics.metrics.apollo_overhead_speculation_allowed,
+        )
+    };
+    let circuit_closed = {
+        let policy = state.policy.lock_recover();
+        matches!(
+            *policy.circuit_breaker.state(),
+            apollo_engine::engine::circuit_breaker::CircuitState::Closed
+        )
+    };
+    let media_available = if audio.session_supported {
+        audio.output_probe_available && audio.input_probe_available
+    } else {
+        media_probe_state == "session-fallback"
+    };
+    let build_active = build_phase != apollo_engine::engine::build_tracker::BuildPhase::Idle;
+
+    (
+        apollo_engine::engine::exploration_scheduler::ExplorationGates {
+            daemon_shutdown: state.stop.load(Ordering::Relaxed),
+            kill_switch: Path::new(kill_switch_path()).exists(),
+            cognitive_paused,
+            audio_output_active: audio.output_active || metric_audio,
+            audio_input_active: audio.input_active,
+            call_active: audio.realtime_call_active() || metric_call,
+            sleep_assertion: metric_sleep,
+            media_available,
+            app_launching,
+            window_operation,
+            fluidity_degraded,
+            predicted_fluidity_degraded: !predicted.is_finite()
+                || predicted <= 0.0
+                || predicted < fluidity_degraded_threshold,
+            memory_pressure,
+            thermal_available: !thermal.is_empty() && thermal != "unknown",
+            thermal_nominal: thermal == "nominal",
+            hazard_available: hazard.is_some(),
+            p_oom_30s: hazard.unwrap_or(f64::NAN),
+            circuit_closed,
+            speculation_allowed,
+            build_workload: build_active,
+            build_phase_idle: !build_active,
+            compiler_protection_active: build_active,
+            ..apollo_engine::engine::exploration_scheduler::ExplorationGates::default()
+        },
+        current_exploration_time(),
+    )
+}
+
 use apollo_engine::collector::SystemCollector;
 use apollo_engine::engine::action_accumulator::{ActionAccumulator, ActionPhase, EmitContext};
 use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest};
@@ -1026,13 +1120,6 @@ fn main() -> anyhow::Result<()> {
                         ram_gib: hierarchy_hardware.ram_gib,
                     },
                 };
-            let exploration_boot_id = (Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64)
-                ^ u64::from(std::process::id());
-            let exploration_now = || apollo_engine::engine::exploration_scheduler::TimePoint {
-                wall_unix_secs: Utc::now().timestamp(),
-                monotonic_secs: daemon_start.elapsed().as_secs(),
-                boot_id: exploration_boot_id.max(1),
-            };
             let mut exploration_scheduler =
                 apollo_engine::engine::exploration_scheduler::ExplorationScheduler::cold_start(
                     exploration_origin,
@@ -1206,7 +1293,7 @@ fn main() -> anyhow::Result<()> {
                             persisted,
                             apollo_engine::engine::exploration_scheduler::RestoreContext::local(
                                 exploration_origin,
-                                exploration_now(),
+                                current_exploration_time(),
                             ),
                         );
                     exploration_scheduler = restored;
@@ -1638,13 +1725,9 @@ fn main() -> anyhow::Result<()> {
             // forward to prevent the freeze gate from flickering on/off every cycle.
             // [Cook et al. 2019] "Caching volatile state in reactive systems"
             let mut last_user_assertions: (bool, bool, bool) = (false, false, false); // (sleep_assert, call, audio)
-            let mut last_exploration_gates: Option<(
-                apollo_engine::engine::exploration_scheduler::ExplorationGates,
-                Instant,
-            )> = None;
-            // Phase 0c cache: last ioreg HIDIdleTime sample + when. Lets
-            // compute_user_context interpolate idle_secs between every-10-cycle
-            // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
+                                                                                      // Phase 0c cache: last ioreg HIDIdleTime sample + when. Lets
+                                                                                      // compute_user_context interpolate idle_secs between every-10-cycle
+                                                                                      // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
             let mut last_idle_sample: Option<(f64, Instant)> = None;
             // Phase 5.1 wiring (2026-05-16) — last cycle's UserContext, carried
             // forward so `apply_specialist_voting` can compute the
@@ -2337,6 +2420,19 @@ fn main() -> anyhow::Result<()> {
                 // FocusMarkov miss check, Markov observe+pre-warm, universal pre-thaw, temporal predictor.
                 // Extracted to daemon_markov_tick::run_markov_tick (Wave 29).
                 // [Fowler 2004] Strangler Fig — pure move, no semantic change.
+                exploration_scheduler.begin_exploration_cycle(cycle_count);
+                let markov_cognitive_paused = prev_cog_decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.pause_learning);
+                let mut markov_exploration_environment = || {
+                    capture_exploration_environment(
+                        &state,
+                        pressure_collector.latest().memory_pressure,
+                        build_tracker.phase,
+                        markov_cognitive_paused,
+                        learnable_params.fluidity_degraded_threshold,
+                    )
+                };
                 let daemon_markov_tick::MarkovTickOutput {
                     temporal_hour: markov_temporal_hour,
                     temporal_weekday: markov_temporal_weekday,
@@ -2360,11 +2456,7 @@ fn main() -> anyhow::Result<()> {
                     &frozen_state_path,
                     &world_model,
                     &mut exploration_scheduler,
-                    last_exploration_gates
-                        .filter(|(_, captured_at)| captured_at.elapsed() <= Duration::from_secs(10))
-                        .map(|(gates, _)| gates)
-                        .unwrap_or_default(),
-                    exploration_now(),
+                    &mut markov_exploration_environment,
                 );
                 cycle_decision_events.extend_buffer(&markov_decision_events);
                 temporal_hour = markov_temporal_hour;
@@ -6121,6 +6213,39 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.outcome_pending_depth = pending_depth;
                 }
 
+                // Give the higher-priority InteractionQos candidate its same-cycle
+                // opportunity before dispatch can reserve a Boost omission.
+                let qos_cognitive_paused = prev_cog_decision
+                    .as_ref()
+                    .is_some_and(|decision| decision.pause_learning);
+                let mut qos_exploration_environment = || {
+                    capture_exploration_environment(
+                        &state,
+                        pressure_collector.latest().memory_pressure,
+                        build_tracker.phase,
+                        qos_cognitive_paused,
+                        learnable_params.fluidity_degraded_threshold,
+                    )
+                };
+                let acceleration_output = daemon_cycle_tail::update_acceleration_lease(
+                    &state,
+                    &mut acceleration_lease,
+                    &fluidity_state,
+                    &thermal_action,
+                    foreground_pid,
+                    build_tracker.phase,
+                    user_context.idle_secs,
+                    &process_tree,
+                    &proc_snaps,
+                    &mut io_shaper,
+                    &world_model,
+                    workload_mode.as_str(),
+                    cycle_count,
+                    &mut exploration_scheduler,
+                    &mut qos_exploration_environment,
+                );
+                cycle_decision_events.extend_buffer(&acceleration_output.decision_events);
+
                 // Snapshot causal QoS preferences before exec_outcomes consumes final_actions.
                 // FreezeProcess actions for CPU-dominant processes will be upgraded to
                 // ThrottleProcess(aggressive=true) — QoS Background tier is less invasive
@@ -6149,44 +6274,18 @@ fn main() -> anyhow::Result<()> {
                         _t_reason_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                     );
                     _t_execute_start_outer = Instant::now();
-                    let exploration_gates = {
-                        let metrics = state.metrics.lock_recover();
-                        let predicted = metrics.metrics.fluidity_predicted_3s;
-                        let thermal = snapshot.pressure.thermal_level.as_str();
-                        apollo_engine::engine::exploration_scheduler::ExplorationGates {
-                            daemon_shutdown: state.stop.load(Ordering::Relaxed),
-                            kill_switch: false,
-                            cognitive_paused: prev_cog_decision
-                                .as_ref()
-                                .is_some_and(|decision| decision.pause_learning),
-                            audio_output_active: user_context.audio_active,
-                            audio_input_active: user_context.audio_active,
-                            call_active: user_context.call_in_progress,
-                            sleep_assertion: user_context.has_sleep_assertion,
-                            media_available: !metrics.metrics.coreaudio_probe_state.is_empty(),
-                            app_launching: metrics.metrics.app_launching,
-                            window_operation: metrics.metrics.window_op_active,
-                            fluidity_degraded: metrics.metrics.fluidity_degraded,
-                            predicted_fluidity_degraded: !predicted.is_finite()
-                                || predicted <= 0.0
-                                || predicted < learnable_params.fluidity_degraded_threshold,
-                            memory_pressure: snapshot.pressure.memory_pressure,
-                            thermal_available: !thermal.is_empty(),
-                            thermal_nominal: thermal == "nominal",
-                            hazard_available: signal_digest.p_oom_30s.is_finite(),
-                            p_oom_30s: signal_digest.p_oom_30s,
-                            circuit_closed: true,
-                            speculation_allowed: metrics
-                                .metrics
-                                .apollo_overhead_speculation_allowed,
-                            build_workload: build_tracker.build_active,
-                            build_phase_idle: build_tracker.phase
-                                == apollo_engine::engine::build_tracker::BuildPhase::Idle,
-                            compiler_protection_active: build_tracker.build_active,
-                            ..apollo_engine::engine::exploration_scheduler::ExplorationGates::healthy()
-                        }
+                    let dispatch_cognitive_paused = prev_cog_decision
+                        .as_ref()
+                        .is_some_and(|decision| decision.pause_learning);
+                    let mut dispatch_exploration_environment = || {
+                        capture_exploration_environment(
+                            &state,
+                            pressure_collector.latest().memory_pressure,
+                            build_tracker.phase,
+                            dispatch_cognitive_paused,
+                            learnable_params.fluidity_degraded_threshold,
+                        )
                     };
-                    last_exploration_gates = Some((exploration_gates, Instant::now()));
                     let output = run_dispatch_tick(DispatchTickInput {
                         state: &state,
                         caps: &caps,
@@ -6213,8 +6312,7 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         exploration_scheduler: &mut exploration_scheduler,
                         telemetry_medallion: &mut telemetry_medallion,
-                        exploration_gates,
-                        exploration_now: exploration_now(),
+                        exploration_environment: &mut dispatch_exploration_environment,
                     });
                     (
                         output.outcomes,
@@ -6727,67 +6825,6 @@ fn main() -> anyhow::Result<()> {
                     &thermal_action,
                 );
 
-                // ── Fluidity QoS elevation ───────────────────────────────────
-                // Extracted to daemon_cycle_tail::apply_fluidity_qos (Wave 10).
-                let qos_circuit_closed = {
-                    let policy = state.policy.lock_recover();
-                    matches!(
-                        *policy.circuit_breaker.state(),
-                        apollo_engine::engine::circuit_breaker::CircuitState::Closed
-                    )
-                };
-                let qos_exploration_gates = {
-                    let metrics = state.metrics.lock_recover();
-                    let predicted = metrics.metrics.fluidity_predicted_3s;
-                    let thermal = snapshot.pressure.thermal_level.as_str();
-                    apollo_engine::engine::exploration_scheduler::ExplorationGates {
-                        daemon_shutdown: state.stop.load(Ordering::Relaxed),
-                        kill_switch: false,
-                        cognitive_paused: cognitive_pause,
-                        audio_output_active: user_context.audio_active,
-                        audio_input_active: user_context.audio_active,
-                        call_active: user_context.call_in_progress,
-                        sleep_assertion: user_context.has_sleep_assertion,
-                        media_available: !metrics.metrics.coreaudio_probe_state.is_empty(),
-                        app_launching: metrics.metrics.app_launching,
-                        window_operation: metrics.metrics.window_op_active,
-                        fluidity_degraded: metrics.metrics.fluidity_degraded,
-                        predicted_fluidity_degraded: !predicted.is_finite()
-                            || predicted <= 0.0
-                            || predicted < learnable_params.fluidity_degraded_threshold,
-                        memory_pressure: snapshot.pressure.memory_pressure,
-                        thermal_available: !thermal.is_empty(),
-                        thermal_nominal: thermal == "nominal",
-                        hazard_available: signal_digest.p_oom_30s.is_finite(),
-                        p_oom_30s: signal_digest.p_oom_30s,
-                        circuit_closed: qos_circuit_closed,
-                        speculation_allowed: metrics.metrics.apollo_overhead_speculation_allowed,
-                        build_workload: build_tracker.build_active,
-                        build_phase_idle: build_tracker.phase
-                            == apollo_engine::engine::build_tracker::BuildPhase::Idle,
-                        compiler_protection_active: build_tracker.build_active,
-                        ..apollo_engine::engine::exploration_scheduler::ExplorationGates::healthy()
-                    }
-                };
-                let acceleration_output = daemon_cycle_tail::update_acceleration_lease(
-                    &state,
-                    &mut acceleration_lease,
-                    &fluidity_state,
-                    &thermal_action,
-                    foreground_pid,
-                    build_tracker.phase,
-                    user_context.idle_secs,
-                    &process_tree,
-                    &proc_snaps,
-                    &mut io_shaper,
-                    &world_model,
-                    workload_mode.as_str(),
-                    cycle_count,
-                    &mut exploration_scheduler,
-                    qos_exploration_gates,
-                    exploration_now(),
-                );
-                cycle_decision_events.extend_buffer(&acceleration_output.decision_events);
                 metrics_reporter::merge_cycle_metrics(
                     &state,
                     &exec_outcomes,
@@ -7495,6 +7532,64 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn exploration_rechecks_use_fresh_real_gate_sources() {
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+
+        assert!(production.contains("capture_exploration_environment"));
+        assert!(!production.contains("last_exploration_gates"));
+        assert!(!production.contains("kill_switch: false"));
+        assert!(!production.contains("circuit_closed: true"));
+        assert!(
+            production
+                .matches("capture_exploration_environment(")
+                .count()
+                >= 4
+        );
+        for seam in [
+            include_str!("daemon_markov_tick.rs"),
+            include_str!("daemon_cycle_tail.rs"),
+            include_str!("daemon_dispatch_tick.rs"),
+        ] {
+            assert!(seam.matches("exploration_environment()").count() >= 3);
+        }
+    }
+
+    #[test]
+    fn exploratory_member_mutations_reverify_captured_identity() {
+        let markov = include_str!("daemon_markov_tick.rs");
+        let qos = include_str!("daemon_cycle_tail.rs");
+
+        assert!(markov.contains("reverify_member_identity"));
+        assert!(markov.contains("release_markov_prewarm"));
+        assert!(qos.contains("reverify_member_identity"));
+        assert!(qos.contains("release_acceleration_lease"));
+        assert!(markov.matches("reverify_member_identity(").count() >= 2);
+        assert!(qos.matches("reverify_member_identity(").count() >= 3);
+    }
+
+    #[test]
+    fn exploration_seams_offer_cycle_global_priority_and_natural_baselines() {
+        let production = include_str!("main.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production source");
+        let markov = production.find("run_markov_tick(").expect("Markov seam");
+        let qos = production
+            .find("update_acceleration_lease(")
+            .expect("QoS seam");
+        let dispatch = production.find("run_dispatch_tick(").expect("Boost seam");
+
+        assert!(markov < qos && qos < dispatch);
+        assert!(production.contains("begin_exploration_cycle(cycle_count)"));
+        assert!(include_str!("daemon_markov_tick.rs").contains(".natural_observation()"));
+        assert!(include_str!("daemon_cycle_tail.rs").contains(".natural_observation()"));
+        assert!(include_str!("daemon_dispatch_tick.rs").contains(".natural_observation()"));
+    }
 
     #[test]
     fn kill_switch_pause_returns_immediately_for_a_pending_resource_wake() {

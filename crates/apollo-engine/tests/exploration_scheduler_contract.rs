@@ -378,6 +378,28 @@ fn selection_is_deterministic_across_every_candidate_permutation() {
 }
 
 #[test]
+fn mutable_selection_prefers_markov_then_qos_then_boost() {
+    let candidates = vec![
+        candidate(ActuatorFamily::Boost, ExplorationArm::BoostOmission),
+        candidate(
+            ActuatorFamily::InteractionQos,
+            ExplorationArm::InteractionQosShort,
+        ),
+        candidate(
+            ActuatorFamily::MarkovPrewarm,
+            ExplorationArm::MarkovCacheOnly,
+        ),
+    ];
+
+    for permutation in permutations(&candidates) {
+        let selected = scheduler()
+            .select(&permutation, &healthy(), now(1_000, 1_000))
+            .expect("selection");
+        assert_eq!(selected.metadata.arm, ExplorationArm::MarkovCacheOnly);
+    }
+}
+
+#[test]
 fn candidate_caps_and_single_reservation_are_enforced() {
     let one = candidate(
         ActuatorFamily::InteractionQos,
@@ -411,6 +433,34 @@ fn candidate_caps_and_single_reservation_are_enforced() {
 }
 
 #[test]
+fn safety_blockers_precede_malformed_and_capacity_errors() {
+    let mut lifecycle = healthy();
+    lifecycle.kill_switch = true;
+    assert_eq!(
+        scheduler()
+            .select(&[], &lifecycle, now(1_000, 1_000))
+            .unwrap_err(),
+        ExplorationGateBlocker::Lifecycle
+    );
+
+    let mut pressure = healthy();
+    pressure.memory_pressure = 0.55;
+    let over_cap = vec![
+        candidate(
+            ActuatorFamily::InteractionQos,
+            ExplorationArm::InteractionQosShort,
+        );
+        MAX_CANDIDATES_PER_CYCLE + 1
+    ];
+    assert_eq!(
+        scheduler()
+            .select(&over_cap, &pressure, now(1_000, 1_000))
+            .unwrap_err(),
+        ExplorationGateBlocker::Pressure
+    );
+}
+
+#[test]
 fn natural_observation_is_preferred_and_consumes_no_budget_or_cooldown() {
     let mut scheduler = scheduler();
     let approval = scheduler
@@ -424,6 +474,29 @@ fn natural_observation_is_preferred_and_consumes_no_budget_or_cooldown() {
     assert!(!scheduler.has_active_reservation());
     assert_eq!(scheduler.committed_count(), 0);
     assert_eq!(scheduler.cooldown_count(), 0);
+}
+
+#[test]
+fn candidate_examination_cap_is_global_to_the_cycle() {
+    let natural = candidate(ActuatorFamily::Boost, ExplorationArm::NaturalObservation);
+    let mut scheduler = scheduler();
+    scheduler.begin_exploration_cycle(42);
+    for _ in 0..MAX_CANDIDATES_PER_CYCLE {
+        assert!(scheduler
+            .request(&natural, &healthy(), now(1_000, 1_000))
+            .is_ok());
+    }
+    assert_eq!(
+        scheduler
+            .request(&natural, &healthy(), now(1_000, 1_000))
+            .unwrap_err(),
+        ExplorationGateBlocker::Capacity
+    );
+
+    scheduler.begin_exploration_cycle(43);
+    assert!(scheduler
+        .request(&natural, &healthy(), now(1_001, 1_001))
+        .is_ok());
 }
 
 #[test]
@@ -571,6 +644,78 @@ fn wall_rollback_and_forward_jump_cannot_bypass_same_boot_monotonic_time() {
             )
             .unwrap_err(),
         ExplorationGateBlocker::GlobalBudget
+    );
+}
+
+#[test]
+fn same_key_forward_jump_still_requires_full_monotonic_day() {
+    let probe = candidate(
+        ActuatorFamily::MarkovPrewarm,
+        ExplorationArm::MarkovCacheOnly,
+    );
+    let mut scheduler = scheduler();
+    let first = scheduler
+        .request(&probe, &healthy(), now(10_000, 10_000))
+        .unwrap();
+    assert_eq!(
+        scheduler.commit(
+            first.metadata.correlation,
+            now(10_000, 10_000),
+            CommitEvidence::MutationApplied,
+        ),
+        CommitResult::Committed
+    );
+
+    assert_eq!(
+        scheduler
+            .request(&probe, &healthy(), now(200_000, 10_900))
+            .unwrap_err(),
+        ExplorationGateBlocker::KeyCooldown
+    );
+    assert!(scheduler
+        .request(&probe, &healthy(), now(200_000, 96_400))
+        .is_ok());
+}
+
+#[test]
+fn same_boot_restore_preserves_global_and_key_monotonic_deadlines() {
+    let probe = candidate(
+        ActuatorFamily::MarkovPrewarm,
+        ExplorationArm::MarkovCacheOnly,
+    );
+    let mut scheduler = scheduler();
+    let first = scheduler
+        .request(&probe, &healthy(), now(10_000, 10_000))
+        .unwrap();
+    scheduler.commit(
+        first.metadata.correlation,
+        now(10_000, 10_000),
+        CommitEvidence::MutationApplied,
+    );
+
+    let (mut restored, disposition) = ExplorationScheduler::restore(
+        scheduler.persisted(),
+        RestoreContext::local(local_origin(), now(200_000, 10_100)),
+    );
+    assert_eq!(disposition, RestoreDisposition::Restored);
+    assert_eq!(
+        restored
+            .request(
+                &candidate(
+                    ActuatorFamily::InteractionQos,
+                    ExplorationArm::InteractionQosShort,
+                ),
+                &healthy(),
+                now(200_000, 10_899),
+            )
+            .unwrap_err(),
+        ExplorationGateBlocker::GlobalBudget
+    );
+    assert_eq!(
+        restored
+            .request(&probe, &healthy(), now(200_000, 10_900))
+            .unwrap_err(),
+        ExplorationGateBlocker::KeyCooldown
     );
 }
 
@@ -838,6 +983,63 @@ fn one_probe_correlation_maps_to_one_normal_decision_id_and_episode() {
     let mut medallion = TelemetryMedallion::new(InstallationId(7));
     medallion.stage_decision_episodes(&episodes);
     assert_eq!(medallion.decision_id_high_water(), episodes[0].id.0);
+}
+
+#[test]
+fn correlated_terminal_merges_cancellation_before_settle() {
+    let mut scheduler = scheduler();
+    let approval = scheduler
+        .request(
+            &candidate(
+                ActuatorFamily::InteractionQos,
+                ExplorationArm::InteractionQosStandard,
+            ),
+            &healthy(),
+            now(1_000, 1_000),
+        )
+        .unwrap();
+    let clean = scheduler
+        .commit_metadata(
+            approval.metadata.correlation,
+            now(1_000, 1_000),
+            CommitEvidence::MutationApplied,
+        )
+        .expect("committed metadata");
+    let mut terminal = clean.clone();
+    terminal.cancelled = Some(TerminalDiagnostic::ReleaseFailed);
+
+    let mut events = CycleDecisionEvents::default();
+    events.push(
+        ActuatorDecisionEvent::local(
+            "interaction_qos:foreground@standard",
+            "general",
+            1,
+            ActuatorDecisionOutcome::Pending,
+            "acceleration-lease",
+            "lease started",
+        )
+        .with_exploration(clean),
+    );
+    let mut ledger = DecisionLedger::new();
+    assert!(ledger.ingest_cycle_events(&mut events).is_empty());
+    events.push(
+        ActuatorDecisionEvent::local(
+            "interaction_qos:foreground@standard",
+            "general",
+            2,
+            ActuatorDecisionOutcome::Failed,
+            "acceleration-lease",
+            "release incomplete",
+        )
+        .with_exploration(terminal),
+    );
+
+    let episode = ledger.ingest_cycle_events(&mut events).remove(0);
+    assert_eq!(
+        episode.envelope.exploration.unwrap().cancelled,
+        Some(TerminalDiagnostic::ReleaseFailed)
+    );
+    assert!(!episode.authority_eligible);
 }
 
 #[test]

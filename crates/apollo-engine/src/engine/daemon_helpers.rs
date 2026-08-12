@@ -294,6 +294,61 @@ pub fn system_uptime_secs() -> u64 {
     now.saturating_sub(boot)
 }
 
+/// Stable boot identity plus monotonic seconds since boot. Unlike daemon-local
+/// `Instant`, this survives service restart; unlike wall time, it cannot jump
+/// forward when the clock is adjusted.
+#[cfg(target_os = "macos")]
+pub fn system_boot_session() -> Option<(u64, u64)> {
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+
+    extern "C" {
+        fn mach_continuous_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+
+    let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+    let mut size = std::mem::size_of::<libc::timeval>();
+    let boot_status = unsafe {
+        libc::sysctlbyname(
+            b"kern.boottime\0".as_ptr() as *const libc::c_char,
+            &mut tv as *mut _ as *mut libc::c_void,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if boot_status != 0 || tv.tv_sec <= 0 {
+        return None;
+    }
+
+    let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+    if unsafe { mach_timebase_info(&mut timebase) } != 0
+        || timebase.numer == 0
+        || timebase.denom == 0
+    {
+        return None;
+    }
+    let ticks = unsafe { mach_continuous_time() };
+    let monotonic_secs = (u128::from(ticks) * u128::from(timebase.numer)
+        / u128::from(timebase.denom)
+        / 1_000_000_000) as u64;
+    let boot_id = (tv.tv_sec as u64).rotate_left(21) ^ tv.tv_usec as u64;
+    (boot_id != 0).then_some((boot_id, monotonic_secs))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn system_boot_session() -> Option<(u64, u64)> {
+    use std::sync::OnceLock;
+    use std::time::Instant;
+
+    static START: OnceLock<Instant> = OnceLock::new();
+    Some((1, START.get_or_init(Instant::now).elapsed().as_secs()))
+}
+
 /// Path where novel effective process patterns are logged for scenario generation.
 /// Append-only JSONL; read by autoresearch loop to generate targeted tests.
 pub fn novel_patterns_path() -> &'static str {

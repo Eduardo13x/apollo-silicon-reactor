@@ -296,6 +296,36 @@ struct LeasedMember {
     prior_nice: Option<i32>,
 }
 
+fn reverify_member_identity(identity: &ProcessIdentity) -> bool {
+    ProcessIdentity::from_pid(identity.pid).is_some_and(|current| {
+        current.matches(
+            Some(&identity.name),
+            identity.start_sec,
+            identity.start_usec,
+        )
+    })
+}
+
+fn acceleration_target_gates(
+    mut gates: ExplorationGates,
+    selection: &AccelerationSelection,
+    identity: Option<&ProcessIdentity>,
+    snapshots: &[ProcessSnapshot],
+) -> ExplorationGates {
+    gates.identity_present = identity.is_some();
+    gates.identity_start_nonzero =
+        identity.is_some_and(|identity| identity.start_sec > 0 || identity.start_usec > 0);
+    gates.identity_recheck_ok = identity.is_some_and(reverify_member_identity);
+    gates.identity_recycled = !gates.identity_recheck_ok;
+    gates.target_protected = snapshots
+        .iter()
+        .find(|snapshot| snapshot.pid == selection.root_pid)
+        .is_none_or(|snapshot| hard_protected_contains(&snapshot.name));
+    gates.target_apple_owned =
+        apollo_engine::engine::apple_owned::is_apple_owned(selection.root_pid);
+    gates
+}
+
 #[derive(Debug)]
 struct ActiveAccelerationLease {
     root_pid: u32,
@@ -713,7 +743,7 @@ fn acquire_acceleration_lease(
     io_bias: ContextualActionBias,
     now: Instant,
     cycle: u64,
-) -> CycleDecisionEvents {
+) -> (CycleDecisionEvents, bool) {
     let mut decision_events = CycleDecisionEvents::default();
     let ttl = ttl_decision.band.ttl(reason);
     let ledger_ttl = ttl.saturating_add(LEDGER_GRACE);
@@ -722,6 +752,7 @@ fn acquire_acceleration_lease(
     let mut nice_fallbacks = 0u64;
     let mut nice_failures = 0u64;
     let mut conflict_skips = 0u64;
+    let mut identity_recheck_failed = false;
     let mut prepared = Vec::with_capacity(selection.members.len());
     for candidate in selection.members {
         if let Some(identity) = ProcessIdentity::from_pid(candidate.pid) {
@@ -753,17 +784,32 @@ fn acquire_acceleration_lease(
     }
 
     let mut members = Vec::with_capacity(prepared.len());
-    let selected_pids: Vec<u32> = prepared
-        .iter()
-        .map(|(candidate, _, _, _)| candidate.pid)
-        .collect();
     let selected_names: HashMap<u32, String> = prepared
         .iter()
         .map(|(candidate, _, _, _)| (candidate.pid, candidate.name.clone()))
         .collect();
     let mut qos = state.mach_qos.lock_recover();
     let io_outcomes = if allow_io_promotion {
-        io_shaper.promote_interactive_outcomes(&selected_pids, Some(&mut qos))
+        let mut outcomes = Vec::with_capacity(prepared.len());
+        for (candidate, identity, _, _) in &prepared {
+            if reverify_member_identity(identity) {
+                outcomes.extend(
+                    io_shaper.promote_interactive_outcomes(&[candidate.pid], Some(&mut qos)),
+                );
+            } else {
+                identity_recheck_failed = true;
+                identity_skips = identity_skips.saturating_add(1);
+                decision_events.push(acceleration_member_event(
+                    candidate.pid,
+                    &candidate.name,
+                    AccelerationMemberEffect::IoPromotion,
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    "process identity changed before I/O promotion",
+                ));
+            }
+        }
+        outcomes
     } else {
         for (candidate, _, _, _) in &prepared {
             decision_events.push(acceleration_member_event(
@@ -803,6 +849,19 @@ fn acquire_acceleration_lease(
         // is deliberately excluded here: several hardened GUI apps accept
         // foreground elevation but reject TASK_UNSPECIFIED rollback.
         if !selection.family.allows_explicit_task_qos() {
+            continue;
+        }
+        if !reverify_member_identity(&identity) {
+            identity_recheck_failed = true;
+            identity_skips = identity_skips.saturating_add(1);
+            decision_events.push(acceleration_member_event(
+                candidate.pid,
+                &candidate.name,
+                AccelerationMemberEffect::TaskQos,
+                cycle,
+                ActuatorDecisionOutcome::Blocked,
+                "process identity changed before task QoS mutation",
+            ));
             continue;
         }
         let mut policy_lease = None;
@@ -1049,7 +1108,7 @@ fn acquire_acceleration_lease(
         // remainder of this interaction window.
         controller.cooldown_until = Some(now + ttl.min(LEASE_COOLDOWN));
     }
-    decision_events
+    (decision_events, identity_recheck_failed)
 }
 
 /// Apply a bounded family acceleration lease and restore only effects this
@@ -1071,8 +1130,7 @@ fn update_acceleration_lease_inner(
     workload: &str,
     cycle: u64,
     exploration_scheduler: &mut ExplorationScheduler,
-    exploration_gates: ExplorationGates,
-    exploration_now: TimePoint,
+    exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
 ) -> CycleDecisionEvents {
     let mut decision_events = CycleDecisionEvents::default();
     let now = Instant::now();
@@ -1158,27 +1216,10 @@ fn update_acceleration_lease_inner(
 
         if let Some(selection) = select_acceleration_family(pid, reason, process_tree, snapshots) {
             let selection_root_pid = selection.root_pid;
-            let mut gates = exploration_gates;
             let identity = ProcessIdentity::from_pid(selection.root_pid);
-            gates.identity_present = identity.is_some();
-            gates.identity_start_nonzero = identity
-                .as_ref()
-                .is_some_and(|identity| identity.start_sec > 0 || identity.start_usec > 0);
-            gates.identity_recheck_ok = identity.as_ref().is_some_and(|identity| {
-                ProcessIdentity::verify(
-                    selection.root_pid,
-                    None,
-                    identity.start_sec,
-                    identity.start_usec,
-                )
-            });
-            gates.identity_recycled = !gates.identity_recheck_ok;
-            gates.target_protected = snapshots
-                .iter()
-                .find(|snapshot| snapshot.pid == selection.root_pid)
-                .is_none_or(|snapshot| hard_protected_contains(&snapshot.name));
-            gates.target_apple_owned =
-                apollo_engine::engine::apple_owned::is_apple_owned(selection.root_pid);
+            let (request_gates, request_now) = exploration_environment();
+            let gates =
+                acceleration_target_gates(request_gates, &selection, identity.as_ref(), snapshots);
             let mut exploration_approval = ExplorationCandidate::new(
                 ActuatorFamily::InteractionQos,
                 ExplorationMode::Treatment,
@@ -1189,28 +1230,19 @@ fn update_acceleration_lease_inner(
             )
             .ok()
             .and_then(|candidate| {
-                exploration_scheduler
-                    .request(&candidate, &gates, exploration_now)
-                    .ok()
-            });
-            if exploration_approval
-                .as_ref()
-                .is_some_and(|approval| exploration_scheduler.recheck(approval, &gates).is_err())
-            {
-                if let Some(approval) = exploration_approval.take() {
-                    exploration_scheduler.cancel(
-                        approval.metadata.correlation,
-                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
-                    );
+                let matched_natural = world_model
+                    .assess_utility("interaction_qos:foreground", workload)
+                    .is_some_and(|assessment| assessment.counterfactual_observations > 0);
+                let mut candidates = Vec::with_capacity(2);
+                if matched_natural {
+                    candidates.push(candidate.natural_observation());
                 }
-            }
-            let ttl_decision = controller.preview_ttl_band(
-                interaction_bias,
-                learned_ttl_band,
-                exploration_approval
-                    .as_ref()
-                    .map(|approval| approval.metadata.arm),
-            );
+                candidates.push(candidate);
+                exploration_scheduler
+                    .select(&candidates, &gates, request_now)
+                    .ok()
+                    .filter(|approval| approval.metadata.arm != ExplorationArm::NaturalObservation)
+            });
             if interaction_bias.is_informative() {
                 let mut metrics = state.metrics.lock_recover();
                 metrics.metrics.world_model_contextual_interaction_total = metrics
@@ -1228,7 +1260,34 @@ fn update_acceleration_lease_inner(
                     );
                 }
             }
-            let acquired = acquire_acceleration_lease(
+            let late_recheck_failed = exploration_approval.as_ref().is_some_and(|approval| {
+                let (fresh_gates, _) = exploration_environment();
+                let fresh_gates = acceleration_target_gates(
+                    fresh_gates,
+                    &selection,
+                    identity.as_ref(),
+                    snapshots,
+                );
+                exploration_scheduler
+                    .recheck(approval, &fresh_gates)
+                    .is_err()
+            });
+            if late_recheck_failed {
+                if let Some(approval) = exploration_approval.take() {
+                    exploration_scheduler.cancel(
+                        approval.metadata.correlation,
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                    );
+                }
+            }
+            let ttl_decision = controller.preview_ttl_band(
+                interaction_bias,
+                learned_ttl_band,
+                exploration_approval
+                    .as_ref()
+                    .map(|approval| approval.metadata.arm),
+            );
+            let (acquired, identity_recheck_failed) = acquire_acceleration_lease(
                 state,
                 controller,
                 io_shaper,
@@ -1242,6 +1301,16 @@ fn update_acceleration_lease_inner(
             );
             decision_events.extend_buffer(&acquired);
             if let Some(approval) = exploration_approval {
+                if identity_recheck_failed {
+                    decision_events
+                        .extend_buffer(&release_acceleration_lease(controller, state, cycle));
+                    exploration_scheduler.commit(
+                        approval.metadata.correlation,
+                        exploration_environment().1,
+                        CommitEvidence::StaleIdentity,
+                    );
+                    return decision_events;
+                }
                 let mutated = controller
                     .active
                     .as_ref()
@@ -1249,7 +1318,7 @@ fn update_acceleration_lease_inner(
                 if mutated {
                     if let Some(metadata) = exploration_scheduler.commit_metadata(
                         approval.metadata.correlation,
-                        exploration_now,
+                        exploration_environment().1,
                         CommitEvidence::MutationApplied,
                     ) {
                         if let Some(active) = controller.active.as_mut() {
@@ -1272,7 +1341,7 @@ fn update_acceleration_lease_inner(
                 } else {
                     exploration_scheduler.commit(
                         approval.metadata.correlation,
-                        exploration_now,
+                        exploration_environment().1,
                         CommitEvidence::NoOp,
                     );
                 }
@@ -1298,8 +1367,7 @@ pub fn update_acceleration_lease(
     workload: &str,
     cycle: u64,
     exploration_scheduler: &mut ExplorationScheduler,
-    exploration_gates: ExplorationGates,
-    exploration_now: TimePoint,
+    exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
 ) -> AccelerationTickOutput {
     let prior_root = controller.active.as_ref().map(|lease| lease.root_pid);
     let expired = controller.active.as_ref().is_some_and(|lease| {
@@ -1320,8 +1388,7 @@ pub fn update_acceleration_lease(
         workload,
         cycle,
         exploration_scheduler,
-        exploration_gates,
-        exploration_now,
+        exploration_environment,
     );
     let target = controller
         .active

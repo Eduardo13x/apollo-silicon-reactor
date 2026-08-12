@@ -644,11 +644,28 @@ impl DecisionLedger {
             );
             return self.settle(id, settled_cycle);
         }
+        let terminal_exploration = event.proposal.exploration.clone();
         let id = event
             .correlation_id
             .and_then(|correlation_id| self.pending_correlations.get(&correlation_id).copied())
             .unwrap_or_else(|| self.propose(event.proposal));
         if let Some(envelope) = self.pending.get_mut(&id) {
+            if let Some(terminal) = terminal_exploration {
+                if terminal.valid()
+                    && envelope.exploration.as_ref().is_some_and(|pending| {
+                        pending.correlation == terminal.correlation
+                            && pending.family == terminal.family
+                            && pending.key == terminal.key
+                    })
+                {
+                    if let Some(pending) = envelope.exploration.as_mut() {
+                        pending.committed |= terminal.committed;
+                        if terminal.cancelled.is_some() {
+                            pending.cancelled = terminal.cancelled;
+                        }
+                    }
+                }
+            }
             envelope.terminal_attribution = Some(event.attribution.clone().bounded());
         }
         let closed = match event.outcome {

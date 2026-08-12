@@ -5,8 +5,11 @@
 //! existing actuator owners remain responsible for every mutation and revert.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
+use std::marker::PhantomData;
 
-use serde::{Deserialize, Serialize};
+use serde::de::{Error as DeError, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::engine::telemetry_medallion::ActuatorFamily;
 
@@ -18,7 +21,7 @@ pub const MAX_SERIALIZED_BYTES: usize = 64 * 1024;
 pub const GLOBAL_INTERVAL_SECS: i64 = 900;
 pub const KEY_COOLDOWN_SECS: i64 = 86_400;
 const MAX_COMMITS_PER_DAY: usize = 96;
-const SCHEDULER_SCHEMA_VERSION: u32 = 1;
+const SCHEDULER_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[serde(transparent)]
@@ -407,6 +410,19 @@ impl ExplorationCandidate {
     pub fn is_mutable(&self) -> bool {
         self.key.mode != ExplorationMode::Natural
     }
+
+    pub fn natural_observation(&self) -> Self {
+        Self {
+            key: ExplorationKey {
+                family: self.key.family,
+                mode: ExplorationMode::Natural,
+                arm: ExplorationArm::NaturalObservation,
+                action_class: ActionClass::Natural,
+                context: self.key.context,
+            },
+            origin: self.origin,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -435,9 +451,31 @@ pub enum CommitResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 struct PersistedCooldown {
     key: ExplorationKey,
     expires_wall_unix_secs: i64,
+    committed_monotonic_secs: u64,
+    boot_id: u64,
+}
+
+impl Default for PersistedCooldown {
+    fn default() -> Self {
+        Self {
+            key: ExplorationKey::default(),
+            expires_wall_unix_secs: 0,
+            committed_monotonic_secs: 0,
+            boot_id: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct PersistedCommit {
+    wall_unix_secs: i64,
+    monotonic_secs: u64,
+    boot_id: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,11 +483,15 @@ struct PersistedCooldown {
 pub struct ExplorationSchedulerPersisted {
     pub schema_version: u32,
     origin: ExplorationOrigin,
+    #[serde(default, deserialize_with = "deserialize_cooldowns")]
     cooldowns: Vec<PersistedCooldown>,
-    commits_wall_unix_secs: VecDeque<i64>,
+    #[serde(default, deserialize_with = "deserialize_commits")]
+    commits: VecDeque<PersistedCommit>,
+    #[serde(default, deserialize_with = "deserialize_terminal_dedup")]
     terminal_dedup: VecDeque<ProbeCorrelation>,
     arm_sequence: u64,
     next_correlation: u64,
+    #[serde(default, deserialize_with = "deserialize_reserved")]
     reserved: String,
 }
 
@@ -465,7 +507,7 @@ impl ExplorationSchedulerPersisted {
             schema_version: SCHEDULER_SCHEMA_VERSION,
             origin,
             cooldowns: Vec::new(),
-            commits_wall_unix_secs: VecDeque::new(),
+            commits: VecDeque::new(),
             terminal_dedup: VecDeque::new(),
             arm_sequence: 0,
             next_correlation: 0,
@@ -502,6 +544,8 @@ fn fixture_cooldowns(count: usize, expiry: i64) -> Vec<PersistedCooldown> {
                 context: ExplorationContext::Workload(index.min(u8::MAX as usize) as u8),
             },
             expires_wall_unix_secs: expiry,
+            committed_monotonic_secs: 1,
+            boot_id: 10,
         })
         .collect()
 }
@@ -559,22 +603,23 @@ struct ActiveReservation {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct SessionCommit {
-    wall_unix_secs: i64,
-    monotonic_secs: u64,
+struct CooldownDeadline {
+    expires_wall_unix_secs: i64,
+    committed_monotonic_secs: u64,
     boot_id: u64,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExplorationScheduler {
     origin: ExplorationOrigin,
-    cooldowns: HashMap<ExplorationKey, i64>,
-    commits_wall_unix_secs: VecDeque<i64>,
+    cooldowns: HashMap<ExplorationKey, CooldownDeadline>,
+    commits: VecDeque<PersistedCommit>,
     terminal_dedup: VecDeque<ProbeCorrelation>,
     active: Option<ActiveReservation>,
     arm_sequence: u64,
     next_correlation: u64,
-    session_last_commit: Option<SessionCommit>,
+    cycle_id: Option<u64>,
+    cycle_candidates_examined: usize,
     last_work: SchedulerWork,
 }
 
@@ -589,13 +634,22 @@ impl ExplorationScheduler {
         Self {
             origin,
             cooldowns: HashMap::with_capacity(MAX_COOLDOWNS),
-            commits_wall_unix_secs: VecDeque::with_capacity(MAX_COMMITS_PER_DAY),
+            commits: VecDeque::with_capacity(MAX_COMMITS_PER_DAY),
             terminal_dedup: VecDeque::with_capacity(MAX_TERMINAL_DEDUP),
             active: None,
             arm_sequence: 0,
             next_correlation: 0,
-            session_last_commit: None,
+            cycle_id: None,
+            cycle_candidates_examined: 0,
             last_work: SchedulerWork::default(),
+        }
+    }
+
+    pub fn begin_exploration_cycle(&mut self, cycle: u64) {
+        if self.cycle_id != Some(cycle) {
+            self.cycle_id = Some(cycle);
+            self.cycle_candidates_examined = 0;
+            self.last_work = SchedulerWork::default();
         }
     }
 
@@ -633,13 +687,25 @@ impl ExplorationScheduler {
         gates: &ExplorationGates,
         now: TimePoint,
     ) -> Result<ExplorationApproval, ExplorationGateBlocker> {
-        self.last_work = SchedulerWork::default();
+        first_safety_gate_blocker(gates)?;
+        if self.cycle_id.is_none() {
+            self.cycle_candidates_examined = 0;
+        }
+        self.last_work.cooldowns_examined = 0;
         if candidates.is_empty() || candidates.len() > MAX_CANDIDATES_PER_CYCLE {
+            return Err(ExplorationGateBlocker::Capacity);
+        }
+        if self
+            .cycle_candidates_examined
+            .saturating_add(candidates.len())
+            > MAX_CANDIDATES_PER_CYCLE
+        {
             return Err(ExplorationGateBlocker::Capacity);
         }
         let mut family_counts = [0_u8; 3];
         for candidate in candidates {
-            self.last_work.candidates_examined += 1;
+            self.cycle_candidates_examined += 1;
+            self.last_work.candidates_examined = self.cycle_candidates_examined;
             if candidate.origin != self.origin || !candidate.origin.is_known() {
                 return Err(ExplorationGateBlocker::Policy);
             }
@@ -670,19 +736,19 @@ impl ExplorationScheduler {
             metadata.treatment = false;
             return Ok(ExplorationApproval { metadata });
         }
-        first_gate_blocker(gates, &selected.key)?;
+        selected_key_gate_blocker(gates, &selected.key)?;
         if self.active.is_some() {
             return Err(ExplorationGateBlocker::Ownership);
         }
         if !now.valid() {
             return Err(ExplorationGateBlocker::Policy);
         }
-        self.prune_expired(now.wall_unix_secs);
+        self.prune_expired(now);
         self.check_global_budget(now)?;
         if self
             .cooldowns
             .get(&selected.key)
-            .is_some_and(|expiry| now.wall_unix_secs < *expiry)
+            .is_some_and(|deadline| !cooldown_satisfied(*deadline, now))
         {
             return Err(ExplorationGateBlocker::KeyCooldown);
         }
@@ -744,18 +810,22 @@ impl ExplorationScheduler {
         {
             return None;
         }
-        let expiry = now.wall_unix_secs.saturating_add(KEY_COOLDOWN_SECS);
-        self.cooldowns
-            .insert(reservation.metadata.key.clone(), expiry);
-        self.commits_wall_unix_secs.push_back(now.wall_unix_secs);
-        while self.commits_wall_unix_secs.len() > MAX_COMMITS_PER_DAY {
-            self.commits_wall_unix_secs.pop_front();
-        }
-        self.session_last_commit = Some(SessionCommit {
+        self.cooldowns.insert(
+            reservation.metadata.key.clone(),
+            CooldownDeadline {
+                expires_wall_unix_secs: now.wall_unix_secs.saturating_add(KEY_COOLDOWN_SECS),
+                committed_monotonic_secs: now.monotonic_secs,
+                boot_id: now.boot_id,
+            },
+        );
+        self.commits.push_back(PersistedCommit {
             wall_unix_secs: now.wall_unix_secs,
             monotonic_secs: now.monotonic_secs,
             boot_id: now.boot_id,
         });
+        while self.commits.len() > MAX_COMMITS_PER_DAY {
+            self.commits.pop_front();
+        }
         if reservation.metadata.family == ActuatorFamily::InteractionQos {
             self.arm_sequence = self.arm_sequence.wrapping_add(1);
         }
@@ -806,16 +876,18 @@ impl ExplorationScheduler {
         let cooldowns: Vec<_> = self
             .cooldowns
             .iter()
-            .map(|(key, expiry)| PersistedCooldown {
+            .map(|(key, deadline)| PersistedCooldown {
                 key: key.clone(),
-                expires_wall_unix_secs: *expiry,
+                expires_wall_unix_secs: deadline.expires_wall_unix_secs,
+                committed_monotonic_secs: deadline.committed_monotonic_secs,
+                boot_id: deadline.boot_id,
             })
             .collect();
         ExplorationSchedulerPersisted {
             schema_version: SCHEDULER_SCHEMA_VERSION,
             origin: self.origin,
             cooldowns,
-            commits_wall_unix_secs: self.commits_wall_unix_secs.clone(),
+            commits: self.commits.clone(),
             terminal_dedup: self.terminal_dedup.clone(),
             arm_sequence: self.arm_sequence,
             next_correlation: self.next_correlation,
@@ -846,15 +918,24 @@ impl ExplorationScheduler {
         scheduler.cooldowns = persisted
             .cooldowns
             .into_iter()
-            .map(|cooldown| (cooldown.key, cooldown.expires_wall_unix_secs))
+            .map(|cooldown| {
+                (
+                    cooldown.key,
+                    CooldownDeadline {
+                        expires_wall_unix_secs: cooldown.expires_wall_unix_secs,
+                        committed_monotonic_secs: cooldown.committed_monotonic_secs,
+                        boot_id: cooldown.boot_id,
+                    },
+                )
+            })
             .collect();
-        scheduler.commits_wall_unix_secs = persisted.commits_wall_unix_secs;
+        scheduler.commits = persisted.commits;
         scheduler.terminal_dedup = persisted.terminal_dedup;
         scheduler.arm_sequence = persisted.arm_sequence;
         scheduler.next_correlation = persisted.next_correlation;
         if context.now.valid() {
-            scheduler.prune_expired(context.now.wall_unix_secs);
-            scheduler.prune_commit_window(context.now.wall_unix_secs);
+            scheduler.prune_expired(context.now);
+            scheduler.prune_commit_window(context.now);
         }
         (scheduler, RestoreDisposition::Restored)
     }
@@ -870,7 +951,7 @@ impl ExplorationScheduler {
     }
 
     pub fn committed_count(&self) -> usize {
-        self.commits_wall_unix_secs.len()
+        self.commits.len()
     }
 
     pub fn cooldown_count(&self) -> usize {
@@ -890,7 +971,8 @@ impl ExplorationScheduler {
         approval: &ExplorationApproval,
         gates: &ExplorationGates,
     ) -> Result<(), ExplorationGateBlocker> {
-        first_gate_blocker(gates, &approval.metadata.key)
+        first_safety_gate_blocker(gates)?;
+        selected_key_gate_blocker(gates, &approval.metadata.key)
     }
 
     fn peek_next_correlation(&self) -> ProbeCorrelation {
@@ -898,45 +980,37 @@ impl ExplorationScheduler {
         ProbeCorrelation(if next == 0 { 1 } else { next })
     }
 
-    fn prune_expired(&mut self, wall_unix_secs: i64) {
+    fn prune_expired(&mut self, now: TimePoint) {
         if self.cooldowns.len() <= MAX_COOLDOWNS {
             self.last_work.cooldowns_examined = self.cooldowns.len();
-            self.cooldowns.retain(|_, expiry| *expiry > wall_unix_secs);
+            self.cooldowns
+                .retain(|_, deadline| !cooldown_satisfied(*deadline, now));
         }
     }
 
-    fn prune_commit_window(&mut self, wall_unix_secs: i64) {
-        let floor = wall_unix_secs.saturating_sub(KEY_COOLDOWN_SECS);
+    fn prune_commit_window(&mut self, now: TimePoint) {
         while self
-            .commits_wall_unix_secs
+            .commits
             .front()
-            .is_some_and(|timestamp| *timestamp <= floor)
+            .copied()
+            .is_some_and(|commit| deadline_satisfied(commit, now, KEY_COOLDOWN_SECS as u64))
         {
-            self.commits_wall_unix_secs.pop_front();
+            self.commits.pop_front();
         }
     }
 
     fn check_global_budget(&mut self, now: TimePoint) -> Result<(), ExplorationGateBlocker> {
-        self.prune_commit_window(now.wall_unix_secs);
-        if self.commits_wall_unix_secs.len() >= MAX_COMMITS_PER_DAY {
+        self.prune_commit_window(now);
+        if self.commits.len() >= MAX_COMMITS_PER_DAY {
             return Err(ExplorationGateBlocker::GlobalBudget);
         }
-        if let Some(last_wall) = self.commits_wall_unix_secs.back().copied() {
-            if now.wall_unix_secs < last_wall
-                || now.wall_unix_secs.saturating_sub(last_wall) < GLOBAL_INTERVAL_SECS
-            {
-                return Err(ExplorationGateBlocker::GlobalBudget);
-            }
-        }
-        if let Some(last) = self.session_last_commit {
-            if now.boot_id == last.boot_id
-                && (now.wall_unix_secs < last.wall_unix_secs
-                    || now.monotonic_secs < last.monotonic_secs
-                    || now.monotonic_secs.saturating_sub(last.monotonic_secs)
-                        < GLOBAL_INTERVAL_SECS as u64)
-            {
-                return Err(ExplorationGateBlocker::GlobalBudget);
-            }
+        if self
+            .commits
+            .back()
+            .copied()
+            .is_some_and(|last| !deadline_satisfied(last, now, GLOBAL_INTERVAL_SECS as u64))
+        {
+            return Err(ExplorationGateBlocker::GlobalBudget);
         }
         Ok(())
     }
@@ -967,18 +1041,15 @@ fn family_rank(family: ActuatorFamily) -> u8 {
 
 fn selection_key(key: &ExplorationKey) -> (u8, u8, ActionClass, ExplorationContext, u8) {
     (
-        key.mode.rank(),
+        key.arm.rank(),
         family_rank(key.family),
         key.action_class,
         key.context,
-        key.arm.rank(),
+        key.mode.rank(),
     )
 }
 
-fn first_gate_blocker(
-    gates: &ExplorationGates,
-    key: &ExplorationKey,
-) -> Result<(), ExplorationGateBlocker> {
+fn first_safety_gate_blocker(gates: &ExplorationGates) -> Result<(), ExplorationGateBlocker> {
     if gates.daemon_shutdown || gates.kill_switch || gates.cognitive_paused {
         return Err(ExplorationGateBlocker::Lifecycle);
     }
@@ -1021,6 +1092,13 @@ fn first_gate_blocker(
     {
         return Err(ExplorationGateBlocker::Identity);
     }
+    Ok(())
+}
+
+fn selected_key_gate_blocker(
+    gates: &ExplorationGates,
+    key: &ExplorationKey,
+) -> Result<(), ExplorationGateBlocker> {
     let boost_omission_conflict = key.family == ActuatorFamily::Boost
         && (gates.coalition_conflict
             || gates.target_foreground
@@ -1043,7 +1121,7 @@ fn valid_persisted(persisted: &ExplorationSchedulerPersisted) -> bool {
     if persisted.schema_version != SCHEDULER_SCHEMA_VERSION
         || !persisted.origin.is_known()
         || persisted.cooldowns.len() > MAX_COOLDOWNS
-        || persisted.commits_wall_unix_secs.len() > MAX_COMMITS_PER_DAY
+        || persisted.commits.len() > MAX_COMMITS_PER_DAY
         || persisted.terminal_dedup.len() > MAX_TERMINAL_DEDUP
         || persisted.next_correlation >= ProbeCorrelation::LEDGER_NAMESPACE
         || !persisted.reserved.is_empty()
@@ -1054,6 +1132,7 @@ fn valid_persisted(persisted: &ExplorationSchedulerPersisted) -> bool {
     let mut keys = HashSet::with_capacity(persisted.cooldowns.len());
     if persisted.cooldowns.iter().any(|cooldown| {
         cooldown.expires_wall_unix_secs <= 0
+            || cooldown.boot_id == 0
             || !valid_key(&cooldown.key)
             || !keys.insert(cooldown.key.clone())
     }) {
@@ -1068,14 +1147,139 @@ fn valid_persisted(persisted: &ExplorationSchedulerPersisted) -> bool {
         return false;
     }
     persisted
-        .commits_wall_unix_secs
+        .commits
         .iter()
-        .all(|timestamp| *timestamp > 0)
+        .all(|commit| commit.wall_unix_secs > 0 && commit.boot_id > 0)
         && persisted
-            .commits_wall_unix_secs
+            .commits
             .iter()
-            .zip(persisted.commits_wall_unix_secs.iter().skip(1))
-            .all(|(left, right)| left <= right)
+            .zip(persisted.commits.iter().skip(1))
+            .all(|(left, right)| left.wall_unix_secs <= right.wall_unix_secs)
+}
+
+fn deadline_satisfied(commit: PersistedCommit, now: TimePoint, duration_secs: u64) -> bool {
+    if now.wall_unix_secs < commit.wall_unix_secs
+        || now.wall_unix_secs.saturating_sub(commit.wall_unix_secs) < duration_secs as i64
+    {
+        return false;
+    }
+    now.boot_id != commit.boot_id
+        || (now.monotonic_secs >= commit.monotonic_secs
+            && now.monotonic_secs.saturating_sub(commit.monotonic_secs) >= duration_secs)
+}
+
+fn cooldown_satisfied(deadline: CooldownDeadline, now: TimePoint) -> bool {
+    if now.wall_unix_secs < deadline.expires_wall_unix_secs {
+        return false;
+    }
+    now.boot_id != deadline.boot_id
+        || (now.monotonic_secs >= deadline.committed_monotonic_secs
+            && now
+                .monotonic_secs
+                .saturating_sub(deadline.committed_monotonic_secs)
+                >= KEY_COOLDOWN_SECS as u64)
+}
+
+struct BoundedVecVisitor<T, const MAX: usize>(PhantomData<T>);
+
+impl<'de, T, const MAX: usize> Visitor<'de> for BoundedVecVisitor<T, MAX>
+where
+    T: Deserialize<'de>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "at most {MAX} scheduler entries")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut values = Vec::with_capacity(MAX.min(sequence.size_hint().unwrap_or(MAX)));
+        while let Some(value) = sequence.next_element()? {
+            if values.len() == MAX {
+                return Err(A::Error::custom("scheduler field exceeds bounded capacity"));
+            }
+            values.push(value);
+        }
+        Ok(values)
+    }
+}
+
+fn deserialize_cooldowns<'de, D>(deserializer: D) -> Result<Vec<PersistedCooldown>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor::<PersistedCooldown, MAX_COOLDOWNS>(
+        PhantomData,
+    ))
+}
+
+fn deserialize_commits<'de, D>(deserializer: D) -> Result<VecDeque<PersistedCommit>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, PersistedCommit, MAX_COMMITS_PER_DAY>(deserializer)
+        .map(VecDeque::from)
+}
+
+fn deserialize_terminal_dedup<'de, D>(
+    deserializer: D,
+) -> Result<VecDeque<ProbeCorrelation>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    deserialize_bounded_vec::<D, ProbeCorrelation, MAX_TERMINAL_DEDUP>(deserializer)
+        .map(VecDeque::from)
+}
+
+fn deserialize_bounded_vec<'de, D, T, const MAX: usize>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    deserializer.deserialize_seq(BoundedVecVisitor::<T, MAX>(PhantomData))
+}
+
+fn deserialize_reserved<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct BoundedStringVisitor;
+
+    impl Visitor<'_> for BoundedStringVisitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "a scheduler string no larger than {MAX_SERIALIZED_BYTES} bytes"
+            )
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            if value.len() > MAX_SERIALIZED_BYTES {
+                return Err(E::custom("scheduler string exceeds serialized payload cap"));
+            }
+            Ok(value.to_string())
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: DeError,
+        {
+            if value.len() > MAX_SERIALIZED_BYTES {
+                return Err(E::custom("scheduler string exceeds serialized payload cap"));
+            }
+            Ok(value)
+        }
+    }
+
+    deserializer.deserialize_string(BoundedStringVisitor)
 }
 
 fn valid_key(key: &ExplorationKey) -> bool {

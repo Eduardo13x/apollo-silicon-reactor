@@ -1317,15 +1317,21 @@ impl LearnedState {
     /// at [`CURRENT_SCHEMA_VERSION`], regardless of how old the on-disk file is.
     pub fn load(path: &Path) -> Option<Self> {
         fn parse_supported(data: &str) -> Result<LearnedState, bool> {
-            let value: serde_json::Value = serde_json::from_str(data).map_err(|_| false)?;
-            let version = value
-                .get("version")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
-            if version > CURRENT_SCHEMA_VERSION as u64 {
+            #[derive(Deserialize)]
+            struct VersionProbe {
+                #[serde(default)]
+                version: u32,
+            }
+
+            let version = serde_json::from_str::<VersionProbe>(data)
+                .map_err(|_| false)?
+                .version;
+            if version > CURRENT_SCHEMA_VERSION {
                 return Err(true);
             }
-            let state: LearnedState = serde_json::from_value(value).map_err(|_| false)?;
+            // Parse directly so bounded field visitors reject hostile scheduler
+            // collections before an unrestricted Value tree is materialized.
+            let state: LearnedState = serde_json::from_str(data).map_err(|_| false)?;
             Ok(try_migrate(state.version, state))
         }
 
@@ -2749,6 +2755,80 @@ mod tests {
 
         let recovered = LearnedState::load(&path).expect("previous checkpoint fallback");
         assert_eq!(recovered.persist_generations, 1);
+    }
+
+    #[test]
+    fn hostile_scheduler_fields_are_rejected_during_load_and_recover_previous() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("learned_state.json");
+        let previous = dir.path().join("learned_state.json.previous");
+        std::fs::write(
+            &previous,
+            serde_json::json!({
+                "version": CURRENT_SCHEMA_VERSION,
+                "persist_generations": 7
+            })
+            .to_string(),
+        )
+        .expect("write previous checkpoint");
+
+        let cooldown = serde_json::json!({
+            "key": {
+                "family": "markov_prewarm",
+                "mode": "treatment",
+                "arm": "markov_cache_only",
+                "action_class": "markov_predicted_app",
+                "context": "general"
+            },
+            "expires_wall_unix_secs": 100000
+        });
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": CURRENT_SCHEMA_VERSION,
+                "persist_generations": 99,
+                "exploration_scheduler": {
+                    "schema_version": 1,
+                    "origin": {
+                        "installation_id": 7,
+                        "hardware": {"p_core_count": 4, "e_core_count": 4, "ram_gib": 8}
+                    },
+                    "cooldowns": vec![cooldown; 257]
+                }
+            })
+            .to_string(),
+        )
+        .expect("write over-cap primary");
+        assert_eq!(
+            LearnedState::load(&path)
+                .expect("previous checkpoint")
+                .persist_generations,
+            7
+        );
+
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "version": CURRENT_SCHEMA_VERSION,
+                "persist_generations": 100,
+                "exploration_scheduler": {
+                    "schema_version": 1,
+                    "origin": {
+                        "installation_id": 7,
+                        "hardware": {"p_core_count": 4, "e_core_count": 4, "ram_gib": 8}
+                    },
+                    "reserved": "x".repeat(crate::engine::exploration_scheduler::MAX_SERIALIZED_BYTES + 1)
+                }
+            })
+            .to_string(),
+        )
+        .expect("write oversized primary");
+        assert_eq!(
+            LearnedState::load(&path)
+                .expect("previous checkpoint")
+                .persist_generations,
+            7
+        );
     }
 
     #[test]

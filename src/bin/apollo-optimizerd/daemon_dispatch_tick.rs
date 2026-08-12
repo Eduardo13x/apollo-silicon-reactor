@@ -913,8 +913,7 @@ pub struct DispatchTickInput<'a> {
     pub foreground_pid: Option<u32>,
     pub exploration_scheduler: &'a mut ExplorationScheduler,
     pub telemetry_medallion: &'a mut TelemetryMedallion,
-    pub exploration_gates: ExplorationGates,
-    pub exploration_now: TimePoint,
+    pub exploration_environment: &'a mut dyn FnMut() -> (ExplorationGates, TimePoint),
 }
 
 /// Output results from the dispatch tick.
@@ -1022,8 +1021,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         foreground_pid,
         exploration_scheduler,
         telemetry_medallion,
-        exploration_gates,
-        exploration_now,
+        exploration_environment,
     } = input;
 
     // ── Filter pipeline ──────────────────────────────────────────────────────
@@ -1198,11 +1196,12 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         let coalition_conflict = coalition_guard.is_some_and(|guard| guard.is_protected(*pid));
         let recovery_required = reason.contains("recovery") || reason.contains("safety");
         let interactive_lease_active = state.metrics.lock_recover().metrics.interaction_qos_active;
+        let (request_gates, request_now) = exploration_environment();
         if !counterfactual_holdouts.is_empty()
             || !boost_omission_capable(
                 action,
                 foreground_pid == Some(*pid),
-                exploration_gates.app_launching,
+                request_gates.app_launching,
                 interactive_lease_active,
                 coalition_conflict,
                 recovery_required,
@@ -1224,10 +1223,9 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
             return true;
         }
         counterfactual_eligible = counterfactual_eligible.saturating_add(1);
-        let mut gates = exploration_gates;
-        gates.circuit_closed = !cb_is_open;
+        let mut gates = request_gates;
         gates.target_foreground = foreground_pid == Some(*pid);
-        gates.target_launching = exploration_gates.app_launching;
+        gates.target_launching = gates.app_launching;
         gates.interactive_lease_active = interactive_lease_active;
         gates.coalition_conflict = coalition_conflict;
         gates.recovery_required = recovery_required;
@@ -1253,11 +1251,40 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         ) else {
             return true;
         };
-        let Ok(approval) = exploration_scheduler.request(&candidate, &gates, exploration_now)
-        else {
+        let mut candidates = Vec::with_capacity(2);
+        if assessment.counterfactual_observations > 0 {
+            candidates.push(candidate.natural_observation());
+        }
+        candidates.push(candidate);
+        let Ok(approval) = exploration_scheduler.select(&candidates, &gates, request_now) else {
             return true;
         };
-        if exploration_scheduler.recheck(&approval, &gates).is_err() {
+        if approval.metadata.arm == ExplorationArm::NaturalObservation {
+            return true;
+        }
+        let (fresh_gates, _) = exploration_environment();
+        let mut fresh_gates = fresh_gates;
+        fresh_gates.target_foreground = foreground_pid == Some(*pid);
+        fresh_gates.target_launching = fresh_gates.app_launching;
+        fresh_gates.interactive_lease_active = interactive_lease_active;
+        fresh_gates.coalition_conflict = coalition_conflict;
+        fresh_gates.recovery_required = recovery_required;
+        fresh_gates.identity_present = *start_sec > 0 || *start_usec > 0;
+        fresh_gates.identity_start_nonzero = fresh_gates.identity_present;
+        fresh_gates.identity_recheck_ok =
+            apollo_engine::engine::process_identity::ProcessIdentity::verify(
+                *pid,
+                Some(name),
+                *start_sec,
+                *start_usec,
+            );
+        fresh_gates.identity_recycled = !fresh_gates.identity_recheck_ok;
+        fresh_gates.target_protected = apollo_engine::engine::safety::is_protected_name(name);
+        fresh_gates.target_apple_owned = apollo_engine::engine::apple_owned::is_apple_owned(*pid);
+        if exploration_scheduler
+            .recheck(&approval, &fresh_gates)
+            .is_err()
+        {
             exploration_scheduler.cancel(
                 approval.metadata.correlation,
                 apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
@@ -1267,14 +1294,14 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         if !telemetry_medallion.issue_controlled_holdout(action, workload, cycle_count) {
             exploration_scheduler.commit(
                 approval.metadata.correlation,
-                exploration_now,
+                exploration_environment().1,
                 CommitEvidence::NoOp,
             );
             return true;
         }
         let Some(metadata) = exploration_scheduler.commit_metadata(
             approval.metadata.correlation,
-            exploration_now,
+            exploration_environment().1,
             CommitEvidence::OmissionEndpointOpened,
         ) else {
             return true;
@@ -1646,6 +1673,16 @@ mod tests {
         let mut telemetry_medallion = TelemetryMedallion::new(
             apollo_engine::engine::installation_identity::InstallationId(1),
         );
+        let mut exploration_environment = || {
+            (
+                ExplorationGates::healthy(),
+                TimePoint {
+                    wall_unix_secs: 1,
+                    monotonic_secs: 1,
+                    boot_id: 1,
+                },
+            )
+        };
 
         let input = DispatchTickInput {
             state: &state,
@@ -1678,12 +1715,7 @@ mod tests {
             foreground_pid: None,
             exploration_scheduler: &mut exploration_scheduler,
             telemetry_medallion: &mut telemetry_medallion,
-            exploration_gates: ExplorationGates::healthy(),
-            exploration_now: TimePoint {
-                wall_unix_secs: 1,
-                monotonic_secs: 1,
-                boot_id: 1,
-            },
+            exploration_environment: &mut exploration_environment,
         };
 
         let output = run_dispatch_tick(input);
