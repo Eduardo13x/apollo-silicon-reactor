@@ -71,6 +71,7 @@ pub fn unified_learning_revision(
 ) -> UnifiedLearningRevision {
     UnifiedLearningRevision {
         ledger: ledger.revision(),
+        ledger_unattributed_applied_total: ledger.unattributed_applied_total(),
         calibration: telemetry.learning_revision(),
         hierarchy: hierarchy.revision(),
         exploration: scheduler.revision(),
@@ -975,6 +976,37 @@ mod tests {
         let second = unified_learning_revision(&ledger, &telemetry, &hierarchy, &scheduler);
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cached_health_refreshes_after_unattributed_applied_receipt() {
+        let mut ledger = apollo_engine::engine::decision_ledger::DecisionLedger::new();
+        let decision_id =
+            ledger.propose(apollo_engine::engine::decision_ledger::DecisionProposal::default());
+        let telemetry = apollo_engine::engine::telemetry_medallion::TelemetryMedallion::new(
+            apollo_engine::engine::installation_identity::InstallationId::UNKNOWN,
+        );
+        let hierarchy = apollo_engine::engine::local_consolidation::LocalConsolidator::default();
+        let scheduler =
+            apollo_engine::engine::exploration_scheduler::ExplorationScheduler::cold_start(
+                apollo_engine::engine::exploration_scheduler::ExplorationOrigin::default(),
+            );
+        let mut cache = UnifiedLearningHealthCache::default();
+
+        refresh_unified_learning_health(&mut cache, &ledger, &telemetry, &hierarchy, &scheduler);
+        assert_eq!(cache.health().decision_ledger_unattributed_applied_total, 0);
+
+        assert!(ledger.record_execution(
+            decision_id,
+            apollo_engine::engine::decision_ledger::ExecutionReceipt {
+                disposition: apollo_engine::engine::decision_ledger::ExecutionDisposition::Applied,
+                attribution: None,
+                ..Default::default()
+            },
+        ));
+        refresh_unified_learning_health(&mut cache, &ledger, &telemetry, &hierarchy, &scheduler);
+
+        assert_eq!(cache.health().decision_ledger_unattributed_applied_total, 1);
     }
 
     fn decision(pid: u32, dec: GovDecision, tier: ProcessTier) -> ProcessDecision {

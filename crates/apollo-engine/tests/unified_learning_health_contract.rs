@@ -29,6 +29,7 @@ fn unchanged_revision_reuses_one_immutable_health_publication() {
     let mut cache = UnifiedLearningHealthCache::default();
     let revision = UnifiedLearningRevision {
         ledger: 7,
+        ledger_unattributed_applied_total: 0,
         calibration: 11,
         hierarchy: 3,
         exploration: 2,

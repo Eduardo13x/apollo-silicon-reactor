@@ -269,6 +269,7 @@ impl AdviceBatch {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UnifiedLearningRevision {
     pub ledger: u64,
+    pub ledger_unattributed_applied_total: u64,
     pub calibration: u64,
     pub hierarchy: u64,
     pub exploration: u64,
