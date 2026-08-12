@@ -19,7 +19,7 @@
 //! 4. **`merge_cycle_metrics`** — Phase 3: merge `ExecuteOutcomes` into
 //!    `MetricsState`, record cycle duration, write to disk.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::time::Instant;
@@ -32,10 +32,13 @@ use apollo_engine::engine::daemon_helpers::{
     append_timeline, battery_pressure_boost, compute_p95, write_metrics,
 };
 use apollo_engine::engine::daemon_state::SharedState;
+use apollo_engine::engine::decision_ledger::{DecisionLedger, DecisionLifecycle};
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
+use apollo_engine::engine::exploration_scheduler::ExplorationScheduler;
 use apollo_engine::engine::intelligence_score::AisScore;
 use apollo_engine::engine::io_tiering::IoShaper;
 use apollo_engine::engine::learning_pipeline::LearningPipeline;
+use apollo_engine::engine::local_consolidation::LocalConsolidator;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::SchedulingTier;
 use apollo_engine::engine::nars_belief::ArousalState;
@@ -51,9 +54,179 @@ use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::telemetry_medallion::TelemetryMedallion;
 use apollo_engine::engine::thermal_bailout::ThermalAction;
 use apollo_engine::engine::types::{BlockerScore, OptimizationProfile, RuntimeMetrics};
+use apollo_engine::engine::unified_learning_health::{
+    AdviceRecord, ClosureObservation, ClosureOutcome, ExplorationLearningSnapshot,
+    HorizonCalibrationInput, LatestResolvedEpisodeSnapshot, UnifiedLearningHealth,
+    UnifiedLearningHealthCache, UnifiedLearningInput, UnifiedLearningRevision,
+};
 use apollo_engine::engine::world_model::WorldModel;
 
 use crate::process_enrichment;
+
+pub fn unified_learning_revision(
+    ledger: &DecisionLedger,
+    telemetry: &TelemetryMedallion,
+    hierarchy: &LocalConsolidator,
+    scheduler: &ExplorationScheduler,
+) -> UnifiedLearningRevision {
+    UnifiedLearningRevision {
+        ledger: ledger.revision(),
+        calibration: telemetry.learning_revision(),
+        hierarchy: hierarchy.revision(),
+        exploration: scheduler.revision(),
+        causal: telemetry.causal_dynamics().publication_revision(),
+    }
+}
+
+pub fn refresh_unified_learning_health(
+    cache: &mut UnifiedLearningHealthCache,
+    ledger: &DecisionLedger,
+    telemetry: &TelemetryMedallion,
+    hierarchy: &LocalConsolidator,
+    scheduler: &ExplorationScheduler,
+) {
+    let revision = unified_learning_revision(ledger, telemetry, hierarchy, scheduler);
+    cache.refresh(revision, || {
+        build_unified_learning_health(ledger, telemetry, hierarchy, scheduler)
+    });
+}
+
+fn build_unified_learning_health(
+    ledger: &DecisionLedger,
+    telemetry: &TelemetryMedallion,
+    hierarchy: &LocalConsolidator,
+    scheduler: &ExplorationScheduler,
+) -> UnifiedLearningHealth {
+    let calibration = telemetry.model_calibration();
+    let mut horizons: BTreeMap<_, (u64, u64, f64, f64, Option<f64>)> = BTreeMap::new();
+    let advice_records = calibration
+        .records()
+        .map(|record| {
+            let entry = horizons
+                .entry(record.key.horizon)
+                .or_insert((0, 0, 0.0, 0.0, None));
+            entry.0 = entry.0.saturating_add(record.authority_gold_count);
+            entry.1 = entry.1.saturating_add(1);
+            entry.2 += record.normalized_mae_ema;
+            entry.3 += record.coverage_ema;
+            if let Some(brier) = record.brier_ema.filter(|value| value.is_finite()) {
+                entry.4 = Some(entry.4.unwrap_or(0.0) + brier);
+            }
+            AdviceRecord {
+                key: record.key.clone(),
+                trust: record.trust,
+                signed_error: record.signed_error_ema,
+                current_epoch: true,
+            }
+        })
+        .collect();
+    let horizon_calibration = horizons
+        .into_iter()
+        .map(|(horizon, (count, records, mae, coverage, brier))| {
+            let divisor = records.max(1) as f64;
+            HorizonCalibrationInput::new(
+                horizon,
+                count,
+                mae / divisor,
+                coverage / divisor,
+                brier.map(|value| value / divisor),
+            )
+        })
+        .collect();
+    let closure_observations = ledger
+        .recent()
+        .iter()
+        .map(|episode| ClosureObservation {
+            decision_id: episode.id.0,
+            local: episode.authority_eligible,
+            outcome: closure_outcome(episode.lifecycle),
+            issued_cycle: episode.envelope.proposed_cycle,
+            horizon_cycles: episode
+                .envelope
+                .predictions
+                .iter()
+                .map(|prediction| prediction.horizon_cycles)
+                .max()
+                .unwrap_or(0),
+            now_cycle: episode.settled_cycle,
+            resolved_evidence: false,
+            duplicate: false,
+            synthetic_overflow: episode.envelope.action_key == "decision_events:overflow",
+        })
+        .collect();
+    let latest_resolved_episodes = ledger
+        .recent()
+        .iter()
+        .map(|episode| LatestResolvedEpisodeSnapshot {
+            present: true,
+            id: episode.id.0,
+            resolved_cycle: episode.settled_cycle,
+            action: episode.envelope.action_key.clone(),
+            tier: "ledger".to_string(),
+            scope: "local".to_string(),
+            authority: episode.authority_eligible,
+            treatment: episode
+                .envelope
+                .exploration
+                .as_ref()
+                .is_some_and(|meta| meta.treatment),
+            control: episode
+                .envelope
+                .exploration
+                .as_ref()
+                .is_some_and(|meta| !meta.treatment),
+            reverted: episode.lifecycle == DecisionLifecycle::Reverted,
+            expected_utility: episode
+                .envelope
+                .predictions
+                .first()
+                .map(|prediction| prediction.expected_utility),
+            measured_utility: None,
+            quality: None,
+            causal_result: String::new(),
+            calibration_result: String::new(),
+            trust_transition: String::new(),
+        })
+        .collect();
+    let view = hierarchy.view();
+    let (committed, terminal) = scheduler.learning_counts();
+    UnifiedLearningHealth::from_input(UnifiedLearningInput {
+        local_gold_decisions: telemetry.metrics().local_gold_total,
+        trusted_active_models: telemetry.model_calibration_summary().trusted_models as u64,
+        active_models: telemetry.model_calibration_metrics().record_count as u64,
+        closure_observations,
+        horizon_calibration,
+        advice_records,
+        hierarchy: apollo_engine::engine::unified_learning_health::HierarchyLearningSnapshot {
+            prototypes: view.families_with_evidence as u64,
+            consolidations: view.total_consolidations,
+            duplicates: 0,
+        },
+        exploration: ExplorationLearningSnapshot {
+            committed,
+            deduplicated: terminal.saturating_sub(committed),
+            ..ExplorationLearningSnapshot::default()
+        },
+        latest_resolved_episodes,
+        ..UnifiedLearningInput::default()
+    })
+}
+
+fn closure_outcome(lifecycle: DecisionLifecycle) -> ClosureOutcome {
+    match lifecycle {
+        DecisionLifecycle::Applied => ClosureOutcome::Applied,
+        DecisionLifecycle::Rejected => ClosureOutcome::Rejected,
+        DecisionLifecycle::Vetoed => ClosureOutcome::Vetoed,
+        DecisionLifecycle::Blocked => ClosureOutcome::Blocked,
+        DecisionLifecycle::Failed => ClosureOutcome::Failed,
+        DecisionLifecycle::NoOp => ClosureOutcome::NoOp,
+        DecisionLifecycle::Reverted => ClosureOutcome::Reverted,
+        DecisionLifecycle::Expired => ClosureOutcome::Expired,
+        DecisionLifecycle::Proposed | DecisionLifecycle::Executing | DecisionLifecycle::Settled => {
+            ClosureOutcome::Pending
+        }
+    }
+}
 
 fn publish_world_model_metrics(
     metrics: &mut RuntimeMetrics,
@@ -228,6 +401,7 @@ pub fn update_learning_metrics<'a>(
     learning_pipeline: &LearningPipeline,
     telemetry_medallion: &TelemetryMedallion,
     world_model: &WorldModel,
+    unified_learning_health: &UnifiedLearningHealth,
 ) {
     let mut m = state.metrics.lock_recover();
     m.metrics.predictive_agent_active = lctx.predictive_agent.is_active();
@@ -247,6 +421,7 @@ pub fn update_learning_metrics<'a>(
     m.metrics.learning_data_quality = medallion.mean_quality;
     m.metrics.learning_gold_rate = medallion.gold_rate;
     publish_world_model_metrics(&mut m.metrics, telemetry_medallion, world_model);
+    unified_learning_health.publish_to(&mut m.metrics);
     m.metrics.si_pressure_smooth = signal_digest.pressure_smooth;
     m.metrics.si_pressure_velocity = signal_digest.pressure_velocity;
     m.metrics.si_p_oom_30s = signal_digest.p_oom_30s;
@@ -781,6 +956,24 @@ mod tests {
         assert!(!should_snapshot_metrics(24, false));
         assert!(should_snapshot_metrics(25, false));
         assert!(!should_snapshot_metrics(25, true));
+    }
+
+    #[test]
+    fn unified_learning_revision_is_stable_without_source_changes() {
+        let ledger = apollo_engine::engine::decision_ledger::DecisionLedger::new();
+        let telemetry = apollo_engine::engine::telemetry_medallion::TelemetryMedallion::new(
+            apollo_engine::engine::installation_identity::InstallationId::UNKNOWN,
+        );
+        let hierarchy = apollo_engine::engine::local_consolidation::LocalConsolidator::default();
+        let scheduler =
+            apollo_engine::engine::exploration_scheduler::ExplorationScheduler::cold_start(
+                apollo_engine::engine::exploration_scheduler::ExplorationOrigin::default(),
+            );
+
+        let first = unified_learning_revision(&ledger, &telemetry, &hierarchy, &scheduler);
+        let second = unified_learning_revision(&ledger, &telemetry, &hierarchy, &scheduler);
+
+        assert_eq!(first, second);
     }
 
     fn decision(pid: u32, dec: GovDecision, tier: ProcessTier) -> ProcessDecision {

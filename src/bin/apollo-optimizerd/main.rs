@@ -1066,6 +1066,9 @@ fn main() -> anyhow::Result<()> {
                     installation_id,
                 );
             let mut decision_ledger = apollo_engine::engine::decision_ledger::DecisionLedger::new();
+            let mut unified_learning_health =
+                apollo_engine::engine::unified_learning_health::UnifiedLearningHealthCache::default(
+                );
             let async_commands = AsyncCommandQueue::new();
             {
                 let mut m_guard = state.metrics.lock_recover();
@@ -6792,6 +6795,13 @@ fn main() -> anyhow::Result<()> {
                 // Metrics reporting: update learning metrics, apply I/O shaping,
                 // route processes to P/E cores, and merge execution outcomes.
                 // Extracted to metrics_reporter.rs; behaviour is unchanged.
+                metrics_reporter::refresh_unified_learning_health(
+                    &mut unified_learning_health,
+                    &decision_ledger,
+                    &telemetry_medallion,
+                    &local_consolidator,
+                    &exploration_scheduler,
+                );
                 metrics_reporter::update_learning_metrics(
                     &state,
                     &lctx,
@@ -6801,6 +6811,7 @@ fn main() -> anyhow::Result<()> {
                     &learning_pipeline,
                     &telemetry_medallion,
                     &world_model,
+                    unified_learning_health.health(),
                 );
                 metrics_reporter::apply_io_shaping(
                     cycle_count,

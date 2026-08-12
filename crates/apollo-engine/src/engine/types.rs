@@ -497,6 +497,7 @@ pub struct ManualOverride {
 /// and daemon_dispatch_tick.rs tests; also by apollo-menubar (indirectly via DaemonStatus).
 /// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
 pub struct RuntimeMetrics {
     pub cycles: u64,
     pub boosts_applied: u64,
@@ -582,6 +583,31 @@ pub struct RuntimeMetrics {
     pub last_episode_vetoes: Vec<String>,
     #[serde(default)]
     pub last_episode_predicted_gain: f64,
+    /// Immutable scalar projection of the cached unified-learning view.
+    #[serde(default)]
+    pub unified_learning_schema_version: u8,
+    #[serde(default)]
+    pub ledger_closure: crate::engine::unified_learning_health::LedgerClosureSnapshot,
+    #[serde(default)]
+    pub trust_inventory: crate::engine::unified_learning_health::TrustInventorySnapshot,
+    #[serde(default)]
+    pub horizon_calibration:
+        Vec<crate::engine::unified_learning_health::HorizonCalibrationSnapshot>,
+    #[serde(default)]
+    pub hierarchy_learning: crate::engine::unified_learning_health::HierarchyLearningSnapshot,
+    #[serde(default)]
+    pub exploration_learning: crate::engine::unified_learning_health::ExplorationLearningSnapshot,
+    #[serde(default)]
+    pub latest_resolved_episode:
+        crate::engine::unified_learning_health::LatestResolvedEpisodeSnapshot,
+    #[serde(default)]
+    pub unified_learning_advice_overflow_total: u64,
+    #[serde(default)]
+    pub ais_local_learning_maturity: f64,
+    #[serde(default)]
+    pub ais_unified_learning_evidence: f64,
+    #[serde(default)]
+    pub unified_learning_ais: crate::engine::unified_learning_health::AisLearningSnapshot,
     /// Adaptive self-overhead governor. Critical sensing, execution and
     /// learning remain active; only optional refresh/speculation is shed.
     #[serde(default)]

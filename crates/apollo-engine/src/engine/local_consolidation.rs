@@ -302,6 +302,16 @@ impl LocalConsolidator {
         }
     }
 
+    /// Constant-time change token for cached observability snapshots.
+    pub fn revision(&self) -> u64 {
+        self.total_consolidations
+            ^ self.total_improvements.rotate_left(11)
+            ^ self.total_regressions.rotate_left(23)
+            ^ self.total_neutral.rotate_left(37)
+            ^ self.total_system1_updates.rotate_left(49)
+            ^ (self.families.len() as u64).rotate_left(5)
+    }
+
     pub fn view_for_installation(&self, installation_id: InstallationId) -> LocalConsolidationView {
         if installation_id.is_known() && self.installation_id == installation_id {
             self.view()

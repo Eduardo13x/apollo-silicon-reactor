@@ -664,6 +664,26 @@ impl ExplorationScheduler {
         self.origin
     }
 
+    /// Constant-time change token for cached observability snapshots.
+    pub fn revision(&self) -> u64 {
+        let active = self
+            .active
+            .as_ref()
+            .map_or(0, |reservation| reservation.metadata.correlation.0);
+        self.arm_sequence
+            ^ self.next_correlation.rotate_left(11)
+            ^ active.rotate_left(23)
+            ^ (self.cooldowns.len() as u64).rotate_left(31)
+            ^ (self.commits.len() as u64).rotate_left(43)
+            ^ (self.terminal_dedup.len() as u64).rotate_left(53)
+    }
+
+    /// Bounded counters for advisory observability. They do not grant
+    /// authority or expose scheduler internals to an actuator.
+    pub fn learning_counts(&self) -> (u64, u64) {
+        (self.commits.len() as u64, self.terminal_dedup.len() as u64)
+    }
+
     pub fn interaction_arm(&self) -> ExplorationArm {
         match self.arm_sequence % 3 {
             0 => ExplorationArm::InteractionQosShort,

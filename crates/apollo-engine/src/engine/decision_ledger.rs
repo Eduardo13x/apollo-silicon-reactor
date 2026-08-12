@@ -822,6 +822,19 @@ impl DecisionLedger {
         self.next_id
     }
 
+    /// Constant-time change token for bounded read-side projections.
+    pub fn revision(&self) -> u64 {
+        let recent = self.recent.back();
+        let recent_token = recent.map_or(0, |episode| {
+            episode.id.0 ^ episode.settled_cycle.rotate_left(17)
+        });
+        self.next_id
+            ^ recent_token
+            ^ (self.pending.len() as u64).rotate_left(29)
+            ^ self.duplicate_receipts_total.rotate_left(7)
+            ^ self.expired_total.rotate_left(13)
+    }
+
     pub fn seed_high_water(&mut self, high_water: u64) {
         self.next_id = self.next_id.max(high_water);
     }

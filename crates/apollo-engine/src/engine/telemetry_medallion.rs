@@ -2921,6 +2921,20 @@ impl TelemetryMedallion {
         self.action_models_revision
     }
 
+    /// Constant-time change token for cached learning-health projections.
+    pub fn learning_revision(&self) -> u64 {
+        self.action_models_revision
+            ^ self.gpu_calibration_revision.rotate_left(11)
+            ^ self.controlled_models_revision.rotate_left(23)
+            ^ self.causal_dynamics.publication_revision().rotate_left(37)
+            ^ self
+                .model_calibration
+                .metrics()
+                .accepted_forecasts_total
+                .rotate_left(49)
+            ^ self.local_gold_total.rotate_left(5)
+    }
+
     /// Accept the ledger's bounded terminal batch. All locally attributed
     /// outcomes cross this interface, but only locally applied episodes may
     /// open actuator evidence. Existing counter/audit fallback episodes are

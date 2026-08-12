@@ -153,6 +153,7 @@ pub mod thermal_iokit;
 pub mod thermal_manager;
 pub mod types;
 pub mod unfreeze_decay;
+pub mod unified_learning_health;
 pub mod usage_model;
 pub mod user_context;
 pub mod user_presence;

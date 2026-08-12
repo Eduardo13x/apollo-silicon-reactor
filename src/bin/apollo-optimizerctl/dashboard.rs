@@ -1291,6 +1291,95 @@ fn render_consumers_band(status: &DaemonStatus) -> Vec<String> {
     lines
 }
 
+fn learning_percent(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{:.0}%", value.clamp(0.0, 1.0) * 100.0))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn utility_percent(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{:.0}%", value.clamp(-1.0, 1.0) * 100.0))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+fn bounded_learning_line(line: String) -> String {
+    let mut bounded = String::new();
+    let mut width = 0;
+    for character in line.chars() {
+        let character_width = if is_wide_char(character) { 2 } else { 1 };
+        if width + character_width > CW {
+            break;
+        }
+        bounded.push(character);
+        width += character_width;
+    }
+    bounded
+}
+
+fn render_learning_band(status: &DaemonStatus) -> Vec<String> {
+    let metrics = &status.metrics;
+    let trust = &metrics.trust_inventory;
+    let gold = trust.local_gold_decisions;
+    let calibration = metrics.unified_learning_ais.calibrated_accuracy;
+    let causal = metrics.unified_learning_ais.causal_resolution;
+    let primary = if metrics.unified_learning_schema_version == 0 {
+        "Learn  legacy metrics; unified evidence unavailable".to_string()
+    } else if trust.degraded > 0 {
+        format!("Learn  degraded {}; ranking stays advisory", trust.degraded)
+    } else if gold == 0 {
+        "Learn  no local Gold evidence yet".to_string()
+    } else if gold < 10 {
+        format!("Learn  collecting {gold}/10 to candidate")
+    } else if gold < 20 {
+        format!("Learn  candidate {gold}/20 to validate")
+    } else if gold < 50 && trust.trusted == 0 {
+        format!("Learn  validated {gold}/50 to trust")
+    } else if trust.trusted == 0 {
+        "Learn  mature evidence; no trusted predictor yet".to_string()
+    } else {
+        format!(
+            "Learn  trusted {} active {} closure {} cal {} causal {}",
+            trust.trusted,
+            trust.active_trusted,
+            learning_percent(metrics.ledger_closure.closure_coverage),
+            learning_percent(calibration),
+            learning_percent(causal),
+        )
+    };
+    let worst = if trust.worst_producer.is_empty() || trust.worst_action.is_empty() {
+        "Worst  none with local Gold calibration".to_string()
+    } else {
+        format!(
+            "Worst  {}/{}@{} MAE {} cov {}",
+            trust.worst_producer,
+            trust.worst_action,
+            trust.worst_horizon,
+            learning_percent(trust.worst_normalized_mae),
+            learning_percent(trust.worst_coverage),
+        )
+    };
+    let latest = &metrics.latest_resolved_episode;
+    let latest = if !latest.present {
+        "Latest none yet".to_string()
+    } else {
+        format!(
+            "Latest {} expected {} measured {} {}/{}",
+            latest.action,
+            utility_percent(latest.expected_utility),
+            utility_percent(latest.measured_utility),
+            latest.tier,
+            latest.scope,
+        )
+    };
+    vec![primary, worst, latest]
+        .into_iter()
+        .map(bounded_learning_line)
+        .collect()
+}
+
 // ── 📋 VERDICT band (cognitive) ──────────────────────────────────────────────
 fn render_verdict_band(status: &DaemonStatus) -> Vec<String> {
     let m = &status.metrics;
@@ -1396,6 +1485,7 @@ pub fn render_dashboard_v2(status: &DaemonStatus) -> String {
         render_gates_band(status),
         render_chromium_band(status),
         render_consumers_band(status),
+        render_learning_band(status),
         render_blockers(&status.last_blockers),
         render_verdict_band(status),
     ];
@@ -1445,6 +1535,72 @@ mod tests {
             metrics: RuntimeMetrics::default(),
             frozen_processes: Vec::new(),
         }
+    }
+
+    #[test]
+    fn unified_learning_band_uses_legacy_degraded_and_collecting_precedence() {
+        let mut status = dashboard_status();
+        assert_eq!(
+            render_learning_band(&status)[0],
+            "Learn  legacy metrics; unified evidence unavailable"
+        );
+
+        status.metrics.unified_learning_schema_version = 1;
+        assert_eq!(
+            render_learning_band(&status)[0],
+            "Learn  no local Gold evidence yet"
+        );
+        status.metrics.trust_inventory.local_gold_decisions = 9;
+        assert_eq!(
+            render_learning_band(&status)[0],
+            "Learn  collecting 9/10 to candidate"
+        );
+        status.metrics.trust_inventory.degraded = 2;
+        status.metrics.trust_inventory.trusted = 4;
+        assert_eq!(
+            render_learning_band(&status)[0],
+            "Learn  degraded 2; ranking stays advisory"
+        );
+    }
+
+    #[test]
+    fn unified_learning_band_reports_worst_and_latest_without_zero_as_evidence() {
+        let mut status = dashboard_status();
+        status.metrics.unified_learning_schema_version = 1;
+        let absent = render_learning_band(&status);
+        assert_eq!(absent[1], "Worst  none with local Gold calibration");
+        assert_eq!(absent[2], "Latest none yet");
+
+        status.metrics.trust_inventory.local_gold_decisions = 50;
+        status.metrics.trust_inventory.trusted = 1;
+        status.metrics.trust_inventory.active_trusted = 1;
+        status.metrics.trust_inventory.worst_producer = "world-model".into();
+        status.metrics.trust_inventory.worst_action = "boost:action".into();
+        status.metrics.trust_inventory.worst_horizon = "5s".into();
+        status.metrics.trust_inventory.worst_normalized_mae = Some(0.12);
+        status.metrics.trust_inventory.worst_coverage = Some(0.90);
+        status.metrics.unified_learning_ais.calibrated_accuracy = Some(0.88);
+        status.metrics.unified_learning_ais.causal_resolution = Some(0.77);
+        status.metrics.latest_resolved_episode.present = true;
+        status.metrics.latest_resolved_episode.action = "boost:action".into();
+        status.metrics.latest_resolved_episode.expected_utility = Some(0.08);
+        status.metrics.latest_resolved_episode.measured_utility = Some(-0.02);
+        status.metrics.latest_resolved_episode.tier = "gold".into();
+        status.metrics.latest_resolved_episode.scope = "treatment".into();
+        let lines = render_learning_band(&status);
+        assert_eq!(
+            lines[1],
+            "Worst  world-model/boost:action@5s MAE 12% cov 90%"
+        );
+        assert_eq!(
+            lines[2],
+            "Latest boost:action expected 8% measured -2% gold/treatment"
+        );
+        assert_eq!(
+            lines[0],
+            "Learn  trusted 1 active 1 closure -- cal 88% causal 77%"
+        );
+        assert!(lines.iter().all(|line| display_width(line) <= CW));
     }
 
     #[test]
