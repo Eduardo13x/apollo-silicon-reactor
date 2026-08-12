@@ -151,7 +151,9 @@ fn raw_sysctlbyname_only_in_allowlisted_files() {
 fn purge_commands_must_transfer_child_ownership_to_the_reaper() {
     check_needle(
         "Command::new(\"purge\")",
-        &[],
+        // The bounded AsyncCommandQueue owns this child and calls `status()`,
+        // so the worker reaps it before publishing the completion receipt.
+        &["crates/apollo-engine/src/engine/daemon_helpers.rs"],
         &["crates/apollo-engine/src", "src/bin"],
     );
 }

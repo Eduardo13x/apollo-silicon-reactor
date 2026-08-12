@@ -96,7 +96,9 @@ fn detail(id: u64, family: ActuatorFamily, action: &str, utility: f64) -> Resolv
             actual_utility: utility,
             signed_error: utility - prediction.expected_utility,
             normalized_absolute_error: (utility - prediction.expected_utility).abs() / 2.0,
-            uncertainty_covered: true,
+            uncertainty_covered: (prediction.expected_utility - prediction.uncertainty
+                ..=prediction.expected_utility + prediction.uncertainty)
+                .contains(&utility),
             brier: None,
             trust_before: TrustState::Immature,
             trust_after: TrustState::Candidate,
