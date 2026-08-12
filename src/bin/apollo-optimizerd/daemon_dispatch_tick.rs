@@ -26,6 +26,10 @@ use apollo_engine::engine::degradation::DegradationInputs;
 use apollo_engine::engine::execute_actions::{
     decision_event_for_root_action_from, ExecuteOutcomes,
 };
+use apollo_engine::engine::exploration_scheduler::{
+    ActionClass, CommitEvidence, ExplorationArm, ExplorationCandidate, ExplorationContext,
+    ExplorationGates, ExplorationMetadata, ExplorationMode, ExplorationScheduler, TimePoint,
+};
 use apollo_engine::engine::gpu_imagination::{
     GpuImaginationCandidate, GpuImaginationGate, GpuImaginationRequest, GpuImaginationWorker,
 };
@@ -34,6 +38,7 @@ use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
 use apollo_engine::engine::swap_reclaim::SwapRisk;
 use apollo_engine::engine::telemetry_medallion::DecisionAttribution;
+use apollo_engine::engine::telemetry_medallion::{ActuatorFamily, TelemetryMedallion};
 use apollo_engine::engine::types::{FreezeSource, FrozenEntry, RootAction};
 use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
 
@@ -852,30 +857,26 @@ pub fn record_world_model_influence(
     metrics.world_model_last_influence_margin = influence.margin;
 }
 
-fn is_responsiveness_accelerator(action: &RootAction) -> bool {
+fn boost_omission_capable(
+    action: &RootAction,
+    target_foreground: bool,
+    target_launching: bool,
+    interactive_lease_active: bool,
+    coalition_conflict: bool,
+    recovery_required: bool,
+) -> bool {
     matches!(action, RootAction::BoostProcess { .. })
-        || matches!(action, RootAction::SetThreadQoS { tier, .. } if tier == "interactive")
-}
-
-const CONTROLLED_HOLDOUT_MODULUS: u64 = 64;
-
-fn controlled_holdout_slot(cycle: u64, action_key: &str) -> bool {
-    let hash = action_key
-        .bytes()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            hash.wrapping_mul(0x100_0000_01b3) ^ byte as u64
-        });
-    (hash ^ cycle).is_multiple_of(CONTROLLED_HOLDOUT_MODULUS)
-}
-
-fn controlled_holdout_safe(pressure: f64, app_launching: bool, fluidity_degraded: bool) -> bool {
-    pressure.is_finite() && pressure < 0.55 && !app_launching && !fluidity_degraded
+        && !target_foreground
+        && !target_launching
+        && !interactive_lease_active
+        && !coalition_conflict
+        && !recovery_required
 }
 
 #[derive(Debug, Clone)]
 pub struct CounterfactualHoldout {
-    pub action: RootAction,
     pub action_key: String,
+    pub exploration: ExplorationMetadata,
 }
 
 /// Input dependencies for the dispatch tick.
@@ -909,6 +910,11 @@ pub struct DispatchTickInput<'a> {
     pub world_model: &'a apollo_engine::engine::world_model::WorldModel,
     pub workload: &'a str,
     pub cycle_count: u64,
+    pub foreground_pid: Option<u32>,
+    pub exploration_scheduler: &'a mut ExplorationScheduler,
+    pub telemetry_medallion: &'a mut TelemetryMedallion,
+    pub exploration_gates: ExplorationGates,
+    pub exploration_now: TimePoint,
 }
 
 /// Output results from the dispatch tick.
@@ -1013,6 +1019,11 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         world_model,
         workload,
         cycle_count,
+        foreground_pid,
+        exploration_scheduler,
+        telemetry_medallion,
+        exploration_gates,
+        exploration_now,
     } = input;
 
     // ── Filter pipeline ──────────────────────────────────────────────────────
@@ -1168,61 +1179,121 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         }
     }
 
-    // A tiny deterministic control arm for mature, positive accelerators.
-    // Selection happens after dedup and every predictive gate so withholding
-    // one action cannot be defeated by an equivalent duplicate downstream.
-    let (app_launching, fluidity_degraded, speculation_allowed) = {
-        let metrics = state.metrics.lock_recover();
-        (
-            metrics.metrics.app_launching,
-            metrics.metrics.fluidity_degraded,
-            metrics.metrics.apollo_overhead_speculation_allowed,
-        )
-    };
-    let holdout_safe = !cb_is_open
-        && speculation_allowed
-        && controlled_holdout_safe(
-            snapshot.pressure.memory_pressure,
-            app_launching,
-            fluidity_degraded,
-        );
+    // The scheduler may omit one already-eligible background Boost. Rejection
+    // or endpoint failure retains the original action unchanged.
     let mut counterfactual_holdouts = Vec::with_capacity(1);
     let mut counterfactual_eligible = 0_u64;
-    if holdout_safe {
-        filtered_actions.retain(|action| {
-            if !counterfactual_holdouts.is_empty() || !is_responsiveness_accelerator(action) {
-                return true;
-            }
-            let Some(key) = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)
-            else {
-                return true;
-            };
-            let Some(assessment) = world_model.assess_utility(&key, workload) else {
-                return true;
-            };
-            if !matches!(
-                assessment.verdict,
-                apollo_engine::engine::world_model::UtilityImagined::ActWins { .. }
-            ) {
-                return true;
-            }
-            counterfactual_eligible = counterfactual_eligible.saturating_add(1);
-            if !controlled_holdout_slot(cycle_count, &key) {
-                return true;
-            }
-            counterfactual_holdouts.push(CounterfactualHoldout {
-                action: action.clone(),
-                action_key: key,
-            });
-            dispatch_decision_events.push(decision_event_for_root_action_from(
+    filtered_actions.retain(|action| {
+        let RootAction::BoostProcess {
+            pid,
+            name,
+            reason,
+            start_sec,
+            start_usec,
+            ..
+        } = action
+        else {
+            return true;
+        };
+        let coalition_conflict = coalition_guard.is_some_and(|guard| guard.is_protected(*pid));
+        let recovery_required = reason.contains("recovery") || reason.contains("safety");
+        let interactive_lease_active = state.metrics.lock_recover().metrics.interaction_qos_active;
+        if !counterfactual_holdouts.is_empty()
+            || !boost_omission_capable(
+                action,
+                foreground_pid == Some(*pid),
+                exploration_gates.app_launching,
+                interactive_lease_active,
+                coalition_conflict,
+                recovery_required,
+            )
+        {
+            return true;
+        }
+        let Some(key) = apollo_engine::engine::telemetry_medallion::actuator_action_key(action)
+        else {
+            return true;
+        };
+        let Some(assessment) = world_model.assess_utility(&key, workload) else {
+            return true;
+        };
+        if !matches!(
+            assessment.verdict,
+            apollo_engine::engine::world_model::UtilityImagined::ActWins { .. }
+        ) {
+            return true;
+        }
+        counterfactual_eligible = counterfactual_eligible.saturating_add(1);
+        let mut gates = exploration_gates;
+        gates.circuit_closed = !cb_is_open;
+        gates.target_foreground = foreground_pid == Some(*pid);
+        gates.target_launching = exploration_gates.app_launching;
+        gates.interactive_lease_active = interactive_lease_active;
+        gates.coalition_conflict = coalition_conflict;
+        gates.recovery_required = recovery_required;
+        gates.identity_present = *start_sec > 0 || *start_usec > 0;
+        gates.identity_start_nonzero = gates.identity_present;
+        gates.identity_recheck_ok =
+            apollo_engine::engine::process_identity::ProcessIdentity::verify(
+                *pid,
+                Some(name),
+                *start_sec,
+                *start_usec,
+            );
+        gates.identity_recycled = !gates.identity_recheck_ok;
+        gates.target_protected = apollo_engine::engine::safety::is_protected_name(name);
+        gates.target_apple_owned = apollo_engine::engine::apple_owned::is_apple_owned(*pid);
+        let Ok(candidate) = ExplorationCandidate::new(
+            ActuatorFamily::Boost,
+            ExplorationMode::Control,
+            ExplorationArm::BoostOmission,
+            ActionClass::BoostBackground,
+            ExplorationContext::Background,
+            exploration_scheduler.origin(),
+        ) else {
+            return true;
+        };
+        let Ok(approval) = exploration_scheduler.request(&candidate, &gates, exploration_now)
+        else {
+            return true;
+        };
+        if exploration_scheduler.recheck(&approval, &gates).is_err() {
+            exploration_scheduler.cancel(
+                approval.metadata.correlation,
+                apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+            );
+            return true;
+        }
+        if !telemetry_medallion.issue_controlled_holdout(action, workload, cycle_count) {
+            exploration_scheduler.commit(
+                approval.metadata.correlation,
+                exploration_now,
+                CommitEvidence::NoOp,
+            );
+            return true;
+        }
+        let Some(metadata) = exploration_scheduler.commit_metadata(
+            approval.metadata.correlation,
+            exploration_now,
+            CommitEvidence::OmissionEndpointOpened,
+        ) else {
+            return true;
+        };
+        counterfactual_holdouts.push(CounterfactualHoldout {
+            action_key: key,
+            exploration: metadata.clone(),
+        });
+        dispatch_decision_events.push(
+            decision_event_for_root_action_from(
                 action,
                 ActuatorDecisionOutcome::Rejected,
                 "controlled-holdout",
                 "controlled-counterfactual-holdout".to_string(),
-            ));
-            false
-        });
-    }
+            )
+            .with_exploration(metadata),
+        );
+        false
+    });
     if counterfactual_eligible > 0 {
         let mut metrics = state.metrics.lock_recover();
         metrics.metrics.world_model_counterfactual_eligible_total = metrics
@@ -1563,6 +1634,18 @@ mod tests {
         };
         let causal_qos = HashSet::new();
         let world_model = apollo_engine::engine::world_model::WorldModel::default();
+        let origin = apollo_engine::engine::exploration_scheduler::ExplorationOrigin {
+            installation_id: 1,
+            hardware: apollo_engine::engine::exploration_scheduler::HardwareIdentity {
+                p_core_count: 4,
+                e_core_count: 4,
+                ram_gib: 16,
+            },
+        };
+        let mut exploration_scheduler = ExplorationScheduler::cold_start(origin);
+        let mut telemetry_medallion = TelemetryMedallion::new(
+            apollo_engine::engine::installation_identity::InstallationId(1),
+        );
 
         let input = DispatchTickInput {
             state: &state,
@@ -1592,6 +1675,15 @@ mod tests {
             world_model: &world_model,
             workload: "idle",
             cycle_count: 1,
+            foreground_pid: None,
+            exploration_scheduler: &mut exploration_scheduler,
+            telemetry_medallion: &mut telemetry_medallion,
+            exploration_gates: ExplorationGates::healthy(),
+            exploration_now: TimePoint {
+                wall_unix_secs: 1,
+                monotonic_secs: 1,
+                boot_id: 1,
+            },
         };
 
         let output = run_dispatch_tick(input);
@@ -2745,15 +2837,43 @@ mod tests {
     }
 
     #[test]
-    fn controlled_holdout_is_sparse_deterministic_and_health_gated() {
-        let selected = (0..CONTROLLED_HOLDOUT_MODULUS)
-            .filter(|cycle| controlled_holdout_slot(*cycle, "boost:p200"))
-            .count();
-        assert_eq!(selected, 1);
-        assert!(controlled_holdout_safe(0.30, false, false));
-        assert!(!controlled_holdout_safe(0.55, false, false));
-        assert!(!controlled_holdout_safe(0.30, true, false));
-        assert!(!controlled_holdout_safe(0.30, false, true));
+    fn boost_omission_capability_is_complete_and_excludes_raw_thread_qos() {
+        let boost = RootAction::BoostProcess {
+            pid: 42,
+            name: "BackgroundWorker".to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 10,
+            start_usec: 20,
+        };
+        assert!(boost_omission_capable(
+            &boost, false, false, false, false, false
+        ));
+        for flags in [
+            (true, false, false, false, false),
+            (false, true, false, false, false),
+            (false, false, true, false, false),
+            (false, false, false, true, false),
+            (false, false, false, false, true),
+        ] {
+            assert!(!boost_omission_capable(
+                &boost, flags.0, flags.1, flags.2, flags.3, flags.4
+            ));
+        }
+        let raw_qos = RootAction::SetThreadQoS {
+            pid: 42,
+            name: "BackgroundWorker".to_string(),
+            thread_index: 0,
+            tier: "interactive".to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            start_sec: 10,
+            start_usec: 20,
+            affinity_tag: None,
+        };
+        assert!(!boost_omission_capable(
+            &raw_qos, false, false, false, false, false
+        ));
     }
 
     #[test]

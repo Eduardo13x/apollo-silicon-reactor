@@ -2024,10 +2024,7 @@ impl TelemetryMedallion {
         let Some(spec) = action_spec(action) else {
             return false;
         };
-        if !matches!(
-            spec.family,
-            ActuatorFamily::Boost | ActuatorFamily::ThreadQos
-        ) {
+        if spec.family != ActuatorFamily::Boost {
             return false;
         }
         if self.pending_controlled_holdouts.len() >= MAX_PENDING_CONTROLLED_HOLDOUTS {
@@ -5810,6 +5807,28 @@ mod tests {
         assert_eq!(controlled.installation_id, LOCAL_ID);
         assert!(controlled.hardware_regime.is_known());
         assert_eq!(medallion.model_calibration_metrics().record_count, 0);
+    }
+
+    #[test]
+    fn controlled_holdout_rejects_raw_thread_qos() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let runtime = healthy_runtime();
+        let outcomes = ExecuteOutcomes::default();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        let action = RootAction::SetThreadQoS {
+            pid: 42,
+            name: "Editor".to_string(),
+            thread_index: 0,
+            tier: "interactive".to_string(),
+            reason: "test".to_string(),
+            decision_reason: DecisionReason::PressureContext,
+            affinity_tag: None,
+            start_sec: 1,
+            start_usec: 0,
+        };
+
+        assert!(!medallion.issue_controlled_holdout(&action, "build", 1));
+        assert_eq!(medallion.metrics().controlled_holdout_issued_total, 0);
     }
 
     #[test]

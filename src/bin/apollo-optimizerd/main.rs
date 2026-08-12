@@ -1017,6 +1017,26 @@ fn main() -> anyhow::Result<()> {
                 ram_gib: hw_ram_gb.round().clamp(0.0, u32::MAX as f64) as u32,
             };
             telemetry_medallion.bind_live_hardware(hierarchy_hardware);
+            let exploration_origin =
+                apollo_engine::engine::exploration_scheduler::ExplorationOrigin {
+                    installation_id: installation_id.0,
+                    hardware: apollo_engine::engine::exploration_scheduler::HardwareIdentity {
+                        p_core_count: hierarchy_hardware.p_core_count,
+                        e_core_count: hierarchy_hardware.e_core_count,
+                        ram_gib: hierarchy_hardware.ram_gib,
+                    },
+                };
+            let exploration_boot_id = (Utc::now().timestamp_nanos_opt().unwrap_or_default() as u64)
+                ^ u64::from(std::process::id());
+            let exploration_now = || apollo_engine::engine::exploration_scheduler::TimePoint {
+                wall_unix_secs: Utc::now().timestamp(),
+                monotonic_secs: daemon_start.elapsed().as_secs(),
+                boot_id: exploration_boot_id.max(1),
+            };
+            let mut exploration_scheduler =
+                apollo_engine::engine::exploration_scheduler::ExplorationScheduler::cold_start(
+                    exploration_origin,
+                );
             // GPU thermal monitoring: integrates with thermal_manager for GPU-aware decisions.
             let mut gpu_mgr = GPUManager::new();
             // Foreground detection: replaces get_foreground_app() with cached, richer detection.
@@ -1180,6 +1200,18 @@ fn main() -> anyhow::Result<()> {
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
                 restored_local_consolidator = learned.local_consolidator.clone();
+                if let Some(persisted) = learned.exploration_scheduler.clone() {
+                    let (restored, disposition) =
+                        apollo_engine::engine::exploration_scheduler::ExplorationScheduler::restore(
+                            persisted,
+                            apollo_engine::engine::exploration_scheduler::RestoreContext::local(
+                                exploration_origin,
+                                exploration_now(),
+                            ),
+                        );
+                    exploration_scheduler = restored;
+                    tracing::info!(?disposition, "restored bounded exploration scheduler");
+                }
                 if let Some(medallion_state) = learned.medallion_state.clone() {
                     let bronze_total = medallion_state.bronze_total;
                     let gold_total = medallion_state.gold_total;
@@ -1606,9 +1638,13 @@ fn main() -> anyhow::Result<()> {
             // forward to prevent the freeze gate from flickering on/off every cycle.
             // [Cook et al. 2019] "Caching volatile state in reactive systems"
             let mut last_user_assertions: (bool, bool, bool) = (false, false, false); // (sleep_assert, call, audio)
-                                                                                      // Phase 0c cache: last ioreg HIDIdleTime sample + when. Lets
-                                                                                      // compute_user_context interpolate idle_secs between every-10-cycle
-                                                                                      // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
+            let mut last_exploration_gates: Option<(
+                apollo_engine::engine::exploration_scheduler::ExplorationGates,
+                Instant,
+            )> = None;
+            // Phase 0c cache: last ioreg HIDIdleTime sample + when. Lets
+            // compute_user_context interpolate idle_secs between every-10-cycle
+            // ioreg subprocess spawns. ~25 ms saved per intermediate cycle.
             let mut last_idle_sample: Option<(f64, Instant)> = None;
             // Phase 5.1 wiring (2026-05-16) — last cycle's UserContext, carried
             // forward so `apply_specialist_voting` can compute the
@@ -1911,6 +1947,21 @@ fn main() -> anyhow::Result<()> {
                 // create the kill-switch file, so this check is pure overhead.
                 // [Nygard 2018 §5] eliminate non-observable work from benchmark path.
                 if !dry_run && Path::new(kill_switch_path()).exists() {
+                    if let Some(lease) = last_markov_prethaw.take() {
+                        let report =
+                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        cycle_decision_events.extend_buffer(&report.decision_events);
+                    }
+                    cycle_decision_events.extend_buffer(
+                        &daemon_cycle_tail::release_acceleration_lease(
+                            &mut acceleration_lease,
+                            &state,
+                            cycle_count,
+                        ),
+                    );
+                    exploration_scheduler.cancel_active(
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::KillSwitch,
+                    );
                     // Even when paused, populate basic observability metrics
                     // so the dashboard shows real system state.
                     {
@@ -2141,7 +2192,39 @@ fn main() -> anyhow::Result<()> {
                     &wake_state_path,
                 );
                 if wake_just_detected {
+                    if let Some(lease) = last_markov_prethaw.take() {
+                        let report =
+                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        cycle_decision_events.extend_buffer(&report.decision_events);
+                    }
+                    cycle_decision_events.extend_buffer(
+                        &daemon_cycle_tail::release_acceleration_lease(
+                            &mut acceleration_lease,
+                            &state,
+                            cycle_count,
+                        ),
+                    );
+                    exploration_scheduler.cancel_active(
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Wake,
+                    );
                     maintenance_state.observe_wake();
+                }
+                if sleep_notifier.is_sleeping() {
+                    if let Some(lease) = last_markov_prethaw.take() {
+                        let report =
+                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        cycle_decision_events.extend_buffer(&report.decision_events);
+                    }
+                    cycle_decision_events.extend_buffer(
+                        &daemon_cycle_tail::release_acceleration_lease(
+                            &mut acceleration_lease,
+                            &state,
+                            cycle_count,
+                        ),
+                    );
+                    exploration_scheduler.cancel_active(
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                    );
                 }
 
                 // Display-Off Turbo: Android Doze-like power management.
@@ -2276,6 +2359,12 @@ fn main() -> anyhow::Result<()> {
                     &mut cache_warmer,
                     &frozen_state_path,
                     &world_model,
+                    &mut exploration_scheduler,
+                    last_exploration_gates
+                        .filter(|(_, captured_at)| captured_at.elapsed() <= Duration::from_secs(10))
+                        .map(|(gates, _)| gates)
+                        .unwrap_or_default(),
+                    exploration_now(),
                 );
                 cycle_decision_events.extend_buffer(&markov_decision_events);
                 temporal_hour = markov_temporal_hour;
@@ -6060,6 +6149,44 @@ fn main() -> anyhow::Result<()> {
                         _t_reason_start.elapsed().as_nanos().min(u64::MAX as u128) as u64,
                     );
                     _t_execute_start_outer = Instant::now();
+                    let exploration_gates = {
+                        let metrics = state.metrics.lock_recover();
+                        let predicted = metrics.metrics.fluidity_predicted_3s;
+                        let thermal = snapshot.pressure.thermal_level.as_str();
+                        apollo_engine::engine::exploration_scheduler::ExplorationGates {
+                            daemon_shutdown: state.stop.load(Ordering::Relaxed),
+                            kill_switch: false,
+                            cognitive_paused: prev_cog_decision
+                                .as_ref()
+                                .is_some_and(|decision| decision.pause_learning),
+                            audio_output_active: user_context.audio_active,
+                            audio_input_active: user_context.audio_active,
+                            call_active: user_context.call_in_progress,
+                            sleep_assertion: user_context.has_sleep_assertion,
+                            media_available: !metrics.metrics.coreaudio_probe_state.is_empty(),
+                            app_launching: metrics.metrics.app_launching,
+                            window_operation: metrics.metrics.window_op_active,
+                            fluidity_degraded: metrics.metrics.fluidity_degraded,
+                            predicted_fluidity_degraded: !predicted.is_finite()
+                                || predicted <= 0.0
+                                || predicted < learnable_params.fluidity_degraded_threshold,
+                            memory_pressure: snapshot.pressure.memory_pressure,
+                            thermal_available: !thermal.is_empty(),
+                            thermal_nominal: thermal == "nominal",
+                            hazard_available: signal_digest.p_oom_30s.is_finite(),
+                            p_oom_30s: signal_digest.p_oom_30s,
+                            circuit_closed: true,
+                            speculation_allowed: metrics
+                                .metrics
+                                .apollo_overhead_speculation_allowed,
+                            build_workload: build_tracker.build_active,
+                            build_phase_idle: build_tracker.phase
+                                == apollo_engine::engine::build_tracker::BuildPhase::Idle,
+                            compiler_protection_active: build_tracker.build_active,
+                            ..apollo_engine::engine::exploration_scheduler::ExplorationGates::healthy()
+                        }
+                    };
+                    last_exploration_gates = Some((exploration_gates, Instant::now()));
                     let output = run_dispatch_tick(DispatchTickInput {
                         state: &state,
                         caps: &caps,
@@ -6083,6 +6210,11 @@ fn main() -> anyhow::Result<()> {
                         world_model: &world_model,
                         workload: workload_mode.as_str(),
                         cycle_count,
+                        foreground_pid,
+                        exploration_scheduler: &mut exploration_scheduler,
+                        telemetry_medallion: &mut telemetry_medallion,
+                        exploration_gates,
+                        exploration_now: exploration_now(),
                     });
                     (
                         output.outcomes,
@@ -6095,17 +6227,12 @@ fn main() -> anyhow::Result<()> {
                     .extend_buffer_at_cycle(&exec_outcomes.decision_events, cycle_count);
 
                 for holdout in &counterfactual_holdouts {
-                    if telemetry_medallion.issue_controlled_holdout(
-                        &holdout.action,
-                        workload_mode.as_str(),
-                        cycle_count,
-                    ) {
-                        tracing::debug!(
-                            action_key = %holdout.action_key,
-                            workload = workload_mode.as_str(),
-                            "world model opened a controlled no-action arm"
-                        );
-                    }
+                    tracing::debug!(
+                        action_key = %holdout.action_key,
+                        correlation = holdout.exploration.correlation.0,
+                        workload = workload_mode.as_str(),
+                        "world model opened a controlled no-action arm"
+                    );
                 }
 
                 // Warn limits are already a real, non-fatal kernel intervention.
@@ -6277,6 +6404,21 @@ fn main() -> anyhow::Result<()> {
                 // [Goodfellow 2016 §7: regularization via confidence-adaptive learning rate]
                 let cognitive_pause = prev_cog_decision.as_ref().is_some_and(|d| d.pause_learning);
                 if cognitive_pause {
+                    if let Some(lease) = last_markov_prethaw.take() {
+                        let report =
+                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        cycle_decision_events.extend_buffer(&report.decision_events);
+                    }
+                    cycle_decision_events.extend_buffer(
+                        &daemon_cycle_tail::release_acceleration_lease(
+                            &mut acceleration_lease,
+                            &state,
+                            cycle_count,
+                        ),
+                    );
+                    exploration_scheduler.cancel_active(
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                    );
                     tracing::debug!(
                         uchs = prev_cog_decision.as_ref().map_or(0.0, |d| d.uchs_composite),
                         "cognitive gate: learning paused (UCHS recovery mode)"
@@ -6491,6 +6633,7 @@ fn main() -> anyhow::Result<()> {
                         &maintenance_state,
                         &cognitive_state.meta_cognition,
                         &local_consolidator,
+                        &exploration_scheduler,
                     );
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.
@@ -6586,6 +6729,46 @@ fn main() -> anyhow::Result<()> {
 
                 // ── Fluidity QoS elevation ───────────────────────────────────
                 // Extracted to daemon_cycle_tail::apply_fluidity_qos (Wave 10).
+                let qos_circuit_closed = {
+                    let policy = state.policy.lock_recover();
+                    matches!(
+                        *policy.circuit_breaker.state(),
+                        apollo_engine::engine::circuit_breaker::CircuitState::Closed
+                    )
+                };
+                let qos_exploration_gates = {
+                    let metrics = state.metrics.lock_recover();
+                    let predicted = metrics.metrics.fluidity_predicted_3s;
+                    let thermal = snapshot.pressure.thermal_level.as_str();
+                    apollo_engine::engine::exploration_scheduler::ExplorationGates {
+                        daemon_shutdown: state.stop.load(Ordering::Relaxed),
+                        kill_switch: false,
+                        cognitive_paused: cognitive_pause,
+                        audio_output_active: user_context.audio_active,
+                        audio_input_active: user_context.audio_active,
+                        call_active: user_context.call_in_progress,
+                        sleep_assertion: user_context.has_sleep_assertion,
+                        media_available: !metrics.metrics.coreaudio_probe_state.is_empty(),
+                        app_launching: metrics.metrics.app_launching,
+                        window_operation: metrics.metrics.window_op_active,
+                        fluidity_degraded: metrics.metrics.fluidity_degraded,
+                        predicted_fluidity_degraded: !predicted.is_finite()
+                            || predicted <= 0.0
+                            || predicted < learnable_params.fluidity_degraded_threshold,
+                        memory_pressure: snapshot.pressure.memory_pressure,
+                        thermal_available: !thermal.is_empty(),
+                        thermal_nominal: thermal == "nominal",
+                        hazard_available: signal_digest.p_oom_30s.is_finite(),
+                        p_oom_30s: signal_digest.p_oom_30s,
+                        circuit_closed: qos_circuit_closed,
+                        speculation_allowed: metrics.metrics.apollo_overhead_speculation_allowed,
+                        build_workload: build_tracker.build_active,
+                        build_phase_idle: build_tracker.phase
+                            == apollo_engine::engine::build_tracker::BuildPhase::Idle,
+                        compiler_protection_active: build_tracker.build_active,
+                        ..apollo_engine::engine::exploration_scheduler::ExplorationGates::healthy()
+                    }
+                };
                 let acceleration_output = daemon_cycle_tail::update_acceleration_lease(
                     &state,
                     &mut acceleration_lease,
@@ -6600,6 +6783,9 @@ fn main() -> anyhow::Result<()> {
                     &world_model,
                     workload_mode.as_str(),
                     cycle_count,
+                    &mut exploration_scheduler,
+                    qos_exploration_gates,
+                    exploration_now(),
                 );
                 cycle_decision_events.extend_buffer(&acceleration_output.decision_events);
                 metrics_reporter::merge_cycle_metrics(
@@ -7067,6 +7253,9 @@ fn main() -> anyhow::Result<()> {
                 cycle_count,
             );
             shutdown_decision_events.extend_buffer(&acceleration_events);
+            exploration_scheduler.cancel_active(
+                apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Shutdown,
+            );
 
             // Revert sysctls to defaults and retain the exact broker receipts.
             {
@@ -7258,6 +7447,7 @@ fn main() -> anyhow::Result<()> {
                     companion_graph: Some(companion_graph.clone()),
                     medallion_state: Some(learning_pipeline.medallion_snapshot()),
                     telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
+                    exploration_scheduler: Some(exploration_scheduler.persisted()),
                 },
             );
 

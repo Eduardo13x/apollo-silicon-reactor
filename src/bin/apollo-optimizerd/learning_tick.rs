@@ -25,6 +25,7 @@ use apollo_engine::engine::daemon_helpers::{hop_groups_path, signal_intelligence
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::effectiveness_tracker::EffectivenessTracker;
 use apollo_engine::engine::execute_actions::ExecuteOutcomes;
+use apollo_engine::engine::exploration_scheduler::ExplorationScheduler;
 use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
 use apollo_engine::engine::learned_state::{
     LearnableParams, LearnedState, LearnedStateSupplement, RestoreQualityMonitor,
@@ -181,6 +182,7 @@ pub fn run_learning_tick<'a>(
     maintenance_state: &MaintenanceState,
     meta_cognition: &MetaCognition,
     local_consolidator: &LocalConsolidator,
+    exploration_scheduler: &ExplorationScheduler,
 ) {
     // Live context and universal actuator evidence are observed by the daemon
     // before this function so cognitive learning pauses cannot create holes in
@@ -966,6 +968,7 @@ pub fn run_learning_tick<'a>(
                 meta_cognition: Some(meta_cognition.clone()),
                 medallion_state: Some(learning_pipeline.medallion_snapshot()),
                 telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
+                exploration_scheduler: Some(exploration_scheduler.persisted()),
                 ..LearnedStateSupplement::default()
             },
         );

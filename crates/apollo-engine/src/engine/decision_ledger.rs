@@ -5,6 +5,8 @@ use std::fmt;
 use serde::de::Visitor;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::engine::exploration_scheduler::ExplorationMetadata;
+
 pub const MAX_PENDING_DECISIONS: usize = 192;
 pub const MAX_RECENT_DECISIONS: usize = 64;
 pub const MAX_EPISODIC_DECISIONS: usize = 128;
@@ -181,6 +183,7 @@ pub struct DecisionProposal {
     pub hierarchy: HierarchyCoordinates,
     pub predictions: Vec<PredictionRecord>,
     pub adviser_contributions: Vec<AdviserContribution>,
+    pub exploration: Option<ExplorationMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -195,6 +198,7 @@ pub struct DecisionEnvelope {
     pub hierarchy: HierarchyCoordinates,
     pub predictions: Vec<PredictionRecord>,
     pub adviser_contributions: Vec<AdviserContribution>,
+    pub exploration: Option<ExplorationMetadata>,
     pub lifecycle: DecisionLifecycle,
     pub terminal_reason: String,
     /// Provenance for terminal outcomes that do not carry an execution
@@ -313,6 +317,14 @@ impl ActuatorDecisionEvent {
     pub fn with_prediction(mut self, prediction: PredictionRecord) -> Self {
         if self.proposal.predictions.len() < MAX_PREDICTIONS {
             self.proposal.predictions.push(prediction.bounded());
+        }
+        self
+    }
+
+    pub fn with_exploration(mut self, metadata: ExplorationMetadata) -> Self {
+        if metadata.valid() {
+            self.correlation_id = Some(metadata.correlation.ledger_correlation_id());
+            self.proposal.exploration = Some(metadata);
         }
         self
     }
@@ -717,6 +729,7 @@ impl DecisionLedger {
                 .map(AdviserContribution::bounded)
                 .take(MAX_ADVISER_CONTRIBUTIONS)
                 .collect(),
+            exploration: proposal.exploration,
             lifecycle: DecisionLifecycle::Proposed,
             terminal_attribution: None,
             terminal_reason: String::new(),
@@ -869,7 +882,10 @@ impl DecisionLedger {
                     .attribution
                     .as_ref()
                     .is_some_and(ReceiptAttribution::grants_local_authority)
-        });
+        }) && envelope
+            .exploration
+            .as_ref()
+            .is_none_or(ExplorationMetadata::clean_treatment);
         let episode = ResolvedDecisionEpisode {
             id,
             lifecycle: DecisionLifecycle::Settled,
@@ -1296,7 +1312,10 @@ fn episode_authority_eligible(envelope: &DecisionEnvelope) -> bool {
                 .attribution
                 .as_ref()
                 .is_some_and(ReceiptAttribution::grants_local_authority)
-    })
+    }) && envelope
+        .exploration
+        .as_ref()
+        .is_none_or(ExplorationMetadata::clean_treatment)
 }
 
 #[cfg(test)]

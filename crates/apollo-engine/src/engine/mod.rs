@@ -51,6 +51,7 @@ pub mod entropy_anomaly;
 pub mod epistemic;
 pub mod evolved_anomaly;
 pub mod execute_actions;
+pub mod exploration_scheduler;
 pub mod fluidity;
 pub mod focus_markov;
 pub mod foreground;

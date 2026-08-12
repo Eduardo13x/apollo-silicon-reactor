@@ -22,6 +22,7 @@ use crate::engine::causal_graph::{CausalEdge, CausalGraph};
 use crate::engine::companion_graph::CompanionGraph;
 use crate::engine::data_medallion::DataMedallionPersisted;
 use crate::engine::effectiveness_tracker::{EffectivenessTracker, ProcessEffectiveness};
+use crate::engine::exploration_scheduler::ExplorationSchedulerPersisted;
 use crate::engine::local_consolidation::LocalConsolidator;
 use crate::engine::maintenance_state::MaintenanceState;
 use crate::engine::meta_cognition::MetaCognition;
@@ -577,6 +578,11 @@ pub struct LearnedState {
     /// `None` = old file format or never set → default RSS.
     #[serde(default)]
     pub policy_aggregator_mode: Option<String>,
+
+    /// Bounded Task 5 exploration state. Live reservations and leases are
+    /// intentionally absent and are never resumed after restart.
+    #[serde(default)]
+    pub exploration_scheduler: Option<ExplorationSchedulerPersisted>,
 }
 
 /// Live snapshots that are owned outside the core learning context but belong
@@ -592,6 +598,7 @@ pub struct LearnedStateSupplement {
     pub companion_graph: Option<CompanionGraph>,
     pub medallion_state: Option<DataMedallionPersisted>,
     pub telemetry_medallion_state: Option<TelemetryMedallionPersisted>,
+    pub exploration_scheduler: Option<ExplorationSchedulerPersisted>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -713,6 +720,9 @@ impl LearnedState {
         if self.policy_aggregator_mode.is_none() {
             self.policy_aggregator_mode = previous.policy_aggregator_mode;
         }
+        if self.exploration_scheduler.is_none() {
+            self.exploration_scheduler = previous.exploration_scheduler;
+        }
     }
 
     /// Collect snapshots from all live components into a single struct.
@@ -766,6 +776,7 @@ impl LearnedState {
             // None → callers wanting to change the mode write the JSON
             // field directly (or use a future CLI tool).
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         }
     }
 
@@ -1143,6 +1154,7 @@ impl LearnedState {
         state.companion_graph = supplement.companion_graph;
         state.medallion_state = supplement.medallion_state;
         state.telemetry_medallion_state = supplement.telemetry_medallion_state;
+        state.exploration_scheduler = supplement.exploration_scheduler;
         // Components not owned by this checkpoint keep their last committed
         // snapshot. Load and parse once, then merge all such fields in memory.
         if let Some(previous) = Self::load(path) {
@@ -1942,6 +1954,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -1980,6 +1993,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -2016,6 +2030,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         assert_eq!(
             state
@@ -2071,6 +2086,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         state.self_improve();
         assert_eq!(
@@ -2121,6 +2137,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -2174,6 +2191,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -2553,6 +2571,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         seed.persist(&tmp);
         let loaded = LearnedState::load_local_consolidator(&tmp)
@@ -2624,6 +2643,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         let migrated = try_migrate(0, state);
         assert_eq!(
@@ -2667,6 +2687,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         let migrated = try_migrate(1, state);
         assert_eq!(migrated.version, CURRENT_SCHEMA_VERSION);
@@ -2764,6 +2785,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         blank.persist(&path);
 
@@ -2919,6 +2941,7 @@ mod tests {
             last_cli_purge_at: None,
             companion_graph: None,
             policy_aggregator_mode: None,
+            exploration_scheduler: None,
         };
         let mut lp = LearnableParams::default();
         let pre = lp.zone_alpha;

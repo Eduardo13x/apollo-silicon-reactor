@@ -124,6 +124,7 @@ fn fresh_state(ot: OutcomeTrackerPersisted, arousal: Option<ArousalState>) -> Le
         last_cli_purge_at: None,
         companion_graph: None,
         policy_aggregator_mode: None,
+        exploration_scheduler: None,
     }
 }
 

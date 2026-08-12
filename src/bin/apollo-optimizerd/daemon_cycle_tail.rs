@@ -40,6 +40,10 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decision_ledger::{
     ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
 };
+use apollo_engine::engine::exploration_scheduler::{
+    ActionClass, CommitEvidence, ExplorationArm, ExplorationCandidate, ExplorationContext,
+    ExplorationGates, ExplorationMetadata, ExplorationMode, ExplorationScheduler, TimePoint,
+};
 use apollo_engine::engine::fluidity::FluidityState;
 use apollo_engine::engine::io_tiering::{IoPromotionDisposition, IoShaper};
 use apollo_engine::engine::lock_ext::LockRecover;
@@ -57,6 +61,7 @@ use apollo_engine::engine::safety::{
     can_boost, hard_protected_contains, is_chromium_family, ProcessInterventionClass,
 };
 use apollo_engine::engine::swap_predictor::SwapForecast;
+use apollo_engine::engine::telemetry_medallion::ActuatorFamily;
 use apollo_engine::engine::thermal_bailout::ThermalAction;
 use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 
@@ -302,6 +307,7 @@ struct ActiveAccelerationLease {
     reason: InteractionReason,
     ttl_band: LeaseTtlBand,
     ttl_exploratory: bool,
+    exploration: Option<ExplorationMetadata>,
 }
 
 /// Short-lived, bounded acceleration ownership for the active application
@@ -314,8 +320,6 @@ pub struct AccelerationLeaseBroker {
     app_launch_was_active: bool,
     window_op_was_active: bool,
     cooldown_until: Option<Instant>,
-    parameter_sequence: u64,
-    parameter_exploration_arm: usize,
 }
 
 impl AccelerationLeaseBroker {
@@ -323,30 +327,19 @@ impl AccelerationLeaseBroker {
         &self,
         contextual_bias: ContextualActionBias,
         learned: Option<LeaseTtlBand>,
+        exploration_arm: Option<ExplorationArm>,
     ) -> LeaseTtlDecision {
-        let next_sequence = self.parameter_sequence.saturating_add(1);
-        // One bounded arm probe every eight admitted leases. The treatment is
-        // at most +/-10% and never extends the hard deadline; randomized-style
-        // variation is needed to learn parameter causality instead of merely
-        // reinforcing whichever duration the aggregate action already used.
-        if next_sequence.is_multiple_of(8) {
-            let band = LeaseTtlBand::ALL[self.parameter_exploration_arm % 3];
-            LeaseTtlDecision {
-                band,
-                exploratory: true,
-            }
-        } else {
-            LeaseTtlDecision {
-                band: learned.unwrap_or_else(|| LeaseTtlBand::from_bias(contextual_bias)),
-                exploratory: false,
-            }
-        }
-    }
-
-    fn commit_ttl_decision(&mut self, decision: LeaseTtlDecision) {
-        self.parameter_sequence = self.parameter_sequence.saturating_add(1);
-        if decision.exploratory {
-            self.parameter_exploration_arm = self.parameter_exploration_arm.wrapping_add(1);
+        let band = match exploration_arm {
+            Some(ExplorationArm::InteractionQosShort) => Some(LeaseTtlBand::Short),
+            Some(ExplorationArm::InteractionQosStandard) => Some(LeaseTtlBand::Standard),
+            Some(ExplorationArm::InteractionQosLong) => Some(LeaseTtlBand::Long),
+            _ => None,
+        };
+        LeaseTtlDecision {
+            band: band.unwrap_or_else(|| {
+                learned.unwrap_or_else(|| LeaseTtlBand::from_bias(contextual_bias))
+            }),
+            exploratory: band.is_some(),
         }
     }
 
@@ -943,9 +936,7 @@ fn acquire_acceleration_lease(
     }
 
     let member_count = members.len() as u32;
-    if member_count > 0 {
-        controller.commit_ttl_decision(ttl_decision);
-    }
+    if member_count > 0 {}
     {
         let mut metrics = state.metrics.lock_recover();
         metrics.metrics.acceleration_lease_identity_skips_total = metrics
@@ -1048,6 +1039,7 @@ fn acquire_acceleration_lease(
                 reason,
                 ttl_band: ttl_decision.band,
                 ttl_exploratory: ttl_decision.exploratory,
+                exploration: None,
             });
         }
     }
@@ -1078,6 +1070,9 @@ fn update_acceleration_lease_inner(
     world_model: &WorldModel,
     workload: &str,
     cycle: u64,
+    exploration_scheduler: &mut ExplorationScheduler,
+    exploration_gates: ExplorationGates,
+    exploration_now: TimePoint,
 ) -> CycleDecisionEvents {
     let mut decision_events = CycleDecisionEvents::default();
     let now = Instant::now();
@@ -1162,7 +1157,60 @@ fn update_acceleration_lease_inner(
         }
 
         if let Some(selection) = select_acceleration_family(pid, reason, process_tree, snapshots) {
-            let ttl_decision = controller.preview_ttl_band(interaction_bias, learned_ttl_band);
+            let selection_root_pid = selection.root_pid;
+            let mut gates = exploration_gates;
+            let identity = ProcessIdentity::from_pid(selection.root_pid);
+            gates.identity_present = identity.is_some();
+            gates.identity_start_nonzero = identity
+                .as_ref()
+                .is_some_and(|identity| identity.start_sec > 0 || identity.start_usec > 0);
+            gates.identity_recheck_ok = identity.as_ref().is_some_and(|identity| {
+                ProcessIdentity::verify(
+                    selection.root_pid,
+                    None,
+                    identity.start_sec,
+                    identity.start_usec,
+                )
+            });
+            gates.identity_recycled = !gates.identity_recheck_ok;
+            gates.target_protected = snapshots
+                .iter()
+                .find(|snapshot| snapshot.pid == selection.root_pid)
+                .is_none_or(|snapshot| hard_protected_contains(&snapshot.name));
+            gates.target_apple_owned =
+                apollo_engine::engine::apple_owned::is_apple_owned(selection.root_pid);
+            let mut exploration_approval = ExplorationCandidate::new(
+                ActuatorFamily::InteractionQos,
+                ExplorationMode::Treatment,
+                exploration_scheduler.interaction_arm(),
+                ActionClass::InteractionForeground,
+                ExplorationContext::Interactive,
+                exploration_scheduler.origin(),
+            )
+            .ok()
+            .and_then(|candidate| {
+                exploration_scheduler
+                    .request(&candidate, &gates, exploration_now)
+                    .ok()
+            });
+            if exploration_approval
+                .as_ref()
+                .is_some_and(|approval| exploration_scheduler.recheck(approval, &gates).is_err())
+            {
+                if let Some(approval) = exploration_approval.take() {
+                    exploration_scheduler.cancel(
+                        approval.metadata.correlation,
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                    );
+                }
+            }
+            let ttl_decision = controller.preview_ttl_band(
+                interaction_bias,
+                learned_ttl_band,
+                exploration_approval
+                    .as_ref()
+                    .map(|approval| approval.metadata.arm),
+            );
             if interaction_bias.is_informative() {
                 let mut metrics = state.metrics.lock_recover();
                 metrics.metrics.world_model_contextual_interaction_total = metrics
@@ -1180,7 +1228,7 @@ fn update_acceleration_lease_inner(
                     );
                 }
             }
-            decision_events.extend_buffer(&acquire_acceleration_lease(
+            let acquired = acquire_acceleration_lease(
                 state,
                 controller,
                 io_shaper,
@@ -1191,7 +1239,44 @@ fn update_acceleration_lease_inner(
                 io_bias,
                 now,
                 cycle,
-            ));
+            );
+            decision_events.extend_buffer(&acquired);
+            if let Some(approval) = exploration_approval {
+                let mutated = controller
+                    .active
+                    .as_ref()
+                    .is_some_and(|lease| lease.root_pid == selection_root_pid);
+                if mutated {
+                    if let Some(metadata) = exploration_scheduler.commit_metadata(
+                        approval.metadata.correlation,
+                        exploration_now,
+                        CommitEvidence::MutationApplied,
+                    ) {
+                        if let Some(active) = controller.active.as_mut() {
+                            active.exploration = Some(metadata.clone());
+                        }
+                        decision_events.push(
+                            acceleration_event(
+                                &format!(
+                                    "interaction_qos:foreground@{}",
+                                    ttl_decision.band.as_str()
+                                ),
+                                selection_root_pid,
+                                cycle,
+                                ActuatorDecisionOutcome::Pending,
+                                "bounded exploration lease started",
+                            )
+                            .with_exploration(metadata),
+                        );
+                    }
+                } else {
+                    exploration_scheduler.commit(
+                        approval.metadata.correlation,
+                        exploration_now,
+                        CommitEvidence::NoOp,
+                    );
+                }
+            }
         }
     }
     decision_events
@@ -1212,6 +1297,9 @@ pub fn update_acceleration_lease(
     world_model: &WorldModel,
     workload: &str,
     cycle: u64,
+    exploration_scheduler: &mut ExplorationScheduler,
+    exploration_gates: ExplorationGates,
+    exploration_now: TimePoint,
 ) -> AccelerationTickOutput {
     let prior_root = controller.active.as_ref().map(|lease| lease.root_pid);
     let expired = controller.active.as_ref().is_some_and(|lease| {
@@ -1231,6 +1319,9 @@ pub fn update_acceleration_lease(
         world_model,
         workload,
         cycle,
+        exploration_scheduler,
+        exploration_gates,
+        exploration_now,
     );
     let target = controller
         .active
@@ -1449,6 +1540,33 @@ pub fn release_acceleration_lease(
         .metrics
         .reverts_applied
         .saturating_add(reverted_effects);
+    drop(metrics);
+    if let Some(mut metadata) = lease.exploration {
+        let release_failed = reverted_members < lease.members.len() as u64;
+        if release_failed {
+            metadata.cancelled = Some(
+                apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::ReleaseFailed,
+            );
+        }
+        decision_events.push(
+            acceleration_event(
+                &format!("interaction_qos:foreground@{}", lease.ttl_band.as_str()),
+                lease.root_pid,
+                cycle,
+                if release_failed {
+                    ActuatorDecisionOutcome::Failed
+                } else {
+                    ActuatorDecisionOutcome::Reverted
+                },
+                if release_failed {
+                    "bounded exploration lease release incomplete"
+                } else {
+                    "bounded exploration lease released"
+                },
+            )
+            .with_exploration(metadata),
+        );
+    }
     tracing::debug!(
         root_pid = lease.root_pid,
         family = lease.family.as_str(),
@@ -1558,28 +1676,39 @@ mod interaction_qos_tests {
     }
 
     #[test]
-    fn parameter_exploration_is_sparse_bounded_and_rotates_all_arms() {
-        let mut broker = AccelerationLeaseBroker::default();
+    fn scheduler_metadata_is_the_only_source_of_qos_arm_variation() {
+        let broker = AccelerationLeaseBroker::default();
         let neutral = ContextualActionBias::default();
-        let mut explored = Vec::new();
         for _ in 0..24 {
-            let decision = broker.preview_ttl_band(neutral, None);
-            if decision.exploratory {
-                explored.push(decision.band);
-            } else {
-                assert_eq!(decision.band, LeaseTtlBand::Standard);
-            }
-            broker.commit_ttl_decision(decision);
+            assert_eq!(
+                broker.preview_ttl_band(neutral, None, None),
+                LeaseTtlDecision {
+                    band: LeaseTtlBand::Standard,
+                    exploratory: false,
+                }
+            );
         }
-        assert_eq!(
-            explored,
-            vec![
+        for (arm, band) in [
+            (
+                apollo_engine::engine::exploration_scheduler::ExplorationArm::InteractionQosShort,
                 LeaseTtlBand::Short,
+            ),
+            (
+                apollo_engine::engine::exploration_scheduler::ExplorationArm::InteractionQosStandard,
                 LeaseTtlBand::Standard,
-                LeaseTtlBand::Long
-            ]
-        );
-        for band in LeaseTtlBand::ALL {
+            ),
+            (
+                apollo_engine::engine::exploration_scheduler::ExplorationArm::InteractionQosLong,
+                LeaseTtlBand::Long,
+            ),
+        ] {
+            assert_eq!(
+                broker.preview_ttl_band(neutral, None, Some(arm)),
+                LeaseTtlDecision {
+                    band,
+                    exploratory: true,
+                }
+            );
             let ttl = band.ttl(InteractionReason::AppLaunch);
             assert!((Duration::from_millis(4_500)..=Duration::from_millis(5_500)).contains(&ttl));
             assert!(ttl < MAX_CONTINUOUS_LEASE);
@@ -1587,24 +1716,23 @@ mod interaction_qos_tests {
     }
 
     #[test]
-    fn failed_lease_does_not_consume_a_parameter_probe() {
-        let mut broker = AccelerationLeaseBroker::default();
+    fn rejected_scheduler_probe_falls_back_to_stable_ttl() {
+        let broker = AccelerationLeaseBroker::default();
         let neutral = ContextualActionBias::default();
-        for _ in 0..7 {
-            let decision = broker.preview_ttl_band(neutral, None);
-            broker.commit_ttl_decision(decision);
-        }
-
-        let failed_preview = broker.preview_ttl_band(neutral, None);
+        let failed_preview = broker.preview_ttl_band(
+            neutral,
+            None,
+            Some(apollo_engine::engine::exploration_scheduler::ExplorationArm::InteractionQosShort),
+        );
         assert!(failed_preview.exploratory);
         assert_eq!(failed_preview.band, LeaseTtlBand::Short);
-        // No commit models a kernel/capability rejection. The same probe must
-        // be retried rather than silently rotating past it.
-        let retry = broker.preview_ttl_band(neutral, None);
-        assert_eq!(retry, failed_preview);
-
-        broker.commit_ttl_decision(retry);
-        assert!(!broker.preview_ttl_band(neutral, None).exploratory);
+        assert_eq!(
+            broker.preview_ttl_band(neutral, None, None),
+            LeaseTtlDecision {
+                band: LeaseTtlBand::Standard,
+                exploratory: false,
+            }
+        );
     }
 
     #[test]

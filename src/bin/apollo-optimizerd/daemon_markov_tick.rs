@@ -24,12 +24,19 @@ use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decision_ledger::{
     ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
 };
+use apollo_engine::engine::exploration_scheduler::{
+    ActionClass, CommitEvidence, ExplorationArm, ExplorationCandidate, ExplorationContext,
+    ExplorationGates, ExplorationMetadata, ExplorationMode, ExplorationScheduler, TimePoint,
+};
 use apollo_engine::engine::focus_markov::{FocusMarkov, PrewarmAdmission, PrewarmContext};
 use apollo_engine::engine::freeze_intelligence::FreezeIntelligence;
 use apollo_engine::engine::jetsam_control;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::{LatencyTier, SchedulingTier, ThroughputTier};
+use apollo_engine::engine::process_identity::ProcessIdentity;
 use apollo_engine::engine::process_tree::ProcessTree;
+use apollo_engine::engine::safety::hard_protected_contains;
+use apollo_engine::engine::telemetry_medallion::ActuatorFamily;
 use apollo_engine::engine::temporal_predictor::TemporalPredictor;
 use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 use chrono::{Timelike, Utc};
@@ -74,6 +81,7 @@ pub struct MarkovPrewarmLease {
     settle_recorded: bool,
     calibration_probe: bool,
     calibration_context: PrewarmContext,
+    exploration: Option<ExplorationMetadata>,
 }
 
 /// Passive prediction tracking. It never owns an actuator or kernel resource;
@@ -146,6 +154,17 @@ enum LeaseResolution {
     Miss,
 }
 
+fn markov_exploration_admission(
+    admission: PrewarmAdmission,
+    scheduler_approved: bool,
+) -> (bool, bool) {
+    match admission {
+        PrewarmAdmission::Probe => (scheduler_approved, false),
+        PrewarmAdmission::Ready => (true, true),
+        PrewarmAdmission::Quarantined => (false, false),
+    }
+}
+
 /// Run FocusMarkov + temporal predictor for this cycle.
 ///
 /// # Parameters
@@ -183,6 +202,9 @@ pub fn run_markov_tick(
     cache_warmer: &mut CacheWarmer,
     frozen_state_path: &Path,
     world_model: &WorldModel,
+    exploration_scheduler: &mut ExplorationScheduler,
+    exploration_gates: ExplorationGates,
+    exploration_now: TimePoint,
 ) -> MarkovTickOutput {
     let mut decision_events = CycleDecisionEvents::default();
     // Fight-hunt fix (2026-06-10): prefetch is a luxury. Under pressure the
@@ -385,10 +407,67 @@ pub fn run_markov_tick(
             cache_warm_allowed,
             probability_floor,
         );
-        let prewarm_eligible = base_eligible && admission.allows_acceleration();
-        // Cache-only probes may test a cold/new context. Reversible kernel
-        // acceleration is reserved for mature transition evidence.
-        markov_acceleration_allowed = admission.allows_kernel_acceleration() && cache_warm_allowed;
+        let predicted_pid = find_running_pid(collector, &pred.app_name);
+        let mut gates = exploration_gates;
+        gates.markov_quarantined = admission == PrewarmAdmission::Quarantined;
+        let identity = predicted_pid.and_then(ProcessIdentity::from_pid);
+        gates.identity_present = identity.is_some();
+        gates.identity_start_nonzero = identity
+            .as_ref()
+            .is_some_and(|identity| identity.start_sec > 0 || identity.start_usec > 0);
+        gates.identity_recheck_ok =
+            predicted_pid
+                .zip(identity.as_ref())
+                .is_some_and(|(pid, identity)| {
+                    ProcessIdentity::verify(
+                        pid,
+                        Some(&pred.app_name),
+                        identity.start_sec,
+                        identity.start_usec,
+                    )
+                });
+        gates.identity_recycled = !gates.identity_recheck_ok;
+        gates.target_protected = predicted_pid.is_none_or(|pid| {
+            hard_protected_contains(&pred.app_name)
+                || apollo_engine::engine::apple_owned::is_apple_owned(pid)
+        });
+        gates.target_apple_owned =
+            predicted_pid.is_none_or(apollo_engine::engine::apple_owned::is_apple_owned);
+        let mut exploration_approval = if admission == PrewarmAdmission::Probe && base_eligible {
+            ExplorationCandidate::new(
+                ActuatorFamily::MarkovPrewarm,
+                ExplorationMode::Treatment,
+                ExplorationArm::MarkovCacheOnly,
+                ActionClass::MarkovPredictedApp,
+                ExplorationContext::Background,
+                exploration_scheduler.origin(),
+            )
+            .ok()
+            .and_then(|candidate| {
+                exploration_scheduler
+                    .request(&candidate, &gates, exploration_now)
+                    .ok()
+            })
+        } else {
+            None
+        };
+        if exploration_approval
+            .as_ref()
+            .is_some_and(|approval| exploration_scheduler.recheck(approval, &gates).is_err())
+        {
+            if let Some(approval) = exploration_approval.take() {
+                exploration_scheduler.cancel(
+                    approval.metadata.correlation,
+                    apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                );
+            }
+        }
+        let (specialist_allowed, allow_kernel_acceleration) =
+            markov_exploration_admission(admission, exploration_approval.is_some());
+        let prewarm_eligible = base_eligible && specialist_allowed;
+        // Cache-only probes may test a cold/new context. Reversible acceleration
+        // remains reserved for mature transition evidence.
+        markov_acceleration_allowed = allow_kernel_acceleration && cache_warm_allowed;
         let probe_transitions_remaining = focus_markov.prewarm_probe_transitions_remaining(
             source_app,
             &pred.app_name,
@@ -450,7 +529,6 @@ pub fn run_markov_tick(
         }
 
         if markov_prewarm.is_none() && prewarm_eligible {
-            let predicted_pid = find_running_pid(collector, &pred.app_name);
             if let Some(pid) = predicted_pid {
                 if markov_shadow.active.take().is_some() {
                     let mut metrics = state.metrics.lock_recover();
@@ -469,7 +547,7 @@ pub fn run_markov_tick(
                         coalition_tracker,
                         cache_warmer,
                         frozen_state_path,
-                        admission.allows_kernel_acceleration(),
+                        allow_kernel_acceleration,
                         cycle_count,
                     );
                 decision_events.extend_buffer(&member_events);
@@ -486,6 +564,22 @@ pub fn run_markov_tick(
                     contextual_bias,
                 );
                 let acquired_at = Instant::now();
+                let exploration = exploration_approval.and_then(|approval| {
+                    if applied {
+                        exploration_scheduler.commit_metadata(
+                            approval.metadata.correlation,
+                            exploration_now,
+                            CommitEvidence::MutationApplied,
+                        )
+                    } else {
+                        exploration_scheduler.commit(
+                            approval.metadata.correlation,
+                            exploration_now,
+                            CommitEvidence::NoOp,
+                        );
+                        None
+                    }
+                });
                 *markov_prewarm = Some(MarkovPrewarmLease {
                     source_app: foreground_app.unwrap_or_default().to_string(),
                     predicted_app: pred.app_name.clone(),
@@ -498,7 +592,19 @@ pub fn run_markov_tick(
                     settle_recorded: false,
                     calibration_probe: admission == PrewarmAdmission::Probe,
                     calibration_context,
+                    exploration: exploration.clone(),
                 });
+                if let Some(metadata) = exploration {
+                    decision_events.push(
+                        markov_event(
+                            pred.app_name.clone(),
+                            cycle_count,
+                            ActuatorDecisionOutcome::Pending,
+                            "bounded cache-only exploration started",
+                        )
+                        .with_exploration(metadata),
+                    );
+                }
                 let mut metrics = state.metrics.lock_recover();
                 metrics.metrics.markov_prewarm_attempts += 1;
                 metrics.metrics.markov_prewarm_probes_total +=
@@ -1280,6 +1386,8 @@ pub fn release_markov_prewarm(
     let member_count = lease.members.len();
     let cache_bytes = lease.cache_bytes;
     let calibration_probe = lease.calibration_probe;
+    let exploration = lease.exploration.clone();
+    let exploration_target = lease.predicted_app.clone();
     for member in lease.members {
         if member.jetsam_applied {
             let effect = apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
@@ -1472,6 +1580,29 @@ pub fn release_markov_prewarm(
     metrics.metrics.markov_prewarm_members = 0;
     metrics.metrics.markov_prewarm_reverts += u64::from(reverted);
     metrics.metrics.reverts_applied += reverted_effects;
+    drop(metrics);
+    if let Some(mut metadata) = exploration {
+        if deferred_effects > 0 {
+            metadata.cancelled = Some(
+                apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::ReleaseFailed,
+            );
+        }
+        decision_events.push(
+            markov_event(
+                exploration_target,
+                cycle,
+                if deferred_effects > 0 {
+                    ActuatorDecisionOutcome::Failed
+                } else if reverted_effects > 0 {
+                    ActuatorDecisionOutcome::Reverted
+                } else {
+                    ActuatorDecisionOutcome::Expired
+                },
+                "bounded cache-only exploration released",
+            )
+            .with_exploration(metadata),
+        );
+    }
     tracing::debug!(
         member_count,
         cache_bytes,
@@ -1527,6 +1658,7 @@ mod tests {
             settle_recorded: false,
             calibration_probe: false,
             calibration_context: PrewarmContext::new("idle", 0, 0.20, false),
+            exploration: None,
         }
     }
 
@@ -1630,6 +1762,26 @@ mod tests {
         assert_eq!(
             prewarm_blocker(0.90, 2.0, true, 0.50, PrewarmAdmission::Probe),
             "ready"
+        );
+    }
+
+    #[test]
+    fn scheduler_rejection_blocks_only_markov_probe_not_ready_policy() {
+        assert_eq!(
+            markov_exploration_admission(PrewarmAdmission::Probe, false),
+            (false, false)
+        );
+        assert_eq!(
+            markov_exploration_admission(PrewarmAdmission::Probe, true),
+            (true, false)
+        );
+        assert_eq!(
+            markov_exploration_admission(PrewarmAdmission::Ready, false),
+            (true, true)
+        );
+        assert_eq!(
+            markov_exploration_admission(PrewarmAdmission::Quarantined, true),
+            (false, false)
         );
     }
 
