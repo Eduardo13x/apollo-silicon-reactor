@@ -12,7 +12,7 @@ use crate::engine::model_calibration::{
 };
 use crate::engine::telemetry_medallion::ActuatorFamily;
 
-pub const UNIFIED_LEARNING_SCHEMA_VERSION: u8 = 1;
+pub const UNIFIED_LEARNING_SCHEMA_VERSION: u8 = 2;
 pub const MAX_ADVICE_REQUESTS: usize = 48;
 const MAX_PRODUCER_BYTES: usize = 48;
 const MAX_ACTION_BYTES: usize = 96;

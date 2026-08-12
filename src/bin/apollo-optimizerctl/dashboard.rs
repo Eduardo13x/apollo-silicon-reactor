@@ -1374,18 +1374,18 @@ fn render_learning_band(status: &DaemonStatus) -> Vec<String> {
             latest.scope,
         )
     };
-    vec![
-        primary,
-        worst,
-        latest,
+    let ledger_orphans = if metrics.unified_learning_schema_version < 2 {
+        "Ledger huérfanos n/d".to_string()
+    } else {
         format!(
             "Ledger huérfanos {}",
             metrics.decision_ledger_unattributed_applied_total
-        ),
-    ]
-    .into_iter()
-    .map(bounded_learning_line)
-    .collect()
+        )
+    };
+    vec![primary, worst, latest, ledger_orphans]
+        .into_iter()
+        .map(bounded_learning_line)
+        .collect()
 }
 
 // ── 📋 VERDICT band (cognitive) ──────────────────────────────────────────────
@@ -1612,14 +1612,32 @@ mod tests {
     }
 
     #[test]
-    fn unified_learning_band_reports_ledger_orphans() {
+    fn unified_learning_band_marks_ledger_orphans_unavailable_before_schema_two() {
         let mut status = dashboard_status();
+        status.metrics.unified_learning_schema_version = 1;
+        status.metrics.decision_ledger_unattributed_applied_total = 3;
+
+        let lines = render_learning_band(&status);
+
+        assert_eq!(lines[3], "Ledger huérfanos n/d");
+        assert!(lines.iter().all(|line| display_width(line) <= CW));
+    }
+
+    #[test]
+    fn unified_learning_band_reports_ledger_orphans_from_schema_two() {
+        let mut status = dashboard_status();
+        status.metrics.unified_learning_schema_version = 2;
         status.metrics.decision_ledger_unattributed_applied_total = 3;
 
         let lines = render_learning_band(&status);
 
         assert_eq!(lines[3], "Ledger huérfanos 3");
         assert!(lines.iter().all(|line| display_width(line) <= CW));
+
+        status.metrics.decision_ledger_unattributed_applied_total = u64::MAX;
+        let max_lines = render_learning_band(&status);
+        assert_eq!(max_lines[3], "Ledger huérfanos 18446744073709551615");
+        assert!(max_lines.iter().all(|line| display_width(line) <= CW));
     }
 
     #[test]

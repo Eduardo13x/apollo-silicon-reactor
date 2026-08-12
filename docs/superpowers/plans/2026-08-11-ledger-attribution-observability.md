@@ -44,9 +44,10 @@ exist yet.
 
 - [ ] **Step 3: Add the minimal projection**
 
-Add the scalar with `#[serde(default)]` to `RuntimeMetrics`,
-`UnifiedLearningInput`, and `UnifiedLearningHealth`; copy it in `from_input`
-and `publish_to`. In `build_unified_learning_health`, set it from
+Add the scalar to `RuntimeMetrics`, `UnifiedLearningInput`, and
+`UnifiedLearningHealth`; apply `#[serde(default)]` only to the `RuntimeMetrics`
+field for historical JSON compatibility. Copy it in `from_input` and
+`publish_to`. In `build_unified_learning_health`, set it from
 `ledger.unattributed_applied_total()`.
 
 - [ ] **Step 4: Run focused engine and daemon tests**
@@ -122,4 +123,3 @@ invoke the scoped root helper, and retain its emitted backup path.
 Require launchd running, cycles advancing, installed hashes matching signed
 candidates, `failures == 0`, `last_error == null`, acceptance gate PASS, and a
 live `decision_ledger_unattributed_applied_total` value.
-

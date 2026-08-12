@@ -193,6 +193,7 @@ fn ledger_unattributed_applied_total_publishes_to_runtime_metrics() {
 
     health.publish_to(&mut metrics);
 
+    assert_eq!(metrics.unified_learning_schema_version, 2);
     assert_eq!(metrics.decision_ledger_unattributed_applied_total, 7);
 }
 

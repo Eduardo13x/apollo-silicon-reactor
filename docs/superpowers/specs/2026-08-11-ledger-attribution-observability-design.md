@@ -15,15 +15,19 @@ source of truth. `build_unified_learning_health` copies that scalar into
 ledger projections and publishes it as
 `RuntimeMetrics::decision_ledger_unattributed_applied_total`.
 
-The field is `u64` with `serde(default)`, preserving compatibility with old
-runtime JSON. It is diagnostic only: it does not contribute to AIS, trust,
-World Model advice, ranking, exploration, or kernel authority. Reading and
-publishing it is O(1), and the existing ledger revision invalidates the cached
-health view when receipts change.
+The `RuntimeMetrics` field is `u64` with `serde(default)`, preserving
+compatibility with old runtime JSON. It is diagnostic only: it does not
+contribute to AIS, trust, World Model advice, ranking, exploration, or kernel
+authority. Reading and publishing it is O(1). Because
+`DecisionLedger::revision()` omits this counter, the scalar is an explicit
+`UnifiedLearningRevision` cache-key component so unattributed applied receipts
+invalidate the cached health view.
 
 The dashboard adds one bounded line to the learning band:
-`Ledger huérfanos N`. Zero is shown explicitly because it is the passing audit
-condition; nonzero values remain visible rather than being normalized away.
+`Ledger huérfanos N`. Schema version 2 marks the counter as available; older
+schemas render `Ledger huérfanos n/d` because a defaulted zero is ambiguous.
+For schema 2, zero is shown explicitly because it is the passing audit
+condition, and nonzero values remain visible rather than being normalized away.
 
 ## Verification
 
@@ -35,4 +39,3 @@ condition; nonzero values remain visible rather than being normalized away.
 - Focused tests run RED before production code, then GREEN.
 - Workspace formatting, Clippy, release tests, release build, signed deployment,
   and live status verify the complete path.
-
