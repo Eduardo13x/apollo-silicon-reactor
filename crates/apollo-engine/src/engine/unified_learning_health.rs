@@ -277,6 +277,7 @@ pub struct UnifiedLearningRevision {
 
 #[derive(Debug, Clone, Default)]
 pub struct UnifiedLearningInput {
+    pub decision_ledger_unattributed_applied_total: u64,
     pub local_gold_decisions: u64,
     pub imported_gold_decisions: u64,
     pub raw_action_count: u64,
@@ -304,6 +305,7 @@ pub struct UnifiedLearningInput {
 #[derive(Debug, Clone, Default)]
 pub struct UnifiedLearningHealth {
     pub schema_version: u8,
+    pub decision_ledger_unattributed_applied_total: u64,
     pub ledger_closure: LedgerClosureSnapshot,
     pub trust_inventory: TrustInventorySnapshot,
     pub horizon_calibration: Vec<HorizonCalibrationSnapshot>,
@@ -386,6 +388,8 @@ impl UnifiedLearningHealth {
 
         Self {
             schema_version: UNIFIED_LEARNING_SCHEMA_VERSION,
+            decision_ledger_unattributed_applied_total: input
+                .decision_ledger_unattributed_applied_total,
             ledger_closure,
             trust_inventory,
             horizon_calibration,
@@ -429,6 +433,8 @@ impl UnifiedLearningHealth {
 
     pub fn publish_to(&self, metrics: &mut crate::engine::types::RuntimeMetrics) {
         metrics.unified_learning_schema_version = self.schema_version;
+        metrics.decision_ledger_unattributed_applied_total =
+            self.decision_ledger_unattributed_applied_total;
         metrics.ledger_closure = self.ledger_closure.clone();
         metrics.trust_inventory = self.trust_inventory.clone();
         metrics.horizon_calibration = self.horizon_calibration.clone();

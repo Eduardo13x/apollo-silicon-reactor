@@ -587,6 +587,8 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub unified_learning_schema_version: u8,
     #[serde(default)]
+    pub decision_ledger_unattributed_applied_total: u64,
+    #[serde(default)]
     pub ledger_closure: crate::engine::unified_learning_health::LedgerClosureSnapshot,
     #[serde(default)]
     pub trust_inventory: crate::engine::unified_learning_health::TrustInventorySnapshot,

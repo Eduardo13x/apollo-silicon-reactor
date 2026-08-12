@@ -171,6 +171,7 @@ fn runtime_metrics_legacy_json_defaults_every_unified_learning_field() {
     assert_eq!(legacy.cycles, 17);
     assert_eq!(legacy.failures, 2);
     assert_eq!(legacy.unified_learning_schema_version, 0);
+    assert_eq!(legacy.decision_ledger_unattributed_applied_total, 0);
     assert_eq!(legacy.ledger_closure.local_due, 0);
     assert!(legacy.horizon_calibration.is_empty());
     assert!(!legacy.latest_resolved_episode.present);
@@ -179,6 +180,19 @@ fn runtime_metrics_legacy_json_defaults_every_unified_learning_field() {
     assert_eq!(encoded["cycles"], 17);
     assert_eq!(encoded["unified_learning_schema_version"], 0);
     assert!(encoded.get("ledger_closure").is_some());
+}
+
+#[test]
+fn ledger_unattributed_applied_total_publishes_to_runtime_metrics() {
+    let health = UnifiedLearningHealth::from_input(UnifiedLearningInput {
+        decision_ledger_unattributed_applied_total: 7,
+        ..Default::default()
+    });
+    let mut metrics = RuntimeMetrics::default();
+
+    health.publish_to(&mut metrics);
+
+    assert_eq!(metrics.decision_ledger_unattributed_applied_total, 7);
 }
 
 #[test]

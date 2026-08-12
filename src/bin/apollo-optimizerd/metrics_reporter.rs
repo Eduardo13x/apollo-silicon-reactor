@@ -191,6 +191,7 @@ fn build_unified_learning_health(
     let view = hierarchy.view();
     let (committed, terminal) = scheduler.learning_counts();
     UnifiedLearningHealth::from_input(UnifiedLearningInput {
+        decision_ledger_unattributed_applied_total: ledger.unattributed_applied_total(),
         local_gold_decisions: telemetry.metrics().local_gold_total,
         trusted_active_models: telemetry.model_calibration_summary().trusted_models as u64,
         active_models: telemetry.model_calibration_metrics().record_count as u64,
