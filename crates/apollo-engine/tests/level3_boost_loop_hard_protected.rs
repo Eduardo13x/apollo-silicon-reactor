@@ -864,6 +864,7 @@ fn test_boost_enrollment_skipped_when_caps_missing() {
         &[],
         &[],
         None,    // qos_mgr = None forces phantom guard to fail
+        None,    // async_commands
         false,   // dry_run = false: we want the !dry_run branch
         0.74,    // memory_pressure (prod-incident)
         6_000.0, // thrashing_score
