@@ -138,10 +138,12 @@ verify_runtime_once() {
     fi
     [ -x "$CTL_STATUS" ] || return 1
     first=$("$CTL_STATUS" status 2>/dev/null | /usr/bin/python3 -c \
-        'import json,sys; print(int(json.load(sys.stdin).get("metrics",{}).get("cycles",0)))') || return 1
+        'import json,sys; print(int(json.load(sys.stdin).get("metrics",{}).get("cycles",0)))' \
+        2>/dev/null) || return 1
     /bin/sleep 3
     second=$("$CTL_STATUS" status 2>/dev/null | /usr/bin/python3 -c \
-        'import json,sys; print(int(json.load(sys.stdin).get("metrics",{}).get("cycles",0)))') || return 1
+        'import json,sys; print(int(json.load(sys.stdin).get("metrics",{}).get("cycles",0)))' \
+        2>/dev/null) || return 1
     [ "$second" -gt "$first" ]
 }
 
