@@ -71,6 +71,7 @@ fn boost_blocks_on_mismatched_start_sec_and_bumps_counter() {
         &[],
         &[],
         None,
+        None,
         true, // dry_run
         0.0,
         0.0,
@@ -125,6 +126,7 @@ fn set_thread_qos_blocks_on_mismatched_start_sec_and_bumps_counter() {
         &mut frozen,
         &[],
         &[],
+        None,
         None,
         true,
         0.0,
