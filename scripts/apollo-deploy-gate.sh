@@ -18,14 +18,15 @@
 #   GATE 3 — POST-SNAPSHOT (90s after restart): honest AIS must stay within
 #            3 points of its pre-deploy value and above the safety floor,
 #            failures must stay 0, last_error must be null. Otherwise
-#            the script alerts loudly. Rollback is suggested but not
-#            executed — the human decides (CLAUDE.md supervision rule).
+#            the script pauses and prints the exact scoped rollback command.
+#            Rollback runs only when --auto-revert was explicitly requested.
 #
 # Usage:
 #   ./scripts/apollo-deploy-gate.sh                      # full guarded deploy
 #   ./scripts/apollo-deploy-gate.sh --skip-test-check    # explicit override
 #                                                       # (logged loudly)
 #   ./scripts/apollo-deploy-gate.sh --dry-run            # gates only, no deploy
+#   ./scripts/apollo-deploy-gate.sh --auto-revert         # deploy; rollback on failure
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -39,17 +40,109 @@ AIS_MAX_REGRESSION=3.0
 AIS_BELOW_FLOOR_TOLERANCE=0.5
 SKIP_TEST_CHECK=0
 DRY_RUN=0
-for a in "$@"; do
-  case "$a" in
-    --skip-test-check) SKIP_TEST_CHECK=1 ;;
-    --dry-run) DRY_RUN=1 ;;
-    *) echo "unknown flag: $a" >&2; exit 2 ;;
+AUTO_REVERT=0
+EXPECTED_HEAD=""
+EXPECTED_DAEMON_SHA=""
+EXPECTED_CTL_SHA=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --skip-test-check) SKIP_TEST_CHECK=1; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --auto-revert) AUTO_REVERT=1; shift ;;
+    --expected-head) EXPECTED_HEAD="${2:?--expected-head needs a SHA}"; shift 2 ;;
+    --expected-daemon-sha) EXPECTED_DAEMON_SHA="${2:?--expected-daemon-sha needs a SHA-256}"; shift 2 ;;
+    --expected-ctl-sha) EXPECTED_CTL_SHA="${2:?--expected-ctl-sha needs a SHA-256}"; shift 2 ;;
+    -h|--help)
+      grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
+      exit 0 ;;
+    *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
 
 red()   { printf "\033[31m%s\033[0m\n" "$*"; }
 green() { printf "\033[32m%s\033[0m\n" "$*"; }
 yellow(){ printf "\033[33m%s\033[0m\n" "$*"; }
+
+sha256_file() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+valid_hex_length() {
+  local value="$1" length="$2"
+  [ "${#value}" -eq "$length" ] || return 1
+  case "$value" in *[!0-9a-fA-F]*) return 1 ;; esac
+  return 0
+}
+
+extract_backup_path() {
+  printf '%s\n' "$1" | awk '
+    /^APOLLO_BACKUP_PATH=\/var\/lib\/apollo\/backups\/deploy-/ {
+      sub(/^APOLLO_BACKUP_PATH=/, ""); path=$0
+    }
+    /^backup_path=\/var\/lib\/apollo\/backups\/deploy-/ {
+      sub(/^backup_path=/, ""); path=$0
+    }
+    /^Apollo deployed; backup: \/var\/lib\/apollo\/backups\/deploy-/ {
+      sub(/^Apollo deployed; backup: /, ""); path=$0
+    }
+    /^deploy failed; rollback: .* rollback \/var\/lib\/apollo\/backups\/deploy-/ {
+      path=$NF
+    }
+    END { if (path != "") print path }
+  '
+}
+
+backup_path_valid() {
+  case "$1" in
+    /var/lib/apollo/backups/deploy-*) ;;
+    *) return 1 ;;
+  esac
+  local leaf="${1#/var/lib/apollo/backups/deploy-}"
+  [ -n "$leaf" ] || return 1
+  case "$leaf" in
+    *..*|*/*|*[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  return 0
+}
+
+emit_rollback_record() {
+  printf 'APOLLO_BACKUP_PATH=%s\n' "$BACKUP_PATH"
+  printf 'APOLLO_ROLLBACK_COMMAND=sudo -n %s rollback %s\n' "$DEPLOYER" "$BACKUP_PATH"
+}
+
+handle_failure_rollback() {
+  local reason="$1"
+  if [ -z "${BACKUP_PATH:-}" ] || ! backup_path_valid "$BACKUP_PATH"; then
+    red "[rollback] unavailable: no valid scoped backup path was captured."
+    printf 'APOLLO_ROLLBACK_STATUS=unavailable\n'
+    return 0
+  fi
+
+  emit_rollback_record
+  if [ "$AUTO_REVERT" != "1" ]; then
+    yellow "[rollback] paused after $reason; --auto-revert was not requested."
+    yellow "[rollback] exact command: sudo -n $DEPLOYER rollback $BACKUP_PATH"
+    printf 'APOLLO_ROLLBACK_STATUS=not-requested\n'
+    return 0
+  fi
+
+  yellow "[rollback] $reason; executing the explicitly approved scoped rollback."
+  local rollback_output rollback_status
+  set +e
+  rollback_output=$(sudo -n "$DEPLOYER" rollback "$BACKUP_PATH" 2>&1)
+  rollback_status=$?
+  set -e
+  printf '%s\n' "$rollback_output"
+  if [ "$rollback_status" -eq 0 ]; then
+    green "[rollback] completed and verified by $DEPLOYER."
+    printf 'APOLLO_ROLLBACK_STATUS=succeeded\n'
+    return 0
+  fi
+
+  red "[rollback] FAILED with status $rollback_status."
+  printf 'APOLLO_ROLLBACK_STATUS=failed\n'
+  return 1
+}
 
 capture_runtime_metrics() {
   local output_path="$1"
@@ -101,6 +194,36 @@ fi
 # actual full workspace gate before touching the installed daemon.
 "$REPO_ROOT/scripts/pipeline.sh" --skip-deploy
 
+# --risky pins the verified source and release artifacts across the pipeline.
+# Direct legacy invocations may omit this tuple, but a partial tuple fails.
+EXPECTED_COUNT=0
+[ -n "$EXPECTED_HEAD" ] && EXPECTED_COUNT=$((EXPECTED_COUNT + 1))
+[ -n "$EXPECTED_DAEMON_SHA" ] && EXPECTED_COUNT=$((EXPECTED_COUNT + 1))
+[ -n "$EXPECTED_CTL_SHA" ] && EXPECTED_COUNT=$((EXPECTED_COUNT + 1))
+if [ "$EXPECTED_COUNT" -ne 0 ] && [ "$EXPECTED_COUNT" -ne 3 ]; then
+  red "[gate-1] incomplete immutable-candidate tuple."
+  exit 2
+fi
+if [ "$EXPECTED_COUNT" -eq 3 ]; then
+  valid_hex_length "$EXPECTED_HEAD" 40 || valid_hex_length "$EXPECTED_HEAD" 64 \
+    || { red "[gate-1] invalid expected HEAD SHA."; exit 2; }
+  valid_hex_length "$EXPECTED_DAEMON_SHA" 64 \
+    || { red "[gate-1] invalid daemon SHA-256."; exit 2; }
+  valid_hex_length "$EXPECTED_CTL_SHA" 64 \
+    || { red "[gate-1] invalid ctl SHA-256."; exit 2; }
+  CURRENT_HEAD=$(git -C "$REPO_ROOT" rev-parse --verify HEAD^{commit} 2>/dev/null) \
+    || { red "[gate-1] cannot resolve HEAD."; exit 1; }
+  [ "$CURRENT_HEAD" = "$(printf '%s' "$EXPECTED_HEAD" | tr '[:upper:]' '[:lower:]')" ] \
+    || { red "[gate-1] HEAD changed after verification."; exit 1; }
+  [ -z "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ] \
+    || { red "[gate-1] worktree changed after verification."; exit 1; }
+  [ -x "$BINARY_SRC" ] && [ "$(sha256_file "$BINARY_SRC")" = "$EXPECTED_DAEMON_SHA" ] \
+    || { red "[gate-1] daemon candidate changed after verification."; exit 1; }
+  [ -x "$BINARY_CTL_SRC" ] && [ "$(sha256_file "$BINARY_CTL_SRC")" = "$EXPECTED_CTL_SHA" ] \
+    || { red "[gate-1] ctl candidate changed after verification."; exit 1; }
+  green "[gate-1] immutable HEAD and candidate hashes match the verification record."
+fi
+
 # ── Gate 2: pre-snapshot ─────────────────────────────────────────────
 PRE_SNAP="/tmp/apollo_pre_snap_$$.json"
 capture_runtime_metrics "$PRE_SNAP"
@@ -128,7 +251,34 @@ cp -f "$BINARY_CTL_SRC" /private/tmp/apollo-optimizerctl-candidate
 chmod 755 /private/tmp/apollo-optimizerd-candidate /private/tmp/apollo-optimizerctl-candidate
 codesign --force --sign - /private/tmp/apollo-optimizerd-candidate
 codesign --force --sign - /private/tmp/apollo-optimizerctl-candidate
-sudo -n "$DEPLOYER"
+set +e
+DEPLOY_OUTPUT=$(sudo -n "$DEPLOYER" deploy 2>&1)
+DEPLOY_STATUS=$?
+set -e
+printf '%s\n' "$DEPLOY_OUTPUT"
+BACKUP_PATH=$(extract_backup_path "$DEPLOY_OUTPUT")
+
+if [ -n "$BACKUP_PATH" ] && ! backup_path_valid "$BACKUP_PATH"; then
+  red "[deploy] deployer returned an invalid backup path."
+  printf 'APOLLO_ROLLBACK_STATUS=unavailable\n'
+  exit 3
+fi
+
+if [ "$DEPLOY_STATUS" -ne 0 ]; then
+  red "[deploy] scoped deployer failed with status $DEPLOY_STATUS."
+  if ! handle_failure_rollback "deployer failure"; then
+    exit 5
+  fi
+  exit "$DEPLOY_STATUS"
+fi
+
+if [ -z "$BACKUP_PATH" ]; then
+  red "[deploy] deployer succeeded without a machine-readable backup path."
+  printf 'APOLLO_ROLLBACK_STATUS=unavailable\n'
+  exit 3
+fi
+emit_rollback_record
+printf 'APOLLO_ROLLBACK_STATUS=armed\n'
 
 # ── Gate 3: post-snapshot 90s window ─────────────────────────────────
 yellow "[gate-3] sleeping 90s for daemon to stabilize before health check..."
@@ -199,4 +349,7 @@ yellow "  2. restore the backup created by $DEPLOYER"
 yellow "[suggest] capture the diff for post-mortem before rollback:"
 yellow "  cp $PRE_SNAP /tmp/incident_pre.json"
 yellow "  cp $POST_SNAP /tmp/incident_post.json"
+if ! handle_failure_rollback "post-deploy health failure"; then
+  exit 5
+fi
 exit 4

@@ -1,47 +1,249 @@
 #!/bin/sh
-# Root-owned fixed deployer for Apollo release binaries staged in /private/tmp.
+# Root-owned, fixed-path deployer and rollback helper for Apollo release binaries.
 set -eu
 
-if [ "$#" -ne 0 ]; then
-    echo "usage: apollo-deploy" >&2
-    exit 64
+LABEL=system/com.eduardocortez.systemoptimizerd
+MAX_LEARNED_STATE_SCHEMA=2
+TEST_ROOT=${APOLLO_DEPLOY_TEST_ROOT:-}
+
+if [ -n "$TEST_ROOT" ]; then
+    case "$TEST_ROOT" in
+        /private/tmp/apollo-deploy-test.*) ;;
+        *) echo "invalid test root" >&2; exit 64 ;;
+    esac
+    [ -d "$TEST_ROOT" ] && [ ! -L "$TEST_ROOT" ] || {
+        echo "invalid test root" >&2; exit 64;
+    }
+    ROOT="$TEST_ROOT"
+    TEST_MODE=1
+else
+    ROOT=""
+    TEST_MODE=0
 fi
 
-DAEMON_CANDIDATE=/private/tmp/apollo-optimizerd-candidate
-CTL_CANDIDATE=/private/tmp/apollo-optimizerctl-candidate
-DAEMON_DEST=/usr/local/libexec/apollo-optimizerd
-CTL_DEST=/usr/local/bin/apollo-optimizerctl
-LABEL=system/com.eduardocortez.systemoptimizerd
-PLIST=/Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist
-BACKUP_DIR="/var/lib/apollo/backups/deploy-$(/bin/date +%Y%m%dT%H%M%SZ)"
+path() { printf '%s%s\n' "$ROOT" "$1"; }
+DAEMON_CANDIDATE=$(path /private/tmp/apollo-optimizerd-candidate)
+CTL_CANDIDATE=$(path /private/tmp/apollo-optimizerctl-candidate)
+DAEMON_DEST=$(path /usr/local/libexec/apollo-optimizerd)
+CTL_DEST=$(path /usr/local/bin/apollo-optimizerctl)
+STATE_DIR=$(path /var/lib/apollo)
+BACKUPS_DIR="$STATE_DIR/backups"
+STATE="$STATE_DIR/learned_state.json"
+STATE_PREVIOUS="$STATE_DIR/learned_state.json.previous"
+PLIST=$(path /Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist)
+CTL_STATUS="$CTL_DEST"
 
-for candidate in "$DAEMON_CANDIDATE" "$CTL_CANDIDATE"; do
-    if [ ! -f "$candidate" ] || [ -L "$candidate" ] || [ ! -x "$candidate" ]; then
-        echo "invalid candidate: $candidate" >&2
-        exit 65
+usage() {
+    echo "usage: apollo-deploy [deploy|rollback BACKUP_DIR]" >&2
+    exit 64
+}
+
+sha256() { /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'; }
+owner_mode() { /usr/bin/stat -f '%u:%g:%Lp' "$1"; }
+
+state_schema() {
+    [ -f "$1" ] || { echo absent; return; }
+    /usr/bin/python3 - "$1" <<'PY'
+import json, sys
+with open(sys.argv[1], encoding="utf-8") as handle:
+    value = json.load(handle)
+version = value.get("version", 0) if isinstance(value, dict) else -1
+if not isinstance(version, int) or version < 0:
+    raise SystemExit(1)
+print(version)
+PY
+}
+
+assert_supported_state() {
+    version=$(state_schema "$1") || { echo "invalid learned state: $1" >&2; exit 65; }
+    [ "$version" = absent ] || [ "$version" -le "$MAX_LEARNED_STATE_SCHEMA" ] || {
+        echo "future learned-state schema: $version" >&2; exit 65;
+    }
+}
+
+regular() { [ -f "$1" ] && [ ! -L "$1" ]; }
+executable_regular() { regular "$1" && [ -x "$1" ]; }
+
+verify_signature() {
+    if [ "$TEST_MODE" -eq 1 ]; then
+        [ -f "$1.signature-ok" ]
+    else
+        /usr/bin/codesign --verify --strict "$1"
     fi
-    /usr/bin/codesign --verify --strict "$candidate"
-done
+}
 
-/bin/mkdir -p "$BACKUP_DIR"
-/bin/cp "$DAEMON_DEST" "$BACKUP_DIR/apollo-optimizerd.pre-deploy"
-/bin/cp "$CTL_DEST" "$BACKUP_DIR/apollo-optimizerctl.pre-deploy"
+assert_candidate() {
+    executable_regular "$1" || { echo "invalid candidate: $1" >&2; exit 65; }
+    verify_signature "$1" || { echo "invalid candidate signature: $1" >&2; exit 65; }
+}
 
-/bin/launchctl bootout "$LABEL" 2>/dev/null || true
-/bin/sleep 2
-/usr/bin/install -o root -g wheel -m 0755 "$DAEMON_CANDIDATE" "$DAEMON_DEST"
-/usr/bin/install -o root -g wheel -m 0755 "$CTL_CANDIDATE" "$CTL_DEST"
+copy_atomic() {
+    src="$1"
+    dst="$2"
+    mode="$3"
+    tmp="${dst}.apollo-new.$$"
+    /bin/rm -f "$tmp"
+    if [ "$TEST_MODE" -eq 1 ]; then
+        /bin/cp "$src" "$tmp"
+        /bin/chmod "$mode" "$tmp"
+    else
+        /usr/bin/install -o root -g wheel -m "$mode" "$src" "$tmp"
+    fi
+    /bin/mv -f "$tmp" "$dst"
+}
 
-# launchd can retain the old service briefly after bootout. Retrying avoids
-# a false deployment failure from Bootstrap error 5 while the teardown ends.
-attempt=1
-while ! /bin/launchctl bootstrap system "$PLIST"; do
-    if [ "$attempt" -ge 3 ]; then
-        echo "Apollo binaries installed, but launchd bootstrap failed" >&2
+copy_optional_state() {
+    src="$1"
+    dst="$2"
+    if regular "$src"; then
+        tmp="${dst}.apollo-new.$$"
+        /bin/rm -f "$tmp"
+        /bin/cp -p "$src" "$tmp"
+        /bin/mv -f "$tmp" "$dst"
+    else
+        /bin/rm -f "$dst"
+    fi
+}
+
+service_bootout() {
+    [ "$TEST_MODE" -eq 1 ] || /bin/launchctl bootout "$LABEL" 2>/dev/null || true
+}
+
+service_bootstrap() {
+    if [ "$TEST_MODE" -eq 1 ]; then
+        [ ! -e "$ROOT/fail-bootstrap" ]
+    else
+        attempt=1
+        while ! /bin/launchctl bootstrap system "$PLIST"; do
+            [ "$attempt" -lt 3 ] || return 1
+            attempt=$((attempt + 1))
+            /bin/sleep 2
+        done
+    fi
+}
+
+verify_runtime() {
+    if [ "$TEST_MODE" -eq 1 ]; then
+        [ ! -e "$ROOT/fail-runtime" ]
+        return
+    fi
+    [ -x "$CTL_STATUS" ] || return 1
+    first=$("$CTL_STATUS" status 2>/dev/null | /usr/bin/python3 -c \
+        'import json,sys; print(int(json.load(sys.stdin).get("metrics",{}).get("cycles",0)))') || return 1
+    /bin/sleep 3
+    second=$("$CTL_STATUS" status 2>/dev/null | /usr/bin/python3 -c \
+        'import json,sys; print(int(json.load(sys.stdin).get("metrics",{}).get("cycles",0)))') || return 1
+    [ "$second" -gt "$first" ]
+}
+
+manifest_value() {
+    /usr/bin/awk -F= -v key="$2" '$1 == key { print substr($0, length(key) + 2); exit }' "$1"
+}
+
+backup_dir_valid() {
+    backup="$1"
+    case "$backup" in "$BACKUPS_DIR"/deploy-*) ;; *) return 1 ;; esac
+    [ -d "$backup" ] && [ ! -L "$backup" ] && regular "$backup/manifest" || return 1
+    canonical_backups=$(cd "$BACKUPS_DIR" 2>/dev/null && /bin/pwd -P) || return 1
+    canonical_backup=$(cd "$backup" 2>/dev/null && /bin/pwd -P) || return 1
+    # Reject traversal spelling and symlinks in any intermediate component.
+    # The rollback directory must be a direct physical child of the fixed
+    # backup root created by this helper, never merely textually prefixed.
+    [ "$backup" = "$canonical_backup" ] || return 1
+    case "$canonical_backup" in "$canonical_backups"/deploy-*) ;; *) return 1 ;; esac
+    [ "$TEST_MODE" -eq 1 ] || [ "$(/usr/bin/stat -f %u "$backup")" = 0 ] || return 1
+    [ "$(manifest_value "$backup/manifest" format)" = "apollo-deploy-v1" ] || return 1
+}
+
+write_manifest() {
+    backup="$1"
+    state_hash="absent"
+    previous_hash="absent"
+    regular "$STATE" && state_hash=$(sha256 "$STATE")
+    regular "$STATE_PREVIOUS" && previous_hash=$(sha256 "$STATE_PREVIOUS")
+    {
+        echo "format=apollo-deploy-v1"
+        echo "created_utc=$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
+        echo "label=$LABEL"
+        echo "daemon_candidate_sha256=$(sha256 "$DAEMON_CANDIDATE")"
+        echo "ctl_candidate_sha256=$(sha256 "$CTL_CANDIDATE")"
+        echo "daemon_installed_sha256=$(sha256 "$DAEMON_DEST")"
+        echo "ctl_installed_sha256=$(sha256 "$CTL_DEST")"
+        echo "daemon_owner_mode=$(owner_mode "$DAEMON_DEST")"
+        echo "ctl_owner_mode=$(owner_mode "$CTL_DEST")"
+        echo "learned_state_sha256=$state_hash"
+        echo "learned_state_schema=$(state_schema "$STATE")"
+        echo "learned_state_previous_sha256=$previous_hash"
+        echo "learned_state_previous_schema=$(state_schema "$STATE_PREVIOUS")"
+    } > "$backup/manifest"
+    /bin/chmod 0600 "$backup/manifest"
+}
+
+deploy() {
+    assert_candidate "$DAEMON_CANDIDATE"
+    assert_candidate "$CTL_CANDIDATE"
+    executable_regular "$DAEMON_DEST" || { echo "installed daemon missing" >&2; exit 66; }
+    executable_regular "$CTL_DEST" || { echo "installed ctl missing" >&2; exit 66; }
+    assert_supported_state "$STATE"
+    assert_supported_state "$STATE_PREVIOUS"
+    /bin/mkdir -p "$BACKUPS_DIR"
+    backup="$BACKUPS_DIR/deploy-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
+    (umask 077 && /bin/mkdir "$backup")
+    /bin/cp -p "$DAEMON_DEST" "$backup/apollo-optimizerd"
+    /bin/cp -p "$CTL_DEST" "$backup/apollo-optimizerctl"
+    regular "$STATE" && /bin/cp -p "$STATE" "$backup/learned_state.json" || true
+    regular "$STATE_PREVIOUS" && /bin/cp -p "$STATE_PREVIOUS" "$backup/learned_state.json.previous" || true
+    write_manifest "$backup"
+    service_bootout
+    copy_atomic "$DAEMON_CANDIDATE" "$DAEMON_DEST" 0755
+    copy_atomic "$CTL_CANDIDATE" "$CTL_DEST" 0755
+    if ! service_bootstrap || ! verify_runtime; then
+        echo "APOLLO_BACKUP_PATH=$backup" >&2
+        echo "deploy failed; rollback: $0 rollback $backup" >&2
         exit 70
     fi
-    attempt=$((attempt + 1))
-    /bin/sleep 2
-done
+    echo "APOLLO_BACKUP_PATH=$backup"
+    echo "Apollo deployed; backup: $backup"
+}
 
-echo "Apollo deployed; backup: $BACKUP_DIR"
+rollback() {
+    [ "$#" -eq 1 ] || usage
+    backup="$1"
+    backup_dir_valid "$backup" || { echo "invalid backup directory" >&2; exit 65; }
+    executable_regular "$backup/apollo-optimizerd" || { echo "invalid daemon backup" >&2; exit 65; }
+    executable_regular "$backup/apollo-optimizerctl" || { echo "invalid ctl backup" >&2; exit 65; }
+    [ "$(manifest_value "$backup/manifest" daemon_installed_sha256)" = "$(sha256 "$backup/apollo-optimizerd")" ] || {
+        echo "daemon backup hash mismatch" >&2; exit 65;
+    }
+    [ "$(manifest_value "$backup/manifest" ctl_installed_sha256)" = "$(sha256 "$backup/apollo-optimizerctl")" ] || {
+        echo "ctl backup hash mismatch" >&2; exit 65;
+    }
+    if regular "$backup/learned_state.json"; then
+        [ "$(manifest_value "$backup/manifest" learned_state_sha256)" = "$(sha256 "$backup/learned_state.json")" ] || {
+            echo "state backup hash mismatch" >&2; exit 65;
+        }
+        assert_supported_state "$backup/learned_state.json"
+    fi
+    if regular "$backup/learned_state.json.previous"; then
+        [ "$(manifest_value "$backup/manifest" learned_state_previous_sha256)" = "$(sha256 "$backup/learned_state.json.previous")" ] || {
+            echo "previous state backup hash mismatch" >&2; exit 65;
+        }
+        assert_supported_state "$backup/learned_state.json.previous"
+    fi
+    service_bootout
+    copy_atomic "$backup/apollo-optimizerd" "$DAEMON_DEST" 0755
+    copy_atomic "$backup/apollo-optimizerctl" "$CTL_DEST" 0755
+    copy_optional_state "$backup/learned_state.json" "$STATE"
+    copy_optional_state "$backup/learned_state.json.previous" "$STATE_PREVIOUS"
+    if ! service_bootstrap || ! verify_runtime; then
+        echo "rollback failed" >&2
+        exit 70
+    fi
+    echo "Apollo rollback complete: $backup"
+}
+
+case "${1:-deploy}" in
+    deploy) [ "$#" -le 1 ] || usage; deploy ;;
+    rollback) shift; rollback "$@" ;;
+    *) usage ;;
+esac

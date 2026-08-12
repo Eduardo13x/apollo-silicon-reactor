@@ -6,6 +6,8 @@ PLIST_SRC="$ROOT_DIR/scripts/com.eduardocortez.systemoptimizerd.plist"
 PLIST_DST="/Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist"
 DAEMON_DST="/usr/local/libexec/apollo-optimizerd"
 CTL_DST="/usr/local/bin/apollo-optimizerctl"
+DEPLOYER_SRC="$ROOT_DIR/scripts/apollo-deploy"
+DEPLOYER_DST="/usr/local/sbin/apollo-deploy"
 LABEL="com.eduardocortez.systemoptimizerd"
 
 cd "$ROOT_DIR"
@@ -50,10 +52,11 @@ sign_binary() {
 }
 
 echo "── Installing binaries..."
-sudo mkdir -p /usr/local/libexec /usr/local/bin /var/lib/apollo /etc/apollo-optimizer /var/log
+sudo mkdir -p /usr/local/libexec /usr/local/bin /usr/local/sbin /var/lib/apollo/backups /etc/apollo-optimizer /var/log
 
 sign_binary "$DAEMON_DST" "$ROOT_DIR/target/release/apollo-optimizerd" true
 sign_binary "$CTL_DST"    "$ROOT_DIR/target/release/apollo-optimizerctl" false
+sudo install -o root -g wheel -m 0755 "$DEPLOYER_SRC" "$DEPLOYER_DST"
 
 sudo cp "$PLIST_SRC" "$PLIST_DST"
 sudo chown root:wheel "$PLIST_DST"

@@ -10,38 +10,185 @@
 #   exit !0 → REJECT / revert the change (baseline NOT touched)
 #
 # Conservative by construction: any missing/unreadable metric FAILS CLOSED.
-# This script NEVER deploys, restarts, or reverts anything — it only judges
-# and prints a scorecard. The caller (deploy gate / fix-loop) acts on the
-# exit code (project supervision doctrine: AI surfaces, human/orchestrator
-# pulls the trigger).
+# Normal mode only judges and prints a scorecard. The explicit --risky mode is
+# the checked-in orchestrator: it validates immutable Task 7 evidence, runs a
+# non-mutating scorecard, then invokes the guarded deploy gate.
 #
 # Usage:
 #   sudo ./scripts/apollo-accept-gate.sh             # judge + update baseline on PASS
 #   sudo ./scripts/apollo-accept-gate.sh --dry-run   # scorecard only, baseline untouched
 #   ./scripts/apollo-accept-gate.sh --metrics FILE   # judge a captured snapshot
+#   ./scripts/apollo-accept-gate.sh --risky --sha SHA --evidence DIR [--auto-revert]
+#
+# DIR must be a real /private/tmp/apollo-task7-* directory containing
+# verification.json with schema/status/commit SHA, both candidate hashes, and
+# passing fmt, clippy, workspace_release_tests, release_build, diff_check,
+# graphify, resource_bounds, and rollback_rehearsal checks.
 #
 # ponytail: single-file bash+inline-python3, stdlib only. The spec's multi-tier
 # framework (STRESS gate, Tier-A auto-revert, multi-file orchestrator) is the
 # upgrade path; this file is the FAST tier hard-gate + rolling-baseline core.
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 METRICS_FILE="/var/lib/apollo/runtime_metrics.json"
 BASELINE_FILE="/var/lib/apollo/accept-baseline.json"
 BASELINE_K=7          # rolling window: median of last K accepted runs
 DRY_RUN=0
 METRICS_EXPLICIT=0
+RISKY=0
+AUTO_REVERT=0
+EXPECTED_SHA=""
+EVIDENCE_DIR=""
+DEPLOY_GATE="$REPO_ROOT/scripts/apollo-deploy-gate.sh"
+DEPLOYER="/usr/local/sbin/apollo-deploy"
+DAEMON_CANDIDATE="$REPO_ROOT/target/release/apollo-optimizerd"
+CTL_CANDIDATE="$REPO_ROOT/target/release/apollo-optimizerctl"
+KILL_SWITCH="/var/run/apollo.disable"
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --dry-run)  DRY_RUN=1; shift ;;
     --metrics)  METRICS_FILE="${2:?--metrics needs a path}"; METRICS_EXPLICIT=1; shift 2 ;;
     --baseline) BASELINE_FILE="${2:?--baseline needs a path}"; shift 2 ;;
+    --risky) RISKY=1; shift ;;
+    --sha) EXPECTED_SHA="${2:?--sha needs a commit SHA}"; shift 2 ;;
+    --evidence) EVIDENCE_DIR="${2:?--evidence needs a directory}"; shift 2 ;;
+    --auto-revert) AUTO_REVERT=1; shift ;;
     -h|--help)
       grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
       exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
+
+risky_fail() {
+  printf 'APOLLO_RISKY_STATUS=blocked\n' >&2
+  printf 'APOLLO_RISKY_REASON=%s\n' "$1" >&2
+  exit 3
+}
+
+sha256_file() {
+  /usr/bin/shasum -a 256 "$1" | /usr/bin/awk '{print $1}'
+}
+
+if [ "$AUTO_REVERT" = "1" ] && [ "$RISKY" != "1" ]; then
+  echo "--auto-revert requires --risky" >&2
+  exit 2
+fi
+if { [ -n "$EXPECTED_SHA" ] || [ -n "$EVIDENCE_DIR" ]; } && [ "$RISKY" != "1" ]; then
+  echo "--sha and --evidence require --risky" >&2
+  exit 2
+fi
+
+if [ "$RISKY" = "1" ]; then
+  [ "$METRICS_EXPLICIT" = "0" ] || risky_fail "explicit-metrics-not-live"
+  [ -n "$EXPECTED_SHA" ] || risky_fail "missing-sha"
+  [ -n "$EVIDENCE_DIR" ] || risky_fail "missing-evidence"
+  [ -x "$DEPLOY_GATE" ] || risky_fail "deploy-gate-not-executable"
+  [ -x "$DAEMON_CANDIDATE" ] || risky_fail "daemon-candidate-missing"
+  [ -x "$CTL_CANDIDATE" ] || risky_fail "ctl-candidate-missing"
+
+  case "$EXPECTED_SHA" in
+    *[!0-9a-fA-F]*|'') risky_fail "invalid-sha" ;;
+  esac
+  case "${#EXPECTED_SHA}" in
+    40|64) ;;
+    *) risky_fail "invalid-sha-length" ;;
+  esac
+
+  ACTUAL_SHA=$(git -C "$REPO_ROOT" rev-parse --verify HEAD^{commit} 2>/dev/null) \
+    || risky_fail "head-unavailable"
+  [ "$(printf '%s' "$EXPECTED_SHA" | tr '[:upper:]' '[:lower:]')" = "$ACTUAL_SHA" ] \
+    || risky_fail "sha-mismatch"
+  [ -z "$(git -C "$REPO_ROOT" status --porcelain 2>/dev/null)" ] \
+    || risky_fail "worktree-dirty"
+
+  case "$EVIDENCE_DIR" in
+    /private/tmp/apollo-task7-*) ;;
+    *) risky_fail "invalid-evidence-path" ;;
+  esac
+  EVIDENCE_LEAF="${EVIDENCE_DIR#/private/tmp/apollo-task7-}"
+  [ -n "$EVIDENCE_LEAF" ] || risky_fail "invalid-evidence-path"
+  case "$EVIDENCE_LEAF" in
+    *..*|*/*|*[!A-Za-z0-9_-]*) risky_fail "invalid-evidence-path" ;;
+  esac
+  [ -d "$EVIDENCE_DIR" ] && [ ! -L "$EVIDENCE_DIR" ] \
+    || risky_fail "invalid-evidence-directory"
+  EVIDENCE_RECORD="$EVIDENCE_DIR/verification.json"
+  [ -f "$EVIDENCE_RECORD" ] && [ ! -L "$EVIDENCE_RECORD" ] \
+    || risky_fail "verification-record-missing"
+  EVIDENCE_SIZE=$(/usr/bin/stat -f %z "$EVIDENCE_RECORD" 2>/dev/null) \
+    || risky_fail "verification-record-stat-failed"
+  [ "$EVIDENCE_SIZE" -le 1048576 ] || risky_fail "verification-record-too-large"
+
+  RECORD_VALUES=$(python3 - "$EVIDENCE_RECORD" "$ACTUAL_SHA" <<'PY'
+import json
+import re
+import sys
+
+path, expected_sha = sys.argv[1:]
+required = (
+    "fmt",
+    "clippy",
+    "workspace_release_tests",
+    "release_build",
+    "diff_check",
+    "graphify",
+    "resource_bounds",
+    "rollback_rehearsal",
+)
+try:
+    with open(path, "rb") as handle:
+        record = json.load(handle)
+except Exception as exc:
+    raise SystemExit(f"verification record unreadable: {exc}")
+
+candidate = record.get("candidate")
+checks = record.get("checks")
+if record.get("schema") != "apollo-task7-v1":
+    raise SystemExit("verification schema mismatch")
+if record.get("status") != "passed":
+    raise SystemExit("verification status is not passed")
+if record.get("commit_sha", "").lower() != expected_sha:
+    raise SystemExit("verification commit SHA mismatch")
+if not isinstance(candidate, dict) or not isinstance(checks, dict):
+    raise SystemExit("verification candidate/checks missing")
+if any(checks.get(name) is not True for name in required):
+    raise SystemExit("required verification check missing or failed")
+
+daemon_sha = candidate.get("daemon_sha256", "").lower()
+ctl_sha = candidate.get("ctl_sha256", "").lower()
+if not re.fullmatch(r"[0-9a-f]{64}", daemon_sha):
+    raise SystemExit("invalid daemon candidate SHA-256")
+if not re.fullmatch(r"[0-9a-f]{64}", ctl_sha):
+    raise SystemExit("invalid ctl candidate SHA-256")
+print(daemon_sha)
+print(ctl_sha)
+PY
+  ) || risky_fail "verification-record-invalid"
+
+  RECORDED_DAEMON_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '1p')
+  RECORDED_CTL_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '2p')
+  [ "$(sha256_file "$DAEMON_CANDIDATE")" = "$RECORDED_DAEMON_SHA" ] \
+    || risky_fail "daemon-candidate-sha-mismatch"
+  [ "$(sha256_file "$CTL_CANDIDATE")" = "$RECORDED_CTL_SHA" ] \
+    || risky_fail "ctl-candidate-sha-mismatch"
+  /usr/bin/codesign --verify --strict "$DAEMON_CANDIDATE" 2>/dev/null \
+    || risky_fail "daemon-signature-invalid"
+  /usr/bin/codesign --verify --strict "$CTL_CANDIDATE" 2>/dev/null \
+    || risky_fail "ctl-signature-invalid"
+  { [ ! -e "$KILL_SWITCH" ] && [ ! -L "$KILL_SWITCH" ]; } \
+    || risky_fail "kill-switch-active"
+  sudo -n -l "$DEPLOYER" deploy >/dev/null 2>&1 \
+    || risky_fail "scoped-deploy-privilege-unavailable"
+  sudo -n -l "$DEPLOYER" rollback /var/lib/apollo/backups/deploy-privilege-probe \
+    >/dev/null 2>&1 || risky_fail "scoped-rollback-privilege-unavailable"
+
+  printf 'APOLLO_RISKY_SHA=%s\n' "$ACTUAL_SHA"
+  printf 'APOLLO_RISKY_EVIDENCE=%s\n' "$EVIDENCE_RECORD"
+  printf 'APOLLO_RISKY_STATUS=validated\n'
+fi
 
 # Read metrics. If root-owned, try non-interactive sudo first. The scoped
 # production sudoers policy intentionally does not grant arbitrary `cat`, so
@@ -71,7 +218,9 @@ fi
 
 # All judgment lives in python3 (stdlib). It prints the scorecard to stdout,
 # writes the updated baseline buffer (unless dry-run) and exits 0=ACCEPT/!0=REJECT.
-SNAP_PATH="$SNAP" BASELINE_PATH="$BASELINE_FILE" DRY_RUN="$DRY_RUN" \
+JUDGE_DRY_RUN="$DRY_RUN"
+[ "$RISKY" = "1" ] && JUDGE_DRY_RUN=1
+SNAP_PATH="$SNAP" BASELINE_PATH="$BASELINE_FILE" DRY_RUN="$JUDGE_DRY_RUN" \
 BASELINE_K="$BASELINE_K" METRICS_SRC="$METRICS_FILE" \
 python3 <<'PY'
 import json, os, sys, statistics, math, datetime
@@ -407,3 +556,18 @@ elif ACCEPT and DRY_RUN:
 
 sys.exit(0 if ACCEPT else 1)
 PY
+
+if [ "$RISKY" = "1" ]; then
+  DEPLOY_ARGS=()
+  [ "$DRY_RUN" = "1" ] && DEPLOY_ARGS+=(--dry-run)
+  [ "$AUTO_REVERT" = "1" ] && DEPLOY_ARGS+=(--auto-revert)
+  DEPLOY_ARGS+=(
+    --expected-head "$ACTUAL_SHA"
+    --expected-daemon-sha "$RECORDED_DAEMON_SHA"
+    --expected-ctl-sha "$RECORDED_CTL_SHA"
+  )
+  printf 'APOLLO_RISKY_STATUS=acceptance-passed\n'
+  rm -f "$SNAP"
+  trap - EXIT
+  exec "$DEPLOY_GATE" "${DEPLOY_ARGS[@]}"
+fi
