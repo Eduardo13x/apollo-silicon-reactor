@@ -62,5 +62,19 @@ fn main() {
         println!("cargo:rustc-link-lib=framework=Metal");
         println!("cargo:rustc-link-lib=dylib=c++");
         println!("cargo:rerun-if-changed=native/gpu_imagination_bridge.mm");
+
+        // ── Core ML temporal predictor bridge ───────────────────────────
+        // The model is optional. The bridge reports Core ML as unavailable
+        // unless an env-provided model passes its schema and model hashes.
+        cc::Build::new()
+            .file("native/coreml_predictor_bridge.mm")
+            .flag("-fobjc-arc")
+            .flag("-std=c++17")
+            .flag("-O2")
+            .flag("-isysroot")
+            .flag(&sdk_path)
+            .compile("apollo_coreml_predictor_bridge");
+        println!("cargo:rustc-link-lib=framework=CoreML");
+        println!("cargo:rerun-if-changed=native/coreml_predictor_bridge.mm");
     }
 }
