@@ -21,6 +21,10 @@ use chrono::{DateTime, Utc};
 
 use crate::engine::adaptive_governor::AdaptiveGovernor;
 use crate::engine::circuit_breaker::CircuitBreaker;
+use crate::engine::context_agent::{
+    accept_process_context, process_context_state, validate_context_payload, ContextAgentState,
+    ContextSummary, ContextValidationError,
+};
 use crate::engine::daemon_helpers::WakeRuntimeState;
 use crate::engine::degradation::DegradationController;
 use crate::engine::iokit_sensors::HardwareSnapshot;
@@ -620,4 +624,36 @@ pub struct SharedState {
 
     // Read-only paths (set once at init)
     pub user_profile_path: PathBuf,
+}
+
+impl SharedState {
+    /// Return the process-local context store used by the authenticated socket
+    /// integration. It is intentionally not a serialized SharedState field:
+    /// context continuity must end with the daemon process.
+    pub fn context_agent_state(&self) -> &'static Mutex<ContextAgentState> {
+        process_context_state()
+    }
+
+    /// Admit one context summary after the caller has authenticated the peer.
+    /// This method performs validation and anti-replay checks, but no UID check;
+    /// the socket integration owns that authority boundary.
+    pub fn submit_context(&self, summary: ContextSummary) -> Result<(), ContextValidationError> {
+        accept_process_context(summary)
+    }
+
+    pub fn submit_context_payload(
+        &self,
+        bytes: &[u8],
+    ) -> Result<ContextSummary, ContextValidationError> {
+        let summary = validate_context_payload(bytes)?;
+        self.submit_context(summary)?;
+        Ok(summary)
+    }
+
+    pub fn latest_context_summary(&self) -> Option<ContextSummary> {
+        self.context_agent_state()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .latest()
+    }
 }

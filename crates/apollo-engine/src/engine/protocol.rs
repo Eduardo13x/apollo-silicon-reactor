@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::engine::context_agent::ContextSummary;
 use crate::engine::policy_store::LearnedPolicy;
 
 /// Wire protocol version.  Bump when adding variants that older clients/daemons
@@ -8,7 +9,7 @@ use crate::engine::policy_store::LearnedPolicy;
 ///
 /// Cross-crate visibility: read by apollo-optimizerctl to detect daemon version mismatches.
 /// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 use crate::engine::types::{
     BlockerScore, CapabilityReport, DaemonStatus, HealthReport, LatencyTarget, OptimizationProfile,
     ProfileTransition, RuntimeMetrics, UsageResponse,
@@ -65,6 +66,12 @@ pub enum DaemonRequest {
     GetVersion,
     /// Returns circuit breaker and degradation health summary.
     GetHealth,
+    /// Submit a bounded, numeric-only user-session context summary.
+    /// Authentication is intentionally handled separately by the daemon's
+    /// peer-UID integration; this request is not generally privileged.
+    SubmitContext {
+        summary: ContextSummary,
+    },
 }
 
 impl DaemonRequest {
@@ -82,7 +89,8 @@ impl DaemonRequest {
             | Self::GetSysctlGovernor
             | Self::Subscribe
             | Self::GetVersion
-            | Self::GetHealth => false,
+            | Self::GetHealth
+            | Self::SubmitContext { .. } => false,
 
             Self::SetProfile { .. }
             | Self::SetLatencyTarget { .. }
@@ -190,6 +198,16 @@ mod tests {
     fn roundtrip_get_version() {
         let rt = roundtrip(&DaemonRequest::GetVersion);
         assert!(matches!(rt, DaemonRequest::GetVersion));
+    }
+
+    #[test]
+    fn submit_context_is_not_privileged() {
+        let request = DaemonRequest::SubmitContext {
+            summary: ContextSummary::default(),
+        };
+        assert!(!request.is_privileged());
+        let rt = roundtrip(&request);
+        assert!(matches!(rt, DaemonRequest::SubmitContext { .. }));
     }
 
     #[test]
