@@ -2,6 +2,8 @@
 
 **Estado:** Especificación de arquitectura
 
+**Alcance:** Subsistema del diseño canónico `Apollo Cognitive OS Companion`; este documento conserva el contrato detallado del Local Knowledge Plane.
+
 **Objetivo:** Convertir Apollo de un controlador que entiende recursos y procesos en un sistema que también entiende tareas, archivos, cambios y continuidad de trabajo, sin entregar contenido privado al daemon root ni depender de servicios generativos externos.
 
 ## 1. Decisiones Cerradas
