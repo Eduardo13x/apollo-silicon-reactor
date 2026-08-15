@@ -5,6 +5,7 @@
 //! an action or acquire action authority by construction.
 
 pub use super::world_state::WorldIdentity;
+use serde::{Deserialize, Serialize};
 
 pub const MAX_JOB_CLASSES: usize = 32;
 pub const MAX_RUNNING_JOBS: usize = 4;
@@ -19,8 +20,9 @@ pub const CANARY_PERCENT: u8 = 10;
 pub const CANARY_MIN_JOBS: u64 = 500;
 pub const CIRCUIT_FAILURE_THRESHOLD: u8 = 3;
 pub const CIRCUIT_COOLDOWN_US: u64 = 60 * 1_000_000;
+pub const COMPUTE_CONTRACT_SCHEMA_VERSION: u16 = 1;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct JobClassId(pub u16);
 
 impl JobClassId {
@@ -29,7 +31,7 @@ impl JobClassId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct ComputeJobId(pub u64);
 
 impl From<u64> for ComputeJobId {
@@ -38,7 +40,7 @@ impl From<u64> for ComputeJobId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct CandidateId(pub u64);
 
 impl From<u64> for CandidateId {
@@ -47,7 +49,8 @@ impl From<u64> for CandidateId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ComputeBackendId {
     CpuLatency,
     CpuUtility,
@@ -77,7 +80,8 @@ impl ComputeBackendId {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "values", rename_all = "kebab-case")]
 pub enum ComputePayload {
     Vector(Vec<f32>),
     CandidateIds(Vec<CandidateId>),
@@ -128,8 +132,25 @@ pub enum PayloadError {
     Oversized,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PrivacyClass {
+    #[default]
+    NumericAggregatesOnly,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccuracyRequirement {
+    #[default]
+    Deterministic,
+    OracleWithinOnePercent,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ComputeJob {
+    #[serde(default = "compute_contract_schema_version")]
+    pub schema_version: u16,
     pub id: ComputeJobId,
     pub job_class: JobClassId,
     pub backend: ComputeBackendId,
@@ -138,6 +159,12 @@ pub struct ComputeJob {
     pub submitted_at_us: u64,
     pub queue_deadline_us: u64,
     pub runtime_deadline_us: u64,
+    #[serde(default)]
+    pub privacy: PrivacyClass,
+    #[serde(default)]
+    pub accuracy: AccuracyRequirement,
+    #[serde(default)]
+    pub estimated_cost: u32,
 }
 
 impl ComputeJob {
@@ -153,6 +180,7 @@ impl ComputeJob {
         runtime_deadline_us: u64,
     ) -> Self {
         Self {
+            schema_version: COMPUTE_CONTRACT_SCHEMA_VERSION,
             id,
             job_class,
             backend,
@@ -161,11 +189,24 @@ impl ComputeJob {
             submitted_at_us,
             queue_deadline_us,
             runtime_deadline_us,
+            privacy: PrivacyClass::NumericAggregatesOnly,
+            accuracy: AccuracyRequirement::Deterministic,
+            estimated_cost: 0,
         }
+    }
+
+    pub fn with_contract(mut self, accuracy: AccuracyRequirement, estimated_cost: u32) -> Self {
+        self.accuracy = accuracy;
+        self.estimated_cost = estimated_cost;
+        self
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+const fn compute_contract_schema_version() -> u16 {
+    COMPUTE_CONTRACT_SCHEMA_VERSION
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendOutcome {
     pub job_id: ComputeJobId,
     pub world_identity: WorldIdentity,
@@ -186,7 +227,8 @@ impl BackendOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CompletionStatus {
     Valid,
     QueueExpired,
@@ -197,6 +239,7 @@ pub enum CompletionStatus {
     NonFinite,
     Oversized,
     CircuitOpen,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +268,7 @@ impl ComputeCompletion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FabricError {
+    UnsupportedContract,
     TooManyJobClasses,
     DuplicateJobClass,
     DuplicateJobId,
@@ -241,19 +285,47 @@ pub enum SubmitOutcome {
     ReplacedPending { replaced_job_id: ComputeJobId },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CircuitState {
     Closed,
     Open,
     HalfOpen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum RolloutPhase {
     Shadow,
     Canary,
     Active,
     RolledBack,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComputeResult {
+    #[serde(default = "compute_contract_schema_version")]
+    pub schema_version: u16,
+    pub job_id: ComputeJobId,
+    pub world_identity: WorldIdentity,
+    pub backend: ComputeBackendId,
+    pub queue_time_us: u64,
+    pub runtime_us: u64,
+    pub energy_uj: Option<u64>,
+    pub confidence: f32,
+    pub output: ComputePayload,
+    pub status: CompletionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendHealth {
+    #[serde(default = "compute_contract_schema_version")]
+    pub schema_version: u16,
+    pub backend: ComputeBackendId,
+    pub state: CircuitState,
+    pub failures: u64,
+    pub deadline_misses: u64,
+    pub cooldown_remaining_us: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,13 +360,18 @@ pub struct EvaluationSample {
     pub candidate_latency_us: u64,
     pub baseline_energy_uj: u64,
     pub candidate_energy_uj: u64,
+    pub energy_measured: bool,
+    pub safety_failure: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct RolloutStats {
+    eligible_jobs: u64,
     jobs: u64,
     deadlines_met: u64,
     oracle_errors: u64,
+    safety_failures: u64,
+    energy_jobs: u64,
     baseline_latency_us: u128,
     candidate_latency_us: u128,
     baseline_energy_uj: u128,
@@ -310,28 +387,49 @@ impl RolloutStats {
         if sample.oracle_error {
             self.oracle_errors = self.oracle_errors.saturating_add(1);
         }
+        if sample.safety_failure {
+            self.safety_failures = self.safety_failures.saturating_add(1);
+        }
         self.baseline_latency_us = self
             .baseline_latency_us
             .saturating_add(u128::from(sample.baseline_latency_us));
         self.candidate_latency_us = self
             .candidate_latency_us
             .saturating_add(u128::from(sample.candidate_latency_us));
-        self.baseline_energy_uj = self
-            .baseline_energy_uj
-            .saturating_add(u128::from(sample.baseline_energy_uj));
-        self.candidate_energy_uj = self
-            .candidate_energy_uj
-            .saturating_add(u128::from(sample.candidate_energy_uj));
+        if sample.energy_measured {
+            self.energy_jobs = self.energy_jobs.saturating_add(1);
+            self.baseline_energy_uj = self
+                .baseline_energy_uj
+                .saturating_add(u128::from(sample.baseline_energy_uj));
+            self.candidate_energy_uj = self
+                .candidate_energy_uj
+                .saturating_add(u128::from(sample.candidate_energy_uj));
+        }
     }
 
-    fn promotable(self) -> bool {
-        self.jobs > 0
+    fn record_eligible(&mut self) {
+        self.eligible_jobs = self.eligible_jobs.saturating_add(1);
+    }
+
+    fn record_deadline_miss(&mut self) {
+        self.jobs = self.jobs.saturating_add(1);
+    }
+
+    fn record_safety_failure(&mut self) {
+        self.jobs = self.jobs.saturating_add(1);
+        self.safety_failures = self.safety_failures.saturating_add(1);
+    }
+
+    fn promotable(self, minimum_samples: u64) -> bool {
+        self.jobs >= minimum_samples.max(1)
             && self.deadlines_met.saturating_mul(100) >= self.jobs.saturating_mul(99)
             && self.oracle_errors.saturating_mul(100) <= self.jobs
-            && (self.candidate_latency_us.saturating_mul(110)
-                <= self.baseline_latency_us.saturating_mul(100)
-                || self.candidate_energy_uj.saturating_mul(115)
-                    <= self.baseline_energy_uj.saturating_mul(100))
+            && self.safety_failures == 0
+            && (self.candidate_latency_us.saturating_mul(100)
+                <= self.baseline_latency_us.saturating_mul(90)
+                || (self.energy_jobs > 0
+                    && self.candidate_energy_uj.saturating_mul(100)
+                        <= self.baseline_energy_uj.saturating_mul(85)))
     }
 }
 
@@ -472,6 +570,29 @@ impl ComputeFabric {
         self.identity
     }
 
+    /// Publish a new immutable world identity and cancel every job tied to the
+    /// previous revision. Cancellation is advisory bookkeeping only; it never
+    /// manufactures an output or action.
+    pub fn update_world_identity(&mut self, identity: WorldIdentity) -> Vec<ComputeCompletion> {
+        if identity == self.identity {
+            return Vec::new();
+        }
+        self.identity = identity;
+        let mut cancelled = Vec::with_capacity(self.pending.len() + self.running.len());
+        cancelled.extend(self.pending.drain(..).map(|job| {
+            ComputeCompletion::new(job.id, Some(job.backend), CompletionStatus::Cancelled, None)
+        }));
+        cancelled.extend(self.running.drain(..).map(|running| {
+            ComputeCompletion::new(
+                running.job.id,
+                Some(running.job.backend),
+                CompletionStatus::Cancelled,
+                None,
+            )
+        }));
+        cancelled
+    }
+
     pub fn register_job_class(&mut self, class: JobClassId) -> Result<(), FabricError> {
         if self.registered_job_classes.contains(&class) {
             return Ok(());
@@ -488,6 +609,9 @@ impl ComputeFabric {
     }
 
     pub fn submit(&mut self, job: ComputeJob) -> Result<SubmitOutcome, FabricError> {
+        if job.schema_version != COMPUTE_CONTRACT_SCHEMA_VERSION {
+            return Err(FabricError::UnsupportedContract);
+        }
         if job.world_identity != self.identity {
             return Err(FabricError::WrongWorldIdentity);
         }
@@ -502,11 +626,9 @@ impl ComputeFabric {
             return Err(FabricError::DuplicateJobId);
         }
 
-        if let Some(index) = self
-            .pending
-            .iter()
-            .position(|pending| pending.job_class == job.job_class && pending.backend == job.backend)
-        {
+        if let Some(index) = self.pending.iter().position(|pending| {
+            pending.job_class == job.job_class && pending.backend == job.backend
+        }) {
             let replaced_job_id = self.pending[index].id;
             self.pending[index] = job;
             return Ok(SubmitOutcome::ReplacedPending { replaced_job_id });
@@ -531,8 +653,25 @@ impl ComputeFabric {
     }
 
     pub fn poll(&mut self, now_us: u64) -> Vec<ComputeCompletion> {
+        let (mut completions, ready) = self.take_ready(now_us);
+        for job in ready {
+            if job.backend.is_deterministic_cpu() {
+                completions.push(self.complete(
+                    now_us,
+                    BackendOutcome::new(job.id, job.world_identity, job.payload),
+                ));
+            }
+        }
+        completions
+    }
+
+    /// Advance deadlines and reserve up to four jobs for external bounded
+    /// workers. The returned jobs remain tracked as running until `complete`
+    /// or the runtime deadline closes them.
+    pub fn take_ready(&mut self, now_us: u64) -> (Vec<ComputeCompletion>, Vec<ComputeJob>) {
         self.advance_rollouts(now_us);
         let mut completions = Vec::with_capacity(MAX_PENDING_JOBS + MAX_RUNNING_JOBS);
+        let mut ready = Vec::with_capacity(MAX_RUNNING_JOBS);
 
         let mut index = 0;
         while index < self.running.len() {
@@ -592,20 +731,32 @@ impl ComputeFabric {
                 continue;
             }
 
-            let synchronous = backend.is_deterministic_cpu();
-            let outcome = synchronous.then(|| {
-                BackendOutcome::new(job.id, job.world_identity, job.payload.clone())
-            });
             self.running.push(RunningJob {
-                job,
+                job: job.clone(),
                 started_at_us: now_us,
             });
-            if let Some(outcome) = outcome {
-                completions.push(self.complete(now_us, outcome));
-            }
+            ready.push(job);
         }
 
-        completions
+        (completions, ready)
+    }
+
+    pub fn cancel_started(&mut self, job_id: ComputeJobId, now_us: u64) -> ComputeCompletion {
+        let Some(index) = self
+            .running
+            .iter()
+            .position(|running| running.job.id == job_id)
+        else {
+            return ComputeCompletion::new(job_id, None, CompletionStatus::OutOfOrder, None);
+        };
+        let running = self.running.remove(index);
+        self.record_backend_failure(running.job.backend, now_us);
+        ComputeCompletion::new(
+            job_id,
+            Some(running.job.backend),
+            CompletionStatus::Cancelled,
+            None,
+        )
     }
 
     pub fn complete(&mut self, now_us: u64, outcome: BackendOutcome) -> ComputeCompletion {
@@ -727,12 +878,60 @@ impl ComputeFabric {
         Ok(self.rollout_phase(backend))
     }
 
+    pub fn record_eligible(
+        &mut self,
+        backend: ComputeBackendId,
+        at_us: u64,
+    ) -> Result<RolloutPhase, FabricError> {
+        let state = &mut self.backends[backend.index()];
+        match state.rollout {
+            RolloutPhase::Shadow => state.shadow.record_eligible(),
+            RolloutPhase::Canary => state.canary.record_eligible(),
+            RolloutPhase::Active => return Ok(RolloutPhase::Active),
+            RolloutPhase::RolledBack => return Err(FabricError::BackendRolledBack),
+        }
+        self.advance_rollouts(at_us);
+        Ok(self.rollout_phase(backend))
+    }
+
+    pub fn record_deadline_miss(
+        &mut self,
+        backend: ComputeBackendId,
+        at_us: u64,
+    ) -> Result<RolloutPhase, FabricError> {
+        let state = &mut self.backends[backend.index()];
+        match state.rollout {
+            RolloutPhase::Shadow => state.shadow.record_deadline_miss(),
+            RolloutPhase::Canary => state.canary.record_deadline_miss(),
+            RolloutPhase::Active => return Ok(RolloutPhase::Active),
+            RolloutPhase::RolledBack => return Err(FabricError::BackendRolledBack),
+        }
+        self.advance_rollouts(at_us);
+        Ok(self.rollout_phase(backend))
+    }
+
+    pub fn record_safety_failure(
+        &mut self,
+        backend: ComputeBackendId,
+        at_us: u64,
+    ) -> Result<RolloutPhase, FabricError> {
+        let state = &mut self.backends[backend.index()];
+        match state.rollout {
+            RolloutPhase::Shadow => state.shadow.record_safety_failure(),
+            RolloutPhase::Canary => state.canary.record_safety_failure(),
+            RolloutPhase::Active => return Ok(RolloutPhase::Active),
+            RolloutPhase::RolledBack => return Err(FabricError::BackendRolledBack),
+        }
+        self.advance_rollouts(at_us);
+        Ok(self.rollout_phase(backend))
+    }
+
     pub fn advance_rollouts(&mut self, now_us: u64) {
         for backend in ComputeBackendId::ALL {
             let state = &mut self.backends[backend.index()];
             match state.rollout {
                 RolloutPhase::Shadow
-                    if state.shadow.jobs >= self.config.shadow_min_jobs
+                    if state.shadow.eligible_jobs >= self.config.shadow_min_jobs
                         && now_us.saturating_sub(self.rollout_started_at_us)
                             >= self.config.shadow_window_us =>
                 {
@@ -740,8 +939,13 @@ impl ComputeFabric {
                     state.canary = RolloutStats::default();
                 }
                 RolloutPhase::Canary
-                    if state.canary.jobs >= self.config.canary_min_jobs
-                        && state.canary.promotable() =>
+                    if state.canary.eligible_jobs >= self.config.canary_min_jobs
+                        && state.canary.promotable(
+                            self.config
+                                .canary_min_jobs
+                                .saturating_mul(u64::from(self.config.canary_percent))
+                                .div_ceil(100),
+                        ) =>
                 {
                     state.rollout = RolloutPhase::Active;
                 }

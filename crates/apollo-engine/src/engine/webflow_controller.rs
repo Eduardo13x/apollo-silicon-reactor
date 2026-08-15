@@ -157,6 +157,14 @@ impl WebFlowController {
         }
     }
 
+    pub fn set_rollout(&mut self, rollout: WebFlowRolloutPhase) {
+        self.rollout = rollout;
+    }
+
+    pub const fn rollout(&self) -> WebFlowRolloutPhase {
+        self.rollout
+    }
+
     pub fn tick(
         &mut self,
         input: WebFlowTickInput,
@@ -203,6 +211,13 @@ impl WebFlowController {
             self.apply_event(received.event, input.now_ms, &mut closed);
         }
 
+        if input.sleeping || input.kill_switch {
+            self.close_all(WebFlowClosure::Invalidated, input.now_ms, &mut closed);
+            self.last_phase = None;
+            self.last_source = None;
+            self.last_event_at_ms = None;
+        }
+
         let constrained = !input.foreground_browser
             || !input.identity_available
             || input.pressure_constrained
@@ -233,12 +248,9 @@ impl WebFlowController {
                 last_phase: self.last_phase,
                 source: self.last_source,
                 confidence_q: self.last_source.map_or(0, WebFlowSource::confidence_q),
-                last_event_age_ms: self.last_event_at_ms.map(|at| {
-                    input
-                        .now_ms
-                        .saturating_sub(at)
-                        .min(u32::MAX as u64) as u32
-                }),
+                last_event_age_ms: self
+                    .last_event_at_ms
+                    .map(|at| input.now_ms.saturating_sub(at).min(u32::MAX as u64) as u32),
                 vitals_available: self.last_source == Some(WebFlowSource::ExtensionVitals),
             },
             intent,
@@ -259,7 +271,9 @@ impl WebFlowController {
                 return false;
             }
         }
-        if !self.browser_sequences.contains_key(&event.browser_session_id)
+        if !self
+            .browser_sequences
+            .contains_key(&event.browser_session_id)
             && self.browser_sequences.len() == MAX_BROWSER_SEQUENCES
         {
             if let Some(oldest) = self
@@ -326,8 +340,10 @@ impl WebFlowController {
             }
         }
 
-        let episode = self.active.entry(event.tab_session_id).or_insert_with(|| {
-            ActiveEpisode {
+        let episode = self
+            .active
+            .entry(event.tab_session_id)
+            .or_insert_with(|| ActiveEpisode {
                 navigation_id: event.navigation_id,
                 site_bucket: event.site_bucket,
                 source: event.source,
@@ -336,8 +352,7 @@ impl WebFlowController {
                 last_update_ms: now_ms,
                 expires_at_ms: now_ms.saturating_add(INITIAL_WEBFLOW_LEASE_MS),
                 hard_deadline_ms: now_ms.saturating_add(MAX_CONTINUOUS_WEBFLOW_LEASE_MS),
-            }
-        });
+            });
         if event.source.precision_rank() >= episode.source.precision_rank() {
             episode.source = event.source;
             episode.site_bucket = event.site_bucket.or(episode.site_bucket);
@@ -394,9 +409,7 @@ impl WebFlowController {
             WebFlowClosure::Settled => {
                 self.counters.settled = self.counters.settled.saturating_add(1)
             }
-            WebFlowClosure::Failed => {
-                self.counters.failed = self.counters.failed.saturating_add(1)
-            }
+            WebFlowClosure::Failed => self.counters.failed = self.counters.failed.saturating_add(1),
             WebFlowClosure::Abandoned => {
                 self.counters.abandoned = self.counters.abandoned.saturating_add(1)
             }

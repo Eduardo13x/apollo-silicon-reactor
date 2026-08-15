@@ -194,6 +194,29 @@ pub enum EvidenceTier {
     Gold,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EvidenceProvenance {
+    ObservedLocal,
+    SyntheticCounter,
+    GpuImagined,
+    ModelCounterfactual,
+    Advisory,
+    #[default]
+    LegacyUnknown,
+}
+
+pub fn quarantine_experimental_tier(
+    provenance: EvidenceProvenance,
+    proposed: EvidenceTier,
+) -> EvidenceTier {
+    if provenance == EvidenceProvenance::ObservedLocal {
+        proposed
+    } else {
+        EvidenceTier::Bronze
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(default)]
 pub struct ActuatorFamilyStats {
@@ -514,6 +537,8 @@ pub struct ResolvedActuatorEvidence {
     pub installation_id: InstallationId,
     pub horizon_cycles: u64,
     pub tier: EvidenceTier,
+    #[serde(default)]
+    pub provenance: EvidenceProvenance,
     pub quality: f64,
     pub raw_utility_delta: f64,
     pub counterfactual_delta: f64,
@@ -798,6 +823,8 @@ struct PendingActuatorEvidence {
     attribution: DecisionAttribution,
     #[serde(default)]
     calibration_provenance: CalibrationProvenance,
+    #[serde(default)]
+    provenance: EvidenceProvenance,
     before: TelemetryContextSummary,
 }
 
@@ -873,6 +900,7 @@ struct ActionSpec {
     target: String,
     target_pid: Option<u32>,
     horizon_cycles: u64,
+    provenance: EvidenceProvenance,
 }
 
 impl ActionSpec {
@@ -890,6 +918,7 @@ impl ActionSpec {
             target: bounded_text(target, 256),
             target_pid: None,
             horizon_cycles,
+            provenance: EvidenceProvenance::SyntheticCounter,
         }
     }
 }
@@ -1640,7 +1669,17 @@ impl TelemetryMedallion {
         prediction.resolved_cycle = Some(evidence.resolved_cycle);
         prediction.actual_utility = Some(evidence.net_utility_delta);
         prediction.quality = evidence.quality;
-        if evidence.tier == EvidenceTier::Bronze {
+        let calibration_tier = if evidence.provenance == EvidenceProvenance::SyntheticCounter
+            && evidence.quality >= 0.85
+            && evidence.confounder_count == 0
+        {
+            // A measured counter endpoint may calibrate bounded GPU advice,
+            // but remains Bronze in the universal/action-authority lane.
+            EvidenceTier::Gold
+        } else {
+            evidence.tier
+        };
+        if calibration_tier == EvidenceTier::Bronze {
             self.gpu_prediction_rejected_total =
                 self.gpu_prediction_rejected_total.saturating_add(1);
             return;
@@ -1655,8 +1694,8 @@ impl TelemetryMedallion {
         prediction.absolute_error = Some(absolute_error);
         prediction.brier_score = Some(brier);
         prediction.p10_covered = Some(p10_covered);
-        prediction.tier = evidence.tier;
-        if evidence.tier != EvidenceTier::Gold {
+        prediction.tier = calibration_tier;
+        if calibration_tier != EvidenceTier::Gold {
             return;
         }
         self.gpu_prediction_gold_total = self.gpu_prediction_gold_total.saturating_add(1);
@@ -1951,20 +1990,17 @@ impl TelemetryMedallion {
                 .collect::<Vec<_>>()
                 .join("+");
             let target = bounded_text(&coordinated_members.join("|"), 256);
-            self.issue(
-                ActionSpec::synthetic(
-                    ActuatorFamily::Coordinated,
-                    ActuatorObjective::BalancedUtility,
-                    &format!("coordinated:{family_key}"),
-                    &target,
-                    8,
-                ),
-                &summary,
-                cycle,
-                1,
-                purge_recent,
-                false,
+            let mut coordinated = ActionSpec::synthetic(
+                ActuatorFamily::Coordinated,
+                ActuatorObjective::BalancedUtility,
+                &format!("coordinated:{family_key}"),
+                &target,
+                8,
             );
+            if root_cohort_size > 0 {
+                coordinated.provenance = EvidenceProvenance::ObservedLocal;
+            }
+            self.issue(coordinated, &summary, cycle, 1, purge_recent, false);
         }
         let cohort_end_total = self.actuator_issued_total;
         for pending in self.pending_actions.iter_mut().rev() {
@@ -2279,6 +2315,7 @@ impl TelemetryMedallion {
             gpu_prediction_generation,
             attribution,
             calibration_provenance: calibration_provenance.unwrap_or_default().bounded(),
+            provenance: spec.provenance,
             before: before.clone(),
         });
     }
@@ -2400,13 +2437,14 @@ impl TelemetryMedallion {
             + 0.20 * horizon_quality
             + 0.10 * (1.0 - confounders as f64 / 6.0))
             .clamp(0.0, 1.0);
-        let tier = if !finite {
+        let proposed_tier = if !finite {
             EvidenceTier::Bronze
         } else if confounders == 0 && quality >= 0.85 {
             EvidenceTier::Gold
         } else {
             EvidenceTier::Silver
         };
+        let tier = quarantine_experimental_tier(pending.provenance, proposed_tier);
         let effective = explicit_score.map_or_else(
             || {
                 net_delta > objective_effect_threshold(pending.objective)
@@ -2446,6 +2484,7 @@ impl TelemetryMedallion {
             installation_id: self.installation_id,
             horizon_cycles: pending.horizon_cycles,
             tier,
+            provenance: pending.provenance,
             quality,
             raw_utility_delta: finite_or_zero(raw_delta),
             counterfactual_delta: finite_or_zero(counterfactual),
@@ -3135,6 +3174,31 @@ impl TelemetryMedallion {
 
     pub fn recent_actuator_evidence(&self) -> &VecDeque<ResolvedActuatorEvidence> {
         &self.recent_evidence
+    }
+
+    pub fn current_machine_recent_evidence(
+        &self,
+    ) -> impl Iterator<Item = &ResolvedActuatorEvidence> {
+        self.recent_evidence.iter().filter(|evidence| {
+            self.installation_id.is_known()
+                && evidence.installation_id == self.installation_id
+                && (!self.live_hardware_regime.is_known()
+                    || evidence.hardware_regime == self.live_hardware_regime)
+        })
+    }
+
+    /// Distinct, current-machine Gold decisions admitted by the calibration
+    /// pipeline. Context Gold samples and legacy aggregate evidence are not
+    /// decision identities and must not contribute to learning maturity.
+    pub fn authoritative_gold_decision_ids(&self) -> Vec<u64> {
+        self.model_calibration
+            .accepted_decision_ids()
+            .map(|id| id.0)
+            .collect()
+    }
+
+    pub fn authoritative_gold_decision_count(&self) -> usize {
+        self.model_calibration.accepted_decision_count()
     }
 
     pub fn causal_dynamics(&self) -> &CausalDynamicsModel {
@@ -4043,6 +4107,7 @@ fn decision_episode_spec(episode: &ResolvedDecisionEpisode) -> Option<ActionSpec
         target: bounded_text(&episode.envelope.target, 256),
         target_pid: target_pid_from_decision_target(&episode.envelope.target),
         horizon_cycles,
+        provenance: EvidenceProvenance::ObservedLocal,
     })
 }
 
@@ -4150,6 +4215,7 @@ fn action_spec(action: &RootAction) -> Option<ActionSpec> {
         target,
         target_pid,
         horizon_cycles,
+        provenance: EvidenceProvenance::ObservedLocal,
     })
 }
 
@@ -4229,7 +4295,15 @@ fn intervention_spec(intervention: Intervention) -> Option<ActionSpec> {
             "predictive_purge:kernel",
         ),
     };
-    Some(ActionSpec::synthetic(family, objective, key, key, 5))
+    Some(ActionSpec {
+        family,
+        objective,
+        action_key: key.to_string(),
+        target: key.to_string(),
+        target_pid: None,
+        horizon_cycles: 5,
+        provenance: EvidenceProvenance::ObservedLocal,
+    })
 }
 
 fn target_presence(pending: &PendingActuatorEvidence, snapshot: &SystemSnapshot) -> Option<bool> {
@@ -4894,6 +4968,48 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_gold_ids_come_from_valid_measured_learning_details() {
+        let persisted = rich_restore_snapshot();
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.latest = persisted.latest.clone();
+        restored.restore(persisted);
+
+        let ids = restored.authoritative_gold_decision_ids();
+
+        assert_eq!(ids.len(), 1);
+        assert!(ids[0] > 0);
+    }
+
+    #[test]
+    fn current_machine_recent_evidence_excludes_imported_installations() {
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut evidence = gold_evidence("boost:Editor", 0.1, 20_000_000, hardware);
+        evidence.decision_id = Some(DecisionId(7));
+        evidence.installation_id = InstallationId(99);
+        let persisted = TelemetryMedallionPersisted {
+            actuator_evidence_schema_version: ACTUATOR_EVIDENCE_SCHEMA_VERSION,
+            context_schema_version: TELEMETRY_CONTEXT_SCHEMA_VERSION,
+            installation_id: InstallationId(99),
+            latest: Some(TelemetryContextSummary {
+                p_core_count: 4,
+                e_core_count: 6,
+                total_ram_bytes: 16 * 1024 * 1024 * 1024,
+                ..TelemetryContextSummary::default()
+            }),
+            recent_evidence: vec![evidence],
+            ..TelemetryMedallionPersisted::default()
+        };
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(persisted);
+
+        assert_eq!(restored.current_machine_recent_evidence().count(), 0);
+    }
+
+    #[test]
     fn local_root_episode_attaches_decision_id_to_existing_medallion_episode() {
         let action = RootAction::BoostProcess {
             pid: 300,
@@ -5547,6 +5663,7 @@ mod tests {
             installation_id: LOCAL_ID,
             horizon_cycles: 3,
             tier: EvidenceTier::Gold,
+            provenance: EvidenceProvenance::ObservedLocal,
             quality: 0.95,
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,
@@ -6363,7 +6480,7 @@ mod tests {
     }
 
     #[test]
-    fn markov_hit_is_resolved_as_effective_gold_evidence() {
+    fn unpaired_markov_hit_is_effective_support_but_not_gold() {
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);
         let mut runtime = RuntimeMetrics {
             markov_prewarm_applied: 1,
@@ -6376,15 +6493,16 @@ mod tests {
         observe(&mut medallion, 2, &ExecuteOutcomes::default(), &runtime);
         let metrics = medallion.metrics();
         assert_eq!(metrics.actuator_bronze_total, 1);
-        assert_eq!(metrics.actuator_gold_total, 1);
+        assert_eq!(metrics.actuator_gold_total, 0);
         assert_eq!(metrics.actuator_effective_total, 1);
         let evidence = medallion
             .recent_actuator_evidence()
             .back()
             .expect("resolved evidence");
         assert_eq!(evidence.family, ActuatorFamily::MarkovPrewarm);
+        assert_eq!(evidence.provenance, EvidenceProvenance::SyntheticCounter);
+        assert_eq!(evidence.tier, EvidenceTier::Bronze);
         assert_eq!(evidence.net_utility_delta, 1.0);
-        assert_eq!(medallion.drain_new_gold_evidence().len(), 1);
         assert!(medallion.drain_new_gold_evidence().is_empty());
     }
 
@@ -6724,6 +6842,7 @@ mod tests {
                 installation_id: InstallationId::UNKNOWN,
                 horizon_cycles: 3,
                 tier: EvidenceTier::Gold,
+                provenance: EvidenceProvenance::LegacyUnknown,
                 quality: 0.95,
                 raw_utility_delta: 0.08,
                 counterfactual_delta: 0.0,
@@ -6757,6 +6876,7 @@ mod tests {
             installation_id: InstallationId::UNKNOWN,
             horizon_cycles: 3,
             tier: EvidenceTier::Gold,
+            provenance: EvidenceProvenance::LegacyUnknown,
             quality: 1.0,
             raw_utility_delta: 1.0,
             counterfactual_delta: 0.0,
@@ -6875,6 +6995,7 @@ mod tests {
             gpu_prediction_generation: None,
             attribution: DecisionAttribution::default(),
             calibration_provenance: CalibrationProvenance::default(),
+            provenance: EvidenceProvenance::LegacyUnknown,
             before: TelemetryContextSummary::default(),
         });
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);
@@ -6968,6 +7089,7 @@ mod tests {
         let result = GpuImaginationResult {
             generation: 2,
             workload: "idle".to_string(),
+            context_revision: 0,
             backend: GpuImaginationBackend::Metal,
             device_name: "Apple M4".to_string(),
             samples: 4_096,
@@ -7041,6 +7163,7 @@ mod tests {
         let result = GpuImaginationResult {
             generation: 2,
             workload: "idle".to_string(),
+            context_revision: 0,
             backend: GpuImaginationBackend::Metal,
             candidates: vec![GpuCandidateAdvice {
                 action_key: "boost:Editor".to_string(),

@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::context_agent::ContextSummary;
 use crate::engine::policy_store::LearnedPolicy;
+use crate::engine::webflow_types::WebFlowEvent;
 
 /// Wire protocol version.  Bump when adding variants that older clients/daemons
 /// cannot understand.  Both apollo-optimizerd and apollo-optimizerctl expose
@@ -9,7 +10,7 @@ use crate::engine::policy_store::LearnedPolicy;
 ///
 /// Cross-crate visibility: read by apollo-optimizerctl to detect daemon version mismatches.
 /// Audited 2026-05-09 during Sprint 5 Mes 0 workspace split.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 use crate::engine::types::{
     BlockerScore, CapabilityReport, DaemonStatus, HealthReport, LatencyTarget, OptimizationProfile,
     ProfileTransition, RuntimeMetrics, UsageResponse,
@@ -72,6 +73,11 @@ pub enum DaemonRequest {
     SubmitContext {
         summary: ContextSummary,
     },
+    /// Submit one validated, content-free browser navigation observation.
+    /// The authenticated context agent is the only accepted production peer.
+    SubmitWebFlow {
+        event: WebFlowEvent,
+    },
 }
 
 impl DaemonRequest {
@@ -90,7 +96,8 @@ impl DaemonRequest {
             | Self::Subscribe
             | Self::GetVersion
             | Self::GetHealth
-            | Self::SubmitContext { .. } => false,
+            | Self::SubmitContext { .. }
+            | Self::SubmitWebFlow { .. } => false,
 
             Self::SetProfile { .. }
             | Self::SetLatencyTarget { .. }
@@ -166,6 +173,9 @@ pub enum DaemonResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::webflow_types::{
+        OpaqueId, WebFlowEvent, WebFlowMetrics, WebFlowPhase, WebFlowSource, WEBFLOW_SCHEMA_VERSION,
+    };
 
     // ── Serde roundtrip helpers ───────────────────────────────────────────────
 
@@ -208,6 +218,28 @@ mod tests {
         assert!(!request.is_privileged());
         let rt = roundtrip(&request);
         assert!(matches!(rt, DaemonRequest::SubmitContext { .. }));
+    }
+
+    #[test]
+    fn submit_webflow_is_not_privileged_and_roundtrips() {
+        let request = DaemonRequest::SubmitWebFlow {
+            event: WebFlowEvent {
+                schema_version: WEBFLOW_SCHEMA_VERSION,
+                browser_session_id: OpaqueId::new([1; 16]).unwrap(),
+                tab_session_id: OpaqueId::new([2; 16]).unwrap(),
+                navigation_id: OpaqueId::new([3; 16]).unwrap(),
+                sequence: 1,
+                phase: WebFlowPhase::Started,
+                source: WebFlowSource::ExtensionLifecycle,
+                site_bucket: None,
+                metrics: WebFlowMetrics::default(),
+            },
+        };
+        assert!(!request.is_privileged());
+        assert!(matches!(
+            roundtrip(&request),
+            DaemonRequest::SubmitWebFlow { .. }
+        ));
     }
 
     #[test]

@@ -4,6 +4,10 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Usage: ./scripts/pipeline.sh [--skip-test] [--skip-deploy]
 #
+# SECURITY: the deploy step crosses into root. Do not grant this helper a
+# NOPASSWD sudoers rule; arbitrary root daemon installation is root code
+# execution. Normal `sudo` is intentional and may prompt for authentication.
+#
 # Exit codes:
 #   0 = all green
 #   1 = build failed
@@ -63,8 +67,9 @@ TOTAL_START=$(date +%s)
 # ── 1. BUILD ─────────────────────────────────────────────────────────────────
 echo "═══ 1/4 BUILD ═══"
 BUILD_STATUS=0
-BUILD_OUT=$("$CARGO_BIN" build --workspace --bins --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1) || BUILD_STATUS=$?
+BUILD_OUT=$(./scripts/build-release.sh 2>&1) || BUILD_STATUS=$?
 if [ "$BUILD_STATUS" -eq 0 ]; then
+    apollo_verify_build_manifest
     printf '%s\n' "$BUILD_OUT" | tail -3
     ok "cargo build --workspace --bins --release ($APOLLO_BUILD_PROFILE)"
 else
@@ -128,18 +133,34 @@ if $SKIP_DEPLOY; then
     warn "skipped (--skip-deploy)"
 else
     DEPLOYER="/usr/local/sbin/apollo-deploy"
-    if [ ! -x "$DEPLOYER" ]; then
-        fail "scoped deployer missing: $DEPLOYER"
-        exit 3
-    fi
+    sudo install -o root -g wheel -m 0755 "$APOLLO_SOURCE_ROOT/scripts/apollo-deploy" "$DEPLOYER"
+    [ "$(apollo_sha256_file "$DEPLOYER")" = \
+        "$(apollo_sha256_file "$APOLLO_SOURCE_ROOT/scripts/apollo-deploy")" ] \
+        || { fail "scoped deployer install verification failed"; exit 3; }
     RESTART_BASELINE=$(grep -c 'predictive-agent: loaded' /var/log/apollo-optimizer.err.log 2>/dev/null || true)
     RESTART_BASELINE=${RESTART_BASELINE:-0}
-    cp -f target/release/apollo-optimizerd /private/tmp/apollo-optimizerd-candidate
-    cp -f target/release/apollo-optimizerctl /private/tmp/apollo-optimizerctl-candidate
-    chmod 755 /private/tmp/apollo-optimizerd-candidate /private/tmp/apollo-optimizerctl-candidate
+    apollo_verify_build_manifest
+    cp -f "$APOLLO_RELEASE_DIR/apollo-optimizerd" /private/tmp/apollo-optimizerd-candidate
+    cp -f "$APOLLO_RELEASE_DIR/apollo-optimizerctl" /private/tmp/apollo-optimizerctl-candidate
+    cp -f "$APOLLO_RELEASE_DIR/apollo-context-agent" /private/tmp/apollo-context-agent-candidate
+    cp -f "$APOLLO_RELEASE_DIR/apollo-web-bridge" /private/tmp/apollo-web-bridge-candidate
+    cp -f "$APOLLO_SOURCE_ROOT/models/apollo-temporal-v1.mlmodel" /private/tmp/apollo-temporal-v1.mlmodel-candidate
+    cp -f "$APOLLO_SOURCE_ROOT/scripts/com.eduardocortez.apollo-context-agent.plist" \
+        /private/tmp/com.eduardocortez.apollo-context-agent.plist-candidate
+    chmod 755 /private/tmp/apollo-optimizerd-candidate /private/tmp/apollo-optimizerctl-candidate \
+        /private/tmp/apollo-context-agent-candidate /private/tmp/apollo-web-bridge-candidate
     codesign --force --sign - /private/tmp/apollo-optimizerd-candidate
     codesign --force --sign - /private/tmp/apollo-optimizerctl-candidate
-    sudo -n "$DEPLOYER"
+    codesign --force --sign - /private/tmp/apollo-context-agent-candidate
+    codesign --force --sign - /private/tmp/apollo-web-bridge-candidate
+    sudo "$DEPLOYER" deploy \
+        "$(apollo_sha256_file /private/tmp/apollo-optimizerd-candidate)" \
+        "$(apollo_sha256_file /private/tmp/apollo-optimizerctl-candidate)" \
+        "$(apollo_sha256_file /private/tmp/apollo-context-agent-candidate)" \
+        "$(apollo_sha256_file /private/tmp/apollo-web-bridge-candidate)" \
+        "$(apollo_sha256_file /private/tmp/apollo-temporal-v1.mlmodel-candidate)" \
+        "$(apollo_sha256_file /private/tmp/com.eduardocortez.apollo-context-agent.plist-candidate)"
+    "$APOLLO_SOURCE_ROOT/scripts/install-webflow-extension.sh"
     ok "scoped deploy completed with backup + launchd verification"
 fi
 

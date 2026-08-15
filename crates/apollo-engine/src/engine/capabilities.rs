@@ -1,11 +1,16 @@
 use crate::engine::types::CapabilityReport;
-use std::sync::OnceLock;
+
+use crate::engine::platform::{MacOsPlatformAdapter, PlatformAdapter};
+
+/// Runtime-reprobeable capability graph. Callers that need lifecycle-aware
+/// revisions should retain the adapter; this convenience function is a fresh
+/// passive snapshot and never performs write probes.
+pub fn detect_capability_graph() -> crate::engine::capability_graph::CapabilityGraph {
+    MacOsPlatformAdapter::detect().probe()
+}
 
 pub fn detect_capabilities() -> CapabilityReport {
-    static PASSIVE_CAPABILITIES: OnceLock<CapabilityReport> = OnceLock::new();
-    PASSIVE_CAPABILITIES
-        .get_or_init(|| detect_capabilities_inner(false))
-        .clone()
+    detect_capability_graph().legacy_report()
 }
 
 /// Detect capabilities and execute the explicit write probes used by `doctor`.

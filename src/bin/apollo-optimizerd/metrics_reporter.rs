@@ -40,7 +40,7 @@ use apollo_engine::engine::io_tiering::IoShaper;
 use apollo_engine::engine::learning_pipeline::LearningPipeline;
 use apollo_engine::engine::local_consolidation::LocalConsolidator;
 use apollo_engine::engine::lock_ext::LockRecover;
-use apollo_engine::engine::mach_qos::SchedulingTier;
+use apollo_engine::engine::mach_qos::{QoSAuditDisposition, QoSOutcome, SchedulingTier};
 use apollo_engine::engine::nars_belief::ArousalState;
 use apollo_engine::engine::network_monitor::NetworkMonitor;
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
@@ -51,7 +51,7 @@ use apollo_engine::engine::process_classifier::ProcessTier;
 use apollo_engine::engine::process_tree::ProcessTree;
 use apollo_engine::engine::profile_governor::GovernorDecision;
 use apollo_engine::engine::signal_intelligence::SignalDigest;
-use apollo_engine::engine::telemetry_medallion::TelemetryMedallion;
+use apollo_engine::engine::telemetry_medallion::{EvidenceTier, TelemetryMedallion};
 use apollo_engine::engine::thermal_bailout::ThermalAction;
 use apollo_engine::engine::types::{BlockerScore, OptimizationProfile, RuntimeMetrics};
 use apollo_engine::engine::unified_learning_health::{
@@ -99,6 +99,14 @@ fn build_unified_learning_health(
     scheduler: &ExplorationScheduler,
 ) -> UnifiedLearningHealth {
     let calibration = telemetry.model_calibration();
+    let authoritative_gold_decision_ids = telemetry.authoritative_gold_decision_ids();
+    let mut measured_decision_ids: HashSet<_> =
+        authoritative_gold_decision_ids.iter().copied().collect();
+    measured_decision_ids.extend(
+        telemetry
+            .current_machine_recent_evidence()
+            .filter_map(|evidence| evidence.decision_id.map(|id| id.0)),
+    );
     let mut horizons: BTreeMap<_, (u64, u64, f64, f64, Option<f64>)> = BTreeMap::new();
     let advice_records = calibration
         .records()
@@ -117,6 +125,12 @@ fn build_unified_learning_health(
                 key: record.key.clone(),
                 trust: record.trust,
                 signed_error: record.signed_error_ema,
+                normalized_mae: record.normalized_mae_ema,
+                coverage: (record.authority_gold_count > 0).then_some(record.coverage_ema),
+                authority_gold_count: record.authority_gold_count,
+                model_authority_gold_count: calibration
+                    .model_for(&record.key)
+                    .map_or(0, |model| model.authority_gold_count),
                 current_epoch: true,
             }
         })
@@ -139,8 +153,18 @@ fn build_unified_learning_health(
         .iter()
         .map(|episode| ClosureObservation {
             decision_id: episode.id.0,
-            local: episode.authority_eligible,
-            outcome: closure_outcome(episode.lifecycle),
+            local: episode
+                .envelope
+                .receipt
+                .as_ref()
+                .and_then(|receipt| receipt.attribution.as_ref())
+                .is_some_and(|attribution| attribution.grants_local_authority())
+                || episode
+                    .envelope
+                    .terminal_attribution
+                    .as_ref()
+                    .is_some_and(|attribution| attribution.grants_local_authority()),
+            outcome: closure_outcome(episode.envelope.lifecycle),
             issued_cycle: episode.envelope.proposed_cycle,
             horizon_cycles: episode
                 .envelope
@@ -150,12 +174,12 @@ fn build_unified_learning_health(
                 .max()
                 .unwrap_or(0),
             now_cycle: episode.settled_cycle,
-            resolved_evidence: false,
+            resolved_evidence: measured_decision_ids.contains(&episode.id.0),
             duplicate: false,
             synthetic_overflow: episode.envelope.action_key == "decision_events:overflow",
         })
         .collect();
-    let latest_resolved_episodes = ledger
+    let mut latest_resolved_episodes: Vec<_> = ledger
         .recent()
         .iter()
         .map(|episode| LatestResolvedEpisodeSnapshot {
@@ -176,7 +200,7 @@ fn build_unified_learning_health(
                 .exploration
                 .as_ref()
                 .is_some_and(|meta| !meta.treatment),
-            reverted: episode.lifecycle == DecisionLifecycle::Reverted,
+            reverted: episode.envelope.lifecycle == DecisionLifecycle::Reverted,
             expected_utility: episode
                 .envelope
                 .predictions
@@ -189,11 +213,53 @@ fn build_unified_learning_health(
             trust_transition: String::new(),
         })
         .collect();
+    latest_resolved_episodes.extend(telemetry.current_machine_recent_evidence().filter_map(
+        |evidence| {
+            let id = evidence.decision_id?.0;
+            let details = evidence.learning_details.as_ref();
+            let expected_utility = details.map(|details| details.expected_utility).or_else(|| {
+                evidence
+                    .calibration_provenance
+                    .predictions
+                    .iter()
+                    .find(|prediction| {
+                        prediction.source == evidence.calibration_provenance.proposer
+                    })
+                    .or_else(|| evidence.calibration_provenance.predictions.first())
+                    .map(|prediction| prediction.expected_utility)
+            });
+            let authority = details.is_some_and(|details| details.is_authoritative());
+            Some(LatestResolvedEpisodeSnapshot {
+                present: true,
+                id,
+                resolved_cycle: evidence.resolved_cycle,
+                action: evidence.action_key.clone(),
+                tier: match evidence.tier {
+                    EvidenceTier::Bronze => "bronze",
+                    EvidenceTier::Silver => "silver",
+                    EvidenceTier::Gold => "gold",
+                }
+                .to_string(),
+                scope: if authority { "authority" } else { "observed" }.to_string(),
+                authority,
+                treatment: false,
+                control: false,
+                reverted: false,
+                expected_utility,
+                measured_utility: Some(evidence.utility.apollo_utility),
+                quality: Some(evidence.quality),
+                causal_result: String::new(),
+                calibration_result: if authority { "accepted" } else { "observed" }.to_string(),
+                trust_transition: String::new(),
+            })
+        },
+    ));
     let view = hierarchy.view();
     let (committed, terminal) = scheduler.learning_counts();
     UnifiedLearningHealth::from_input(UnifiedLearningInput {
         decision_ledger_unattributed_applied_total: ledger.unattributed_applied_total(),
-        local_gold_decisions: telemetry.metrics().local_gold_total,
+        local_gold_decisions: authoritative_gold_decision_ids.len() as u64,
+        authoritative_gold_decision_ids,
         trusted_active_models: telemetry.model_calibration_summary().trusted_models as u64,
         active_models: telemetry.model_calibration_metrics().record_count as u64,
         closure_observations,
@@ -654,19 +720,72 @@ pub fn apply_qos_routing(
     if cycle_count.is_multiple_of(30) {
         qos.gc_dead_pids();
     }
-    let outcomes = qos.apply_batch(&qos_changes);
+    let outcomes: Vec<_> = qos_changes
+        .iter()
+        .map(|(pid, tier)| qos.set_tier_audited(*pid, *tier))
+        .collect();
+    let accounting = summarize_qos_route_outcomes(&outcomes);
     {
         let mut m = state.metrics.lock_recover();
-        m.metrics.qos_foreground_count += outcomes
-            .iter()
-            .filter(|o| o.tier == SchedulingTier::Foreground && o.success)
-            .count() as u64;
-        m.metrics.qos_background_count += outcomes
-            .iter()
-            .filter(|o| o.tier == SchedulingTier::Background && o.success)
-            .count() as u64;
-        m.metrics.qos_errors += outcomes.iter().filter(|o| !o.success).count() as u64;
+        m.metrics.qos_requests_count = m
+            .metrics
+            .qos_requests_count
+            .saturating_add(accounting.requests);
+        m.metrics.qos_foreground_count = m
+            .metrics
+            .qos_foreground_count
+            .saturating_add(accounting.foreground_applied);
+        m.metrics.qos_background_count = m
+            .metrics
+            .qos_background_count
+            .saturating_add(accounting.background_applied);
+        m.metrics.qos_noop_count = m.metrics.qos_noop_count.saturating_add(accounting.no_ops);
+        m.metrics.qos_blocked_count = m
+            .metrics
+            .qos_blocked_count
+            .saturating_add(accounting.blocked);
+        m.metrics.qos_errors = m.metrics.qos_errors.saturating_add(accounting.failed);
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct QosRouteAccounting {
+    requests: u64,
+    foreground_applied: u64,
+    background_applied: u64,
+    no_ops: u64,
+    blocked: u64,
+    failed: u64,
+}
+
+fn summarize_qos_route_outcomes(
+    outcomes: &[(QoSOutcome, QoSAuditDisposition)],
+) -> QosRouteAccounting {
+    let mut accounting = QosRouteAccounting {
+        requests: outcomes.len() as u64,
+        ..QosRouteAccounting::default()
+    };
+    for (outcome, disposition) in outcomes {
+        match disposition {
+            QoSAuditDisposition::Applied if outcome.mutated => match outcome.tier {
+                SchedulingTier::Foreground => {
+                    accounting.foreground_applied = accounting.foreground_applied.saturating_add(1)
+                }
+                SchedulingTier::Background => {
+                    accounting.background_applied = accounting.background_applied.saturating_add(1)
+                }
+                SchedulingTier::Normal => {}
+            },
+            QoSAuditDisposition::Applied | QoSAuditDisposition::NoOp => {
+                accounting.no_ops = accounting.no_ops.saturating_add(1)
+            }
+            QoSAuditDisposition::Blocked => {
+                accounting.blocked = accounting.blocked.saturating_add(1)
+            }
+            QoSAuditDisposition::Failed => accounting.failed = accounting.failed.saturating_add(1),
+        }
+    }
+    accounting
 }
 
 /// How often to flush runtime_metrics.json to disk.
@@ -1009,6 +1128,36 @@ mod tests {
         assert_eq!(cache.health().decision_ledger_unattributed_applied_total, 1);
     }
 
+    #[test]
+    fn archived_wrapper_does_not_hide_reverted_envelope_closure() {
+        use apollo_engine::engine::decision_ledger::{
+            ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+        };
+
+        let mut ledger = DecisionLedger::new();
+        let mut events = CycleDecisionEvents::default();
+        assert!(events.push(ActuatorDecisionEvent::local(
+            "interaction_qos:foreground",
+            "pid:42",
+            10,
+            ActuatorDecisionOutcome::Reverted,
+            "test",
+            "rollback-complete",
+        )));
+        assert_eq!(ledger.ingest_cycle_events(&mut events).len(), 1);
+        let telemetry = TelemetryMedallion::new(
+            apollo_engine::engine::installation_identity::InstallationId::UNKNOWN,
+        );
+        let hierarchy = apollo_engine::engine::local_consolidation::LocalConsolidator::default();
+        let scheduler = ExplorationScheduler::cold_start(
+            apollo_engine::engine::exploration_scheduler::ExplorationOrigin::default(),
+        );
+
+        let health = build_unified_learning_health(&ledger, &telemetry, &hierarchy, &scheduler);
+        assert!(health.latest_resolved_episode.reverted);
+        assert_eq!(health.ledger_closure.closure_coverage, Some(1.0));
+    }
+
     fn decision(pid: u32, dec: GovDecision, tier: ProcessTier) -> ProcessDecision {
         ProcessDecision {
             pid,
@@ -1170,5 +1319,51 @@ mod tests {
             decide_qos_tier(&d, &fg, false),
             Some(SchedulingTier::Background)
         );
+    }
+
+    #[test]
+    fn qos_route_accounting_does_not_report_noops_as_applied() {
+        use apollo_engine::engine::mach_qos::{QoSAuditDisposition, QoSOutcome};
+
+        let outcomes = vec![
+            (
+                QoSOutcome {
+                    pid: 10,
+                    tier: SchedulingTier::Foreground,
+                    success: true,
+                    mutated: true,
+                    error: None,
+                },
+                QoSAuditDisposition::Applied,
+            ),
+            (
+                QoSOutcome {
+                    pid: 11,
+                    tier: SchedulingTier::Foreground,
+                    success: true,
+                    mutated: false,
+                    error: None,
+                },
+                QoSAuditDisposition::NoOp,
+            ),
+            (
+                QoSOutcome {
+                    pid: 12,
+                    tier: SchedulingTier::Background,
+                    success: true,
+                    mutated: false,
+                    error: None,
+                },
+                QoSAuditDisposition::Blocked,
+            ),
+        ];
+
+        let accounting = summarize_qos_route_outcomes(&outcomes);
+        assert_eq!(accounting.requests, 3);
+        assert_eq!(accounting.foreground_applied, 1);
+        assert_eq!(accounting.background_applied, 0);
+        assert_eq!(accounting.no_ops, 1);
+        assert_eq!(accounting.blocked, 1);
+        assert_eq!(accounting.failed, 0);
     }
 }

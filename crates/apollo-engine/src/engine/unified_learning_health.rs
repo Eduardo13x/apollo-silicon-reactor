@@ -47,6 +47,8 @@ pub struct TrustInventorySnapshot {
     pub validated: u64,
     pub trusted: u64,
     pub degraded: u64,
+    pub recovery_best_gold: u64,
+    pub recovery_target_gold: u64,
     pub local_gold_decisions: u64,
     pub active_trusted: u64,
     pub worst_producer: String,
@@ -194,11 +196,15 @@ impl HorizonCalibrationInput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct AdviceRecord {
     pub key: CalibrationKey,
     pub trust: TrustState,
     pub signed_error: f64,
+    pub normalized_mae: f64,
+    pub coverage: Option<f64>,
+    pub authority_gold_count: u64,
+    pub model_authority_gold_count: u64,
     pub current_epoch: bool,
 }
 
@@ -374,8 +380,10 @@ impl UnifiedLearningHealth {
             .into_iter()
             .filter(|episode| episode.present && episode.id > 0 && episode.resolved_cycle > 0)
             .max_by(|left, right| {
-                left.resolved_cycle
-                    .cmp(&right.resolved_cycle)
+                left.measured_utility
+                    .is_some()
+                    .cmp(&right.measured_utility.is_some())
+                    .then_with(|| left.resolved_cycle.cmp(&right.resolved_cycle))
                     .then_with(|| left.id.cmp(&right.id))
             })
             .or_else(|| {
@@ -664,16 +672,25 @@ fn trust_inventory(
         active_trusted,
         ..TrustInventorySnapshot::default()
     };
-    let mut unique = BTreeMap::new();
-    for record in records
+    let current: Vec<_> = records
         .iter()
         .filter(|record| record.current_epoch)
         .take(512)
-    {
-        unique.insert(record.key.clone(), record);
+        .collect();
+    let mut unique_models = BTreeMap::new();
+    for record in &current {
+        let model_key = (record.key.producer, record.key.action.clone());
+        unique_models
+            .entry(model_key)
+            .and_modify(|current: &mut &&AdviceRecord| {
+                if record.model_authority_gold_count > current.model_authority_gold_count {
+                    *current = record;
+                }
+            })
+            .or_insert(record);
     }
     let mut worst: Option<(&AdviceRecord, f64)> = None;
-    for record in unique.into_values() {
+    for record in unique_models.into_values() {
         match record.trust {
             TrustState::Immature => inventory.immature = inventory.immature.saturating_add(1),
             TrustState::Candidate => inventory.candidate = inventory.candidate.saturating_add(1),
@@ -681,7 +698,18 @@ fn trust_inventory(
             TrustState::Trusted => inventory.trusted = inventory.trusted.saturating_add(1),
             TrustState::Degraded => inventory.degraded = inventory.degraded.saturating_add(1),
         }
-        let Some(error) = finite_nonnegative(record.signed_error.abs(), 1.0) else {
+        if record.trust == TrustState::Degraded {
+            inventory.recovery_best_gold = inventory
+                .recovery_best_gold
+                .max(record.model_authority_gold_count.min(10));
+            inventory.recovery_target_gold = 10;
+        }
+    }
+    for record in current {
+        if record.authority_gold_count == 0 {
+            continue;
+        }
+        let Some(error) = finite_nonnegative(record.normalized_mae, 1.0) else {
             continue;
         };
         let replace = worst.is_none_or(|(current, current_error)| {
@@ -696,6 +724,7 @@ fn trust_inventory(
         inventory.worst_action = action_label(&record.key.action);
         inventory.worst_horizon = horizon_label(record.key.horizon).to_string();
         inventory.worst_normalized_mae = Some(error);
+        inventory.worst_coverage = record.coverage.and_then(finite_unit_option);
     }
     inventory
 }

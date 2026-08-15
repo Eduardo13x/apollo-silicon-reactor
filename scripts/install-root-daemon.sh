@@ -6,6 +6,12 @@ PLIST_SRC="$ROOT_DIR/scripts/com.eduardocortez.systemoptimizerd.plist"
 PLIST_DST="/Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist"
 DAEMON_DST="/usr/local/libexec/apollo-optimizerd"
 CTL_DST="/usr/local/bin/apollo-optimizerctl"
+AGENT_DST="/usr/local/libexec/apollo-context-agent"
+WEB_BRIDGE_DST="/usr/local/libexec/apollo-web-bridge"
+MODEL_SRC="$ROOT_DIR/models/apollo-temporal-v1.mlmodel"
+MODEL_DST="/usr/local/share/apollo/models/apollo-temporal-v1.mlmodel"
+AGENT_PLIST_SRC="$ROOT_DIR/scripts/com.eduardocortez.apollo-context-agent.plist"
+AGENT_PLIST_DST="/Library/LaunchAgents/com.eduardocortez.apollo-context-agent.plist"
 DEPLOYER_SRC="$ROOT_DIR/scripts/apollo-deploy"
 DEPLOYER_DST="/usr/local/sbin/apollo-deploy"
 LABEL="com.eduardocortez.systemoptimizerd"
@@ -14,7 +20,8 @@ cd "$ROOT_DIR"
 source scripts/hardware-build-profile.sh
 
 echo "── Building release..."
-cargo build --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"}
+"$ROOT_DIR/scripts/build-release.sh"
+apollo_verify_build_manifest
 
 # ── Code signing ────────────────────────────────────────────────────────────
 # Apple Silicon requires valid code signature. cp invalidates cargo's ad-hoc
@@ -52,10 +59,16 @@ sign_binary() {
 }
 
 echo "── Installing binaries..."
-sudo mkdir -p /usr/local/libexec /usr/local/bin /usr/local/sbin /var/lib/apollo/backups /etc/apollo-optimizer /var/log
+sudo mkdir -p /usr/local/libexec /usr/local/bin /usr/local/sbin \
+  /usr/local/share/apollo/models /var/lib/apollo/backups /etc/apollo-optimizer /var/log
 
-sign_binary "$DAEMON_DST" "$ROOT_DIR/target/release/apollo-optimizerd" true
-sign_binary "$CTL_DST"    "$ROOT_DIR/target/release/apollo-optimizerctl" false
+sign_binary "$DAEMON_DST" "$APOLLO_RELEASE_DIR/apollo-optimizerd" true
+sign_binary "$CTL_DST"    "$APOLLO_RELEASE_DIR/apollo-optimizerctl" false
+sign_binary "$AGENT_DST"  "$APOLLO_RELEASE_DIR/apollo-context-agent" false
+sign_binary "$WEB_BRIDGE_DST" "$APOLLO_RELEASE_DIR/apollo-web-bridge" false
+"$ROOT_DIR/scripts/install-webflow-extension.sh"
+sudo install -o root -g wheel -m 0644 "$MODEL_SRC" "$MODEL_DST"
+sudo install -o root -g wheel -m 0644 "$AGENT_PLIST_SRC" "$AGENT_PLIST_DST"
 sudo install -o root -g wheel -m 0755 "$DEPLOYER_SRC" "$DEPLOYER_DST"
 
 sudo cp "$PLIST_SRC" "$PLIST_DST"
@@ -102,6 +115,12 @@ policy = "aggressive-controlled"
 # Values: "error" | "warn" | "info" | "debug" | "trace"
 #log_level = "info"
 
+# Reversible low-latency lane. It observes for 500 healthy cycles before its
+# admission decisions replace the legacy acceleration admission.
+[reflex]
+enabled = true
+shadow_cycles = 500
+
 CFG
 fi
 
@@ -118,6 +137,12 @@ sleep 2
 
 sudo launchctl bootstrap system "$PLIST_DST"
 sudo launchctl kickstart -k system/$LABEL
+
+CONSOLE_UID="$(stat -f %u /dev/console 2>/dev/null || true)"
+if [[ "$CONSOLE_UID" =~ ^[0-9]+$ ]] && [[ "$CONSOLE_UID" -gt 0 ]]; then
+  sudo launchctl bootout "gui/$CONSOLE_UID/com.eduardocortez.apollo-context-agent" 2>/dev/null || true
+  sudo launchctl bootstrap "gui/$CONSOLE_UID" "$AGENT_PLIST_DST"
+fi
 
 # Wait and verify the daemon is actually running (not crash-looping).
 sleep 3

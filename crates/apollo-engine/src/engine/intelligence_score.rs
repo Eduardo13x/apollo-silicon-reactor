@@ -26,6 +26,45 @@
 
 use serde::{Deserialize, Serialize};
 
+/// AIS-facing projection of one-pair/one-Gold evidence. Raw actuator
+/// counters, rollback completions, and unpaired prediction hits are excluded.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PairEvidenceProjection {
+    pub attributed_observations: u64,
+    pub effective_observations: u64,
+    pub harmful_observations: u64,
+    pub verified_adaptations_correct: u32,
+    pub verified_adaptations_total: u32,
+    pub mean_effect: f64,
+}
+
+pub fn project_pair_evidence(metrics: &serde_json::Value) -> PairEvidenceProjection {
+    let gold = metrics["microexperiment_pair_gold_total"]
+        .as_u64()
+        .unwrap_or(0);
+    let effective = metrics["microexperiment_effective_total"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(gold);
+    let harmful = metrics["microexperiment_harmful_total"]
+        .as_u64()
+        .unwrap_or(0)
+        .min(gold.saturating_sub(effective));
+    let mean_effect = metrics["microexperiment_mean_effect"]
+        .as_f64()
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .clamp(-1.0, 1.0);
+    PairEvidenceProjection {
+        attributed_observations: gold,
+        effective_observations: effective,
+        harmful_observations: harmful,
+        verified_adaptations_correct: effective.min(u64::from(u32::MAX)) as u32,
+        verified_adaptations_total: gold.min(u64::from(u32::MAX)) as u32,
+        mean_effect,
+    }
+}
+
 // ── Weights ──────────────────────────────────────────────────────────────────
 const W_DECISION: f64 = 0.22;
 const W_SIGNAL: f64 = 0.18;
@@ -494,10 +533,10 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let actuator_learning_raw = rm_u("world_model_actuator_bronze_total");
     let actuator_learning_gold = rm_u("world_model_actuator_gold_total");
     let actuator_learning_quality = rm_f("world_model_actuator_quality").clamp(0.0, 1.0);
-    let learning_attributed_observations = rm_u("world_model_actuator_bronze_total");
-    let learning_effective_observations =
-        rm_u("world_model_actuator_effective_total").min(learning_attributed_observations);
-    let learning_mean_utility = rm_f("world_model_actuator_mean_utility").clamp(-1.0, 1.0);
+    let pair_evidence = project_pair_evidence(&rm);
+    let learning_attributed_observations = pair_evidence.attributed_observations;
+    let learning_effective_observations = pair_evidence.effective_observations;
+    let learning_mean_utility = pair_evidence.mean_effect;
     let (learning_raw_observations, learning_gold_observations, learning_data_quality) =
         merge_learning_evidence(
             pressure_learning_raw,
@@ -585,13 +624,8 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let interaction_failed = interaction_activations
         .saturating_sub(interaction_reverts)
         .saturating_sub(interaction_in_flight);
-    let prediction_hits = rm_u("markov_prewarm_hits");
-    let prediction_misses = rm_u("markov_prewarm_misses");
-    let verified_adaptations_correct = interaction_reverts.saturating_add(prediction_hits);
-    let verified_adaptations_total = interaction_reverts
-        .saturating_add(interaction_failed)
-        .saturating_add(prediction_hits)
-        .saturating_add(prediction_misses);
+    let verified_adaptations_correct = pair_evidence.verified_adaptations_correct;
+    let verified_adaptations_total = pair_evidence.verified_adaptations_total;
 
     let input = AisInput {
         total_decisions: resolved_total + boosts + preservation_events,
@@ -658,8 +692,8 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         total_workload_class: workload_total,
         regime_shifts_detected: 0,
         regime_shifts_total: 0,
-        verified_adaptations_correct: verified_adaptations_correct.min(u32::MAX as u64) as u32,
-        verified_adaptations_total: verified_adaptations_total.min(u32::MAX as u64) as u32,
+        verified_adaptations_correct,
+        verified_adaptations_total,
 
         causal_mechanism_count,
         experience_memory_count,
@@ -1697,10 +1731,10 @@ mod tests {
                 rm_u("world_model_actuator_gold_total"),
                 rm_f("world_model_actuator_quality"),
             );
-        let learning_attributed_observations = rm_u("world_model_actuator_bronze_total");
-        let learning_effective_observations =
-            rm_u("world_model_actuator_effective_total").min(learning_attributed_observations);
-        let learning_mean_utility = rm_f("world_model_actuator_mean_utility").clamp(-1.0, 1.0);
+        let pair_evidence = project_pair_evidence(&rm);
+        let learning_attributed_observations = pair_evidence.attributed_observations;
+        let learning_effective_observations = pair_evidence.effective_observations;
+        let learning_mean_utility = pair_evidence.mean_effect;
 
         // ── Build AisInput ───────────────────────────────────────────────────
         let input = AisInput {
@@ -1782,8 +1816,8 @@ mod tests {
             // 5% miss buffer: consistent with CUSUM buffer (recalibrated, see D2 comment).
             // [Kenett & Thyregod 2006] SPC §7.3 — buffer = 95th pct detection lag boundary.
             regime_shifts_total: (regime_shifts.saturating_add(regime_shifts / 20)).max(1),
-            verified_adaptations_correct: 0,
-            verified_adaptations_total: 0,
+            verified_adaptations_correct: pair_evidence.verified_adaptations_correct,
+            verified_adaptations_total: pair_evidence.verified_adaptations_total,
 
             hardware_cores: 8,
             hardware_memory_gb: 8,

@@ -35,6 +35,7 @@ use apollo_engine::engine::local_consolidation::LocalConsolidator;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
 use apollo_engine::engine::meta_cognition::MetaCognition;
+use apollo_engine::engine::microexperiment_lab::MicroexperimentLabPersisted;
 use apollo_engine::engine::nars_belief::{ArousalState, Salience};
 use apollo_engine::engine::nested_learner::NestedLearner;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
@@ -183,6 +184,7 @@ pub fn run_learning_tick<'a>(
     meta_cognition: &MetaCognition,
     local_consolidator: &LocalConsolidator,
     exploration_scheduler: &ExplorationScheduler,
+    microexperiment_lab: Option<&MicroexperimentLabPersisted>,
 ) {
     // Live context and universal actuator evidence are observed by the daemon
     // before this function so cognitive learning pauses cannot create holes in
@@ -969,6 +971,7 @@ pub fn run_learning_tick<'a>(
                 medallion_state: Some(learning_pipeline.medallion_snapshot()),
                 telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
                 exploration_scheduler: Some(exploration_scheduler.persisted()),
+                microexperiment_lab: microexperiment_lab.cloned(),
                 ..LearnedStateSupplement::default()
             },
         );

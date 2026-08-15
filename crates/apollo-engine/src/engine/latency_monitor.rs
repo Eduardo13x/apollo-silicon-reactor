@@ -18,7 +18,8 @@
 //! When score > 0.5, Apollo should immediately boost the foreground app
 //! and throttle background noise more aggressively.
 
-/// Thresholds calibrated for M1 MacBook Air 8GB.
+/// Per-process CPU and scheduler thresholds. These inputs use macOS-normalized
+/// units and are independent of the number of physical cores.
 const JITTER_NOMINAL_US: f64 = 50.0;
 const JITTER_BAD_US: f64 = 2000.0;
 const WS_CPU_NOMINAL: f64 = 15.0;
@@ -96,12 +97,14 @@ pub fn compute_latency(signals: &LatencySignals) -> LatencyScore {
     let csw_norm =
         ((signals.foreground_csw_per_sec - CSW_NOMINAL) / (CSW_BAD - CSW_NOMINAL)).clamp(0.0, 1.0);
 
-    // Foreground CPU: both extremes are bad.
-    // Too low (<5%) = starved by other processes (not getting scheduled).
-    // 0% → 1.0 (completely frozen), 5% → 0.0 (getting enough CPU).
-    // Wider range than original 2% catches partial starvation (1-4% CPU)
-    // which on M1 means the app misses multiple frame deadlines.
-    let fg_starved = if signals.foreground_cpu < 5.0 {
+    // Low foreground CPU is ambiguous: most GUI applications legitimately
+    // sleep while waiting for input. Treat it as starvation only when the
+    // scheduler or the process itself also shows contention. This prevents a
+    // quiet editor/browser from creating a self-reinforcing boost loop while
+    // retaining the true-positive path for a runnable app that is not getting
+    // scheduled.
+    let runnable_pressure = jitter_norm > 0.10 || csw_norm > 0.10;
+    let fg_starved = if signals.foreground_cpu < 5.0 && runnable_pressure {
         (5.0 - signals.foreground_cpu) / 5.0
     } else {
         0.0
@@ -191,9 +194,10 @@ mod tests {
     }
 
     #[test]
-    fn starved_foreground_raises_score() {
+    fn contended_starved_foreground_raises_score() {
         let mut signals = nominal_signals();
         signals.foreground_cpu = 0.5; // Nearly starved
+        signals.jitter_us = 400.0; // Runnable work is waiting on the scheduler
         let score = compute_latency(&signals);
         assert!(
             score.score > 0.1,
@@ -229,5 +233,22 @@ mod tests {
         let score = compute_latency(&signals);
         assert_eq!(score.category, LatencyCategory::Responsive);
         assert!(!score.needs_boost);
+    }
+
+    #[test]
+    fn quiet_foreground_is_not_mistaken_for_cpu_starvation() {
+        let signals = LatencySignals {
+            jitter_us: 0.0,
+            windowserver_cpu: 44.0,
+            foreground_cpu: 0.7,
+            foreground_csw_per_sec: 120.0,
+            has_foreground: true,
+        };
+
+        let score = compute_latency(&signals);
+
+        assert!(!score.needs_boost);
+        assert_ne!(score.category, LatencyCategory::Sluggish);
+        assert_ne!(score.category, LatencyCategory::Broken);
     }
 }

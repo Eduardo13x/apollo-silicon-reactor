@@ -1129,6 +1129,14 @@ impl ModelCalibrationStore {
         }
     }
 
+    pub fn accepted_decision_ids(&self) -> impl Iterator<Item = DecisionId> + '_ {
+        self.accepted_decision_order.iter().copied()
+    }
+
+    pub fn accepted_decision_count(&self) -> usize {
+        self.accepted_decision_order.len()
+    }
+
     pub fn observe_local_gold(
         &mut self,
         observation: &CalibrationObservation<'_>,
@@ -1479,6 +1487,10 @@ impl ModelCalibrationStore {
                 }
             }
         }
+        if !persisted_hardware.is_known() || persisted_hardware != current {
+            self.accepted_decision_ids.clear();
+            self.accepted_decision_order.clear();
+        }
 
         let mut retained_records = BoundedCalibrationRecords::new();
         for mut record in records {
@@ -1627,6 +1639,8 @@ impl ModelCalibrationStore {
 
     fn reset_authority_for_hardware(&mut self, hardware_regime: HardwareRegime) {
         self.hardware_regime = hardware_regime;
+        self.accepted_decision_ids.clear();
+        self.accepted_decision_order.clear();
         for record in self.records.values_mut() {
             reset_record_authority(record, hardware_regime);
         }
@@ -2905,6 +2919,7 @@ mod tests {
         same.validate_hardware(changed_hardware);
         assert_eq!(same.model_for(&key).unwrap().trust, TrustState::Degraded);
         assert_eq!(same.model_for(&key).unwrap().authority_gold_count, 0);
+        assert_eq!(same.accepted_decision_ids().count(), 0);
         let recovery_provenance = CalibrationProvenance {
             local_authority_eligible: true,
             predictions: vec![prediction("world-model", 0.0, 0.2)],
@@ -2928,6 +2943,7 @@ mod tests {
         changed.restore(snapshot.clone(), changed_hardware);
         assert_eq!(changed.model_for(&key).unwrap().trust, TrustState::Degraded);
         assert_eq!(changed.model_for(&key).unwrap().authority_gold_count, 0);
+        assert_eq!(changed.accepted_decision_ids().count(), 0);
 
         let mut foreign = ModelCalibrationStore::new(InstallationId(99));
         foreign.restore(snapshot.clone(), HARDWARE);

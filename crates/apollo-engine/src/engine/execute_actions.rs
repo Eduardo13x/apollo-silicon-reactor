@@ -25,6 +25,27 @@ use crate::engine::safety::{
 };
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
+const BOOST_EFFECT_TTL: std::time::Duration = std::time::Duration::from_secs(12);
+
+fn record_boost_qos_effects(pid: u32, start_sec: u64, tier_applied: bool, task_qos_applied: bool) {
+    if tier_applied {
+        crate::engine::effect_ledger::record_global(
+            crate::engine::effect_ledger::AppliedEffect::MachTier { pid },
+            BOOST_EFFECT_TTL,
+            start_sec,
+            "boost: Foreground tier",
+        );
+    }
+    if task_qos_applied {
+        crate::engine::effect_ledger::record_global(
+            crate::engine::effect_ledger::AppliedEffect::TaskQoS { pid },
+            BOOST_EFFECT_TTL,
+            start_sec,
+            "boost: interactive task QoS",
+        );
+    }
+}
+
 /// Set the nice value for a process via `setpriority(2)`.
 /// Returns the prior nice value when the process priority actually changed.
 /// `Ok(None)` means the target value was already present.
@@ -661,7 +682,7 @@ pub fn execute_actions(
                         if nice_prior.is_none() {
                             crate::engine::effect_ledger::refresh_nice_global(
                                 *pid,
-                                crate::engine::effect_ledger::DEFAULT_TTL,
+                                BOOST_EFFECT_TTL,
                             );
                         }
                         action_applied |= tier_syscall_ok || latency_syscall_ok || nice_applied;
@@ -676,19 +697,17 @@ pub fn execute_actions(
                                     pid: *pid,
                                     prior,
                                 },
-                                crate::engine::effect_ledger::DEFAULT_TTL,
+                                BOOST_EFFECT_TTL,
                                 *start_sec,
                                 "boost: renice -10",
                             );
                         }
-                        if tier_syscall_ok {
-                            crate::engine::effect_ledger::record_global(
-                                crate::engine::effect_ledger::AppliedEffect::MachTier { pid: *pid },
-                                crate::engine::effect_ledger::DEFAULT_TTL,
-                                *start_sec,
-                                "boost: Foreground tier",
-                            );
-                        }
+                        record_boost_qos_effects(
+                            *pid,
+                            *start_sec,
+                            tier_syscall_ok,
+                            latency_syscall_ok,
+                        );
                     }
                     out.boosts_applied += (action_applied || dry_run) as u64;
                     if !dry_run && !action_applied {
@@ -1809,6 +1828,26 @@ mod tests {
             set_nice(pid, current).expect("same-priority set must be readable"),
             None
         );
+    }
+
+    #[test]
+    fn boost_effects_are_short_lived() {
+        assert_eq!(BOOST_EFFECT_TTL, std::time::Duration::from_secs(12));
+    }
+
+    #[test]
+    fn boost_records_explicit_task_qos_for_ttl_rollback() {
+        const PID: u32 = 8_901_113;
+        const START_SEC: u64 = 123;
+        let effect = crate::engine::effect_ledger::AppliedEffect::TaskQoS { pid: PID };
+
+        record_boost_qos_effects(PID, START_SEC, false, true);
+
+        assert!(crate::engine::effect_ledger::is_global_owner(
+            &effect,
+            "boost: interactive task QoS"
+        ));
+        crate::engine::effect_ledger::forget_global(&effect);
     }
 
     #[test]

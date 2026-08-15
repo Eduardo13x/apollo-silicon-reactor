@@ -102,6 +102,7 @@ pub mod mpc_horizon;
 pub mod nars_belief;
 pub mod neon_ema;
 pub mod nested_learner;
+pub mod network_flow;
 pub mod network_monitor;
 pub mod network_optimizer;
 pub mod neuromodulator;
@@ -171,6 +172,9 @@ pub mod user_profile;
 pub mod value_scheduler;
 pub mod wait_graph;
 pub mod wake_storm_detector;
+pub mod webflow_controller;
+pub mod webflow_native;
+pub mod webflow_types;
 pub mod window_sensor;
 pub mod work_session;
 pub mod workload_classifier;
@@ -178,8 +182,6 @@ pub mod workload_phase;
 pub mod world_model;
 pub mod world_model_sequence;
 pub mod world_state;
-pub mod webflow_controller;
-pub mod webflow_types;
 pub mod zombie_hunter;
 
 // ── Pipeline stage abstraction ────────────────────────────────────────────────

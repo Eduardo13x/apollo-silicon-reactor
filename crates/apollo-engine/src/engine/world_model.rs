@@ -80,6 +80,8 @@ const GPU_ADVICE_MAX_AGE_CYCLES: u64 = 30;
 const MAX_GPU_ADVICE_ENTRIES: usize = 96;
 const GPU_COLD_START_TRUST: f64 = 0.25;
 const GPU_MAX_RANK_SUPPORT: f64 = 0.005;
+const FABRIC_PREDICTION_MAX_AGE_CYCLES: u64 = 2;
+const FABRIC_MAX_CONTEXT_SUPPORT: f64 = 0.04;
 type EpisodicNeighbor = (f64, f64, f64, bool, f64);
 
 /// The model's verdict for a candidate action.
@@ -167,6 +169,7 @@ pub struct ContextualActionBias {
     pub model_observations: u32,
     pub episodic_observations: u32,
     pub gpu_predictions: u32,
+    pub fabric_predictions: u32,
     /// The bounded portion of `score` contributed by the fresh GPU forecast.
     pub gpu_context_support: f64,
     pub gpu_calibration_trust: f64,
@@ -179,7 +182,8 @@ impl ContextualActionBias {
         self.score.abs() > f64::EPSILON
             && (self.model_observations > 0
                 || self.episodic_observations > 0
-                || self.gpu_predictions > 0)
+                || self.gpu_predictions > 0
+                || self.fabric_predictions > 0)
     }
 
     /// True when the bounded GPU forecast contributed to this bias. This is
@@ -207,6 +211,9 @@ pub struct DeliberationEvidence {
     pub gpu_top_context_support: f64,
     pub gpu_top_rank_support: f64,
     pub gpu_calibration_trust: f64,
+    pub validated_models: u64,
+    pub trusted_models: u64,
+    pub degraded_models: u64,
 }
 
 /// Local replacement for the former prompt/JSON teacher. It fuses System 1's
@@ -227,7 +234,18 @@ pub struct SystemDeliberation {
 struct GpuAdviceEntry {
     generation: u64,
     workload: String,
+    context_revision: u64,
     advice: GpuCandidateAdvice,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct FabricPredictionEntry {
+    cycle: u64,
+    workload: String,
+    load: f64,
+    transition: f64,
+    pressure: f64,
+    p95: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,6 +377,7 @@ pub struct WorldModel {
     causal_dynamics_revision: Option<u64>,
     gpu_advice: HashMap<String, GpuAdviceEntry>,
     gpu_advice_generation: Option<u64>,
+    gpu_context_revision: u64,
     gpu_calibration: HashMap<String, GpuCalibrationStats>,
     gpu_calibration_revision: Option<u64>,
     local_consolidation_confidence: f64,
@@ -367,9 +386,52 @@ pub struct WorldModel {
     deliberation_advisory_support_scale: f64,
     deliberation_gpu_support_scale: f64,
     deliberation_active: bool,
+    unified_authoritative_gold: u64,
+    unified_validated_models: u64,
+    unified_trusted_models: u64,
+    unified_degraded_models: u64,
+    unified_trust_attached: bool,
+    runtime_cycle: u64,
+    fabric_prediction: Option<FabricPredictionEntry>,
 }
 
 impl WorldModel {
+    pub fn set_runtime_cycle(&mut self, cycle: u64) {
+        self.runtime_cycle = cycle;
+        if self.fabric_prediction.as_ref().is_some_and(|entry| {
+            cycle.saturating_sub(entry.cycle) > FABRIC_PREDICTION_MAX_AGE_CYCLES
+        }) {
+            self.fabric_prediction = None;
+        }
+    }
+
+    /// Attach an Active-phase prediction from the heterogeneous fabric. This
+    /// is a bounded ranking hint for actions proposed elsewhere; it never
+    /// creates an action, changes admission, or bypasses a safety gate.
+    pub fn attach_fabric_prediction(
+        &mut self,
+        cycle: u64,
+        workload: &str,
+        load: f64,
+        transition: f64,
+        pressure: f64,
+        p95: f64,
+    ) -> bool {
+        let values = [load, transition, pressure, p95];
+        if values.iter().any(|value| !value.is_finite()) {
+            return false;
+        }
+        self.fabric_prediction = Some(FabricPredictionEntry {
+            cycle,
+            workload: workload.chars().take(128).collect(),
+            load: load.clamp(0.0, 1.0),
+            transition: transition.clamp(0.0, 1.0),
+            pressure: pressure.clamp(0.0, 1.0),
+            p95: p95.clamp(0.0, 1.0),
+        });
+        true
+    }
+
     /// Attach the bounded reflex memory compiled from universal Gold outcomes.
     /// This affects ranking and parameter tuning only; model verdicts and
     /// actuator admission remain owned by their existing safety paths.
@@ -381,6 +443,23 @@ impl WorldModel {
             .into_iter()
             .map(|(family, scale)| (family, scale.clamp(0.75, 1.0)))
             .collect();
+    }
+
+    /// Attach the current-machine authoritative calibration inventory. This
+    /// can only reduce advisory confidence; it never promotes a model verdict
+    /// or authorizes an actuator.
+    pub fn attach_unified_trust(
+        &mut self,
+        authoritative_gold: u64,
+        validated_models: u64,
+        trusted_models: u64,
+        degraded_models: u64,
+    ) {
+        self.unified_authoritative_gold = authoritative_gold;
+        self.unified_validated_models = validated_models;
+        self.unified_trusted_models = trusted_models;
+        self.unified_degraded_models = degraded_models;
+        self.unified_trust_attached = true;
     }
 
     /// Snapshot the live learned state into a query-cheap model.
@@ -672,6 +751,7 @@ impl WorldModel {
                 GpuAdviceEntry {
                     generation: result.generation,
                     workload: result.workload.clone(),
+                    context_revision: result.context_revision,
                     advice: advice.clone(),
                 },
             );
@@ -729,12 +809,23 @@ impl WorldModel {
             .gpu_advice
             .get(&gpu_calibration_key(action_key, workload))?;
         if entry.workload != workload
+            || entry.context_revision != self.gpu_context_revision
             || context.cycle < entry.generation
             || context.cycle.saturating_sub(entry.generation) > GPU_ADVICE_MAX_AGE_CYCLES
         {
             return None;
         }
         Some(entry)
+    }
+
+    pub fn set_gpu_context_revision(&mut self, context_revision: u64) {
+        self.gpu_context_revision = context_revision;
+    }
+
+    pub fn invalidate_gpu_advice(&mut self, context_revision: u64) {
+        self.gpu_advice.clear();
+        self.gpu_advice_generation = None;
+        self.gpu_context_revision = context_revision;
     }
 
     fn gpu_context_support(&self, action_key: &str, workload: &str) -> Option<(f64, f64)> {
@@ -779,11 +870,18 @@ impl WorldModel {
         let mut evidence = DeliberationEvidence {
             workload: workload.to_string(),
             authority_phase: self.authority_phase.as_str().to_string(),
-            local_gold: self.context_local_gold,
+            local_gold: if self.unified_trust_attached {
+                self.unified_authoritative_gold
+            } else {
+                self.context_local_gold
+            },
             data_quality: self.context_quality.clamp(0.0, 1.0),
             utility_ready_actions: self.utility_ready_actions() as u64,
             local_consolidation_confidence: self.local_consolidation_confidence,
             local_consolidation_families: self.local_consolidation_families,
+            validated_models: self.unified_validated_models,
+            trusted_models: self.unified_trusted_models,
+            degraded_models: self.unified_degraded_models,
             ..DeliberationEvidence::default()
         };
         let Some(context) = self.latest_context.as_ref() else {
@@ -794,6 +892,7 @@ impl WorldModel {
             .iter()
             .filter_map(|(key, entry)| {
                 (entry.workload == workload
+                    && entry.context_revision == self.gpu_context_revision
                     && context.cycle >= entry.generation
                     && context.cycle.saturating_sub(entry.generation) <= GPU_ADVICE_MAX_AGE_CYCLES)
                     .then_some((key, entry))
@@ -846,19 +945,32 @@ impl WorldModel {
         } else {
             0.50
         };
-        let confidence = (evidence.data_quality * 0.25
+        let raw_confidence = (evidence.data_quality * 0.25
             + medallion_maturity * 0.25
             + self_check * 0.20
             + local_confidence * 0.20
             + gpu_confidence * 0.10)
             * if system1_struggling { 0.85 } else { 1.0 };
-        let confidence = confidence.clamp(0.0, 1.0);
+        let trust_scale = if !self.unified_trust_attached || evidence.trusted_models > 0 {
+            1.0
+        } else if evidence.validated_models > 0 {
+            0.90
+        } else if evidence.degraded_models > 0 {
+            0.75
+        } else {
+            0.80
+        };
+        let confidence = (raw_confidence * trust_scale).clamp(0.0, 1.0);
         let advisory_support_scale = (0.80 + confidence * 0.20).clamp(0.80, 1.0);
         let gpu_support_scale = (0.35 + confidence * 0.65).clamp(0.35, 1.0);
         self.deliberation_advisory_support_scale = advisory_support_scale;
         self.deliberation_gpu_support_scale = gpu_support_scale;
         self.deliberation_active = true;
-        let mode = if evidence.authority_phase == "trusted"
+        let unified_authority_ready = !self.unified_trust_attached
+            || evidence.validated_models > 0
+            || evidence.trusted_models > 0;
+        let mode = if unified_authority_ready
+            && evidence.authority_phase == "trusted"
             && evidence.data_quality >= MIN_UTILITY_DATA_QUALITY
             && evidence.local_gold >= MIN_UTILITY_EVIDENCE as u64
             && self_check >= 0.70
@@ -1241,7 +1353,33 @@ impl WorldModel {
             bias.gpu_context_support = support;
             bias.gpu_calibration_trust = trust;
         }
+        if let Some(support) = self.fabric_context_support(action_key, workload) {
+            bias.score = (bias.score + support).clamp(-1.0, 1.0);
+            bias.fabric_predictions = 1;
+        }
         bias
+    }
+
+    fn fabric_context_support(&self, action_key: &str, workload: &str) -> Option<f64> {
+        let entry = self.fabric_prediction.as_ref()?;
+        if entry.workload != workload
+            || self.runtime_cycle < entry.cycle
+            || self.runtime_cycle.saturating_sub(entry.cycle) > FABRIC_PREDICTION_MAX_AGE_CYCLES
+        {
+            return None;
+        }
+        let family = action_key
+            .split_once(':')
+            .map_or(action_key, |(family, _)| family);
+        let support = match family {
+            "markov_prewarm" | "prewarm" => entry.transition * 0.025 + entry.load * 0.005,
+            "boost" | "interaction_qos" | "thread_qos" | "chromium_ecore" => {
+                entry.transition * 0.010 + (entry.p95 - 0.50).max(0.0) * 0.030
+            }
+            "io_shaping" | "io" => entry.load * 0.008 + entry.pressure * 0.006,
+            _ => 0.0,
+        };
+        (support > 0.0).then_some(support.clamp(0.0, FABRIC_MAX_CONTEXT_SUPPORT))
     }
 
     fn counterfactual_rank_support(
@@ -1726,6 +1864,7 @@ mod tests {
             installation_id,
             horizon_cycles: 3,
             tier: EvidenceTier::Gold,
+            provenance: crate::engine::telemetry_medallion::EvidenceProvenance::ObservedLocal,
             quality: 0.96,
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,
@@ -1806,6 +1945,7 @@ mod tests {
             model.attach_gpu_imagination(&GpuImaginationResult {
                 generation: 100,
                 workload: "build".to_string(),
+                context_revision: 0,
                 backend: GpuImaginationBackend::Metal,
                 device_name: "Apple M4".to_string(),
                 samples: 4_096,
@@ -1843,9 +1983,11 @@ mod tests {
         let context = m4_context(Utc::now().timestamp());
         let mut model = WorldModel::default();
         attach_view(&mut model, Some(&context), &BTreeMap::new(), 3);
+        model.set_gpu_context_revision(17);
         let result = |generation: u64, action_key: &str, context_score: f64| GpuImaginationResult {
             generation,
             workload: "build".to_string(),
+            context_revision: 17,
             backend: GpuImaginationBackend::Metal,
             device_name: "Apple M4".to_string(),
             samples: 4_096,
@@ -1878,6 +2020,14 @@ mod tests {
         assert!(evidence.gpu_top_context_support > 0.0);
         assert!(evidence.gpu_top_rank_support > 0.0);
         assert_eq!(evidence.local_gold, 3);
+
+        model.set_gpu_context_revision(18);
+        assert!(model
+            .gpu_rank_support_for("markov_prewarm:predicted_app", "build")
+            .is_none());
+        assert!(!model
+            .contextual_action_bias("markov_prewarm:predicted_app", "build")
+            .has_gpu_influence());
     }
 
     #[test]
@@ -1895,6 +2045,20 @@ mod tests {
         assert!(deliberation.gpu_support_scale >= 0.35);
         assert!(deliberation.gpu_support_scale < 1.0);
         assert_eq!(model.authority_phase(), ModelAuthorityPhase::Calibrating);
+    }
+
+    #[test]
+    fn deliberation_cannot_be_grounded_without_validated_local_models() {
+        let context = m4_context(Utc::now().timestamp());
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &BTreeMap::new(), 500);
+        model.attach_unified_trust(40, 0, 0, 2);
+
+        let deliberation = model.synthesize_deliberation("build", false, 0.0);
+
+        assert_eq!(deliberation.mode, "calibrating");
+        assert!(deliberation.confidence <= 0.75);
+        assert_eq!(deliberation.evidence.local_gold, 40);
     }
 
     #[test]
@@ -2922,5 +3086,35 @@ mod tests {
             "500-outcome build plus 10k queries took {elapsed:?}"
         );
         eprintln!("curated_world_model_500: {elapsed:?}");
+    }
+
+    #[test]
+    fn active_fabric_prediction_only_tunes_existing_actions_and_expires() {
+        let mut model = WorldModel::default();
+        model.set_runtime_cycle(100);
+        assert!(model.attach_fabric_prediction(100, "build", 0.7, 0.9, 0.2, 0.8));
+
+        let prewarm = model.contextual_action_bias("markov_prewarm:Editor", "build");
+        assert!(prewarm.score > 0.0);
+        assert_eq!(prewarm.fabric_predictions, 1);
+        assert!(!prewarm.authoritative);
+        assert_eq!(
+            model.contextual_action_bias("freeze:worker", "build").score,
+            0.0
+        );
+        assert_eq!(
+            model
+                .contextual_action_bias("markov_prewarm:Editor", "idle")
+                .score,
+            0.0
+        );
+
+        model.set_runtime_cycle(103);
+        assert_eq!(
+            model
+                .contextual_action_bias("markov_prewarm:Editor", "build")
+                .score,
+            0.0
+        );
     }
 }

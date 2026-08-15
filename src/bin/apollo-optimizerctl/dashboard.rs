@@ -160,15 +160,6 @@ fn score_label(score: f64) -> &'static str {
     }
 }
 
-fn thermal_emoji(state: &str) -> &'static str {
-    match state {
-        "critical" => "🔴",
-        "serious" => "🟠",
-        "moderate" | "fair" => "🟡",
-        _ => "🟢",
-    }
-}
-
 fn thermal_label(state: &str) -> &'static str {
     match state {
         "critical" => "Crítico",
@@ -334,10 +325,18 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
     ));
     lines.push(format!("       {}", swap_label));
 
+    let thermal_sensor_available = m.smc_cpu_temp_celsius.is_some()
+        || m.smc_gpu_temp_celsius.is_some()
+        || m.iokit_p_cluster_temp.is_some()
+        || m.iokit_e_cluster_temp.is_some();
     lines.push(format!(
-        "Temp   {} {}",
-        thermal_emoji(&status.thermal_state),
-        thermal_label(&status.thermal_state)
+        "Therm  k:{} sensor:{}",
+        thermal_label(&status.thermal_state),
+        if thermal_sensor_available {
+            "ok"
+        } else {
+            "n/a"
+        }
     ));
 
     lines.push(format!(
@@ -357,7 +356,7 @@ fn render_sense_q(status: &DaemonStatus) -> Vec<String> {
     lines.push(format!("Throttle {}", status.throttle_level));
     lines.push(format!("WS     {}% CPU", m.windowserver_cpu_pct as i32));
     lines.push(format!(
-        "UX     {} {:.0}%",
+        "UX-p   {} {:.0}%",
         if m.perceptual_latency_category.is_empty() {
             "unmeasured"
         } else {
@@ -402,9 +401,209 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         m.nars_drifted_beliefs, m.nars_beliefs_total, m.nars_drift_score, drift_emoji
     ));
 
+    let compact_profile = |profile: &str| match profile {
+        "adaptive-multicore" => "multi",
+        "sequential" => "seq",
+        "" => "n/a",
+        _ => "other",
+    };
+    if !m.parallel_expected_profile.is_empty()
+        || !m.parallel_compiled_profile.is_empty()
+        || !m.parallel_effective_profile.is_empty()
+    {
+        lines.push(format!(
+            "CPU-P  exp {} build {}",
+            compact_profile(&m.parallel_expected_profile),
+            compact_profile(&m.parallel_compiled_profile),
+        ));
+        lines.push(format!(
+            "       eff {} W{}/{} {} {}",
+            compact_profile(&m.parallel_effective_profile),
+            m.parallel_worker_threads,
+            m.parallel_max_worker_threads,
+            if m.parallel_worker_qos_intent.is_empty() {
+                "default"
+            } else {
+                m.parallel_worker_qos_intent.as_str()
+            },
+            if !m.parallel_worker_qos_status.is_empty() {
+                m.parallel_worker_qos_status.clone()
+            } else if m.parallel_worker_qos_failures == 0 {
+                "unknown".to_string()
+            } else {
+                format!("fail{}", m.parallel_worker_qos_failures)
+            },
+        ));
+        if !m.parallel_disabled_reason.is_empty() {
+            lines.push(format!(
+                "       off {}",
+                m.parallel_disabled_reason
+                    .chars()
+                    .take(20)
+                    .collect::<String>()
+            ));
+        }
+    }
+
+    if m.reflex_enabled || !m.reflex_phase.is_empty() {
+        lines.push(format!(
+            "Reflex {} {}/{}",
+            if m.reflex_phase.is_empty() {
+                "disabled"
+            } else {
+                m.reflex_phase.as_str()
+            },
+            format_number(m.reflex_valid_cycles),
+            format_number(m.reflex_shadow_cycles),
+        ));
+        if !m.reflex_blocker.is_empty() && m.reflex_blocker != "ready" {
+            lines.push(format!(
+                "       block {}",
+                m.reflex_blocker.chars().take(18).collect::<String>()
+            ));
+        }
+        lines.push(format!(
+            "R-act  P{} A{} real{} sh{}",
+            compact_counter(m.reflex_proposed_total),
+            compact_counter(m.reflex_admitted_total),
+            compact_counter(m.reflex_applied_total),
+            compact_counter(m.reflex_shadowed_total),
+        ));
+        lines.push(format!(
+            "       O{} no{} V{} R{} F{}",
+            compact_counter(m.reflex_omitted_total),
+            compact_counter(m.reflex_noop_total),
+            compact_counter(m.reflex_vetoed_total),
+            compact_counter(m.reflex_reverted_total),
+            compact_counter(m.reflex_failed_total),
+        ));
+        lines.push(format!(
+            "       fast {}us",
+            compact_counter(m.reflex_last_decision_latency_us),
+        ));
+        lines.push(format!(
+            "R-deep W{}/{} d{} age{} {}us",
+            compact_counter(m.reflex_reasoning_completed_total),
+            compact_counter(m.reflex_reasoning_submitted_total),
+            compact_counter(m.reflex_reasoning_dropped_total),
+            compact_counter(m.reflex_reasoning_last_result_age_cycles),
+            compact_counter(m.reflex_reasoning_last_latency_us),
+        ));
+    }
+
+    if !m.value_scheduler_phase.is_empty() {
+        lines.push(format!(
+            "Value  {} obs{} J{}/{} {}/{}ms",
+            m.value_scheduler_phase,
+            compact_counter(m.value_scheduler_valid_cycles),
+            m.value_scheduler_selected_jobs,
+            m.value_scheduler_registered_jobs,
+            m.value_scheduler_predicted_us / 1_000,
+            m.value_scheduler_budget_us / 1_000,
+        ));
+        if !m.value_scheduler_blocker.is_empty() && m.value_scheduler_blocker != "shadow-ready" {
+            lines.push(format!(
+                "       block {}",
+                m.value_scheduler_blocker
+                    .chars()
+                    .take(20)
+                    .collect::<String>()
+            ));
+        }
+    }
+
+    if !m.fabric_phase.is_empty() {
+        lines.push(format!(
+            "Fabric {} W{} C{}/{} X{}",
+            m.fabric_phase,
+            compact_counter(m.fabric_workers_active),
+            compact_counter(m.fabric_completed_total),
+            compact_counter(m.fabric_submitted_total),
+            compact_counter(
+                m.fabric_cancelled_total
+                    .saturating_add(m.fabric_stale_total)
+                    .saturating_add(m.fabric_deadline_misses_total)
+            ),
+        ));
+        lines.push(format!(
+            "Cost   cpu{:.2}% rss{}M p95{:.0}",
+            m.fabric_cpu_percent,
+            m.fabric_rss_delta_bytes / (1024 * 1024),
+            m.fabric_control_p95_baseline_ms,
+        ));
+        let ane = if m.coreml_ane_execution_measured {
+            "ok"
+        } else {
+            "?"
+        };
+        let ml_backend = match m.coreml_effective_backend.as_str() {
+            "cpu-and-neural-engine" => "cpu+ane",
+            "cpu-only" => "cpu",
+            "all" => "all",
+            "" => "unavailable",
+            other => other,
+        };
+        lines.push(format!(
+            "ML     {} E{}/{} ANE {}",
+            ml_backend,
+            compact_counter(m.fabric_evaluation_total),
+            compact_counter(m.fabric_eligible_total),
+            ane,
+        ));
+        if !m.temporal_prediction_backend.is_empty() {
+            lines.push(format!(
+                "Pred   {} {} p95{:.0}%",
+                m.temporal_prediction_backend
+                    .chars()
+                    .take(12)
+                    .collect::<String>(),
+                if m.temporal_prediction_authoritative {
+                    "active"
+                } else {
+                    "shadow"
+                },
+                m.temporal_prediction_p95 * 100.0,
+            ));
+        }
+        if !m.fabric_blocker.is_empty() {
+            lines.push(format!(
+                "       block {}",
+                m.fabric_blocker.chars().take(20).collect::<String>()
+            ));
+        }
+    }
+
+    if !m.microexperiment_phase.is_empty() {
+        lines.push(format!(
+            "Lab    {} would{} open{} Gold{}",
+            m.microexperiment_phase,
+            compact_counter(m.microexperiment_shadow_would_open_total),
+            compact_counter(m.microexperiment_open_pairs),
+            compact_counter(m.microexperiment_pair_gold_total),
+        ));
+        lines.push(format!(
+            "       eff{} harm{} q{}",
+            compact_counter(m.microexperiment_effective_total),
+            compact_counter(m.microexperiment_harmful_total),
+            compact_counter(m.microexperiment_synthetic_quarantined_total),
+        ));
+        if !m.microexperiment_blocker.is_empty()
+            && m.microexperiment_blocker != "shadow-observed"
+            && m.microexperiment_blocker != "no-candidates"
+        {
+            lines.push(format!(
+                "       block {}",
+                m.microexperiment_blocker
+                    .chars()
+                    .take(20)
+                    .collect::<String>()
+            ));
+        }
+    }
+
     // Local Gold outcomes are compiled into fast System 1 reflexes.
     lines.push(format!(
-        "Learn  G{} F{} S1+{}",
+        "Learn  Gold{} F{} S1+{}",
         compact_counter(m.system_deliberation_local_gold),
         m.system_deliberation_local_families,
         compact_counter(m.local_consolidation_system1_updates),
@@ -433,7 +632,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if m.world_model_context_bronze_total > 0 {
         lines.push(format!(
-            "Ctx    G{} S{} R{} q{:.0}%",
+            "Ctx-L  G{} S{} R{} q{:.0}%",
             format_number(m.world_model_context_gold_total),
             format_number(m.world_model_context_silver_total),
             format_number(m.world_model_context_rejected_total),
@@ -487,11 +686,16 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.acceleration_lease_io_promotions_total),
         ));
         lines.push(format!(
-            "       C{} G{} N{} renew{}",
+            "       C{} G{} renew{}",
             format_number(m.acceleration_lease_chromium_total),
             format_number(m.acceleration_lease_general_total),
-            format_number(m.acceleration_lease_nice_fallbacks_total),
             format_number(m.acceleration_lease_renewals_total),
+        ));
+        lines.push(format!(
+            "       qos{} nice{} skip{}",
+            format_number(m.acceleration_lease_task_qos_applied_total),
+            format_number(m.acceleration_lease_nice_fallbacks_total),
+            format_number(m.acceleration_lease_capability_skips_total),
         ));
         if !m.interaction_qos_ttl_band.is_empty() {
             lines.push(format!(
@@ -506,6 +710,45 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 format_number(m.interaction_qos_parameter_explorations_total),
             ));
         }
+    }
+    if !m.webflow_mode.is_empty() || m.webflow_proposed_total > 0 {
+        lines.push(format!(
+            "Web    {} N{} P{}/A{}",
+            if m.webflow_mode.is_empty() {
+                "unavailable"
+            } else {
+                m.webflow_mode.as_str()
+            },
+            m.webflow_active_navigations,
+            format_number(m.webflow_proposed_total),
+            format_number(m.webflow_admitted_total),
+        ));
+        if !m.webflow_phase.is_empty() {
+            lines.push(format!(
+                "       {} G{} {}",
+                m.webflow_phase,
+                format_number(m.webflow_valid_health_cycles),
+                if m.webflow_blocker.is_empty() {
+                    "ready"
+                } else {
+                    m.webflow_blocker.as_str()
+                },
+            ));
+        }
+    }
+    if m.network_flow_proposed_total > 0 || m.network_flow_active {
+        lines.push(format!(
+            "Net+   {} {:.1}MB/s P{} R{} X{}",
+            if m.network_flow_active {
+                "active"
+            } else {
+                "idle"
+            },
+            m.network_flow_traffic_bps as f64 / 1_000_000.0,
+            format_number(m.network_flow_proposed_total),
+            format_number(m.network_flow_renewed_total),
+            format_number(m.network_flow_suppressed_exact_total),
+        ));
     }
     let authority_phase = match m.world_model_context_authority_phase.as_str() {
         "calibrating" => "calibrating",
@@ -545,7 +788,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if m.world_model_utility_vetoes_total > 0 || m.world_model_utility_promotions_total > 0 {
         lines.push(format!(
-            "WM-U+  V{} P{}",
+            "WM-S   V{} rank{}",
             format_number(m.world_model_utility_vetoes_total),
             format_number(m.world_model_utility_promotions_total)
         ));
@@ -742,9 +985,20 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         } else {
             0.0
         };
+        let backend_health = if m.gpu_imagination_circuit_state.is_empty() {
+            m.gpu_imagination_backend.clone()
+        } else {
+            let circuit = match m.gpu_imagination_circuit_state.as_str() {
+                "closed" => "C",
+                "open" => "O",
+                "half-open" => "H",
+                _ => "?",
+            };
+            format!("{}/{}", m.gpu_imagination_backend, circuit)
+        };
         lines.push(format!(
             "GPU-I  {} J{} S{} t{:.2}ms",
-            m.gpu_imagination_backend,
+            backend_health,
             format_number(m.gpu_imagination_jobs_completed_total),
             format_number(m.gpu_imagination_samples_total),
             mean_gpu_ms
@@ -845,12 +1099,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     lines.push(format!(
         // This is the pressure-causal imagination model, not the universal
         // actuator-learning stream shown above as `Act` / `Act+`.
-        "Causal {}/{} ready G{} q{:.0}% P{}",
+        "Causal {}/{} ready G{} q{:.0}%",
         format_number(m.world_model_ready_actions),
         format_number(m.world_model_curated_actions),
         format_number(m.world_model_gold_evidence),
         m.world_model_data_quality * 100.0,
-        format_number(m.world_model_utility_promotions_total)
     ));
     if m.world_model_causal_actuator_gold_total > 0 {
         lines.push(format!(
@@ -902,11 +1155,16 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if !m.markov_prediction_app.is_empty() {
         let app: String = m.markov_prediction_app.chars().take(11).collect();
+        let timing = if m.markov_prediction_overdue_secs > 0.0 {
+            format!("stale{:.0}s", m.markov_prediction_overdue_secs)
+        } else {
+            format!("eta{:.0}s", m.markov_prediction_eta_secs)
+        };
         lines.push(format!(
-            "Mk-P   {} {:.0}% eta{:.0}s {}",
+            "Mk-P   {} {:.0}% {} {}",
             app,
             m.markov_prediction_confidence * 100.0,
-            m.markov_prediction_eta_secs,
+            timing,
             if m.markov_prewarm_blocker.is_empty() {
                 m.markov_prewarm_admission.as_str()
             } else {
@@ -1248,12 +1506,14 @@ fn render_chromium_band(status: &DaemonStatus) -> Vec<String> {
         return Vec::new();
     }
     let mut lines = vec![bold("🌳 CHROMIUM")];
+    let freeze = if m.chromium_gate_regime == "disabled" {
+        "off".to_string()
+    } else {
+        m.chromium_renderers_frozen.to_string()
+    };
     lines.push(format!(
-        "renderers={} frozen={} e-core={} freed={:.0}MB",
-        m.chromium_renderers_total,
-        m.chromium_renderers_frozen,
-        m.chromium_renderers_ecore,
-        m.chromium_freed_mb
+        "renderers={} freeze={} e-core={} freed={:.0}MB",
+        m.chromium_renderers_total, freeze, m.chromium_renderers_ecore, m.chromium_freed_mb
     ));
     if !m.chromium_browsers_managed.is_empty() {
         let apps = m.chromium_browsers_managed.join(", ");
@@ -1328,7 +1588,19 @@ fn render_learning_band(status: &DaemonStatus) -> Vec<String> {
     let primary = if metrics.unified_learning_schema_version == 0 {
         "Learn  legacy metrics; unified evidence unavailable".to_string()
     } else if trust.degraded > 0 {
-        format!("Learn  degraded {}; ranking stays advisory", trust.degraded)
+        if trust.recovery_target_gold > 0 {
+            format!(
+                "Learn  relearning {} models; best Gold {}/{} + quality",
+                trust.degraded, trust.recovery_best_gold, trust.recovery_target_gold
+            )
+        } else {
+            format!("Learn  relearning {} models; Gold {}", trust.degraded, gold)
+        }
+    } else if trust.trusted == 0 && metrics.world_model_actuator_ready_models > 0 {
+        format!(
+            "Learn  WM ready {}; unified Gold {}",
+            metrics.world_model_actuator_ready_models, gold
+        )
     } else if gold == 0 {
         "Learn  no local Gold evidence yet".to_string()
     } else if gold < 10 {
@@ -1364,6 +1636,8 @@ fn render_learning_band(status: &DaemonStatus) -> Vec<String> {
     let latest = &metrics.latest_resolved_episode;
     let latest = if !latest.present {
         "Latest none yet".to_string()
+    } else if latest.measured_utility.is_none() {
+        format!("Latest {} evaluated; no measurement", latest.action)
     } else {
         format!(
             "Latest {} expected {} measured {} {}/{}",
@@ -1567,7 +1841,13 @@ mod tests {
         status.metrics.trust_inventory.trusted = 4;
         assert_eq!(
             render_learning_band(&status)[0],
-            "Learn  degraded 2; ranking stays advisory"
+            "Learn  relearning 2 models; Gold 9"
+        );
+        status.metrics.trust_inventory.recovery_best_gold = 3;
+        status.metrics.trust_inventory.recovery_target_gold = 10;
+        assert_eq!(
+            render_learning_band(&status)[0],
+            "Learn  relearning 2 models; best Gold 3/10 + quality"
         );
     }
 
@@ -1607,6 +1887,36 @@ mod tests {
         assert_eq!(
             lines[0],
             "Learn  trusted 1 active 1 closure -- cal 88% causal 77%"
+        );
+        assert!(lines.iter().all(|line| display_width(line) <= CW));
+    }
+
+    #[test]
+    fn unified_learning_band_keeps_ready_world_model_visible_while_unified_calibrates() {
+        let mut status = dashboard_status();
+        status.metrics.unified_learning_schema_version = 2;
+        status.metrics.world_model_actuator_ready_models = 18;
+
+        let lines = render_learning_band(&status);
+
+        assert_eq!(lines[0], "Learn  WM ready 18; unified Gold 0");
+        assert!(lines.iter().all(|line| display_width(line) <= CW));
+    }
+
+    #[test]
+    fn unified_learning_band_labels_unmeasured_ledger_event_as_evaluation() {
+        let mut status = dashboard_status();
+        status.metrics.unified_learning_schema_version = 2;
+        status.metrics.latest_resolved_episode.present = true;
+        status.metrics.latest_resolved_episode.action = "predictive_purge:maintenance".into();
+        status.metrics.latest_resolved_episode.tier = "ledger".into();
+        status.metrics.latest_resolved_episode.scope = "local".into();
+
+        let lines = render_learning_band(&status);
+
+        assert_eq!(
+            lines[2],
+            "Latest predictive_purge:maintenance evaluated; no measurement"
         );
         assert!(lines.iter().all(|line| display_width(line) <= CW));
     }
@@ -1688,7 +1998,7 @@ mod tests {
 
         assert!(render_header_v2(&status)[0].contains("c-p95 37ms"));
         let sense = render_sense_q(&status);
-        assert!(sense.iter().any(|line| line == "UX     responsive 18%"));
+        assert!(sense.iter().any(|line| line == "UX-p   responsive 18%"));
         assert!(sense.iter().any(|line| line == "Sched  p95 0.12ms n42"));
         let act = render_act_q(&status);
         assert!(act.iter().any(|line| line == "Ep#7 gold q94%"));
@@ -1703,6 +2013,20 @@ mod tests {
         assert!(render_act_q(&status)
             .iter()
             .all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn markov_prediction_labels_expired_timing_as_stale() {
+        let mut status = dashboard_status();
+        status.metrics.markov_prediction_app = "Alacritty".to_string();
+        status.metrics.markov_prediction_confidence = 0.53;
+        status.metrics.markov_prediction_eta_secs = 0.0;
+        status.metrics.markov_prediction_overdue_secs = 333.0;
+        status.metrics.markov_prewarm_blocker = "confidence".to_string();
+
+        assert!(render_think_q(&status)
+            .iter()
+            .any(|line| line == "Mk-P   Alacritty 53% stale333s confidence"));
     }
 
     #[test]
@@ -1725,6 +2049,82 @@ mod tests {
             .iter()
             .any(|line| line == "WM wait immature4 uncertain2"));
         assert!(think.iter().any(|line| line == "Mk-H 5s5 30s25 2m70 10m80"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_reports_fabric_work_separately_from_verified_ane_use() {
+        let mut status = dashboard_status();
+        status.metrics.fabric_phase = "shadow".to_string();
+        status.metrics.fabric_workers_active = 3;
+        status.metrics.fabric_completed_total = 12;
+        status.metrics.fabric_submitted_total = 14;
+        status.metrics.fabric_cancelled_total = 1;
+        status.metrics.coreml_effective_backend = "cpu-and-neural-engine".to_string();
+        status.metrics.fabric_evaluation_total = 8;
+        status.metrics.fabric_eligible_total = 10;
+        status.metrics.coreml_ane_execution_measured = false;
+        status.metrics.temporal_prediction_backend = "cpu-utility".to_string();
+        status.metrics.temporal_prediction_p95 = 0.42;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "Fabric shadow W3 C12/14 X1"));
+        assert!(think
+            .iter()
+            .any(|line| line == "ML     cpu+ane E8/10 ANE ?"));
+        assert!(think
+            .iter()
+            .any(|line| line == "Pred   cpu-utility shadow p9542%"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_separates_reflex_actions_model_support_and_parallel_profiles() {
+        let mut status = dashboard_status();
+        status.metrics.reflex_enabled = true;
+        status.metrics.reflex_phase = "shadow".to_string();
+        status.metrics.reflex_blocker = "warming-up".to_string();
+        status.metrics.reflex_valid_cycles = 123;
+        status.metrics.reflex_shadow_cycles = 500;
+        status.metrics.reflex_proposed_total = 9;
+        status.metrics.reflex_admitted_total = 3;
+        status.metrics.reflex_applied_total = 2;
+        status.metrics.reflex_shadowed_total = 6;
+        status.metrics.reflex_omitted_total = 4;
+        status.metrics.reflex_noop_total = 2;
+        status.metrics.reflex_vetoed_total = 1;
+        status.metrics.reflex_reverted_total = 1;
+        status.metrics.reflex_failed_total = 0;
+        status.metrics.reflex_last_decision_latency_us = 7;
+        status.metrics.reflex_reasoning_submitted_total = 5;
+        status.metrics.reflex_reasoning_completed_total = 4;
+        status.metrics.reflex_reasoning_dropped_total = 1;
+        status.metrics.reflex_reasoning_last_result_age_cycles = 2;
+        status.metrics.reflex_reasoning_last_latency_us = 39;
+        status.metrics.parallel_expected_profile = "adaptive-multicore".to_string();
+        status.metrics.parallel_compiled_profile = "adaptive-multicore".to_string();
+        status.metrics.parallel_effective_profile = "adaptive-multicore".to_string();
+        status.metrics.parallel_worker_threads = 4;
+        status.metrics.parallel_max_worker_threads = 4;
+        status.metrics.parallel_worker_qos_intent = "utility".to_string();
+        status.metrics.parallel_worker_qos_status = "ok".to_string();
+        status.metrics.world_model_utility_promotions_total = 3;
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line == "Reflex shadow 123/500"));
+        assert!(think.iter().any(|line| line == "R-act  P9 A3 real2 sh6"));
+        assert!(think.iter().any(|line| line == "       O4 no2 V1 R1 F0"));
+        assert!(think.iter().any(|line| line == "       fast 7us"));
+        assert!(think.iter().any(|line| line == "R-deep W4/5 d1 age2 39us"));
+        assert!(think
+            .iter()
+            .any(|line| line == "CPU-P  exp multi build multi"));
+        assert!(think
+            .iter()
+            .any(|line| line == "       eff multi W4/4 utility ok"));
+        assert!(think.iter().any(|line| line == "WM-S   V0 rank3"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -1900,14 +2300,14 @@ mod tests {
         assert!(think.iter().any(|line| line == "Data   G 198/200 q99%"));
         assert!(think
             .iter()
-            .any(|line| line == "Causal 2/3 ready G127 q100% P3"));
+            .any(|line| line == "Causal 2/3 ready G127 q100%"));
         assert!(think.iter().any(|line| line == "Caus+  U42 universal Gold"));
-        assert!(think.iter().any(|line| line == "Ctx    G490 S7 R3 q98%"));
+        assert!(think.iter().any(|line| line == "Ctx-L  G490 S7 R3 q98%"));
         assert!(think.iter().any(|line| line == "Act    G 8/10 P2 q94%"));
         assert!(think.iter().any(|line| line == "Act+   boost G5/6"));
         assert!(think.iter().any(|line| line == "       eff 4/6 u+3%"));
         assert!(think.iter().any(|line| line == "WM-U   calibrating 2/7"));
-        assert!(think.iter().any(|line| line == "WM-U+  V0 P3"));
+        assert!(think.iter().any(|line| line == "WM-S   V0 rank3"));
         assert!(think.iter().any(|line| line == "CF     R3/4 H2 rank7"));
         assert!(think.iter().any(|line| line == "WM-E   M23 F6 rank9"));
         assert!(think.iter().any(|line| line == "WM-X   K12 Q8 O5 P42 C4"));
@@ -1964,6 +2364,43 @@ mod tests {
             .iter()
             .any(|line| line == "GPU-I  metal J0 S0 t0.00ms"));
         assert!(think.iter().any(|line| line == "GPU-G  no-candidates"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn think_quadrant_separates_exact_web_from_universal_network_flow() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "lifecycle".to_string();
+        status.metrics.webflow_active_navigations = 1;
+        status.metrics.webflow_proposed_total = 12;
+        status.metrics.webflow_admitted_total = 4;
+        status.metrics.network_flow_active = true;
+        status.metrics.network_flow_traffic_bps = 2_400_000;
+        status.metrics.network_flow_proposed_total = 8;
+        status.metrics.network_flow_renewed_total = 6;
+        status.metrics.network_flow_suppressed_exact_total = 3;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "Web    lifecycle N1 P12/A4"));
+        assert!(think
+            .iter()
+            .any(|line| line == "Net+   active 2.4MB/s P8 R6 X3"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn think_quadrant_exposes_the_metal_circuit_breaker_state() {
+        let mut status = dashboard_status();
+        status.metrics.gpu_imagination_backend = "metal".to_string();
+        status.metrics.gpu_imagination_circuit_state = "half-open".to_string();
+
+        let think = render_think_q(&status);
+
+        assert!(think
+            .iter()
+            .any(|line| line == "GPU-I  metal/H J0 S0 t0.00ms"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

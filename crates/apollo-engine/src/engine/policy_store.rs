@@ -17,6 +17,39 @@ use crate::engine::types::HardPath;
 pub struct RepoConfig {
     #[serde(default)]
     pub history: Option<crate::engine::daemon_metrics_history::HistoryConfig>,
+    #[serde(default)]
+    pub reflex: ReflexConfig,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReflexConfig {
+    #[serde(default = "default_reflex_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_reflex_shadow_cycles")]
+    pub shadow_cycles: u64,
+}
+
+impl Default for ReflexConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_reflex_enabled(),
+            shadow_cycles: default_reflex_shadow_cycles(),
+        }
+    }
+}
+
+impl ReflexConfig {
+    pub fn effective_shadow_cycles(&self) -> u64 {
+        self.shadow_cycles.max(500)
+    }
+}
+
+fn default_reflex_enabled() -> bool {
+    true
+}
+
+fn default_reflex_shadow_cycles() -> u64 {
+    500
 }
 
 pub fn load_repo_config(path: &Path) -> RepoConfig {
@@ -272,5 +305,23 @@ enabled = false
         assert!(!json.contains("prompt"));
         let restored: LearnedPolicy = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(restored.interactive_patterns.as_slice(), ["Editor"]);
+    }
+
+    #[test]
+    fn reflex_config_defaults_on_and_bounds_shadow_window() {
+        let legacy: RepoConfig = toml::from_str("").expect("legacy config");
+        assert!(legacy.reflex.enabled);
+        assert_eq!(legacy.reflex.shadow_cycles, 500);
+
+        let configured: RepoConfig = toml::from_str(
+            r#"
+[reflex]
+enabled = false
+shadow_cycles = 3
+"#,
+        )
+        .expect("reflex config");
+        assert!(!configured.reflex.enabled);
+        assert_eq!(configured.reflex.effective_shadow_cycles(), 500);
     }
 }

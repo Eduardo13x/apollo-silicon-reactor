@@ -1,8 +1,14 @@
 #!/bin/sh
 # Root-owned, fixed-path deployer and rollback helper for Apollo release binaries.
+#
+# SECURITY: this helper installs code as root. A sudoers NOPASSWD rule that
+# permits arbitrary invocation is equivalent to granting root code execution;
+# the project must never recommend or require such a rule. The caller crosses
+# the trust boundary with normal `sudo`, which may prompt for authentication.
 set -eu
 
 LABEL=system/com.eduardocortez.systemoptimizerd
+CONTEXT_LABEL=com.eduardocortez.apollo-context-agent
 MAX_LEARNED_STATE_SCHEMA=2
 TEST_ROOT=${APOLLO_DEPLOY_TEST_ROOT:-}
 
@@ -24,17 +30,27 @@ fi
 path() { printf '%s%s\n' "$ROOT" "$1"; }
 DAEMON_CANDIDATE=$(path /private/tmp/apollo-optimizerd-candidate)
 CTL_CANDIDATE=$(path /private/tmp/apollo-optimizerctl-candidate)
+AGENT_CANDIDATE=$(path /private/tmp/apollo-context-agent-candidate)
+WEB_BRIDGE_CANDIDATE=$(path /private/tmp/apollo-web-bridge-candidate)
+MODEL_CANDIDATE=$(path /private/tmp/apollo-temporal-v1.mlmodel-candidate)
+AGENT_PLIST_CANDIDATE=$(path /private/tmp/com.eduardocortez.apollo-context-agent.plist-candidate)
 DAEMON_DEST=$(path /usr/local/libexec/apollo-optimizerd)
 CTL_DEST=$(path /usr/local/bin/apollo-optimizerctl)
+AGENT_DEST=$(path /usr/local/libexec/apollo-context-agent)
+WEB_BRIDGE_DEST=$(path /usr/local/libexec/apollo-web-bridge)
+MODEL_DEST=$(path /usr/local/share/apollo/models/apollo-temporal-v1.mlmodel)
+AGENT_PLIST=$(path /Library/LaunchAgents/com.eduardocortez.apollo-context-agent.plist)
 STATE_DIR=$(path /var/lib/apollo)
 BACKUPS_DIR="$STATE_DIR/backups"
 STATE="$STATE_DIR/learned_state.json"
 STATE_PREVIOUS="$STATE_DIR/learned_state.json.previous"
 PLIST=$(path /Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist)
 CTL_STATUS="$CTL_DEST"
+TRANSACTION_PHASE=idle
+TRANSACTION_COPY_COUNT=0
 
 usage() {
-    echo "usage: apollo-deploy [deploy|rollback BACKUP_DIR]" >&2
+    echo "usage: apollo-deploy deploy DAEMON_SHA CTL_SHA AGENT_SHA WEB_BRIDGE_SHA MODEL_SHA PLIST_SHA | rollback BACKUP_DIR" >&2
     exit 64
 }
 
@@ -77,19 +93,58 @@ assert_candidate() {
     verify_signature "$1" || { echo "invalid candidate signature: $1" >&2; exit 65; }
 }
 
+assert_regular_candidate() {
+    regular "$1" || { echo "invalid candidate: $1" >&2; exit 65; }
+}
+
+assert_expected_hash() {
+    file="$1"; expected="$2"; label="$3"
+    [ "${#expected}" -eq 64 ] \
+        || { echo "invalid expected hash for $label" >&2; exit 64; }
+    case "$expected" in
+        *[!0-9a-fA-F]*) echo "invalid expected hash for $label" >&2; exit 64 ;;
+    esac
+    [ "$(sha256 "$file")" = "$(printf '%s' "$expected" | /usr/bin/tr 'A-F' 'a-f')" ] \
+        || { echo "$label candidate hash mismatch" >&2; exit 65; }
+}
+
 copy_atomic() {
     src="$1"
     dst="$2"
     mode="$3"
+    expected_hash="${4:-}"
     tmp="${dst}.apollo-new.$$"
     /bin/rm -f "$tmp"
-    if [ "$TEST_MODE" -eq 1 ]; then
-        /bin/cp "$src" "$tmp"
-        /bin/chmod "$mode" "$tmp"
-    else
-        /usr/bin/install -o root -g wheel -m "$mode" "$src" "$tmp"
+    if [ "$TEST_MODE" -eq 1 ] && [ "$TRANSACTION_PHASE" = deploy ]; then
+        fail_after=0
+        if regular "$ROOT/fail-copy-after"; then
+            fail_after=$(/bin/cat "$ROOT/fail-copy-after")
+            case "$fail_after" in ''|*[!0-9]*) return 1 ;; esac
+        fi
+        TRANSACTION_COPY_COUNT=$((TRANSACTION_COPY_COUNT + 1))
+        if [ "$fail_after" -gt 0 ] && [ "$TRANSACTION_COPY_COUNT" -eq "$fail_after" ]; then
+            echo "injected mid-copy failure at copy $TRANSACTION_COPY_COUNT" >&2
+            return 1
+        fi
     fi
-    /bin/mv -f "$tmp" "$dst"
+    if [ "$TEST_MODE" -eq 1 ]; then
+        /bin/cp "$src" "$tmp" || { /bin/rm -f "$tmp"; return 1; }
+        /bin/chmod "$mode" "$tmp" || { /bin/rm -f "$tmp"; return 1; }
+    else
+        /usr/bin/install -o root -g wheel -m "$mode" "$src" "$tmp" || {
+            /bin/rm -f "$tmp"
+            return 1
+        }
+    fi
+    if [ -n "$expected_hash" ]; then
+        expected_hash=$(printf '%s' "$expected_hash" | /usr/bin/tr 'A-F' 'a-f')
+    fi
+    if [ -n "$expected_hash" ] && [ "$(sha256 "$tmp")" != "$expected_hash" ]; then
+        /bin/rm -f "$tmp"
+        echo "atomic copy hash mismatch: $src" >&2
+        return 65
+    fi
+    /bin/mv -f "$tmp" "$dst" || { /bin/rm -f "$tmp"; return 1; }
 }
 
 copy_optional_state() {
@@ -98,19 +153,42 @@ copy_optional_state() {
     if regular "$src"; then
         tmp="${dst}.apollo-new.$$"
         /bin/rm -f "$tmp"
-        /bin/cp -p "$src" "$tmp"
-        /bin/mv -f "$tmp" "$dst"
+        /bin/cp -p "$src" "$tmp" || return 1
+        /bin/mv -f "$tmp" "$dst" || return 1
     else
-        /bin/rm -f "$dst"
+        /bin/rm -f "$dst" || return 1
+    fi
+}
+
+backup_existing() {
+    src="$1"
+    dst="$2"
+    if regular "$src"; then
+        /bin/cp -p "$src" "$dst" || return 1
     fi
 }
 
 service_bootout() {
-    [ "$TEST_MODE" -eq 1 ] || /bin/launchctl bootout "$LABEL" 2>/dev/null || true
+    if [ "$TEST_MODE" -eq 1 ]; then
+        return 0
+    fi
+    context_uid=$(/usr/bin/stat -f %u /dev/console 2>/dev/null || true)
+    case "$context_uid" in ''|0|*[!0-9]*) ;; *)
+        /bin/launchctl bootout "gui/$context_uid/$CONTEXT_LABEL" 2>/dev/null || true
+        ;;
+    esac
+    /bin/launchctl bootout "$LABEL" 2>/dev/null || true
 }
 
 service_bootstrap() {
     if [ "$TEST_MODE" -eq 1 ]; then
+        attempts_file="$ROOT/service-bootstrap-attempts"
+        attempts=0
+        if regular "$attempts_file"; then
+            attempts=$(/bin/cat "$attempts_file")
+            case "$attempts" in ''|*[!0-9]*) return 1 ;; esac
+        fi
+        echo $((attempts + 1)) > "$attempts_file" || return 1
         [ ! -e "$ROOT/fail-bootstrap" ]
     else
         attempt=1
@@ -120,6 +198,23 @@ service_bootstrap() {
             /bin/sleep 2
         done
     fi
+}
+
+context_service_bootstrap() {
+    if [ "$TEST_MODE" -eq 1 ]; then
+        [ ! -e "$ROOT/fail-context-bootstrap" ]
+        return
+    fi
+    context_uid=$(/usr/bin/stat -f %u /dev/console 2>/dev/null || true)
+    case "$context_uid" in
+        ''|0|*[!0-9]*)
+            echo "no active console user; context agent will start at the next login" >&2
+            return 0
+            ;;
+    esac
+    /bin/launchctl bootstrap "gui/$context_uid" "$AGENT_PLIST" 2>/dev/null \
+        || /bin/launchctl kickstart -k "gui/$context_uid/$CONTEXT_LABEL"
+    /bin/launchctl print "gui/$context_uid/$CONTEXT_LABEL" >/dev/null 2>&1
 }
 
 verify_runtime_once() {
@@ -163,16 +258,31 @@ manifest_value() {
 backup_dir_valid() {
     backup="$1"
     case "$backup" in "$BACKUPS_DIR"/deploy-*) ;; *) return 1 ;; esac
+    leaf=${backup#"$BACKUPS_DIR"/}
+    # The rollback target must be one direct helper-created child. This rejects
+    # traversal before physical canonicalization while still accepting the
+    # macOS /var -> /private/var alias used by the helper's own output.
+    case "$leaf" in
+        deploy-*) ;;
+        *) return 1 ;;
+    esac
+    case "$leaf" in
+        *[!A-Za-z0-9_-]*|*/*|*..*) return 1 ;;
+    esac
     [ -d "$backup" ] && [ ! -L "$backup" ] && regular "$backup/manifest" || return 1
     canonical_backups=$(cd "$BACKUPS_DIR" 2>/dev/null && /bin/pwd -P) || return 1
     canonical_backup=$(cd "$backup" 2>/dev/null && /bin/pwd -P) || return 1
     # Reject traversal spelling and symlinks in any intermediate component.
     # The rollback directory must be a direct physical child of the fixed
     # backup root created by this helper, never merely textually prefixed.
-    [ "$backup" = "$canonical_backup" ] || return 1
     case "$canonical_backup" in "$canonical_backups"/deploy-*) ;; *) return 1 ;; esac
+    [ "${canonical_backup#"$canonical_backups"/}" = "$leaf" ] || return 1
     [ "$TEST_MODE" -eq 1 ] || [ "$(/usr/bin/stat -f %u "$backup")" = 0 ] || return 1
-    [ "$(manifest_value "$backup/manifest" format)" = "apollo-deploy-v1" ] || return 1
+    [ "$(manifest_value "$backup/manifest" format)" = "apollo-deploy-v2" ] || return 1
+}
+
+hash_or_absent() {
+    if regular "$1"; then sha256 "$1"; else echo absent; fi
 }
 
 write_manifest() {
@@ -182,48 +292,155 @@ write_manifest() {
     regular "$STATE" && state_hash=$(sha256 "$STATE")
     regular "$STATE_PREVIOUS" && previous_hash=$(sha256 "$STATE_PREVIOUS")
     {
-        echo "format=apollo-deploy-v1"
+        echo "format=apollo-deploy-v2"
         echo "created_utc=$(/bin/date -u +%Y-%m-%dT%H:%M:%SZ)"
         echo "label=$LABEL"
         echo "daemon_candidate_sha256=$(sha256 "$DAEMON_CANDIDATE")"
         echo "ctl_candidate_sha256=$(sha256 "$CTL_CANDIDATE")"
+        echo "agent_candidate_sha256=$(sha256 "$AGENT_CANDIDATE")"
+        echo "web_bridge_candidate_sha256=$(sha256 "$WEB_BRIDGE_CANDIDATE")"
+        echo "model_candidate_sha256=$(sha256 "$MODEL_CANDIDATE")"
+        echo "agent_plist_candidate_sha256=$(sha256 "$AGENT_PLIST_CANDIDATE")"
         echo "daemon_installed_sha256=$(sha256 "$DAEMON_DEST")"
         echo "ctl_installed_sha256=$(sha256 "$CTL_DEST")"
+        echo "agent_installed_sha256=$(hash_or_absent "$AGENT_DEST")"
+        echo "web_bridge_installed_sha256=$(hash_or_absent "$WEB_BRIDGE_DEST")"
+        echo "model_installed_sha256=$(hash_or_absent "$MODEL_DEST")"
+        echo "agent_plist_installed_sha256=$(hash_or_absent "$AGENT_PLIST")"
         echo "daemon_owner_mode=$(owner_mode "$DAEMON_DEST")"
         echo "ctl_owner_mode=$(owner_mode "$CTL_DEST")"
         echo "learned_state_sha256=$state_hash"
         echo "learned_state_schema=$(state_schema "$STATE")"
         echo "learned_state_previous_sha256=$previous_hash"
         echo "learned_state_previous_schema=$(state_schema "$STATE_PREVIOUS")"
-    } > "$backup/manifest"
-    /bin/chmod 0600 "$backup/manifest"
+    } > "$backup/manifest.apollo-new.$$" || return 1
+    /bin/chmod 0600 "$backup/manifest.apollo-new.$$" || return 1
+    /bin/mv -f "$backup/manifest.apollo-new.$$" "$backup/manifest" || return 1
+}
+
+restore_artifact() {
+    src="$1"
+    dst="$2"
+    mode="$3"
+    if regular "$src"; then
+        copy_atomic "$src" "$dst" "$mode"
+    else
+        /bin/rm -f "$dst"
+    fi
+}
+
+restore_from_backup() {
+    TRANSACTION_PHASE=restore
+    TRANSACTION_COPY_COUNT=0
+    restore_status=0
+
+    service_bootout || restore_status=1
+    restore_artifact "$backup/apollo-optimizerd" "$DAEMON_DEST" 0755 || restore_status=1
+    restore_artifact "$backup/apollo-optimizerctl" "$CTL_DEST" 0755 || restore_status=1
+    restore_artifact "$backup/apollo-context-agent" "$AGENT_DEST" 0755 || restore_status=1
+    restore_artifact "$backup/apollo-web-bridge" "$WEB_BRIDGE_DEST" 0755 || restore_status=1
+    restore_artifact "$backup/apollo-temporal-v1.mlmodel" "$MODEL_DEST" 0644 || restore_status=1
+    restore_artifact "$backup/com.eduardocortez.apollo-context-agent.plist" "$AGENT_PLIST" 0644 || restore_status=1
+    copy_optional_state "$backup/learned_state.json" "$STATE" || restore_status=1
+    copy_optional_state "$backup/learned_state.json.previous" "$STATE_PREVIOUS" || restore_status=1
+
+    # Restart is attempted even when one restoration copy failed, so a
+    # transient install error does not leave the machine intentionally down.
+    service_bootstrap || restore_status=1
+    if regular "$AGENT_PLIST"; then
+        context_service_bootstrap || restore_status=1
+    fi
+    verify_runtime || restore_status=1
+    TRANSACTION_PHASE=idle
+    return "$restore_status"
+}
+
+transaction_failure() {
+    # Normalize copy/install/service failures to the deploy transaction code so
+    # callers do not mistake a partial-install status for a preflight reject.
+    failure_status=70
+    # The backup was complete before the transaction began. Always publish its
+    # fixed, rollback-valid path before attempting restoration.
+    echo "APOLLO_BACKUP_PATH=$backup" >&2
+    if restore_from_backup; then
+        echo "deploy failed; previous release restored and service restart attempted" >&2
+    else
+        echo "deploy failed; restoration was incomplete; service restart was attempted" >&2
+        failure_status=70
+    fi
+    echo "deploy failed; rollback: $0 rollback $backup" >&2
+    return "$failure_status"
+}
+
+install_release() {
+    TRANSACTION_PHASE=deploy
+    TRANSACTION_COPY_COUNT=0
+    copy_atomic "$DAEMON_CANDIDATE" "$DAEMON_DEST" 0755 "$daemon_sha" || return 1
+    copy_atomic "$CTL_CANDIDATE" "$CTL_DEST" 0755 "$ctl_sha" || return 1
+    copy_atomic "$AGENT_CANDIDATE" "$AGENT_DEST" 0755 "$agent_sha" || return 1
+    copy_atomic "$WEB_BRIDGE_CANDIDATE" "$WEB_BRIDGE_DEST" 0755 "$web_bridge_sha" || return 1
+    copy_atomic "$MODEL_CANDIDATE" "$MODEL_DEST" 0644 "$model_sha" || return 1
+    copy_atomic "$AGENT_PLIST_CANDIDATE" "$AGENT_PLIST" 0644 "$plist_sha" || return 1
+    TRANSACTION_PHASE=idle
 }
 
 deploy() {
+    [ "$#" -eq 6 ] || usage
+    daemon_sha="$1"; ctl_sha="$2"; agent_sha="$3"; web_bridge_sha="$4"; model_sha="$5"; plist_sha="$6"
     assert_candidate "$DAEMON_CANDIDATE"
     assert_candidate "$CTL_CANDIDATE"
+    assert_candidate "$AGENT_CANDIDATE"
+    assert_candidate "$WEB_BRIDGE_CANDIDATE"
+    assert_regular_candidate "$MODEL_CANDIDATE"
+    assert_regular_candidate "$AGENT_PLIST_CANDIDATE"
+    assert_expected_hash "$DAEMON_CANDIDATE" "$daemon_sha" daemon
+    assert_expected_hash "$CTL_CANDIDATE" "$ctl_sha" ctl
+    assert_expected_hash "$AGENT_CANDIDATE" "$agent_sha" agent
+    assert_expected_hash "$WEB_BRIDGE_CANDIDATE" "$web_bridge_sha" web-bridge
+    assert_expected_hash "$MODEL_CANDIDATE" "$model_sha" model
+    assert_expected_hash "$AGENT_PLIST_CANDIDATE" "$plist_sha" agent-plist
     executable_regular "$DAEMON_DEST" || { echo "installed daemon missing" >&2; exit 66; }
     executable_regular "$CTL_DEST" || { echo "installed ctl missing" >&2; exit 66; }
     assert_supported_state "$STATE"
     assert_supported_state "$STATE_PREVIOUS"
     /bin/mkdir -p "$BACKUPS_DIR"
+    /bin/mkdir -p "$(/usr/bin/dirname "$MODEL_DEST")" "$(/usr/bin/dirname "$AGENT_PLIST")"
     backup="$BACKUPS_DIR/deploy-$(/bin/date -u +%Y%m%dT%H%M%SZ)-$$"
     (umask 077 && /bin/mkdir "$backup")
-    /bin/cp -p "$DAEMON_DEST" "$backup/apollo-optimizerd"
-    /bin/cp -p "$CTL_DEST" "$backup/apollo-optimizerctl"
-    regular "$STATE" && /bin/cp -p "$STATE" "$backup/learned_state.json" || true
-    regular "$STATE_PREVIOUS" && /bin/cp -p "$STATE_PREVIOUS" "$backup/learned_state.json.previous" || true
-    write_manifest "$backup"
-    service_bootout
-    copy_atomic "$DAEMON_CANDIDATE" "$DAEMON_DEST" 0755
-    copy_atomic "$CTL_CANDIDATE" "$CTL_DEST" 0755
-    if ! service_bootstrap || ! verify_runtime; then
+    if backup_existing "$DAEMON_DEST" "$backup/apollo-optimizerd" \
+        && backup_existing "$CTL_DEST" "$backup/apollo-optimizerctl" \
+        && backup_existing "$AGENT_DEST" "$backup/apollo-context-agent" \
+        && backup_existing "$WEB_BRIDGE_DEST" "$backup/apollo-web-bridge" \
+        && backup_existing "$MODEL_DEST" "$backup/apollo-temporal-v1.mlmodel" \
+        && backup_existing "$AGENT_PLIST" "$backup/com.eduardocortez.apollo-context-agent.plist" \
+        && backup_existing "$STATE" "$backup/learned_state.json" \
+        && backup_existing "$STATE_PREVIOUS" "$backup/learned_state.json.previous"; then
+        :
+    else
         echo "APOLLO_BACKUP_PATH=$backup" >&2
-        echo "deploy failed; rollback: $0 rollback $backup" >&2
+        echo "backup creation failed; no release was installed" >&2
         exit 70
     fi
-    echo "APOLLO_BACKUP_PATH=$backup"
-    echo "Apollo deployed; backup: $backup"
+    if write_manifest "$backup"; then
+        :
+    else
+        echo "APOLLO_BACKUP_PATH=$backup" >&2
+        echo "backup manifest creation failed; no release was installed" >&2
+        exit 70
+    fi
+    service_bootout
+    if install_release && service_bootstrap && context_service_bootstrap && verify_runtime; then
+        echo "APOLLO_BACKUP_PATH=$backup"
+        echo "Apollo deployed; backup: $backup"
+    else
+        failure_status=$?
+        if transaction_failure "$failure_status"; then
+            exit 70
+        else
+            failure_status=$?
+            exit "$failure_status"
+        fi
+    fi
 }
 
 rollback() {
@@ -238,6 +455,23 @@ rollback() {
     [ "$(manifest_value "$backup/manifest" ctl_installed_sha256)" = "$(sha256 "$backup/apollo-optimizerctl")" ] || {
         echo "ctl backup hash mismatch" >&2; exit 65;
     }
+    verify_optional_backup() {
+        key="$1"; file="$2"
+        expected=$(manifest_value "$backup/manifest" "$key")
+        if [ "$expected" = absent ]; then
+            [ ! -e "$backup/$file" ] || return 1
+        else
+            regular "$backup/$file" && [ "$expected" = "$(sha256 "$backup/$file")" ]
+        fi
+    }
+    verify_optional_backup agent_installed_sha256 apollo-context-agent \
+        || { echo "agent backup hash mismatch" >&2; exit 65; }
+    verify_optional_backup web_bridge_installed_sha256 apollo-web-bridge \
+        || { echo "web bridge backup hash mismatch" >&2; exit 65; }
+    verify_optional_backup model_installed_sha256 apollo-temporal-v1.mlmodel \
+        || { echo "model backup hash mismatch" >&2; exit 65; }
+    verify_optional_backup agent_plist_installed_sha256 com.eduardocortez.apollo-context-agent.plist \
+        || { echo "agent plist backup hash mismatch" >&2; exit 65; }
     if regular "$backup/learned_state.json"; then
         [ "$(manifest_value "$backup/manifest" learned_state_sha256)" = "$(sha256 "$backup/learned_state.json")" ] || {
             echo "state backup hash mismatch" >&2; exit 65;
@@ -250,20 +484,16 @@ rollback() {
         }
         assert_supported_state "$backup/learned_state.json.previous"
     fi
-    service_bootout
-    copy_atomic "$backup/apollo-optimizerd" "$DAEMON_DEST" 0755
-    copy_atomic "$backup/apollo-optimizerctl" "$CTL_DEST" 0755
-    copy_optional_state "$backup/learned_state.json" "$STATE"
-    copy_optional_state "$backup/learned_state.json.previous" "$STATE_PREVIOUS"
-    if ! service_bootstrap || ! verify_runtime; then
-        echo "rollback failed" >&2
+    if ! restore_from_backup; then
+        echo "APOLLO_BACKUP_PATH=$backup" >&2
+        echo "rollback failed; service restart was attempted" >&2
         exit 70
     fi
     echo "Apollo rollback complete: $backup"
 }
 
-case "${1:-deploy}" in
-    deploy) [ "$#" -le 1 ] || usage; deploy ;;
+case "${1:-}" in
+    deploy) shift; deploy "$@" ;;
     rollback) shift; rollback "$@" ;;
     *) usage ;;
 esac

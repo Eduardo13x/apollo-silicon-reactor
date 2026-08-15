@@ -20,8 +20,12 @@
 #   ./scripts/apollo-accept-gate.sh --metrics FILE   # judge a captured snapshot
 #   ./scripts/apollo-accept-gate.sh --risky --sha SHA --evidence DIR [--auto-revert]
 #
+# SECURITY: this gate ultimately invokes a root deployer. Never recommend a
+# NOPASSWD sudoers rule for it: arbitrary root daemon installation is equivalent
+# to root code execution. The trust boundary uses normal `sudo` instead.
+#
 # DIR must be a real /private/tmp/apollo-task7-* directory containing
-# verification.json with schema/status/commit SHA, both candidate hashes, and
+# verification.json with schema/status/commit SHA, all six candidate hashes, and
 # passing fmt, clippy, workspace_release_tests, release_build, diff_check,
 # graphify, resource_bounds, and rollback_rehearsal checks.
 #
@@ -31,6 +35,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$REPO_ROOT"
+source scripts/hardware-build-profile.sh
 METRICS_FILE="/var/lib/apollo/runtime_metrics.json"
 BASELINE_FILE="/var/lib/apollo/accept-baseline.json"
 BASELINE_K=7          # rolling window: median of last K accepted runs
@@ -42,8 +48,12 @@ EXPECTED_SHA=""
 EVIDENCE_DIR=""
 DEPLOY_GATE="$REPO_ROOT/scripts/apollo-deploy-gate.sh"
 DEPLOYER="/usr/local/sbin/apollo-deploy"
-DAEMON_CANDIDATE="$REPO_ROOT/target/release/apollo-optimizerd"
-CTL_CANDIDATE="$REPO_ROOT/target/release/apollo-optimizerctl"
+DAEMON_CANDIDATE="$APOLLO_RELEASE_DIR/apollo-optimizerd"
+CTL_CANDIDATE="$APOLLO_RELEASE_DIR/apollo-optimizerctl"
+CONTEXT_AGENT_CANDIDATE="$APOLLO_RELEASE_DIR/apollo-context-agent"
+WEB_BRIDGE_CANDIDATE="$APOLLO_RELEASE_DIR/apollo-web-bridge"
+COREML_MODEL_CANDIDATE="$REPO_ROOT/models/apollo-temporal-v1.mlmodel"
+CONTEXT_PLIST_CANDIDATE="$REPO_ROOT/scripts/com.eduardocortez.apollo-context-agent.plist"
 KILL_SWITCH="/var/run/apollo.disable"
 
 while [ $# -gt 0 ]; do
@@ -85,9 +95,14 @@ if [ "$RISKY" = "1" ]; then
   [ "$METRICS_EXPLICIT" = "0" ] || risky_fail "explicit-metrics-not-live"
   [ -n "$EXPECTED_SHA" ] || risky_fail "missing-sha"
   [ -n "$EVIDENCE_DIR" ] || risky_fail "missing-evidence"
+  apollo_verify_build_manifest || risky_fail "build-manifest-invalid"
   [ -x "$DEPLOY_GATE" ] || risky_fail "deploy-gate-not-executable"
   [ -x "$DAEMON_CANDIDATE" ] || risky_fail "daemon-candidate-missing"
   [ -x "$CTL_CANDIDATE" ] || risky_fail "ctl-candidate-missing"
+  [ -x "$CONTEXT_AGENT_CANDIDATE" ] || risky_fail "context-agent-candidate-missing"
+  [ -x "$WEB_BRIDGE_CANDIDATE" ] || risky_fail "web-bridge-candidate-missing"
+  [ -f "$COREML_MODEL_CANDIDATE" ] || risky_fail "coreml-model-candidate-missing"
+  [ -f "$CONTEXT_PLIST_CANDIDATE" ] || risky_fail "context-plist-candidate-missing"
 
   case "$EXPECTED_SHA" in
     *[!0-9a-fA-F]*|'') risky_fail "invalid-sha" ;;
@@ -146,7 +161,7 @@ except Exception as exc:
 
 candidate = record.get("candidate")
 checks = record.get("checks")
-if record.get("schema") != "apollo-task7-v1":
+if record.get("schema") != "apollo-task7-v3":
     raise SystemExit("verification schema mismatch")
 if record.get("status") != "passed":
     raise SystemExit("verification status is not passed")
@@ -157,48 +172,65 @@ if not isinstance(candidate, dict) or not isinstance(checks, dict):
 if any(checks.get(name) is not True for name in required):
     raise SystemExit("required verification check missing or failed")
 
-daemon_sha = candidate.get("daemon_sha256", "").lower()
-ctl_sha = candidate.get("ctl_sha256", "").lower()
-if not re.fullmatch(r"[0-9a-f]{64}", daemon_sha):
-    raise SystemExit("invalid daemon candidate SHA-256")
-if not re.fullmatch(r"[0-9a-f]{64}", ctl_sha):
-    raise SystemExit("invalid ctl candidate SHA-256")
-print(daemon_sha)
-print(ctl_sha)
+hash_keys = (
+    ("daemon_sha256", "daemon"),
+    ("ctl_sha256", "ctl"),
+    ("context_agent_sha256", "context agent"),
+    ("web_bridge_sha256", "web bridge"),
+    ("coreml_model_sha256", "Core ML model"),
+    ("context_plist_sha256", "context plist"),
+)
+for key, label in hash_keys:
+    value = candidate.get(key, "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise SystemExit(f"invalid {label} candidate SHA-256")
+    print(value)
 PY
   ) || risky_fail "verification-record-invalid"
 
-  RECORDED_DAEMON_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '1p')
-  RECORDED_CTL_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '2p')
-  [ "$(sha256_file "$DAEMON_CANDIDATE")" = "$RECORDED_DAEMON_SHA" ] \
+RECORDED_DAEMON_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '1p')
+RECORDED_CTL_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '2p')
+RECORDED_AGENT_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '3p')
+RECORDED_WEB_BRIDGE_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '4p')
+RECORDED_MODEL_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '5p')
+RECORDED_PLIST_SHA=$(printf '%s\n' "$RECORD_VALUES" | sed -n '6p')
+[ "$(sha256_file "$DAEMON_CANDIDATE")" = "$RECORDED_DAEMON_SHA" ] \
     || risky_fail "daemon-candidate-sha-mismatch"
-  [ "$(sha256_file "$CTL_CANDIDATE")" = "$RECORDED_CTL_SHA" ] \
+[ "$(sha256_file "$CTL_CANDIDATE")" = "$RECORDED_CTL_SHA" ] \
     || risky_fail "ctl-candidate-sha-mismatch"
+[ "$(sha256_file "$CONTEXT_AGENT_CANDIDATE")" = "$RECORDED_AGENT_SHA" ] \
+    || risky_fail "context-agent-candidate-sha-mismatch"
+[ "$(sha256_file "$WEB_BRIDGE_CANDIDATE")" = "$RECORDED_WEB_BRIDGE_SHA" ] \
+    || risky_fail "web-bridge-candidate-sha-mismatch"
+[ "$(sha256_file "$COREML_MODEL_CANDIDATE")" = "$RECORDED_MODEL_SHA" ] \
+    || risky_fail "coreml-model-candidate-sha-mismatch"
+[ "$(sha256_file "$CONTEXT_PLIST_CANDIDATE")" = "$RECORDED_PLIST_SHA" ] \
+    || risky_fail "context-plist-candidate-sha-mismatch"
   /usr/bin/codesign --verify --strict "$DAEMON_CANDIDATE" 2>/dev/null \
     || risky_fail "daemon-signature-invalid"
   /usr/bin/codesign --verify --strict "$CTL_CANDIDATE" 2>/dev/null \
     || risky_fail "ctl-signature-invalid"
+  /usr/bin/codesign --verify --strict "$CONTEXT_AGENT_CANDIDATE" 2>/dev/null \
+    || risky_fail "context-agent-signature-invalid"
+  /usr/bin/codesign --verify --strict "$WEB_BRIDGE_CANDIDATE" 2>/dev/null \
+    || risky_fail "web-bridge-signature-invalid"
   { [ ! -e "$KILL_SWITCH" ] && [ ! -L "$KILL_SWITCH" ]; } \
     || risky_fail "kill-switch-active"
-  sudo -n -l "$DEPLOYER" deploy >/dev/null 2>&1 \
-    || risky_fail "scoped-deploy-privilege-unavailable"
-  sudo -n -l "$DEPLOYER" rollback /var/lib/apollo/backups/deploy-privilege-probe \
-    >/dev/null 2>&1 || risky_fail "scoped-rollback-privilege-unavailable"
 
   printf 'APOLLO_RISKY_SHA=%s\n' "$ACTUAL_SHA"
   printf 'APOLLO_RISKY_EVIDENCE=%s\n' "$EVIDENCE_RECORD"
   printf 'APOLLO_RISKY_STATUS=validated\n'
 fi
 
-# Read metrics. If root-owned, try non-interactive sudo first. The scoped
-# production sudoers policy intentionally does not grant arbitrary `cat`, so
-# the default live path falls back to the daemon's read-only status socket.
+# Read metrics. If root-owned, use normal sudo. The scoped production sudoers
+# policy intentionally does not grant arbitrary `cat`, so the default live
+# path falls back to the daemon's read-only status socket.
 SNAP="$(mktemp -t apollo_accept_snap.XXXXXX)"
 trap 'rm -f "$SNAP"' EXIT
 if [ -r "$METRICS_FILE" ]; then
   cat "$METRICS_FILE" > "$SNAP" 2>/dev/null || true
 else
-  sudo -n cat "$METRICS_FILE" > "$SNAP" 2>/dev/null || true
+  sudo cat "$METRICS_FILE" > "$SNAP" 2>/dev/null || true
 fi
 if [ ! -s "$SNAP" ] && [ "$METRICS_EXPLICIT" -eq 0 ]; then
   APOLLO_CTL="${APOLLO_CTL:-/usr/local/bin/apollo-optimizerctl}"
@@ -565,6 +597,10 @@ if [ "$RISKY" = "1" ]; then
     --expected-head "$ACTUAL_SHA"
     --expected-daemon-sha "$RECORDED_DAEMON_SHA"
     --expected-ctl-sha "$RECORDED_CTL_SHA"
+    --expected-agent-sha "$RECORDED_AGENT_SHA"
+    --expected-web-bridge-sha "$RECORDED_WEB_BRIDGE_SHA"
+    --expected-model-sha "$RECORDED_MODEL_SHA"
+    --expected-plist-sha "$RECORDED_PLIST_SHA"
   )
   printf 'APOLLO_RISKY_STATUS=acceptance-passed\n'
   rm -f "$SNAP"

@@ -1,0 +1,9 @@
+{
+  "name": "com.eduardocortez.apollo_webflow",
+  "description": "Apollo WebFlow unprivileged native bridge",
+  "path": "/usr/local/libexec/apollo-web-bridge",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://mhagiddoeecedoknmhdlhghdnglglbhp/"
+  ]
+}

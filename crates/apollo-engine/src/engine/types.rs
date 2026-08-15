@@ -634,6 +634,142 @@ pub struct RuntimeMetrics {
     pub apollo_overhead_holt_skips_total: u64,
     #[serde(default)]
     pub apollo_overhead_page_reclaim_skips_total: u64,
+    /// Option C global optional-work scheduler. Shadow is observational and
+    /// cannot alter legacy execution or grant action authority.
+    #[serde(default)]
+    pub value_scheduler_phase: String,
+    #[serde(default)]
+    pub value_scheduler_blocker: String,
+    #[serde(default)]
+    pub value_scheduler_valid_cycles: u64,
+    #[serde(default)]
+    pub value_scheduler_shadow_cycles: u64,
+    #[serde(default)]
+    pub value_snapshot_epoch: u64,
+    #[serde(default)]
+    pub value_snapshot_revision: u64,
+    #[serde(default)]
+    pub value_scheduler_registered_jobs: u64,
+    #[serde(default)]
+    pub value_scheduler_eligible_jobs: u64,
+    #[serde(default)]
+    pub value_scheduler_selected_jobs: u64,
+    #[serde(default)]
+    pub value_scheduler_selected_total: u64,
+    #[serde(default)]
+    pub value_scheduler_budget_us: u64,
+    #[serde(default)]
+    pub value_scheduler_predicted_us: u64,
+    #[serde(default)]
+    pub value_scheduler_selection_latency_us: u64,
+    #[serde(default)]
+    pub value_scheduler_max_selection_latency_us: u64,
+    #[serde(default)]
+    pub value_scheduler_budget_skips_total: u64,
+    #[serde(default)]
+    pub value_scheduler_capacity_skips_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_samples_total: u64,
+    /// Operational heterogeneous-compute telemetry. These fields are not AIS
+    /// evidence and cannot authorize actions.
+    #[serde(default)]
+    pub fabric_phase: String,
+    #[serde(default)]
+    pub fabric_blocker: String,
+    #[serde(default)]
+    pub fabric_workers_active: u64,
+    #[serde(default)]
+    pub fabric_qos_failures: u64,
+    #[serde(default)]
+    pub fabric_result_drops: u64,
+    #[serde(default)]
+    pub fabric_submitted_total: u64,
+    #[serde(default)]
+    pub fabric_completed_total: u64,
+    #[serde(default)]
+    pub fabric_cancelled_total: u64,
+    #[serde(default)]
+    pub fabric_stale_total: u64,
+    #[serde(default)]
+    pub fabric_deadline_misses_total: u64,
+    #[serde(default)]
+    pub fabric_dispatch_skips_total: u64,
+    #[serde(default)]
+    pub fabric_eligible_total: u64,
+    #[serde(default)]
+    pub fabric_evaluation_total: u64,
+    #[serde(default)]
+    pub fabric_last_latency_us: u64,
+    #[serde(default)]
+    pub fabric_control_p95_baseline_ms: f64,
+    #[serde(default)]
+    pub fabric_cpu_percent: f64,
+    #[serde(default)]
+    pub fabric_rss_delta_bytes: u64,
+    #[serde(default)]
+    pub coreml_model_available: bool,
+    #[serde(default)]
+    pub coreml_requested_backend: String,
+    #[serde(default)]
+    pub coreml_effective_backend: String,
+    #[serde(default)]
+    pub coreml_ane_execution_measured: bool,
+    #[serde(default)]
+    pub coreml_circuit_state: String,
+    #[serde(default)]
+    pub temporal_prediction_backend: String,
+    #[serde(default)]
+    pub temporal_prediction_load: f64,
+    #[serde(default)]
+    pub temporal_prediction_transition: f64,
+    #[serde(default)]
+    pub temporal_prediction_pressure: f64,
+    #[serde(default)]
+    pub temporal_prediction_p95: f64,
+    #[serde(default)]
+    pub temporal_prediction_authoritative: bool,
+    /// Paired microexperiment lab. Shadow diagnostics never mutate effects;
+    /// Pair Gold counts only fully closed local control/treatment pairs.
+    #[serde(default)]
+    pub microexperiment_phase: String,
+    #[serde(default)]
+    pub microexperiment_blocker: String,
+    #[serde(default)]
+    pub microexperiment_restore: String,
+    #[serde(default)]
+    pub microexperiment_proposed_total: u64,
+    #[serde(default)]
+    pub microexperiment_eligible_total: u64,
+    #[serde(default)]
+    pub microexperiment_randomized_total: u64,
+    #[serde(default)]
+    pub microexperiment_shadow_would_open_total: u64,
+    #[serde(default)]
+    pub microexperiment_open_pairs: u64,
+    #[serde(default)]
+    pub microexperiment_completed_pairs: u64,
+    #[serde(default)]
+    pub microexperiment_control_endpoints_total: u64,
+    #[serde(default)]
+    pub microexperiment_treatment_endpoints_total: u64,
+    #[serde(default)]
+    pub microexperiment_complete_horizons_total: u64,
+    #[serde(default)]
+    pub microexperiment_rollback_closed_total: u64,
+    #[serde(default)]
+    pub microexperiment_pair_gold_total: u64,
+    #[serde(default)]
+    pub microexperiment_effective_total: u64,
+    #[serde(default)]
+    pub microexperiment_harmful_total: u64,
+    #[serde(default)]
+    pub microexperiment_confounded_total: u64,
+    #[serde(default)]
+    pub microexperiment_interrupted_total: u64,
+    #[serde(default)]
+    pub microexperiment_synthetic_quarantined_total: u64,
+    #[serde(default)]
+    pub microexperiment_mean_effect: f64,
     #[serde(default)]
     pub metrics_disk_writes_total: u64,
     #[serde(default)]
@@ -786,6 +922,14 @@ pub struct RuntimeMetrics {
     pub qos_foreground_count: u64,
     pub qos_background_count: u64,
     pub qos_errors: u64,
+    /// Audited Mach task-policy routing requests. Foreground/background above
+    /// count confirmed kernel mutations only; these fields explain the rest.
+    #[serde(default)]
+    pub qos_requests_count: u64,
+    #[serde(default)]
+    pub qos_noop_count: u64,
+    #[serde(default)]
+    pub qos_blocked_count: u64,
     /// Direct user-interaction QoS leases. These counters make it possible to
     /// verify that boosts both activate and return to their prior tier.
     #[serde(default)]
@@ -807,6 +951,41 @@ pub struct RuntimeMetrics {
     pub interaction_qos_ttl_exploratory: bool,
     #[serde(default)]
     pub interaction_qos_parameter_explorations_total: u64,
+    /// Exact browser and universal inferred network-flow observability.
+    #[serde(default)]
+    pub webflow_mode: String,
+    #[serde(default)]
+    pub webflow_phase: String,
+    #[serde(default)]
+    pub webflow_blocker: String,
+    #[serde(default)]
+    pub webflow_valid_health_cycles: u64,
+    #[serde(default)]
+    pub webflow_active_navigations: u16,
+    #[serde(default)]
+    pub webflow_proposed_total: u64,
+    #[serde(default)]
+    pub webflow_admitted_total: u64,
+    #[serde(default)]
+    pub webflow_skipped_total: u64,
+    #[serde(default)]
+    pub network_flow_active: bool,
+    #[serde(default)]
+    pub network_flow_traffic_bps: u64,
+    #[serde(default)]
+    pub network_flow_confidence_q: u16,
+    #[serde(default)]
+    pub network_flow_proposed_total: u64,
+    #[serde(default)]
+    pub network_flow_started_total: u64,
+    #[serde(default)]
+    pub network_flow_renewed_total: u64,
+    #[serde(default)]
+    pub network_flow_skipped_total: u64,
+    #[serde(default)]
+    pub network_flow_suppressed_exact_total: u64,
+    #[serde(default)]
+    pub network_flow_hard_cap_total: u64,
     /// Member-level observability for the bounded acceleration lease broker.
     /// The legacy interaction counters above remain the actuator-learning
     /// contract consumed by AIS and the telemetry medallion.
@@ -814,6 +993,10 @@ pub struct RuntimeMetrics {
     pub acceleration_lease_members_active: u32,
     #[serde(default)]
     pub acceleration_lease_members_applied_total: u64,
+    /// Lease members that received a confirmed TASK_POLICY_QOS mutation.
+    /// Members accelerated only through the `nice` fallback are excluded.
+    #[serde(default)]
+    pub acceleration_lease_task_qos_applied_total: u64,
     #[serde(default)]
     pub acceleration_lease_member_reverts_total: u64,
     #[serde(default)]
@@ -838,6 +1021,66 @@ pub struct RuntimeMetrics {
     pub acceleration_lease_family: String,
     #[serde(default)]
     pub acceleration_lease_last_family: String,
+    /// Typed, reversible fast-lane observability. These counters describe the
+    /// reflex route itself; legacy acceleration counters above remain stable.
+    #[serde(default)]
+    pub reflex_enabled: bool,
+    #[serde(default)]
+    pub reflex_phase: String,
+    #[serde(default)]
+    pub reflex_blocker: String,
+    #[serde(default)]
+    pub reflex_shadow_cycles: u64,
+    #[serde(default)]
+    pub reflex_valid_cycles: u64,
+    #[serde(default)]
+    pub reflex_invalid_samples_total: u64,
+    #[serde(default)]
+    pub reflex_baseline_p95_ms: f64,
+    #[serde(default)]
+    pub reflex_candidate_p95_ms: f64,
+    #[serde(default)]
+    pub reflex_baseline_churn: f64,
+    #[serde(default)]
+    pub reflex_candidate_churn: f64,
+    #[serde(default)]
+    pub reflex_proposed_total: u64,
+    #[serde(default)]
+    pub reflex_admitted_total: u64,
+    #[serde(default)]
+    pub reflex_applied_total: u64,
+    #[serde(default)]
+    pub reflex_shadowed_total: u64,
+    #[serde(default)]
+    pub reflex_omitted_total: u64,
+    #[serde(default)]
+    pub reflex_noop_total: u64,
+    #[serde(default)]
+    pub reflex_vetoed_total: u64,
+    #[serde(default)]
+    pub reflex_reverted_total: u64,
+    #[serde(default)]
+    pub reflex_failed_total: u64,
+    #[serde(default)]
+    pub reflex_protected_blocked_total: u64,
+    #[serde(default)]
+    pub reflex_last_decision_latency_us: u64,
+    #[serde(default)]
+    pub reflex_reasoning_submitted_total: u64,
+    #[serde(default)]
+    pub reflex_reasoning_dropped_total: u64,
+    #[serde(default)]
+    pub reflex_reasoning_completed_total: u64,
+    #[serde(default)]
+    pub reflex_reasoning_failed_total: u64,
+    #[serde(default)]
+    pub reflex_reasoning_deadline_misses_total: u64,
+    #[serde(default)]
+    pub reflex_reasoning_identity_mismatches_total: u64,
+    #[serde(default)]
+    pub reflex_reasoning_last_result_age_cycles: u64,
+    #[serde(default)]
+    pub reflex_reasoning_last_latency_us: u64,
     pub iokit_snapshots: u64,
     pub iokit_errors: u64,
     pub iokit_p_cluster_temp: Option<f32>,
@@ -932,6 +1175,24 @@ pub struct RuntimeMetrics {
     pub parallel_runtime_enabled: bool,
     #[serde(default)]
     pub parallel_worker_threads: usize,
+    #[serde(default)]
+    pub parallel_expected_profile: String,
+    #[serde(default)]
+    pub parallel_compiled_profile: String,
+    #[serde(default)]
+    pub parallel_effective_profile: String,
+    #[serde(default)]
+    pub parallel_feature_compiled: bool,
+    #[serde(default)]
+    pub parallel_max_worker_threads: usize,
+    #[serde(default)]
+    pub parallel_disabled_reason: String,
+    #[serde(default)]
+    pub parallel_worker_qos_intent: String,
+    #[serde(default)]
+    pub parallel_worker_qos_status: String,
+    #[serde(default)]
+    pub parallel_worker_qos_failures: u64,
     #[serde(default)]
     pub invalid_sysctl_value_denied: u64,
     #[serde(default)]
@@ -1865,6 +2126,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub gpu_imagination_device: String,
     #[serde(default)]
+    pub gpu_imagination_circuit_state: String,
+    #[serde(default)]
+    pub gpu_imagination_circuit_reason: String,
+    #[serde(default)]
     pub gpu_imagination_jobs_submitted_total: u64,
     #[serde(default)]
     pub gpu_imagination_jobs_completed_total: u64,
@@ -2473,6 +2738,10 @@ pub struct RuntimeMetrics {
     pub markov_prediction_confidence: f64,
     #[serde(default)]
     pub markov_prediction_eta_secs: f64,
+    /// Age of a prediction whose expected switch point has already passed.
+    /// Mutually exclusive with the remaining ETA above.
+    #[serde(default)]
+    pub markov_prediction_overdue_secs: f64,
     /// Probability that the predicted destination becomes foreground within
     /// each intent horizon. These are context signals, not prewarm authority.
     #[serde(default)]
@@ -3336,5 +3605,20 @@ mod tests {
             !json.contains("\"survival_mode_entry_count\":"),
             "new field name leaked into JSON; will break rm_u callers"
         );
+    }
+
+    #[test]
+    fn reflex_and_build_capability_metrics_default_for_legacy_json() {
+        let legacy = r#"{"cycles":7}"#;
+        let metrics: RuntimeMetrics = serde_json::from_str(legacy).expect("legacy metrics");
+        assert_eq!(metrics.reflex_phase, "");
+        assert_eq!(metrics.reflex_proposed_total, 0);
+        assert_eq!(metrics.reflex_applied_total, 0);
+        assert_eq!(metrics.reflex_omitted_total, 0);
+        assert_eq!(metrics.reflex_last_decision_latency_us, 0);
+        assert_eq!(metrics.reflex_reasoning_dropped_total, 0);
+        assert_eq!(metrics.parallel_expected_profile, "");
+        assert_eq!(metrics.parallel_compiled_profile, "");
+        assert_eq!(metrics.parallel_effective_profile, "");
     }
 }

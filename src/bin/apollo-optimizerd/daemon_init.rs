@@ -33,6 +33,10 @@ use apollo_engine::engine::thermal_manager::ThermalManager;
 use apollo_engine::engine::thread_selfcounts::CycleIpcTracker;
 use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
 use apollo_engine::engine::wake_storm_detector::WakeStormDetector;
+#[cfg(feature = "adaptive-multicore")]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "adaptive-multicore")]
+use std::sync::Arc;
 
 /// Subsystems constructed once at daemon startup with no shared-state dependencies.
 ///
@@ -121,10 +125,47 @@ pub(super) fn detect_hw_caps() -> (u32, f64) {
     (hw_cores, hw_ram_gb)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct BuildCapabilities {
+    pub expected_profile: String,
+    pub compiled_profile: String,
+    pub effective_profile: String,
+    pub adaptive_feature_compiled: bool,
+    pub max_worker_threads: usize,
+    pub disabled_reason: String,
+    pub worker_qos_intent: String,
+    pub worker_qos_status: String,
+    pub worker_qos_failures: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ParallelRuntimeConfig {
     pub enabled: bool,
     pub worker_threads: usize,
+    pub capability_revision: u64,
+    pub build: BuildCapabilities,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParallelPoolResolution {
+    enabled: bool,
+    pool_available: bool,
+    effective_workers: usize,
+}
+
+fn resolve_parallel_pool(
+    requested_workers: usize,
+    build_succeeded: bool,
+    observed_workers: usize,
+) -> ParallelPoolResolution {
+    let observed_workers = observed_workers.max(1);
+    let pool_available = build_succeeded || observed_workers > 1;
+    let enabled = requested_workers > 1 && pool_available && observed_workers > 1;
+    ParallelPoolResolution {
+        enabled,
+        pool_available,
+        effective_workers: if enabled { observed_workers } else { 1 },
+    }
 }
 
 fn choose_parallel_workers(total_cores: usize, p_cores: usize, e_cores: usize) -> usize {
@@ -136,28 +177,107 @@ fn choose_parallel_workers(total_cores: usize, p_cores: usize, e_cores: usize) -
     p_cores.clamp(2, 4)
 }
 
+fn build_capabilities_for(
+    total_cores: usize,
+    p_cores: usize,
+    e_cores: usize,
+    feature_compiled: bool,
+    pool_built: bool,
+    effective_workers: usize,
+) -> BuildCapabilities {
+    let max_worker_threads = choose_parallel_workers(total_cores, p_cores, e_cores);
+    let expected_adaptive = max_worker_threads > 1;
+    let effective_adaptive =
+        expected_adaptive && feature_compiled && pool_built && effective_workers > 1;
+    let disabled_reason = if !expected_adaptive {
+        "hardware-sequential"
+    } else if !feature_compiled {
+        "feature-not-compiled"
+    } else if !pool_built {
+        "worker-pool-unavailable"
+    } else if effective_workers <= 1 {
+        "insufficient-workers"
+    } else {
+        ""
+    };
+    BuildCapabilities {
+        expected_profile: if expected_adaptive {
+            "adaptive-multicore"
+        } else {
+            "sequential"
+        }
+        .to_string(),
+        compiled_profile: if feature_compiled {
+            "adaptive-multicore"
+        } else {
+            "sequential"
+        }
+        .to_string(),
+        effective_profile: if effective_adaptive {
+            "adaptive-multicore"
+        } else {
+            "sequential"
+        }
+        .to_string(),
+        adaptive_feature_compiled: feature_compiled,
+        max_worker_threads,
+        disabled_reason: disabled_reason.to_string(),
+        worker_qos_intent: parallel_worker_qos_intent().to_string(),
+        worker_qos_status: if effective_adaptive {
+            "pending"
+        } else {
+            "disabled"
+        }
+        .to_string(),
+        worker_qos_failures: 0,
+    }
+}
+
 /// Configure sysinfo's persistent Rayon pool before the first process refresh.
 pub(super) fn configure_parallel_runtime() -> ParallelRuntimeConfig {
-    let caps = apollo_engine::engine::capabilities::detect_capabilities();
+    let capability_graph = apollo_engine::engine::capabilities::detect_capability_graph();
+    let caps = capability_graph.legacy_report();
     let fallback_total = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(1);
     let p_cores = caps.p_core_count.unwrap_or(0) as usize;
     let e_cores = caps.e_core_count.unwrap_or(0) as usize;
     let total_cores = (p_cores + e_cores).max(fallback_total);
-    let worker_threads = choose_parallel_workers(total_cores, p_cores, e_cores);
+    let worker_threads = choose_parallel_workers(total_cores, p_cores, e_cores)
+        .min(capability_graph.recommended_cpu_workers().max(1));
 
     #[cfg(feature = "adaptive-multicore")]
     {
+        let qos_failures = Arc::new(AtomicU64::new(0));
+        let worker_qos_failures = Arc::clone(&qos_failures);
         let built = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_threads)
             .thread_name(|index| format!("apollo-sense-{index}"))
-            .start_handler(|_| set_parallel_worker_qos())
+            .start_handler(move |_| {
+                if set_parallel_worker_qos() != 0 {
+                    worker_qos_failures.fetch_add(1, Ordering::Relaxed);
+                }
+            })
             .build_global()
             .is_ok();
+        let pool = resolve_parallel_pool(worker_threads, built, rayon::current_num_threads());
+        let mut build = build_capabilities_for(
+            total_cores,
+            p_cores,
+            e_cores,
+            true,
+            pool.pool_available,
+            pool.effective_workers,
+        );
+        build.worker_qos_failures = qos_failures.load(Ordering::Relaxed);
+        let (intent, status) = parallel_worker_qos_report(built, build.worker_qos_failures);
+        build.worker_qos_intent = intent.to_string();
+        build.worker_qos_status = status.to_string();
         return ParallelRuntimeConfig {
-            enabled: built && worker_threads > 1,
-            worker_threads,
+            enabled: pool.enabled,
+            worker_threads: pool.effective_workers,
+            capability_revision: capability_graph.revision,
+            build,
         };
     }
 
@@ -167,13 +287,35 @@ pub(super) fn configure_parallel_runtime() -> ParallelRuntimeConfig {
         ParallelRuntimeConfig {
             enabled: false,
             worker_threads: 1,
+            capability_revision: capability_graph.revision,
+            build: build_capabilities_for(total_cores, p_cores, e_cores, false, false, 1),
         }
     }
 }
 
+fn parallel_worker_qos_intent() -> &'static str {
+    "utility"
+}
+
+fn parallel_worker_qos_report(
+    apollo_owned_pool: bool,
+    failures: u64,
+) -> (&'static str, &'static str) {
+    if !apollo_owned_pool {
+        ("inherited", "not-observed")
+    } else if failures > 0 {
+        ("utility", "failed")
+    } else {
+        ("utility", "ok")
+    }
+}
+
+fn parallel_worker_qos_class() -> libc::c_uint {
+    0x11
+}
+
 #[cfg(all(feature = "adaptive-multicore", target_os = "macos"))]
-fn set_parallel_worker_qos() {
-    const QOS_CLASS_USER_INITIATED: libc::c_uint = 0x19;
+fn set_parallel_worker_qos() -> libc::c_int {
     unsafe {
         extern "C" {
             fn pthread_set_qos_class_self_np(
@@ -181,12 +323,14 @@ fn set_parallel_worker_qos() {
                 relative_priority: libc::c_int,
             ) -> libc::c_int;
         }
-        let _ = pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+        pthread_set_qos_class_self_np(parallel_worker_qos_class(), 0)
     }
 }
 
 #[cfg(all(feature = "adaptive-multicore", not(target_os = "macos")))]
-fn set_parallel_worker_qos() {}
+fn set_parallel_worker_qos() -> libc::c_int {
+    0
+}
 
 impl DaemonSubsystems {
     pub(super) fn new() -> Self {
@@ -268,6 +412,52 @@ mod tests {
         assert_eq!(choose_parallel_workers(10, 4, 6), 4);
         assert_eq!(choose_parallel_workers(14, 10, 4), 4);
         assert_eq!(choose_parallel_workers(10, 0, 0), 1);
+    }
+
+    #[test]
+    fn parallel_sensing_uses_efficiency_intent_not_foreground_priority() {
+        assert_eq!(parallel_worker_qos_intent(), "utility");
+        assert_eq!(parallel_worker_qos_class(), 0x11);
+    }
+
+    #[test]
+    fn qos_report_distinguishes_apollo_owned_and_inherited_global_pools() {
+        assert_eq!(parallel_worker_qos_report(true, 0), ("utility", "ok"));
+        assert_eq!(
+            parallel_worker_qos_report(false, 0),
+            ("inherited", "not-observed")
+        );
+        assert_eq!(parallel_worker_qos_report(true, 2), ("utility", "failed"));
+    }
+
+    #[test]
+    fn build_capabilities_distinguish_expected_compiled_and_effective_profiles() {
+        let mismatch = build_capabilities_for(10, 4, 6, false, false, 1);
+        assert_eq!(mismatch.expected_profile, "adaptive-multicore");
+        assert_eq!(mismatch.compiled_profile, "sequential");
+        assert_eq!(mismatch.effective_profile, "sequential");
+        assert_eq!(mismatch.disabled_reason, "feature-not-compiled");
+        assert_eq!(mismatch.max_worker_threads, 4);
+
+        let m4 = build_capabilities_for(10, 4, 6, true, true, 4);
+        assert_eq!(m4.expected_profile, "adaptive-multicore");
+        assert_eq!(m4.compiled_profile, "adaptive-multicore");
+        assert_eq!(m4.effective_profile, "adaptive-multicore");
+        assert!(m4.disabled_reason.is_empty());
+
+        let m1 = build_capabilities_for(8, 4, 4, false, false, 1);
+        assert_eq!(m1.expected_profile, "sequential");
+        assert_eq!(m1.compiled_profile, "sequential");
+        assert_eq!(m1.effective_profile, "sequential");
+        assert_eq!(m1.disabled_reason, "hardware-sequential");
+    }
+
+    #[test]
+    fn existing_parallel_pool_is_usable_when_global_build_was_already_claimed() {
+        let resolved = resolve_parallel_pool(4, false, 4);
+        assert!(resolved.enabled);
+        assert!(resolved.pool_available);
+        assert_eq!(resolved.effective_workers, 4);
     }
 
     #[test]

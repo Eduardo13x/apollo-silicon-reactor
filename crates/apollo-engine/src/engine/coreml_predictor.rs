@@ -299,6 +299,14 @@ pub struct PredictorStatus {
 }
 
 impl PredictorStatus {
+    pub fn accelerator_backend_available(&self) -> bool {
+        self.backend == PredictorBackend::CoreMl
+            && matches!(
+                self.effective_backend,
+                Some(CoreMlBackend::CpuAndNeuralEngine | CoreMlBackend::All)
+            )
+    }
+
     fn cpu_oracle(reason: impl Into<String>) -> Self {
         Self {
             backend: PredictorBackend::CpuOracle,

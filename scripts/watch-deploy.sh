@@ -372,7 +372,7 @@ while true; do
         # Build
         write_report ""
         write_report "── BUILD ──"
-        BUILD_OUT=$(cargo build --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1)
+        BUILD_OUT=$("$PWD/scripts/build-release.sh" 2>&1)
         BUILD_RC=$?
         write_report "$BUILD_OUT"
         if [ $BUILD_RC -ne 0 ]; then
@@ -383,36 +383,21 @@ while true; do
         write_report "BUILD: OK"
         touch /tmp/.apollo-last-build
 
-        # Deploy
+        # Deploy the daemon, control client, context agent, model and LaunchAgent
+        # as one verified unit. Never leave the fabric on mixed versions.
         write_report ""
         write_report "── DEPLOY ──"
-        killall apollo-optimizerd 2>/dev/null || true
-        sleep 1
-        if pgrep -x apollo-optimizerd >/dev/null 2>&1; then
-            killall -9 apollo-optimizerd 2>/dev/null || true
-            sleep 1
+        if ! apollo_verify_build_manifest >> "$REPORT" 2>&1; then
+            write_report "STATUS: BUILD_MANIFEST_FAILED"
+            sleep 3
+            continue
         fi
-
-        cp -f target/release/apollo-optimizerd "$DAEMON"
-        chown root:wheel "$DAEMON"
-        chmod 755 "$DAEMON"
-        codesign -s - -f "$DAEMON" 2>/dev/null || true
-        MD5=$(md5 -q "$DAEMON")
-        write_report "BINARY: installed (md5=$MD5)"
-
-        if [ -f target/release/apollo-optimizerctl ]; then
-            cp -f target/release/apollo-optimizerctl "$CTL"
-            chown root:wheel "$CTL"
-            chmod 755 "$CTL"
-            codesign -s - -f "$CTL" 2>/dev/null || true
+        if ! "$PWD/scripts/deploy.sh" >> "$REPORT" 2>&1; then
+            write_report "STATUS: DEPLOY_FAILED"
+            sleep 3
+            continue
         fi
-
-        truncate -s 0 /var/log/apollo-optimizer.out.log /var/log/apollo-optimizer.err.log 2>/dev/null || true
-
-        launchctl kickstart -k system/$LABEL 2>/dev/null || \
-            launchctl kickstart system/$LABEL 2>/dev/null || \
-            launchctl load /Library/LaunchDaemons/$LABEL.plist 2>/dev/null || true
-        write_report "RESTART: issued"
+        write_report "FABRIC: atomically installed and restarted"
 
         # Verify
         write_report ""

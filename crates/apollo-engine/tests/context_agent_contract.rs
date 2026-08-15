@@ -1,6 +1,8 @@
+use std::time::Duration;
+
 use apollo_engine::engine::context_agent::{
-    validate_context_payload, AntiReplayStore, ContextPermissions, ContextSummary,
-    ContextValidationError, PermissionState, TriState, MAX_CONTEXT_PAYLOAD_BYTES,
+    validate_context_payload, AntiReplayStore, ContextAgentState, ContextPermissions,
+    ContextSummary, ContextValidationError, PermissionState, TriState, MAX_CONTEXT_PAYLOAD_BYTES,
 };
 use apollo_engine::engine::protocol::DaemonRequest;
 
@@ -112,4 +114,13 @@ fn payload_parser_enforces_wire_bound_before_deserialization() {
         validate_context_payload(&oversized),
         Err(ContextValidationError::PayloadTooLarge)
     );
+}
+
+#[test]
+fn disconnected_context_expires_instead_of_becoming_a_permanent_signal() {
+    let mut state = ContextAgentState::default();
+    state.accept(summary(1)).expect("fresh context");
+    assert!(state.latest_fresh(Duration::from_secs(1)).is_some());
+    std::thread::sleep(Duration::from_millis(2));
+    assert!(state.latest_fresh(Duration::from_millis(1)).is_none());
 }

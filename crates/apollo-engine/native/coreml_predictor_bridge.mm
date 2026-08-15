@@ -108,16 +108,18 @@ static bool apollo_validate_model(MLModel *model,
     }
 
     NSDictionary *metadata = model.modelDescription.metadata;
+    NSDictionary *user_defined = metadata[MLModelCreatorDefinedKey];
     uint64_t schema_hash = 0;
     uint64_t model_hash = 0;
-    if (!apollo_read_hash(metadata[kApolloSchemaHashKey], &schema_hash) ||
+    if (![user_defined isKindOfClass:[NSDictionary class]] ||
+        !apollo_read_hash(user_defined[kApolloSchemaHashKey], &schema_hash) ||
         schema_hash != expected_schema_hash) {
         *failure = [NSString stringWithFormat:
             @"Core ML schema hash mismatch (expected 0x%016llx)",
             static_cast<unsigned long long>(expected_schema_hash)];
         return false;
     }
-    if (!apollo_read_hash(metadata[kApolloModelHashKey], &model_hash) ||
+    if (!apollo_read_hash(user_defined[kApolloModelHashKey], &model_hash) ||
         model_hash != expected_model_hash) {
         *failure = [NSString stringWithFormat:
             @"Core ML model hash mismatch (expected 0x%016llx)",
@@ -146,8 +148,7 @@ static bool apollo_validate_model(MLModel *model,
 static NSURL *apollo_model_url(NSString **failure) {
     NSString *path = NSProcessInfo.processInfo.environment[@"APOLLO_COREML_MODEL_PATH"];
     if (path == nil || path.length == 0) {
-        *failure = @"APOLLO_COREML_MODEL_PATH is unset; no compiled Core ML model is available";
-        return nil;
+        path = @"/usr/local/share/apollo/models/apollo-temporal-v1.mlmodel";
     }
     if (![NSFileManager.defaultManager fileExistsAtPath:path]) {
         *failure = [NSString stringWithFormat:@"Core ML model path does not exist: %@", path];

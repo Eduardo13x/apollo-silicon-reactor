@@ -15,7 +15,7 @@ use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 
@@ -654,6 +654,6 @@ impl SharedState {
         self.context_agent_state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .latest()
+            .latest_fresh(Duration::from_secs(5))
     }
 }

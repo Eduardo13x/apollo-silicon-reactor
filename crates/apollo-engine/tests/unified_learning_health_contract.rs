@@ -65,12 +65,14 @@ fn changed_revision_publishes_once_and_advice_is_signed_and_trust_capped() {
                 trust: TrustState::Validated,
                 signed_error: 1.0,
                 current_epoch: true,
+                ..AdviceRecord::default()
             },
             AdviceRecord {
                 key: key("thread_qos:interactive"),
                 trust: TrustState::Trusted,
                 signed_error: -1.0,
                 current_epoch: true,
+                ..AdviceRecord::default()
             },
         ],
         ..Default::default()
@@ -84,6 +86,48 @@ fn changed_revision_publishes_once_and_advice_is_signed_and_trust_capped() {
     assert_eq!(batch.support(&candidates[0]), 0.00125);
     assert_eq!(batch.support(&candidates[1]), -0.005);
     assert_eq!(batch.len(), 2);
+}
+
+#[test]
+fn trust_inventory_counts_one_model_across_multiple_context_records() {
+    let first = AdviceRecord {
+        key: key("interaction_qos:nice"),
+        trust: TrustState::Degraded,
+        signed_error: 0.12,
+        current_epoch: true,
+        ..AdviceRecord::default()
+    };
+    let mut second = first.clone();
+    second.key.workload = "browsing".to_string();
+    second.key.foreground = ForegroundContext::Launching;
+
+    let health = UnifiedLearningHealth::from_input(UnifiedLearningInput {
+        advice_records: vec![first, second],
+        ..Default::default()
+    });
+
+    assert_eq!(health.trust_inventory.degraded, 1);
+}
+
+#[test]
+fn zero_authority_record_does_not_claim_perfect_worst_error() {
+    let health = UnifiedLearningHealth::from_input(UnifiedLearningInput {
+        advice_records: vec![AdviceRecord {
+            key: key("interaction_qos:nice"),
+            trust: TrustState::Degraded,
+            normalized_mae: 0.0,
+            coverage: None,
+            authority_gold_count: 0,
+            current_epoch: true,
+            ..AdviceRecord::default()
+        }],
+        ..Default::default()
+    });
+
+    assert_eq!(health.trust_inventory.degraded, 1);
+    assert!(health.trust_inventory.worst_producer.is_empty());
+    assert_eq!(health.trust_inventory.worst_normalized_mae, None);
+    assert_eq!(health.trust_inventory.worst_coverage, None);
 }
 
 #[test]
@@ -357,6 +401,37 @@ fn latest_resolved_episode_uses_newest_cycle_then_id() {
 
     assert_eq!(health.latest_resolved_episode.id, 5);
     assert_eq!(health.latest_resolved_episode.action, "newer-tie");
+}
+
+#[test]
+fn latest_resolved_episode_prefers_measured_evidence_over_newer_audit_only_event() {
+    let health = UnifiedLearningHealth::from_input(UnifiedLearningInput {
+        latest_resolved_episodes: vec![
+            LatestResolvedEpisodeSnapshot {
+                present: true,
+                id: 10,
+                resolved_cycle: 100,
+                action: "boost:measured".into(),
+                measured_utility: Some(0.04),
+                quality: Some(0.95),
+                ..Default::default()
+            },
+            LatestResolvedEpisodeSnapshot {
+                present: true,
+                id: 11,
+                resolved_cycle: 101,
+                action: "predictive_purge:evaluated".into(),
+                measured_utility: None,
+                quality: None,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+
+    assert_eq!(health.latest_resolved_episode.id, 10);
+    assert_eq!(health.latest_resolved_episode.action, "boost:measured");
+    assert_eq!(health.latest_resolved_episode.measured_utility, Some(0.04));
 }
 
 #[test]

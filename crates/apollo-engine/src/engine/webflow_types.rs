@@ -2,6 +2,8 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -203,8 +205,8 @@ impl WebFlowEvent {
 
     pub fn bounded_json(&self) -> Result<Vec<u8>, WebFlowValidationError> {
         self.validate()?;
-        let bytes = serde_json::to_vec(self)
-            .map_err(|_| WebFlowValidationError::SerializationFailed)?;
+        let bytes =
+            serde_json::to_vec(self).map_err(|_| WebFlowValidationError::SerializationFailed)?;
         if bytes.len() > MAX_WEBFLOW_MESSAGE_BYTES {
             return Err(WebFlowValidationError::PayloadTooLarge);
         }
@@ -215,8 +217,8 @@ impl WebFlowEvent {
         if bytes.len() > MAX_WEBFLOW_MESSAGE_BYTES {
             return Err(WebFlowValidationError::PayloadTooLarge);
         }
-        let event: Self = serde_json::from_slice(bytes)
-            .map_err(|_| WebFlowValidationError::MalformedPayload)?;
+        let event: Self =
+            serde_json::from_slice(bytes).map_err(|_| WebFlowValidationError::MalformedPayload)?;
         event.validate()?;
         Ok(event)
     }
@@ -240,6 +242,12 @@ pub enum WebFlowIngressOutcome {
     Accepted,
     Invalid,
     Dropped,
+}
+
+impl WebFlowIngressOutcome {
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::Accepted)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -274,7 +282,9 @@ impl WebFlowIngress {
     }
 
     pub fn drain(&mut self, maximum: usize) -> Vec<ReceivedWebFlowEvent> {
-        let count = maximum.min(MAX_WEBFLOW_EVENTS_PER_CYCLE).min(self.queue.len());
+        let count = maximum
+            .min(MAX_WEBFLOW_EVENTS_PER_CYCLE)
+            .min(self.queue.len());
         self.queue.drain(..count).collect()
     }
 
@@ -282,9 +292,56 @@ impl WebFlowIngress {
         self.queue.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
     pub const fn counters(&self) -> WebFlowIngressCounters {
         self.counters
     }
+}
+
+static PROCESS_WEBFLOW_INGRESS: OnceLock<Mutex<WebFlowIngress>> = OnceLock::new();
+
+fn process_webflow_ingress() -> &'static Mutex<WebFlowIngress> {
+    PROCESS_WEBFLOW_INGRESS.get_or_init(|| Mutex::new(WebFlowIngress::new()))
+}
+
+pub fn webflow_monotonic_ms() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_millis()
+        .clamp(1, u64::MAX as u128) as u64
+}
+
+pub fn accept_process_webflow(event: WebFlowEvent) -> WebFlowIngressOutcome {
+    accept_process_webflow_at(event, webflow_monotonic_ms())
+}
+
+pub fn accept_process_webflow_at(
+    event: WebFlowEvent,
+    received_at_ms: u64,
+) -> WebFlowIngressOutcome {
+    process_webflow_ingress()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .accept_at(event, received_at_ms)
+}
+
+pub fn drain_process_webflow(maximum: usize) -> Vec<ReceivedWebFlowEvent> {
+    process_webflow_ingress()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain(maximum)
+}
+
+pub fn process_webflow_ingress_counters() -> WebFlowIngressCounters {
+    process_webflow_ingress()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .counters()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

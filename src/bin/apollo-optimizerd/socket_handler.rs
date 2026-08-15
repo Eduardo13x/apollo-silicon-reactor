@@ -10,11 +10,12 @@
 use std::ffi::CString;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
@@ -25,6 +26,7 @@ use chrono::Utc;
 use apollo_engine::engine::capabilities::{
     detect_capabilities, detect_capabilities_with_write_probes,
 };
+use apollo_engine::engine::context_agent::MAX_CONTEXT_PAYLOAD_BYTES;
 use apollo_engine::engine::daemon_helpers::{
     frozen_state_path, kill_switch_path, metrics_path, socket_path, unfreeze_pids_verified_outcome,
     write_frozen_state,
@@ -35,8 +37,11 @@ use apollo_engine::engine::protocol::{DaemonRequest, DaemonResponse};
 use apollo_engine::engine::types::{
     DaemonStatus, FrozenProcessInfo, HardPath, HealthReport, RuntimeMetrics, UsageResponse,
 };
+use apollo_engine::engine::webflow_types::{accept_process_webflow, MAX_WEBFLOW_MESSAGE_BYTES};
 
 use super::{SharedState, STOP_REQUESTED};
+
+const CONTEXT_AGENT_EXECUTABLE: &str = "/usr/local/libexec/apollo-context-agent";
 
 // ── Peer Authentication ────────────────────────────────────────────────────
 
@@ -46,17 +51,123 @@ pub fn is_peer_root(stream: &UnixStream) -> bool {
         return true;
     }
 
+    if let Some(euid) = peer_uid(stream) {
+        return euid == 0;
+    }
+    // Default to false for security if we can't verify
+    false
+}
+
+fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
     #[cfg(target_os = "macos")]
     {
         let mut euid: libc::uid_t = 0;
         let mut egid: libc::gid_t = 0;
-        let res = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
-        if res == 0 {
-            return euid == 0;
-        }
+        let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+        return (result == 0).then_some(euid);
     }
-    // Default to false for security if we can't verify
-    false
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = stream;
+        None
+    }
+}
+
+fn active_console_uid() -> Option<libc::uid_t> {
+    fs::metadata("/dev/console")
+        .ok()
+        .map(|metadata| metadata.uid() as libc::uid_t)
+        .filter(|uid| *uid != 0)
+}
+
+#[cfg(target_os = "macos")]
+fn peer_executable_path(stream: &UnixStream) -> Option<PathBuf> {
+    let mut pid: libc::pid_t = 0;
+    let mut length = std::mem::size_of::<libc::pid_t>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut length,
+        )
+    };
+    if result != 0 || pid <= 0 {
+        return None;
+    }
+    let mut bytes = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let path_length = unsafe {
+        libc::proc_pidpath(
+            pid,
+            bytes.as_mut_ptr().cast(),
+            libc::PROC_PIDPATHINFO_MAXSIZE as u32,
+        )
+    };
+    if path_length <= 0 {
+        return None;
+    }
+    bytes.truncate(path_length as usize);
+    String::from_utf8(bytes).ok().map(PathBuf::from)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn peer_executable_path(_stream: &UnixStream) -> Option<PathBuf> {
+    None
+}
+
+fn trusted_context_agent_binary(path: &Path) -> bool {
+    if path != Path::new(CONTEXT_AGENT_EXECUTABLE) {
+        return false;
+    }
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0
+    })
+}
+
+fn context_request_allowed(
+    peer_uid: Option<libc::uid_t>,
+    peer_executable: Option<&Path>,
+    trusted_agent_binary: bool,
+    daemon_euid: libc::uid_t,
+    console_uid: Option<libc::uid_t>,
+    request_bytes: usize,
+) -> bool {
+    agent_request_allowed(
+        peer_uid,
+        peer_executable,
+        trusted_agent_binary,
+        daemon_euid,
+        console_uid,
+        request_bytes,
+        MAX_CONTEXT_PAYLOAD_BYTES,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_request_allowed(
+    peer_uid: Option<libc::uid_t>,
+    peer_executable: Option<&Path>,
+    trusted_agent_binary: bool,
+    daemon_euid: libc::uid_t,
+    console_uid: Option<libc::uid_t>,
+    request_bytes: usize,
+    maximum_request_bytes: usize,
+) -> bool {
+    if request_bytes > maximum_request_bytes {
+        return false;
+    }
+    let Some(peer_uid) = peer_uid else {
+        return false;
+    };
+    if daemon_euid == 0 {
+        peer_uid != 0
+            && console_uid == Some(peer_uid)
+            && peer_executable == Some(Path::new(CONTEXT_AGENT_EXECUTABLE))
+            && trusted_agent_binary
+    } else {
+        peer_uid == daemon_euid
+    }
 }
 
 // ── Client Handler ─────────────────────────────────────────────────────────
@@ -65,6 +176,7 @@ pub fn handle_client(mut stream: UnixStream, state: &SharedState) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(5)));
     let is_root = is_peer_root(&stream);
+    let peer_uid = peer_uid(&stream);
 
     // Lee y parsea la peticion (reader se libera al salir del bloque)
     let req_result = {
@@ -73,13 +185,14 @@ pub fn handle_client(mut stream: UnixStream, state: &SharedState) {
         let mut line = String::new();
         match reader.by_ref().take(MAX_REQUEST_BYTES).read_line(&mut line) {
             Ok(_) => serde_json::from_str::<DaemonRequest>(&line)
+                .map(|request| (request, line.len()))
                 .map_err(|e| format!("invalid request: {e}")),
             Err(e) => Err(format!("read error: {e}")),
         }
     };
 
-    let mut req = match req_result {
-        Ok(r) => r,
+    let (mut req, request_bytes) = match req_result {
+        Ok(request) => request,
         Err(msg) => {
             if let Ok(text) = serde_json::to_string(&DaemonResponse::Error { message: msg }) {
                 let _ = writeln!(stream, "{}", text);
@@ -88,6 +201,68 @@ pub fn handle_client(mut stream: UnixStream, state: &SharedState) {
         }
     };
     req.sanitize();
+
+    if let DaemonRequest::SubmitContext { summary } = &req {
+        let peer_executable = peer_executable_path(&stream);
+        let trusted_agent_binary = peer_executable
+            .as_deref()
+            .is_some_and(trusted_context_agent_binary);
+        let allowed = context_request_allowed(
+            peer_uid,
+            peer_executable.as_deref(),
+            trusted_agent_binary,
+            unsafe { libc::geteuid() },
+            active_console_uid(),
+            request_bytes,
+        );
+        let response = if !allowed {
+            DaemonResponse::Error {
+                message: "context submission requires the active console user".to_string(),
+            }
+        } else {
+            match state.submit_context(*summary) {
+                Ok(()) => DaemonResponse::Ok,
+                Err(error) => DaemonResponse::Error {
+                    message: format!("context rejected: {error}"),
+                },
+            }
+        };
+        if let Ok(text) = serde_json::to_string(&response) {
+            let _ = writeln!(stream, "{}", text);
+        }
+        return;
+    }
+
+    if let DaemonRequest::SubmitWebFlow { event } = &req {
+        let peer_executable = peer_executable_path(&stream);
+        let trusted_agent_binary = peer_executable
+            .as_deref()
+            .is_some_and(trusted_context_agent_binary);
+        let allowed = agent_request_allowed(
+            peer_uid,
+            peer_executable.as_deref(),
+            trusted_agent_binary,
+            unsafe { libc::geteuid() },
+            active_console_uid(),
+            request_bytes,
+            MAX_WEBFLOW_MESSAGE_BYTES + 1_024,
+        );
+        let response = if !allowed {
+            DaemonResponse::Error {
+                message: "WebFlow submission requires the active console agent".to_string(),
+            }
+        } else if accept_process_webflow(event.clone()).is_accepted() {
+            DaemonResponse::Ok
+        } else {
+            DaemonResponse::Error {
+                message: "WebFlow event rejected or ingress full".to_string(),
+            }
+        };
+        if let Ok(text) = serde_json::to_string(&response) {
+            let _ = writeln!(stream, "{}", text);
+        }
+        return;
+    }
 
     // Suscripcion push: conexion persistente, el daemon enviara StatusPush cada ciclo
     if let DaemonRequest::Subscribe = req {
@@ -365,7 +540,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 iokit_errors,
                 qos_foreground,
                 qos_background,
+                qos_requests,
+                qos_noops,
+                qos_blocked,
                 qos_errors,
+                lease_task_qos,
+                lease_nice_fallbacks,
+                lease_capability_skips,
                 kpc_available,
                 kpc_ipc,
                 kpc_memory_bound,
@@ -380,7 +561,13 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     m.metrics.iokit_errors,
                     m.metrics.qos_foreground_count,
                     m.metrics.qos_background_count,
+                    m.metrics.qos_requests_count,
+                    m.metrics.qos_noop_count,
+                    m.metrics.qos_blocked_count,
                     m.metrics.qos_errors,
+                    m.metrics.acceleration_lease_task_qos_applied_total,
+                    m.metrics.acceleration_lease_nice_fallbacks_total,
+                    m.metrics.acceleration_lease_capability_skips_total,
                     m.metrics.kpc_available,
                     m.metrics.kpc_ipc,
                     m.metrics.kpc_memory_bound_score,
@@ -441,8 +628,17 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     iokit_snapshots, iokit_errors
                 ),
                 format!(
-                    "qos_observed: foreground={} background={} errors={}",
-                    qos_foreground, qos_background, qos_errors
+                    "qos_effective: requests={} foreground={} background={} no_op={} blocked={} errors={}",
+                    qos_requests,
+                    qos_foreground,
+                    qos_background,
+                    qos_noops,
+                    qos_blocked,
+                    qos_errors
+                ),
+                format!(
+                    "interaction_acceleration: task_qos={} nice_fallback={} capability_skips={}",
+                    lease_task_qos, lease_nice_fallbacks, lease_capability_skips
                 ),
                 format!(
                     "kpc_observed: available={} ipc={:.3} memory_bound_proxy={:.3}",
@@ -577,6 +773,12 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             protocol: apollo_engine::engine::protocol::PROTOCOL_VERSION,
             build: env!("CARGO_PKG_VERSION").to_string(),
         },
+        DaemonRequest::SubmitContext { .. } => DaemonResponse::Error {
+            message: "context requires authenticated socket transport".to_string(),
+        },
+        DaemonRequest::SubmitWebFlow { .. } => DaemonResponse::Error {
+            message: "WebFlow requires authenticated context-agent transport".to_string(),
+        },
     }
 }
 
@@ -681,4 +883,90 @@ pub fn run_socket_server(state: SharedState) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_submission_requires_the_active_console_uid() {
+        let agent = Path::new("/usr/local/libexec/apollo-context-agent");
+        assert!(context_request_allowed(
+            Some(501),
+            Some(agent),
+            true,
+            0,
+            Some(501),
+            512
+        ));
+        assert!(!context_request_allowed(
+            Some(501),
+            Some(Path::new("/tmp/spoof")),
+            true,
+            0,
+            Some(501),
+            512
+        ));
+        assert!(!context_request_allowed(
+            Some(501),
+            Some(agent),
+            false,
+            0,
+            Some(501),
+            512
+        ));
+        assert!(!context_request_allowed(
+            Some(0),
+            Some(agent),
+            true,
+            0,
+            Some(501),
+            512
+        ));
+        assert!(!context_request_allowed(
+            Some(502),
+            Some(agent),
+            true,
+            0,
+            Some(501),
+            512
+        ));
+        assert!(!context_request_allowed(
+            None,
+            Some(agent),
+            true,
+            0,
+            Some(501),
+            512
+        ));
+    }
+
+    #[test]
+    fn context_submission_is_bounded_and_nonroot_daemon_accepts_only_its_uid() {
+        assert!(context_request_allowed(
+            Some(501),
+            None,
+            false,
+            501,
+            None,
+            4_096
+        ));
+        assert!(!context_request_allowed(
+            Some(502),
+            None,
+            false,
+            501,
+            None,
+            512
+        ));
+        assert!(!context_request_allowed(
+            Some(501),
+            None,
+            false,
+            501,
+            None,
+            4_097
+        ));
+    }
 }

@@ -36,11 +36,17 @@ use apollo_engine::engine::gpu_imagination::{
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lse_counters::LockFreeMetrics;
 use apollo_engine::engine::recently_applied::{CachedActionKind, RecentlyApplied};
+use apollo_engine::engine::reflex::{
+    ReflexActionKind, ReflexDecision, ReflexIntent, ReflexRolloutPhase, ReflexSafetyContext,
+    ReflexSource, ReflexTarget, ReflexTrigger,
+};
 use apollo_engine::engine::swap_reclaim::SwapRisk;
 use apollo_engine::engine::telemetry_medallion::DecisionAttribution;
 use apollo_engine::engine::telemetry_medallion::{ActuatorFamily, TelemetryMedallion};
 use apollo_engine::engine::types::{FreezeSource, FrozenEntry, RootAction};
 use apollo_engine::engine::unfreeze_decay::UnfreezeDecayModel;
+
+use crate::daemon_cycle_tail::ReflexBroker;
 
 /// Action kinds tracked for per-PID dedup.
 /// Variants without a target PID (SetSysctl, ToggleSpotlight, QuarantineDaemon)
@@ -443,6 +449,7 @@ pub fn plan_action_intents(
 
 pub struct GpuPlannerRuntime<'a> {
     pub cycle: u64,
+    pub context_revision: u64,
     pub worker: &'a mut GpuImaginationWorker,
     pub gate: GpuImaginationGate,
     pub external_candidates: Vec<GpuImaginationCandidate>,
@@ -671,7 +678,13 @@ fn plan_action_intents_inner(
             let support = world_model.gpu_rank_support_for(key, workload).or_else(|| {
                 latest_result
                     .as_ref()
-                    .filter(|result| result.is_fresh_for(runtime.cycle, workload))
+                    .filter(|result| {
+                        result.is_fresh_for_context(
+                            runtime.cycle,
+                            workload,
+                            runtime.context_revision,
+                        )
+                    })
                     .and_then(|result| result.support_for(key))
                     .map(|raw| world_model.calibrate_gpu_rank_support(key, workload, raw))
                     .filter(|support| support.abs() > f64::EPSILON)
@@ -726,6 +739,7 @@ fn plan_action_intents_inner(
         gpu_candidates.truncate(12);
         gpu_candidates.extend(runtime.external_candidates.iter().cloned());
         gpu_submit_outcome = GpuImaginationRequest::new(runtime.cycle, workload, gpu_candidates)
+            .map(|request| request.with_context_revision(runtime.context_revision))
             .map(|request| runtime.worker.try_submit(request, runtime.gate).as_str())
             .unwrap_or("no-candidates")
             .to_string();
@@ -873,6 +887,77 @@ fn boost_omission_capable(
         && !recovery_required
 }
 
+fn temporal_boost_intent(action: &RootAction, cycle: u64) -> Option<ReflexIntent> {
+    let RootAction::BoostProcess {
+        pid,
+        name,
+        decision_reason,
+        start_sec,
+        start_usec,
+        ..
+    } = action
+    else {
+        return None;
+    };
+    let trigger = match decision_reason {
+        DecisionReason::CausalInference => ReflexTrigger::Prediction,
+        DecisionReason::MLWorkload => ReflexTrigger::BuildStart,
+        _ => ReflexTrigger::Input,
+    };
+    ReflexIntent::new(
+        ReflexActionKind::TemporalBoost,
+        Some(ReflexTarget {
+            pid: *pid,
+            start_sec: *start_sec,
+            start_usec: *start_usec,
+            name: name.clone(),
+        }),
+        trigger,
+        ReflexSource::Deterministic,
+        cycle,
+        12_000,
+    )
+    .ok()
+}
+
+fn reflex_boost_safety(action: &RootAction, gates: ExplorationGates) -> ReflexSafetyContext {
+    let RootAction::BoostProcess {
+        pid,
+        name,
+        start_sec,
+        start_usec,
+        ..
+    } = action
+    else {
+        return ReflexSafetyContext::default();
+    };
+    ReflexSafetyContext {
+        identity_present: *start_sec > 0 || *start_usec > 0,
+        identity_start_nonzero: *start_sec > 0 || *start_usec > 0,
+        identity_recheck_ok: apollo_engine::engine::process_identity::ProcessIdentity::verify(
+            *pid,
+            Some(name),
+            *start_sec,
+            *start_usec,
+        ),
+        target_protected: apollo_engine::engine::safety::is_boost_forbidden(name),
+        target_apple_owned: apollo_engine::engine::apple_owned::is_apple_owned(*pid),
+        capability_available: true,
+        kill_switch: gates.kill_switch || gates.daemon_shutdown,
+        thermal_force_ecores: !gates.thermal_available || !gates.thermal_nominal,
+        existing_conflict: gates.effect_owner_conflict,
+    }
+}
+
+fn reflex_decision_reason(decision: ReflexDecision) -> String {
+    match decision {
+        ReflexDecision::Veto(blocker) => format!("reflex veto: {}", blocker.as_str()),
+        ReflexDecision::Skipped(blocker) => format!("reflex blocked: {}", blocker.as_str()),
+        ReflexDecision::Shadow => "reflex shadow".to_string(),
+        ReflexDecision::Admit => "reflex admitted".to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CounterfactualHoldout {
     pub action_key: String,
@@ -913,6 +998,7 @@ pub struct DispatchTickInput<'a> {
     pub foreground_pid: Option<u32>,
     pub exploration_scheduler: &'a mut ExplorationScheduler,
     pub telemetry_medallion: &'a mut TelemetryMedallion,
+    pub reflex_broker: Option<&'a mut ReflexBroker>,
     pub exploration_environment: &'a mut dyn FnMut() -> (ExplorationGates, TimePoint),
 }
 
@@ -1021,6 +1107,7 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
         foreground_pid,
         exploration_scheduler,
         telemetry_medallion,
+        mut reflex_broker,
         exploration_environment,
     } = input;
 
@@ -1175,6 +1262,36 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
                 );
             }
         }
+    }
+
+    // Every production Boost passes through the same typed reflex admission.
+    // Shadow mode preserves the legacy action exactly; active mode owns the
+    // admission decision while the existing executor retains actuation.
+    if let Some(broker) = reflex_broker.as_deref_mut() {
+        filtered_actions.retain(|action| {
+            if !matches!(action, RootAction::BoostProcess { .. }) {
+                return true;
+            }
+            let Some(intent) = temporal_boost_intent(action, cycle_count) else {
+                return broker.phase() == ReflexRolloutPhase::Shadow;
+            };
+            let gates = (exploration_environment)().0;
+            let decision = broker.decide_external(&intent, reflex_boost_safety(action, gates));
+            let allowed = broker.allows_current_actuation(decision);
+            if !allowed {
+                dispatch_decision_events.push(decision_event_for_root_action_from(
+                    action,
+                    if matches!(decision, ReflexDecision::Veto(_)) {
+                        ActuatorDecisionOutcome::Vetoed
+                    } else {
+                        ActuatorDecisionOutcome::Blocked
+                    },
+                    "reflex-broker",
+                    reflex_decision_reason(decision),
+                ));
+            }
+            allowed
+        });
     }
 
     // The scheduler may omit one already-eligible background Boost. Rejection
@@ -1432,6 +1549,9 @@ pub fn run_dispatch_tick(input: DispatchTickInput) -> DispatchTickOutput {
     outcomes
         .decision_events
         .attach_predictions(&decision_time_forecasts);
+    if let Some(broker) = reflex_broker.as_deref_mut() {
+        broker.record_outcomes_for_prefix(&outcomes.decision_events, "boost:");
+    }
 
     // Update degradation controller with new failure count.
     if outcomes.failures > 0 {
@@ -1715,6 +1835,7 @@ mod tests {
             foreground_pid: None,
             exploration_scheduler: &mut exploration_scheduler,
             telemetry_medallion: &mut telemetry_medallion,
+            reflex_broker: None,
             exploration_environment: &mut exploration_environment,
         };
 
@@ -1809,6 +1930,7 @@ mod tests {
                 &apollo_engine::engine::gpu_imagination::GpuImaginationResult {
                     generation: 0,
                     workload: "idle".to_string(),
+                    context_revision: 0,
                     backend: apollo_engine::engine::gpu_imagination::GpuImaginationBackend::Metal,
                     device_name: "test-gpu".to_string(),
                     samples: 4_096,
@@ -2103,6 +2225,40 @@ mod tests {
             start_sec: 0,
             start_usec: 0,
         }
+    }
+
+    #[test]
+    fn temporal_boost_intent_uses_existing_identity_and_closed_catalog() {
+        let action = RootAction::BoostProcess {
+            pid: 42,
+            name: "Editor".to_string(),
+            reason: "interactive focus boost".to_string(),
+            decision_reason: DecisionReason::InteractiveFocus,
+            start_sec: 100,
+            start_usec: 7,
+        };
+        let intent = temporal_boost_intent(&action, 31).expect("boost intent");
+
+        assert_eq!(intent.action, ReflexActionKind::TemporalBoost);
+        assert_eq!(intent.trigger, ReflexTrigger::Input);
+        assert_eq!(intent.ttl_ms, 12_000);
+        assert_eq!(intent.target.expect("target").start_usec, 7);
+    }
+
+    #[test]
+    fn compositor_reason_never_exempts_a_protected_process_from_reflex_safety() {
+        let action = RootAction::BoostProcess {
+            pid: 42,
+            name: "WindowServer".to_string(),
+            reason: "display boost".to_string(),
+            decision_reason: DecisionReason::CompositorPriority,
+            start_sec: 100,
+            start_usec: 7,
+        };
+
+        let safety = reflex_boost_safety(&action, ExplorationGates::healthy());
+
+        assert!(safety.target_protected);
     }
 
     fn thread_qos(pid: u32, thread_index: u32) -> RootAction {
@@ -2602,6 +2758,8 @@ mod tests {
                 installation_id,
                 horizon_cycles: 3,
                 tier: EvidenceTier::Gold,
+                provenance:
+                    apollo_engine::engine::telemetry_medallion::EvidenceProvenance::ObservedLocal,
                 quality: 0.96,
                 raw_utility_delta: 0.08,
                 counterfactual_delta: 0.0,

@@ -11,11 +11,18 @@ use std::time::{Duration, Instant};
 
 const MAX_CANDIDATES: usize = 24;
 const DEFAULT_SAMPLES_PER_CANDIDATE: u32 = 4_096;
+const MAX_SAMPLES_PER_CANDIDATE: u32 = 4_096;
+const METAL_CROSSOVER_SAMPLES: u64 = 4_096;
+const MAX_WORKLOAD_BYTES: usize = 128;
+const MAX_ACTION_KEY_BYTES: usize = 256;
 const UNCERTAINTY_TO_SIGMA: f32 = 0.08;
 const MAX_RANK_SUPPORT: f64 = 0.005;
 const MAX_CONTEXT_SCORE: f64 = 0.08;
 const MAX_RESULT_AGE_CYCLES: u64 = 30;
 const SUBMIT_COOLDOWN: Duration = Duration::from_secs(10);
+const GPU_IMAGINATION_DEADLINE: Duration = Duration::from_millis(250);
+const GPU_CIRCUIT_COOLDOWN: Duration = Duration::from_secs(30);
+const GPU_FAILURE_THRESHOLD: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GpuImaginationBackend {
@@ -43,7 +50,9 @@ pub struct GpuImaginationGate {
     pub memory_pressure: f64,
     /// GPU utilization in [0, 1] when available.
     pub gpu_load: f64,
-    pub gpu_watts: f64,
+    /// `None` means the public sensors did not report power. Unknown is not
+    /// rewritten to zero; the remaining public load/thermal gates still apply.
+    pub gpu_watts: Option<f64>,
     pub thermal_nominal: bool,
     pub app_launching: bool,
     pub fluidity_degraded: bool,
@@ -57,7 +66,10 @@ impl GpuImaginationGate {
             Some("memory-pressure")
         } else if !self.gpu_load.is_finite() || self.gpu_load >= 0.20 {
             Some("gpu-busy")
-        } else if !self.gpu_watts.is_finite() || self.gpu_watts >= 2.5 {
+        } else if self
+            .gpu_watts
+            .is_some_and(|watts| !watts.is_finite() || watts >= 2.5)
+        {
             Some("gpu-power")
         } else if !self.thermal_nominal {
             Some("thermal")
@@ -82,6 +94,7 @@ pub struct GpuImaginationCandidate {
 pub struct GpuImaginationRequest {
     pub generation: u64,
     pub workload: String,
+    pub context_revision: u64,
     pub candidates: Vec<GpuImaginationCandidate>,
     pub samples_per_candidate: u32,
     pub seed: u32,
@@ -124,6 +137,7 @@ impl GpuImaginationRequest {
         Some(Self {
             generation,
             workload: workload.to_string(),
+            context_revision: 0,
             candidates,
             samples_per_candidate: DEFAULT_SAMPLES_PER_CANDIDATE,
             seed,
@@ -132,6 +146,11 @@ impl GpuImaginationRequest {
 
     pub fn total_samples(&self) -> u64 {
         self.candidates.len() as u64 * self.samples_per_candidate as u64
+    }
+
+    pub fn with_context_revision(mut self, context_revision: u64) -> Self {
+        self.context_revision = context_revision;
+        self
     }
 }
 
@@ -154,6 +173,7 @@ pub struct GpuCandidateAdvice {
 pub struct GpuImaginationResult {
     pub generation: u64,
     pub workload: String,
+    pub context_revision: u64,
     pub backend: GpuImaginationBackend,
     pub device_name: String,
     pub samples: u64,
@@ -169,6 +189,10 @@ impl GpuImaginationResult {
             && self.workload == workload
             && cycle >= self.generation
             && cycle - self.generation <= MAX_RESULT_AGE_CYCLES
+    }
+
+    pub fn is_fresh_for_context(&self, cycle: u64, workload: &str, context_revision: u64) -> bool {
+        self.context_revision == context_revision && self.is_fresh_for(cycle, workload)
     }
 
     pub fn support_for(&self, action_key: &str) -> Option<f64> {
@@ -196,6 +220,24 @@ pub enum GpuSubmitOutcome {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GpuCircuitState {
+    #[default]
+    Closed,
+    Open,
+    HalfOpen,
+}
+
+impl GpuCircuitState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half-open",
+        }
+    }
+}
+
 impl GpuSubmitOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -213,6 +255,14 @@ struct BackendStatus {
     backend: GpuImaginationBackend,
     device_name: String,
     initialization_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct InFlightJob {
+    generation: u64,
+    workload: String,
+    context_revision: u64,
+    submitted_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,6 +284,13 @@ pub struct GpuImaginationWorker {
     last_submit: Option<Instant>,
     latest: Option<GpuImaginationResult>,
     last_consumed_generation: Option<u64>,
+    in_flight: Option<InFlightJob>,
+    draining: Option<InFlightJob>,
+    circuit_state: GpuCircuitState,
+    circuit_opened_at: Option<Instant>,
+    circuit_cooldown: Duration,
+    consecutive_failures: u32,
+    quarantine_reason: Option<String>,
 }
 
 impl std::fmt::Debug for GpuImaginationWorker {
@@ -248,32 +305,102 @@ impl std::fmt::Debug for GpuImaginationWorker {
 
 impl GpuImaginationWorker {
     pub fn spawn_metal_only() -> Self {
-        Self::spawn(BackendPreference::MetalOnly)
+        Self::spawn(
+            BackendPreference::MetalOnly,
+            Duration::ZERO,
+            GPU_CIRCUIT_COOLDOWN,
+            false,
+        )
     }
 
     #[cfg(test)]
     fn spawn_cpu_reference() -> Self {
-        Self::spawn(BackendPreference::CpuReference)
+        Self::spawn(
+            BackendPreference::CpuReference,
+            Duration::ZERO,
+            GPU_CIRCUIT_COOLDOWN,
+            false,
+        )
     }
 
-    fn spawn(preference: BackendPreference) -> Self {
+    #[cfg(test)]
+    fn spawn_cpu_reference_with_delay(delay: Duration) -> Self {
+        Self::spawn(
+            BackendPreference::CpuReference,
+            delay,
+            GPU_CIRCUIT_COOLDOWN,
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_cpu_reference_with_timing(delay: Duration, circuit_cooldown: Duration) -> Self {
+        Self::spawn(
+            BackendPreference::CpuReference,
+            delay,
+            circuit_cooldown,
+            false,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_cpu_reference_with_recovery_timing(
+        first_delay: Duration,
+        circuit_cooldown: Duration,
+    ) -> Self {
+        Self::spawn(
+            BackendPreference::CpuReference,
+            first_delay,
+            circuit_cooldown,
+            true,
+        )
+    }
+
+    fn spawn(
+        preference: BackendPreference,
+        test_delay: Duration,
+        circuit_cooldown: Duration,
+        test_delay_once: bool,
+    ) -> Self {
         let (request_tx, request_rx) = mpsc::sync_channel::<GpuImaginationRequest>(1);
         let (result_tx, result_rx) = mpsc::sync_channel::<GpuImaginationResult>(1);
         let (status_tx, status_rx) = mpsc::sync_channel::<BackendStatus>(1);
-        thread::Builder::new()
+        let spawn_result = thread::Builder::new()
             .name("apollo-gpu-imagination".to_string())
-            .spawn(move || run_worker(preference, request_rx, result_tx, status_tx))
-            .expect("spawn GPU imagination worker");
+            .spawn(move || {
+                run_worker(
+                    preference,
+                    request_rx,
+                    result_tx,
+                    status_tx,
+                    test_delay,
+                    test_delay_once,
+                )
+            });
+        let (backend, initialization_error) = match spawn_result {
+            Ok(_) => (GpuImaginationBackend::Initializing, None),
+            Err(error) => (
+                GpuImaginationBackend::Unavailable,
+                Some(format!("GPU imagination worker spawn failed: {error}")),
+            ),
+        };
         Self {
             request_tx,
             result_rx,
             status_rx,
-            backend: GpuImaginationBackend::Initializing,
+            backend,
             device_name: String::new(),
-            initialization_error: None,
+            initialization_error,
             last_submit: None,
             latest: None,
             last_consumed_generation: None,
+            in_flight: None,
+            draining: None,
+            circuit_state: GpuCircuitState::Closed,
+            circuit_opened_at: None,
+            circuit_cooldown,
+            consecutive_failures: 0,
+            quarantine_reason: None,
         }
     }
 
@@ -309,27 +436,80 @@ impl GpuImaginationWorker {
         Some(result.clone())
     }
 
+    pub fn quarantine_reason(&mut self) -> Option<&str> {
+        self.poll();
+        self.quarantine_reason.as_deref()
+    }
+
+    pub fn circuit_state(&mut self) -> GpuCircuitState {
+        self.poll();
+        self.circuit_state
+    }
+
+    /// Results submitted before sleep/wake are no longer comparable with the
+    /// resumed hardware context, so they are dropped rather than consumed.
+    pub fn invalidate_for_wake(&mut self) {
+        if let Some(in_flight) = self.in_flight.take() {
+            self.draining = Some(in_flight);
+            self.open_circuit("wake-invalidation");
+        }
+        self.latest = None;
+        self.last_consumed_generation = None;
+        self.last_submit = None;
+    }
+
     pub fn try_submit(
         &mut self,
         request: GpuImaginationRequest,
         gate: GpuImaginationGate,
     ) -> GpuSubmitOutcome {
         self.poll();
+        if request.candidates.is_empty()
+            || request.candidates.len() > MAX_CANDIDATES
+            || request.samples_per_candidate == 0
+            || request.samples_per_candidate > MAX_SAMPLES_PER_CANDIDATE
+            || request.workload.len() > MAX_WORKLOAD_BYTES
+            || request.candidates.iter().any(|candidate| {
+                candidate.action_key.is_empty()
+                    || candidate.action_key.len() > MAX_ACTION_KEY_BYTES
+                    || !candidate.expected_gain.is_finite()
+                    || !candidate.uncertainty.is_finite()
+            })
+        {
+            return GpuSubmitOutcome::Gated("invalid-request");
+        }
+        if request.total_samples() < METAL_CROSSOVER_SAMPLES {
+            return GpuSubmitOutcome::Gated("below-crossover");
+        }
         if let Some(blocker) = gate.blocker() {
             return GpuSubmitOutcome::Gated(blocker);
         }
         if self.backend == GpuImaginationBackend::Unavailable {
             return GpuSubmitOutcome::Unavailable;
         }
-        if self
-            .last_submit
-            .is_some_and(|last| last.elapsed() < SUBMIT_COOLDOWN)
+        self.maybe_enter_half_open();
+        if self.circuit_state == GpuCircuitState::Open {
+            return GpuSubmitOutcome::Unavailable;
+        }
+        if self.circuit_state == GpuCircuitState::Closed
+            && self
+                .last_submit
+                .is_some_and(|last| last.elapsed() < SUBMIT_COOLDOWN)
         {
             return GpuSubmitOutcome::Cooldown;
         }
+        let generation = request.generation;
+        let workload = request.workload.clone();
+        let context_revision = request.context_revision;
         match self.request_tx.try_send(request) {
             Ok(()) => {
                 self.last_submit = Some(Instant::now());
+                self.in_flight = Some(InFlightJob {
+                    generation,
+                    workload,
+                    context_revision,
+                    submitted_at: Instant::now(),
+                });
                 GpuSubmitOutcome::Submitted
             }
             Err(TrySendError::Full(_)) => GpuSubmitOutcome::Busy,
@@ -349,9 +529,47 @@ impl GpuImaginationWorker {
         loop {
             match self.result_rx.try_recv() {
                 Ok(result) => {
-                    self.backend = result.backend;
-                    if !result.device_name.is_empty() {
-                        self.device_name.clone_from(&result.device_name);
+                    let matches_in_flight = self.in_flight.as_ref().is_some_and(|job| {
+                        job.generation == result.generation
+                            && job.workload == result.workload
+                            && job.context_revision == result.context_revision
+                    });
+                    let matches_draining = self.draining.as_ref().is_some_and(|job| {
+                        job.generation == result.generation
+                            && job.workload == result.workload
+                            && job.context_revision == result.context_revision
+                    });
+                    if matches_draining {
+                        self.draining = None;
+                        continue;
+                    }
+                    if !matches_in_flight {
+                        continue;
+                    }
+                    self.in_flight = None;
+                    if Duration::from_nanos(result.wall_time_ns) > GPU_IMAGINATION_DEADLINE {
+                        self.open_circuit("deadline");
+                        self.initialization_error =
+                            Some("GPU imagination deadline exceeded".to_string());
+                        continue;
+                    }
+                    if result.error.is_some() {
+                        self.consecutive_failures = self.consecutive_failures.saturating_add(1);
+                        if self.circuit_state == GpuCircuitState::HalfOpen
+                            || self.consecutive_failures >= GPU_FAILURE_THRESHOLD
+                        {
+                            self.open_circuit("backend-error");
+                        }
+                    } else {
+                        self.consecutive_failures = 0;
+                        self.circuit_state = GpuCircuitState::Closed;
+                        self.circuit_opened_at = None;
+                        self.quarantine_reason = None;
+                        self.initialization_error = None;
+                        self.backend = result.backend;
+                        if !result.device_name.is_empty() {
+                            self.device_name.clone_from(&result.device_name);
+                        }
                     }
                     self.latest = Some(result);
                 }
@@ -362,6 +580,35 @@ impl GpuImaginationWorker {
                 }
             }
         }
+        // The control loop may collect less frequently than the GPU deadline.
+        // Drain queued completions first and judge them by worker wall time;
+        // elapsed collection time only expires a job that has no result yet.
+        if self
+            .in_flight
+            .as_ref()
+            .is_some_and(|job| job.submitted_at.elapsed() > GPU_IMAGINATION_DEADLINE)
+        {
+            self.draining = self.in_flight.take();
+            self.open_circuit("deadline");
+            self.initialization_error = Some("GPU imagination deadline exceeded".to_string());
+        }
+    }
+
+    fn open_circuit(&mut self, reason: &str) {
+        self.circuit_state = GpuCircuitState::Open;
+        self.circuit_opened_at = Some(Instant::now());
+        self.quarantine_reason = Some(reason.to_string());
+    }
+
+    fn maybe_enter_half_open(&mut self) {
+        if self.circuit_state == GpuCircuitState::Open
+            && self.draining.is_none()
+            && self
+                .circuit_opened_at
+                .is_some_and(|opened| opened.elapsed() >= self.circuit_cooldown)
+        {
+            self.circuit_state = GpuCircuitState::HalfOpen;
+        }
     }
 }
 
@@ -370,16 +617,40 @@ fn run_worker(
     request_rx: Receiver<GpuImaginationRequest>,
     result_tx: SyncSender<GpuImaginationResult>,
     status_tx: SyncSender<BackendStatus>,
+    test_delay: Duration,
+    test_delay_once: bool,
 ) {
     #[cfg(target_os = "macos")]
-    let (mut metal, initialization_error) = if matches!(preference, BackendPreference::MetalOnly) {
-        match metal::MetalKernel::new() {
-            Ok(kernel) => (Some(kernel), None),
-            Err(error) => (None, Some(error)),
+    let (mut metal, mut initialization_error) =
+        if matches!(preference, BackendPreference::MetalOnly) {
+            match metal::MetalKernel::new() {
+                Ok(kernel) => (Some(kernel), None),
+                Err(error) => (None, Some(error)),
+            }
+        } else {
+            (None, None)
+        };
+    #[cfg(target_os = "macos")]
+    if let Some(kernel) = metal.as_mut() {
+        // Pipeline creation and this one minimal dispatch stay on the worker,
+        // so the daemon's control cycle never pays Metal warmup latency.
+        let prewarm = GpuImaginationRequest {
+            generation: 0,
+            workload: "prewarm".to_string(),
+            context_revision: 0,
+            candidates: vec![GpuImaginationCandidate {
+                action_key: "prewarm".to_string(),
+                expected_gain: 0.0,
+                uncertainty: 0.0,
+            }],
+            samples_per_candidate: METAL_CROSSOVER_SAMPLES as u32,
+            seed: 0,
+        };
+        if let Err(error) = kernel.run(&prewarm) {
+            initialization_error = Some(format!("Metal prewarm failed: {error}"));
+            metal = None;
         }
-    } else {
-        (None, None)
-    };
+    }
     #[cfg(not(target_os = "macos"))]
     let metal: Option<()> = None;
     #[cfg(not(target_os = "macos"))]
@@ -404,8 +675,20 @@ fn run_worker(
         initialization_error: initialization_error.clone(),
     });
 
+    #[cfg(test)]
+    let mut first_request = true;
     while let Ok(request) = request_rx.recv() {
         let started = Instant::now();
+        #[cfg(test)]
+        if !test_delay.is_zero() && (!test_delay_once || first_request) {
+            thread::sleep(test_delay);
+        }
+        #[cfg(not(test))]
+        let _ = (test_delay, test_delay_once);
+        #[cfg(test)]
+        {
+            first_request = false;
+        }
         let execution = match preference {
             BackendPreference::MetalOnly => {
                 #[cfg(target_os = "macos")]
@@ -438,6 +721,7 @@ fn run_worker(
             Err(error) => GpuImaginationResult {
                 generation: request.generation,
                 workload: request.workload,
+                context_revision: request.context_revision,
                 backend: GpuImaginationBackend::Unavailable,
                 device_name: device_name.clone(),
                 wall_time_ns,
@@ -462,10 +746,23 @@ fn summarize(
         return GpuImaginationResult {
             generation: request.generation,
             workload: request.workload.clone(),
+            context_revision: request.context_revision,
             backend: GpuImaginationBackend::Unavailable,
             device_name: device_name.to_string(),
             wall_time_ns,
             error: Some("GPU output shape mismatch".to_string()),
+            ..GpuImaginationResult::default()
+        };
+    }
+    if samples.iter().any(|sample| !sample.is_finite()) {
+        return GpuImaginationResult {
+            generation: request.generation,
+            workload: request.workload.clone(),
+            context_revision: request.context_revision,
+            backend: GpuImaginationBackend::Unavailable,
+            device_name: device_name.to_string(),
+            wall_time_ns,
+            error: Some("GPU output is non-finite".to_string()),
             ..GpuImaginationResult::default()
         };
     }
@@ -501,6 +798,7 @@ fn summarize(
     GpuImaginationResult {
         generation: request.generation,
         workload: request.workload.clone(),
+        context_revision: request.context_revision,
         backend,
         device_name: device_name.to_string(),
         samples: request.total_samples(),
@@ -709,12 +1007,38 @@ mod tests {
     }
 
     #[test]
+    fn submission_rejects_invalid_shapes_and_work_below_the_metal_crossover() {
+        let mut worker = GpuImaginationWorker::spawn_cpu_reference();
+        let gate = GpuImaginationGate {
+            speculation_allowed: true,
+            memory_pressure: 0.20,
+            gpu_load: 0.0,
+            gpu_watts: None,
+            thermal_nominal: true,
+            app_launching: false,
+            fluidity_degraded: false,
+        };
+        let mut too_small = request();
+        too_small.samples_per_candidate = 1;
+        assert_eq!(
+            worker.try_submit(too_small, gate),
+            GpuSubmitOutcome::Gated("below-crossover")
+        );
+        let mut oversized = request();
+        oversized.samples_per_candidate = MAX_SAMPLES_PER_CANDIDATE + 1;
+        assert_eq!(
+            worker.try_submit(oversized, gate),
+            GpuSubmitOutcome::Gated("invalid-request")
+        );
+    }
+
+    #[test]
     fn gate_yields_to_user_gpu_and_system_stress() {
         let safe = GpuImaginationGate {
             speculation_allowed: true,
             memory_pressure: 0.30,
             gpu_load: 0.05,
-            gpu_watts: 0.4,
+            gpu_watts: Some(0.4),
             thermal_nominal: true,
             app_launching: false,
             fluidity_degraded: false,
@@ -735,6 +1059,36 @@ mod tests {
             }
             .blocker(),
             Some("memory-pressure")
+        );
+    }
+
+    #[test]
+    fn missing_gpu_watts_stays_unknown_without_blocking_public_safety_gates() {
+        let unknown = GpuImaginationGate {
+            speculation_allowed: true,
+            memory_pressure: 0.20,
+            gpu_load: 0.05,
+            gpu_watts: None,
+            thermal_nominal: true,
+            app_launching: false,
+            fluidity_degraded: false,
+        };
+        assert_eq!(unknown.blocker(), None);
+        assert_eq!(
+            GpuImaginationGate {
+                gpu_watts: Some(3.0),
+                ..unknown
+            }
+            .blocker(),
+            Some("gpu-power")
+        );
+        assert_eq!(
+            GpuImaginationGate {
+                gpu_watts: Some(f64::NAN),
+                ..unknown
+            }
+            .blocker(),
+            Some("gpu-power")
         );
     }
 
@@ -784,13 +1138,28 @@ mod tests {
     }
 
     #[test]
+    fn result_never_crosses_capability_or_thermal_revision() {
+        let request = request().with_context_revision(17);
+        let result = summarize(
+            &request,
+            simulate_samples_cpu(&request),
+            GpuImaginationBackend::CpuReference,
+            "cpu",
+            0,
+            1,
+        );
+        assert!(result.is_fresh_for_context(60, "coding", 17));
+        assert!(!result.is_fresh_for_context(60, "coding", 18));
+    }
+
+    #[test]
     fn worker_keeps_compute_off_the_calling_thread() {
         let mut worker = GpuImaginationWorker::spawn_cpu_reference();
         let gate = GpuImaginationGate {
             speculation_allowed: true,
             memory_pressure: 0.20,
             gpu_load: 0.0,
-            gpu_watts: 0.0,
+            gpu_watts: Some(0.0),
             thermal_nominal: true,
             app_launching: false,
             fluidity_degraded: false,
@@ -807,6 +1176,181 @@ mod tests {
         assert!(worker.latest().is_some_and(|result| result.error.is_none()));
         assert!(worker.take_completed().is_some());
         assert!(worker.take_completed().is_none());
+    }
+
+    #[test]
+    fn non_finite_gpu_output_is_rejected() {
+        let request = request();
+        let mut samples = simulate_samples_cpu(&request);
+        samples[0] = f32::NAN;
+        let result = summarize(
+            &request,
+            samples,
+            GpuImaginationBackend::CpuReference,
+            "cpu",
+            0,
+            1,
+        );
+        assert_eq!(result.error.as_deref(), Some("GPU output is non-finite"));
+    }
+
+    #[test]
+    fn overdue_gpu_job_is_quarantined_and_late_result_is_ignored() {
+        let mut worker = GpuImaginationWorker::spawn_cpu_reference_with_delay(
+            GPU_IMAGINATION_DEADLINE + Duration::from_millis(40),
+        );
+        let gate = GpuImaginationGate {
+            speculation_allowed: true,
+            memory_pressure: 0.20,
+            gpu_load: 0.0,
+            gpu_watts: None,
+            thermal_nominal: true,
+            app_launching: false,
+            fluidity_degraded: false,
+        };
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Submitted
+        );
+        thread::sleep(GPU_IMAGINATION_DEADLINE + Duration::from_millis(10));
+        assert_eq!(worker.quarantine_reason(), Some("deadline"));
+        thread::sleep(Duration::from_millis(50));
+        assert!(worker.latest().is_none());
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Unavailable
+        );
+    }
+
+    #[test]
+    fn completed_but_overdue_result_is_rejected_before_receive() {
+        let mut worker = GpuImaginationWorker::spawn_cpu_reference_with_delay(
+            GPU_IMAGINATION_DEADLINE + Duration::from_millis(10),
+        );
+        let gate = GpuImaginationGate {
+            speculation_allowed: true,
+            memory_pressure: 0.20,
+            gpu_load: 0.0,
+            gpu_watts: None,
+            thermal_nominal: true,
+            app_launching: false,
+            fluidity_degraded: false,
+        };
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Submitted
+        );
+        thread::sleep(GPU_IMAGINATION_DEADLINE + Duration::from_millis(40));
+        assert_eq!(worker.quarantine_reason(), Some("deadline"));
+        assert!(worker.latest().is_none());
+    }
+
+    #[test]
+    fn result_completed_within_deadline_survives_a_slow_control_poll() {
+        let mut worker =
+            GpuImaginationWorker::spawn_cpu_reference_with_delay(Duration::from_millis(10));
+        let gate = GpuImaginationGate {
+            speculation_allowed: true,
+            memory_pressure: 0.20,
+            gpu_load: 0.0,
+            gpu_watts: None,
+            thermal_nominal: true,
+            app_launching: false,
+            fluidity_degraded: false,
+        };
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Submitted
+        );
+
+        // Production often polls this worker on a cadence longer than the GPU
+        // deadline. Completion time, not collection time, decides freshness.
+        thread::sleep(GPU_IMAGINATION_DEADLINE + Duration::from_millis(40));
+
+        let completed = worker.take_completed().expect("on-time worker result");
+        assert!(completed.error.is_none());
+        assert_eq!(worker.circuit_state(), GpuCircuitState::Closed);
+        assert_eq!(worker.quarantine_reason(), None);
+    }
+
+    #[test]
+    fn wake_invalidation_discards_pre_wake_result_and_reopens_lane() {
+        let mut worker = GpuImaginationWorker::spawn_cpu_reference_with_timing(
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+        );
+        let gate = GpuImaginationGate {
+            speculation_allowed: true,
+            memory_pressure: 0.20,
+            gpu_load: 0.0,
+            gpu_watts: None,
+            thermal_nominal: true,
+            app_launching: false,
+            fluidity_degraded: false,
+        };
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Submitted
+        );
+        worker.invalidate_for_wake();
+        assert_eq!(worker.circuit_state(), GpuCircuitState::Open);
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Unavailable
+        );
+        thread::sleep(Duration::from_millis(60));
+        assert!(worker.latest().is_none());
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Submitted
+        );
+        assert_eq!(worker.circuit_state(), GpuCircuitState::HalfOpen);
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while worker.latest().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(worker.circuit_state(), GpuCircuitState::Closed);
+        assert_eq!(worker.quarantine_reason(), None);
+    }
+
+    #[test]
+    fn timed_out_worker_recovers_only_after_late_result_drains_and_probe_succeeds() {
+        let mut worker = GpuImaginationWorker::spawn_cpu_reference_with_recovery_timing(
+            GPU_IMAGINATION_DEADLINE + Duration::from_millis(30),
+            Duration::from_millis(10),
+        );
+        let gate = GpuImaginationGate {
+            speculation_allowed: true,
+            memory_pressure: 0.20,
+            gpu_load: 0.0,
+            gpu_watts: None,
+            thermal_nominal: true,
+            app_launching: false,
+            fluidity_degraded: false,
+        };
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Submitted
+        );
+        thread::sleep(GPU_IMAGINATION_DEADLINE + Duration::from_millis(5));
+        assert_eq!(worker.circuit_state(), GpuCircuitState::Open);
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Unavailable
+        );
+
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            worker.try_submit(request(), gate),
+            GpuSubmitOutcome::Submitted
+        );
+        assert_eq!(worker.circuit_state(), GpuCircuitState::HalfOpen);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while worker.latest().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(worker.circuit_state(), GpuCircuitState::Closed);
     }
 
     #[cfg(target_os = "macos")]

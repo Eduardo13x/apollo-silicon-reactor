@@ -1,8 +1,9 @@
 use apollo_engine::engine::compute_fabric::{
-    BackendOutcome, CircuitState, CompletionStatus, ComputeBackendId, ComputeFabric,
-    ComputeFabricConfig, ComputeJob, ComputePayload, EvaluationSample, FabricError, JobClassId,
-    RolloutPhase, MAX_JOB_CLASSES, MAX_RUNNING_JOBS, MAX_VECTOR_VALUES, SHADOW_MIN_JOBS,
-    SHADOW_MIN_WINDOW_US,
+    AccuracyRequirement, BackendHealth, BackendOutcome, CircuitState, CompletionStatus,
+    ComputeBackendId, ComputeFabric, ComputeFabricConfig, ComputeJob, ComputePayload,
+    ComputeResult, EvaluationSample, FabricError, JobClassId, PrivacyClass, RolloutPhase,
+    COMPUTE_CONTRACT_SCHEMA_VERSION, MAX_JOB_CLASSES, MAX_RUNNING_JOBS, MAX_VECTOR_VALUES,
+    SHADOW_MIN_JOBS, SHADOW_MIN_WINDOW_US,
 };
 use apollo_engine::engine::world_state::WorldIdentity;
 
@@ -53,12 +54,19 @@ fn passing_sample(at_us: u64) -> EvaluationSample {
         candidate_latency_us: 90,
         baseline_energy_uj: 100,
         candidate_energy_uj: 100,
+        energy_measured: false,
+        safety_failure: false,
     }
 }
 
 fn move_to_canary(fabric: &mut ComputeFabric, backend: ComputeBackendId) {
     for _ in 0..SHADOW_MIN_JOBS {
-        fabric.record_evaluation(backend, passing_sample(SHADOW_MIN_WINDOW_US)).unwrap();
+        fabric
+            .record_eligible(backend, SHADOW_MIN_WINDOW_US)
+            .unwrap();
+        fabric
+            .record_evaluation(backend, passing_sample(SHADOW_MIN_WINDOW_US))
+            .unwrap();
     }
     assert_eq!(fabric.rollout_phase(backend), RolloutPhase::Canary);
 }
@@ -91,10 +99,64 @@ fn jobs_carry_the_exact_world_identity_without_a_second_identity_type() {
 }
 
 #[test]
+fn public_compute_contracts_are_versioned_numeric_and_backward_compatible() {
+    let request = job(1, 1, ComputeBackendId::CoreMl, 0, 100, 100)
+        .with_contract(AccuracyRequirement::OracleWithinOnePercent, 16);
+    assert_eq!(request.schema_version, COMPUTE_CONTRACT_SCHEMA_VERSION);
+    assert_eq!(request.privacy, PrivacyClass::NumericAggregatesOnly);
+    let mut encoded = serde_json::to_value(&request).unwrap();
+    assert_eq!(encoded["accuracy"], "oracle-within-one-percent");
+    assert!(encoded.to_string().len() < 4_096);
+    for field in ["schema_version", "privacy", "accuracy", "estimated_cost"] {
+        encoded.as_object_mut().unwrap().remove(field);
+    }
+    let legacy: ComputeJob = serde_json::from_value(encoded).unwrap();
+    assert_eq!(legacy.schema_version, COMPUTE_CONTRACT_SCHEMA_VERSION);
+    assert_eq!(legacy.privacy, PrivacyClass::NumericAggregatesOnly);
+
+    let result = ComputeResult {
+        schema_version: COMPUTE_CONTRACT_SCHEMA_VERSION,
+        job_id: request.id,
+        world_identity: identity(),
+        backend: ComputeBackendId::CoreMl,
+        queue_time_us: 10,
+        runtime_us: 20,
+        energy_uj: None,
+        confidence: 0.99,
+        output: ComputePayload::try_vector(vec![0.1; 4]).unwrap(),
+        status: CompletionStatus::Valid,
+    };
+    let health = BackendHealth {
+        schema_version: COMPUTE_CONTRACT_SCHEMA_VERSION,
+        backend: ComputeBackendId::CoreMl,
+        state: CircuitState::Closed,
+        failures: 0,
+        deadline_misses: 0,
+        cooldown_remaining_us: 0,
+    };
+    assert!(serde_json::to_vec(&result).unwrap().len() < 4_096);
+    assert!(serde_json::to_vec(&health).unwrap().len() < 1_024);
+}
+
+#[test]
+fn future_compute_contract_is_rejected_before_queueing() {
+    let mut request = job(1, 1, ComputeBackendId::CoreMl, 0, 100, 100);
+    request.schema_version = COMPUTE_CONTRACT_SCHEMA_VERSION + 1;
+    let mut fabric = fabric();
+    assert_eq!(
+        fabric.submit(request),
+        Err(FabricError::UnsupportedContract)
+    );
+    assert_eq!(fabric.pending_len(), 0);
+}
+
+#[test]
 fn registration_stops_at_thirty_two_job_classes() {
     let mut fabric = fabric();
     for index in 0..MAX_JOB_CLASSES {
-        fabric.register_job_class(JobClassId::new(index as u16)).unwrap();
+        fabric
+            .register_job_class(JobClassId::new(index as u16))
+            .unwrap();
     }
     assert_eq!(fabric.registered_job_classes(), MAX_JOB_CLASSES);
     assert_eq!(
@@ -106,11 +168,17 @@ fn registration_stops_at_thirty_two_job_classes() {
 #[test]
 fn pending_work_is_latest_wins_per_job_class_and_backend() {
     let mut fabric = fabric();
-    fabric.submit(job(1, 1, ComputeBackendId::Metal, 0, 1_000, 1_000)).unwrap();
+    fabric
+        .submit(job(1, 1, ComputeBackendId::Metal, 0, 1_000, 1_000))
+        .unwrap();
     fabric.poll(1);
 
-    fabric.submit(job(2, 1, ComputeBackendId::Metal, 2, 1_000, 1_000)).unwrap();
-    fabric.submit(job(3, 1, ComputeBackendId::Metal, 3, 1_000, 1_000)).unwrap();
+    fabric
+        .submit(job(2, 1, ComputeBackendId::Metal, 2, 1_000, 1_000))
+        .unwrap();
+    fabric
+        .submit(job(3, 1, ComputeBackendId::Metal, 3, 1_000, 1_000))
+        .unwrap();
 
     assert_eq!(fabric.running_len(), 1);
     assert_eq!(fabric.pending_job_ids(), vec![3.into()]);
@@ -260,8 +328,14 @@ fn each_backend_has_an_independent_closed_open_half_open_circuit() {
     for _ in 0..3 {
         fabric.record_backend_failure(ComputeBackendId::Metal, 0);
     }
-    assert_eq!(fabric.circuit_state(ComputeBackendId::Metal, 0), CircuitState::Open);
-    assert_eq!(fabric.circuit_state(ComputeBackendId::CoreMl, 0), CircuitState::Closed);
+    assert_eq!(
+        fabric.circuit_state(ComputeBackendId::Metal, 0),
+        CircuitState::Open
+    );
+    assert_eq!(
+        fabric.circuit_state(ComputeBackendId::CoreMl, 0),
+        CircuitState::Closed
+    );
 
     let half_open_at = ComputeFabricConfig::default().circuit_cooldown_us;
     assert_eq!(
@@ -287,21 +361,30 @@ fn canary_traffic_is_exactly_ten_percent() {
 
 #[test]
 fn promotion_requires_shadow_window_canary_sample_and_all_quality_gates() {
-    let mut fabric = fabric();
-    move_to_canary(&mut fabric, ComputeBackendId::Metal);
+    let mut promoted = fabric();
+    move_to_canary(&mut promoted, ComputeBackendId::Metal);
     for index in 0..500 {
+        promoted
+            .record_eligible(ComputeBackendId::Metal, SHADOW_MIN_WINDOW_US)
+            .unwrap();
         let mut sample = passing_sample(SHADOW_MIN_WINDOW_US);
         sample.deadline_met = index >= 5;
         sample.oracle_error = index < 5;
-        fabric
+        promoted
             .record_evaluation(ComputeBackendId::Metal, sample)
             .unwrap();
     }
-    assert_eq!(fabric.rollout_phase(ComputeBackendId::Metal), RolloutPhase::Active);
+    assert_eq!(
+        promoted.rollout_phase(ComputeBackendId::Metal),
+        RolloutPhase::Active
+    );
 
     let mut failing = fabric();
     move_to_canary(&mut failing, ComputeBackendId::CoreMl);
     for index in 0..500 {
+        failing
+            .record_eligible(ComputeBackendId::CoreMl, SHADOW_MIN_WINDOW_US)
+            .unwrap();
         let mut sample = passing_sample(SHADOW_MIN_WINDOW_US);
         sample.deadline_met = index >= 6;
         sample.oracle_error = index < 6;
@@ -310,7 +393,10 @@ fn promotion_requires_shadow_window_canary_sample_and_all_quality_gates() {
             .record_evaluation(ComputeBackendId::CoreMl, sample)
             .unwrap();
     }
-    assert_eq!(failing.rollout_phase(ComputeBackendId::CoreMl), RolloutPhase::Canary);
+    assert_eq!(
+        failing.rollout_phase(ComputeBackendId::CoreMl),
+        RolloutPhase::Canary
+    );
 }
 
 #[test]
@@ -318,24 +404,156 @@ fn promotion_accepts_the_fifteen_percent_energy_branch() {
     let mut fabric = fabric();
     move_to_canary(&mut fabric, ComputeBackendId::CoreMl);
     for _ in 0..500 {
+        fabric
+            .record_eligible(ComputeBackendId::CoreMl, SHADOW_MIN_WINDOW_US)
+            .unwrap();
         let mut sample = passing_sample(SHADOW_MIN_WINDOW_US);
         sample.candidate_latency_us = sample.baseline_latency_us;
         sample.candidate_energy_uj = 85;
-        fabric.record_evaluation(ComputeBackendId::CoreMl, sample).unwrap();
+        sample.energy_measured = true;
+        fabric
+            .record_evaluation(ComputeBackendId::CoreMl, sample)
+            .unwrap();
     }
-    assert_eq!(fabric.rollout_phase(ComputeBackendId::CoreMl), RolloutPhase::Active);
+    assert_eq!(
+        fabric.rollout_phase(ComputeBackendId::CoreMl),
+        RolloutPhase::Active
+    );
+}
+
+#[test]
+fn canary_duration_counts_eligible_work_not_only_admitted_results() {
+    let mut fabric = fabric();
+    move_to_canary(&mut fabric, ComputeBackendId::CoreMl);
+
+    for eligible in 0..500_u64 {
+        fabric
+            .record_eligible(ComputeBackendId::CoreMl, SHADOW_MIN_WINDOW_US)
+            .unwrap();
+        if fabric.canary_admitted(ComputeBackendId::CoreMl, eligible.into()) {
+            fabric
+                .record_evaluation(
+                    ComputeBackendId::CoreMl,
+                    passing_sample(SHADOW_MIN_WINDOW_US),
+                )
+                .unwrap();
+        }
+    }
+
+    assert_eq!(
+        fabric.rollout_phase(ComputeBackendId::CoreMl),
+        RolloutPhase::Active
+    );
+}
+
+#[test]
+fn deadline_and_safety_failures_block_promotion() {
+    let mut deadlines = fabric();
+    move_to_canary(&mut deadlines, ComputeBackendId::CoreMl);
+    for index in 0..500 {
+        deadlines
+            .record_eligible(ComputeBackendId::CoreMl, SHADOW_MIN_WINDOW_US)
+            .unwrap();
+        if index < 6 {
+            deadlines
+                .record_deadline_miss(ComputeBackendId::CoreMl, SHADOW_MIN_WINDOW_US)
+                .unwrap();
+        } else {
+            deadlines
+                .record_evaluation(
+                    ComputeBackendId::CoreMl,
+                    passing_sample(SHADOW_MIN_WINDOW_US),
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        deadlines.rollout_phase(ComputeBackendId::CoreMl),
+        RolloutPhase::Canary
+    );
+
+    let mut unsafe_backend = fabric();
+    move_to_canary(&mut unsafe_backend, ComputeBackendId::Metal);
+    for index in 0..500 {
+        unsafe_backend
+            .record_eligible(ComputeBackendId::Metal, SHADOW_MIN_WINDOW_US)
+            .unwrap();
+        if index == 0 {
+            unsafe_backend
+                .record_safety_failure(ComputeBackendId::Metal, SHADOW_MIN_WINDOW_US)
+                .unwrap();
+        } else {
+            unsafe_backend
+                .record_evaluation(
+                    ComputeBackendId::Metal,
+                    passing_sample(SHADOW_MIN_WINDOW_US),
+                )
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        unsafe_backend.rollout_phase(ComputeBackendId::Metal),
+        RolloutPhase::Canary
+    );
+}
+
+#[test]
+fn improvement_thresholds_are_exactly_ten_and_fifteen_percent() {
+    let mut latency = fabric();
+    move_to_canary(&mut latency, ComputeBackendId::CoreMl);
+    for _ in 0..500 {
+        latency
+            .record_eligible(ComputeBackendId::CoreMl, SHADOW_MIN_WINDOW_US)
+            .unwrap();
+        let mut sample = passing_sample(SHADOW_MIN_WINDOW_US);
+        sample.candidate_latency_us = 91;
+        latency
+            .record_evaluation(ComputeBackendId::CoreMl, sample)
+            .unwrap();
+    }
+    assert_eq!(
+        latency.rollout_phase(ComputeBackendId::CoreMl),
+        RolloutPhase::Canary
+    );
+
+    let mut unmeasured_energy = fabric();
+    move_to_canary(&mut unmeasured_energy, ComputeBackendId::Metal);
+    for _ in 0..500 {
+        unmeasured_energy
+            .record_eligible(ComputeBackendId::Metal, SHADOW_MIN_WINDOW_US)
+            .unwrap();
+        let mut sample = passing_sample(SHADOW_MIN_WINDOW_US);
+        sample.candidate_latency_us = 100;
+        sample.candidate_energy_uj = 1;
+        unmeasured_energy
+            .record_evaluation(ComputeBackendId::Metal, sample)
+            .unwrap();
+    }
+    assert_eq!(
+        unmeasured_energy.rollout_phase(ComputeBackendId::Metal),
+        RolloutPhase::Canary
+    );
 }
 
 #[test]
 fn shadow_requires_both_five_hundred_jobs_and_fifteen_minutes() {
     let mut fabric = fabric();
     for _ in 0..SHADOW_MIN_JOBS {
-        fabric.record_evaluation(ComputeBackendId::Metal, passing_sample(1)).unwrap();
+        fabric.record_eligible(ComputeBackendId::Metal, 1).unwrap();
+        fabric
+            .record_evaluation(ComputeBackendId::Metal, passing_sample(1))
+            .unwrap();
     }
-    assert_eq!(fabric.rollout_phase(ComputeBackendId::Metal), RolloutPhase::Shadow);
+    assert_eq!(
+        fabric.rollout_phase(ComputeBackendId::Metal),
+        RolloutPhase::Shadow
+    );
 
     fabric.advance_rollouts(SHADOW_MIN_WINDOW_US);
-    assert_eq!(fabric.rollout_phase(ComputeBackendId::Metal), RolloutPhase::Canary);
+    assert_eq!(
+        fabric.rollout_phase(ComputeBackendId::Metal),
+        RolloutPhase::Canary
+    );
 }
 
 #[test]
@@ -344,13 +562,67 @@ fn rollback_is_scoped_to_one_backend() {
     move_to_canary(&mut fabric, ComputeBackendId::Metal);
     for _ in 0..500 {
         fabric
-            .record_evaluation(ComputeBackendId::Metal, passing_sample(SHADOW_MIN_WINDOW_US))
+            .record_eligible(ComputeBackendId::Metal, SHADOW_MIN_WINDOW_US)
+            .unwrap();
+        fabric
+            .record_evaluation(
+                ComputeBackendId::Metal,
+                passing_sample(SHADOW_MIN_WINDOW_US),
+            )
             .unwrap();
     }
-    assert_eq!(fabric.rollout_phase(ComputeBackendId::Metal), RolloutPhase::Active);
+    assert_eq!(
+        fabric.rollout_phase(ComputeBackendId::Metal),
+        RolloutPhase::Active
+    );
 
-    fabric.rollback_backend(ComputeBackendId::Metal, 123).unwrap();
-    assert_eq!(fabric.rollout_phase(ComputeBackendId::Metal), RolloutPhase::RolledBack);
-    assert_eq!(fabric.rollout_phase(ComputeBackendId::CoreMl), RolloutPhase::Shadow);
-    assert_eq!(fabric.circuit_state(ComputeBackendId::Metal, 123), CircuitState::Open);
+    fabric
+        .rollback_backend(ComputeBackendId::Metal, 123)
+        .unwrap();
+    assert_eq!(
+        fabric.rollout_phase(ComputeBackendId::Metal),
+        RolloutPhase::RolledBack
+    );
+    assert_eq!(
+        fabric.rollout_phase(ComputeBackendId::CoreMl),
+        RolloutPhase::Shadow
+    );
+    assert_eq!(
+        fabric.circuit_state(ComputeBackendId::Metal, 123),
+        CircuitState::Open
+    );
+}
+
+#[test]
+fn world_revision_change_cancels_all_pending_and_running_work_once() {
+    let mut fabric = fabric();
+    fabric
+        .submit(job(1, 1, ComputeBackendId::Metal, 0, 1_000, 1_000))
+        .unwrap();
+    fabric
+        .submit(job(2, 2, ComputeBackendId::CoreMl, 0, 1_000, 1_000))
+        .unwrap();
+    fabric.poll(1);
+    assert_eq!(fabric.running_len(), 2);
+
+    let mut next = identity();
+    next.revision += 1;
+    let cancelled = fabric.update_world_identity(next);
+    assert_eq!(cancelled.len(), 2);
+    assert!(cancelled
+        .iter()
+        .all(|completion| completion.status == CompletionStatus::Cancelled));
+    assert_eq!(fabric.running_len(), 0);
+    assert_eq!(fabric.pending_len(), 0);
+    assert!(fabric.update_world_identity(next).is_empty());
+}
+
+#[test]
+fn compute_contracts_are_versioned_serializable_and_action_free() {
+    let request = job(1, 1, ComputeBackendId::CpuUtility, 0, 100, 100);
+    let json = serde_json::to_string(&request).expect("compute job serializes");
+    assert!(json.contains("world_identity"));
+    assert!(!json.contains("RootAction"));
+    let restored: ComputeJob = serde_json::from_str(&json).expect("compute job restores");
+    assert_eq!(restored, request);
 }

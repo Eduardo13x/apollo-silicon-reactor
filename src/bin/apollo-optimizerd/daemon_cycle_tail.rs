@@ -30,7 +30,7 @@
 //! them. Do not bundle them into a sub-struct (NotebookLM §"Advertencia
 //! de Bloqueo").
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -38,7 +38,7 @@ use apollo_engine::collector::{SystemCollector, SystemSnapshot};
 use apollo_engine::engine::build_tracker::BuildPhase;
 use apollo_engine::engine::daemon_state::SharedState;
 use apollo_engine::engine::decision_ledger::{
-    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents,
+    ActuatorDecisionEvent, ActuatorDecisionOutcome, CycleDecisionEvents, PredictionRecord,
 };
 use apollo_engine::engine::exploration_scheduler::{
     ActionClass, CommitEvidence, ExplorationArm, ExplorationCandidate, ExplorationContext,
@@ -57,6 +57,12 @@ use apollo_engine::engine::pipeline::periodic_stage::{
 use apollo_engine::engine::process_classifier::ProcessSnapshot;
 use apollo_engine::engine::process_identity::ProcessIdentity;
 use apollo_engine::engine::process_tree::ProcessTree;
+use apollo_engine::engine::reflex::{
+    LatestReasoningWorker, ReasoningIdentity, ReasoningLookup, ReasoningSnapshot, ReflexActionKind,
+    ReflexAdvice, ReflexBroker as AdmissionReflexBroker, ReflexDecision, ReflexHealthSample,
+    ReflexIntent, ReflexRolloutPhase, ReflexRolloutState, ReflexSafetyContext, ReflexSource,
+    ReflexTarget, ReflexTrigger,
+};
 use apollo_engine::engine::safety::{
     can_boost, hard_protected_contains, is_chromium_family, ProcessInterventionClass,
 };
@@ -73,6 +79,8 @@ enum InteractionReason {
     WindowOperation,
     BuildStart,
     AppLaunch,
+    WebNavigation,
+    NetworkActivity,
 }
 
 impl InteractionReason {
@@ -82,6 +90,8 @@ impl InteractionReason {
             Self::WindowOperation => Duration::from_millis(1_200),
             Self::BuildStart => Duration::from_secs(3),
             Self::AppLaunch => Duration::from_secs(5),
+            Self::WebNavigation => Duration::from_secs(2),
+            Self::NetworkActivity => Duration::from_millis(1_200),
         }
     }
 
@@ -91,7 +101,68 @@ impl InteractionReason {
             Self::WindowOperation => "window",
             Self::BuildStart => "build_start",
             Self::AppLaunch => "app_launch",
+            Self::WebNavigation => "web_navigation",
+            Self::NetworkActivity => "network_activity",
         }
+    }
+
+    fn reflex_trigger(self) -> ReflexTrigger {
+        match self {
+            Self::Input => ReflexTrigger::Input,
+            Self::WindowOperation => ReflexTrigger::WindowOperation,
+            Self::BuildStart => ReflexTrigger::BuildStart,
+            Self::AppLaunch => ReflexTrigger::AppLaunch,
+            Self::WebNavigation => ReflexTrigger::WebNavigation,
+            Self::NetworkActivity => ReflexTrigger::NetworkActivity,
+        }
+    }
+
+    fn max_continuous(self) -> Duration {
+        if self == Self::WebNavigation {
+            Duration::from_secs(15)
+        } else {
+            MAX_CONTINUOUS_LEASE
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccelerationHintKind {
+    WebNavigation,
+    NetworkActivity,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccelerationHint {
+    pub kind: AccelerationHintKind,
+    pub target_pid: u32,
+    pub ttl_ms: u32,
+}
+
+impl AccelerationHint {
+    fn reason(self) -> InteractionReason {
+        match self.kind {
+            AccelerationHintKind::WebNavigation => InteractionReason::WebNavigation,
+            AccelerationHintKind::NetworkActivity => InteractionReason::NetworkActivity,
+        }
+    }
+
+    fn valid_for(self, foreground_pid: Option<u32>) -> bool {
+        foreground_pid == Some(self.target_pid) && (100..=5_000).contains(&self.ttl_ms)
+    }
+}
+
+fn select_acceleration_reason(
+    legacy: Option<InteractionReason>,
+    hint: Option<AccelerationHint>,
+) -> Option<InteractionReason> {
+    match legacy {
+        Some(
+            reason @ (InteractionReason::AppLaunch
+            | InteractionReason::WindowOperation
+            | InteractionReason::BuildStart),
+        ) => Some(reason),
+        _ => hint.map(AccelerationHint::reason).or(legacy),
     }
 }
 
@@ -102,10 +173,189 @@ const LEDGER_GRACE: Duration = Duration::from_secs(5);
 const TASK_QOS_OWNER: &str = "acceleration lease: interactive task QoS";
 const NICE_OWNER: &str = "acceleration lease: nice fallback";
 const LEASE_NICE: i32 = -2;
+const REFLEX_REASONING_CADENCE_CYCLES: u64 = 2;
+
+#[derive(Debug, Clone)]
+struct ReflexReasoningPayload {
+    world_model: WorldModel,
+    workload: String,
+    signals: ReflexModelSignals,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ReflexModelSignals {
+    pub nars_reliability: f64,
+    pub mpc_urgency: f64,
+    pub mpc_recommendation: usize,
+    pub causal_confidence: f64,
+    pub markov_confidence: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReflexReasoningAdvice {
+    interaction_bias: ContextualActionBias,
+    io_bias: ContextualActionBias,
+    learned_ttl_band: Option<LeaseTtlBand>,
+    sources: Vec<ReflexSource>,
+}
+
+fn evaluate_reflex_reasoning(payload: ReflexReasoningPayload) -> ReflexReasoningAdvice {
+    let mut sources = Vec::with_capacity(4);
+    if payload.signals.nars_reliability.is_finite() && payload.signals.nars_reliability >= 0.70 {
+        sources.push(ReflexSource::Nars);
+    }
+    if payload.signals.mpc_urgency.is_finite()
+        && payload.signals.mpc_urgency >= 0.50
+        && payload.signals.mpc_recommendation != 0
+    {
+        sources.push(ReflexSource::Mpc);
+    }
+    if payload.signals.causal_confidence.is_finite() && payload.signals.causal_confidence >= 0.70 {
+        sources.push(ReflexSource::Causal);
+    }
+    if payload.signals.markov_confidence.is_finite() && payload.signals.markov_confidence >= 0.50 {
+        sources.push(ReflexSource::Markov);
+    }
+    let mut learned_ttl_band = learned_lease_ttl_band(&payload.world_model, &payload.workload);
+    if payload.signals.mpc_recommendation == 2 && payload.signals.mpc_urgency >= 0.50 {
+        learned_ttl_band = Some(LeaseTtlBand::Long);
+    }
+    ReflexReasoningAdvice {
+        interaction_bias: payload
+            .world_model
+            .contextual_action_bias("interaction_qos:foreground", &payload.workload),
+        io_bias: payload
+            .world_model
+            .contextual_action_bias("io_shaping:interactive_release", &payload.workload),
+        learned_ttl_band,
+        sources,
+    }
+}
+
+fn reflex_advice_from_bias(
+    bias: ContextualActionBias,
+    supporting_sources: &[ReflexSource],
+) -> ReflexAdvice {
+    let observations = bias
+        .model_observations
+        .saturating_add(bias.episodic_observations);
+    let confidence = if observations == 0 {
+        0.0
+    } else {
+        f64::from(observations) / (f64::from(observations) + 10.0)
+    };
+    let mut sources = Vec::with_capacity(2);
+    if bias.is_informative() {
+        sources.push(ReflexSource::WorldModel);
+    }
+    if bias.has_gpu_influence() {
+        sources.push(ReflexSource::Gpu);
+    }
+    sources.extend_from_slice(supporting_sources);
+    ReflexAdvice {
+        score: bias.score,
+        lower_bound: (bias.score - 0.05).clamp(-1.0, 1.0),
+        upper_bound: (bias.score + 0.05).clamp(-1.0, 1.0),
+        confidence,
+        authoritative: bias.authoritative,
+        sources,
+    }
+}
+
+fn reflex_decision_allows_actuation(decision: ReflexDecision, phase: ReflexRolloutPhase) -> bool {
+    phase == ReflexRolloutPhase::Shadow || matches!(decision, ReflexDecision::Admit)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AccelerationLaneAdmission {
+    task_qos: bool,
+    nice: bool,
+    io_release: bool,
+}
+
+fn decide_acceleration_lanes(
+    controller: &mut AccelerationLeaseBroker,
+    identity: Option<&ProcessIdentity>,
+    reason: InteractionReason,
+    cycle: u64,
+    ttl_ms: u64,
+    safety: ReflexSafetyContext,
+    reasoning: &ReflexReasoningAdvice,
+) -> AccelerationLaneAdmission {
+    let decide = |controller: &mut AccelerationLeaseBroker,
+                  action: ReflexActionKind,
+                  bias: ContextualActionBias| {
+        let decision = identity
+            .and_then(|identity| {
+                ReflexIntent::new(
+                    action,
+                    Some(ReflexTarget {
+                        pid: identity.pid,
+                        start_sec: identity.start_sec,
+                        start_usec: identity.start_usec,
+                        name: identity.name.clone(),
+                    }),
+                    reason.reflex_trigger(),
+                    ReflexSource::Deterministic,
+                    cycle,
+                    ttl_ms,
+                )
+                .ok()
+            })
+            .map(|intent| {
+                controller.admission.decide(
+                    &intent.with_advice(reflex_advice_from_bias(bias, &reasoning.sources)),
+                    safety,
+                )
+            })
+            .unwrap_or(ReflexDecision::Skipped(
+                apollo_engine::engine::reflex::ReflexBlocker::MissingIdentity,
+            ));
+        reflex_decision_allows_actuation(decision, controller.admission.rollout().phase)
+    };
+
+    AccelerationLaneAdmission {
+        task_qos: decide(
+            controller,
+            ReflexActionKind::InteractionQos,
+            reasoning.interaction_bias,
+        ),
+        nice: decide(
+            controller,
+            ReflexActionKind::Nice,
+            reasoning.interaction_bias,
+        ),
+        io_release: decide(
+            controller,
+            ReflexActionKind::InteractiveIoRelease,
+            reasoning.io_bias,
+        ),
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct AccelerationTickOutput {
     pub decision_events: CycleDecisionEvents,
+}
+
+fn capture_acceleration_forecasts(
+    events: &CycleDecisionEvents,
+    mut forecast_for: impl FnMut(&str) -> Vec<PredictionRecord>,
+) -> BTreeMap<String, Vec<PredictionRecord>> {
+    let mut forecasts = BTreeMap::new();
+    for event in events.as_slice() {
+        if event.outcome != ActuatorDecisionOutcome::Applied
+            || !event.proposal.predictions.is_empty()
+            || forecasts.contains_key(&event.proposal.action_key)
+        {
+            continue;
+        }
+        let predictions = forecast_for(&event.proposal.action_key);
+        if !predictions.is_empty() {
+            forecasts.insert(event.proposal.action_key.clone(), predictions);
+        }
+    }
+    forecasts
 }
 
 fn acceleration_event(
@@ -192,13 +442,29 @@ impl LeaseTtlBand {
     }
 
     fn ttl(self, reason: InteractionReason) -> Duration {
+        self.apply(reason.ttl())
+    }
+
+    fn apply(self, base: Duration) -> Duration {
         let factor = match self {
             Self::Short => 0.90,
             Self::Standard => 1.0,
             Self::Long => 1.10,
         };
-        reason.ttl().mul_f64(factor)
+        base.mul_f64(factor)
     }
+}
+
+fn hinted_ttl(
+    band: LeaseTtlBand,
+    reason: InteractionReason,
+    hint: Option<AccelerationHint>,
+) -> Duration {
+    let base = hint.filter(|hint| hint.reason() == reason).map_or_else(
+        || reason.ttl(),
+        |hint| Duration::from_millis(u64::from(hint.ttl_ms)),
+    );
+    band.apply(base)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,7 +608,7 @@ struct ActiveAccelerationLease {
 
 /// Short-lived, bounded acceleration ownership for the active application
 /// family. Input history detects HID idle resets without another IOKit query.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AccelerationLeaseBroker {
     active: Option<ActiveAccelerationLease>,
     last_idle_secs: Option<f64>,
@@ -350,9 +616,292 @@ pub struct AccelerationLeaseBroker {
     app_launch_was_active: bool,
     window_op_was_active: bool,
     cooldown_until: Option<Instant>,
+    admission: AdmissionReflexBroker,
+    reasoning: Option<LatestReasoningWorker<ReflexReasoningPayload, ReflexReasoningAdvice>>,
+    last_reasoning_submit_cycle: u64,
+    last_reasoning_identity: Option<ReasoningIdentity>,
+    last_reasoning_workload: String,
+}
+
+pub type ReflexBroker = AccelerationLeaseBroker;
+
+impl Default for AccelerationLeaseBroker {
+    fn default() -> Self {
+        Self::new(true, 500, compiled_reflex_profile())
+    }
 }
 
 impl AccelerationLeaseBroker {
+    pub fn new(enabled: bool, shadow_cycles: u64, build_profile: &str) -> Self {
+        let reasoning = LatestReasoningWorker::spawn(
+            "apollo-reflex-reasoner",
+            evaluate_reflex_reasoning,
+        )
+        .map_err(|error| {
+            tracing::warn!(%error, "reflex reasoner unavailable; deterministic fallback active");
+            error
+        })
+        .ok();
+        Self {
+            active: None,
+            last_idle_secs: None,
+            build_was_active: false,
+            app_launch_was_active: false,
+            window_op_was_active: false,
+            cooldown_until: None,
+            admission: AdmissionReflexBroker::new(enabled, shadow_cycles, build_profile),
+            reasoning,
+            last_reasoning_submit_cycle: 0,
+            last_reasoning_identity: None,
+            last_reasoning_workload: String::new(),
+        }
+    }
+
+    pub fn restore(
+        enabled: bool,
+        shadow_cycles: u64,
+        build_profile: &str,
+        persisted_json: Option<&str>,
+    ) -> Self {
+        let mut broker = Self::new(enabled, shadow_cycles, build_profile);
+        let Some(json) = persisted_json else {
+            return broker;
+        };
+        let restored = AdmissionReflexBroker::restore_json(json, build_profile);
+        if restored.rollout().enabled == enabled
+            && restored.rollout().shadow_cycles == shadow_cycles.max(500)
+        {
+            broker.admission = restored;
+        }
+        broker
+    }
+
+    fn current_reasoning_advice(
+        &self,
+        cycle: u64,
+        identity: ReasoningIdentity,
+    ) -> ReflexReasoningAdvice {
+        self.reasoning
+            .as_ref()
+            .and_then(|worker| match worker.latest_for(cycle, identity) {
+                ReasoningLookup::Fresh(result) => Some(result.payload),
+                ReasoningLookup::Pending
+                | ReasoningLookup::Stale { .. }
+                | ReasoningLookup::IdentityMismatch => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn refresh_reasoning(
+        &mut self,
+        cycle: u64,
+        identity: ReasoningIdentity,
+        world_model: &WorldModel,
+        workload: &str,
+        active_hint: bool,
+        signals: ReflexModelSignals,
+    ) {
+        if !active_hint {
+            return;
+        }
+        let target_changed = self.last_reasoning_identity != Some(identity)
+            || self.last_reasoning_workload != workload;
+        if !target_changed
+            && cycle.saturating_sub(self.last_reasoning_submit_cycle)
+                < REFLEX_REASONING_CADENCE_CYCLES
+        {
+            return;
+        }
+        let Some(worker) = self.reasoning.as_ref() else {
+            return;
+        };
+        if worker.submit(ReasoningSnapshot::new(
+            cycle,
+            identity,
+            ReflexReasoningPayload {
+                world_model: world_model.clone(),
+                workload: workload.to_string(),
+                signals,
+            },
+        )) {
+            self.last_reasoning_submit_cycle = cycle;
+            self.last_reasoning_identity = Some(identity);
+            self.last_reasoning_workload.clear();
+            self.last_reasoning_workload.push_str(workload);
+        }
+    }
+
+    pub fn record_outcomes(&mut self, events: &CycleDecisionEvents) {
+        self.record_outcomes_matching(events, |_| true);
+    }
+
+    pub fn record_outcomes_for_prefix(&mut self, events: &CycleDecisionEvents, prefix: &str) {
+        self.record_outcomes_matching(events, |event| {
+            event.proposal.action_key.starts_with(prefix)
+        });
+    }
+
+    fn record_outcomes_matching(
+        &mut self,
+        events: &CycleDecisionEvents,
+        matches_event: impl Fn(&apollo_engine::engine::decision_ledger::ActuatorDecisionEvent) -> bool,
+    ) {
+        let mut applied = 0u64;
+        let mut failed = 0u64;
+        let mut reverted = 0u64;
+        let mut no_op = 0u64;
+        let mut applied_members = HashSet::new();
+        let mut failed_members = HashSet::new();
+        let mut unscoped_failures = 0u64;
+        let mut reverted_members = HashSet::new();
+        for event in events.as_slice() {
+            if !matches_event(event) {
+                continue;
+            }
+            let member_pid = event
+                .proposal
+                .target
+                .rsplit(':')
+                .next()
+                .and_then(|value| value.parse::<u32>().ok());
+            match event.outcome {
+                ActuatorDecisionOutcome::Applied => {
+                    applied = applied.saturating_add(1);
+                    if let Some(pid) = member_pid {
+                        applied_members.insert(pid);
+                    }
+                }
+                ActuatorDecisionOutcome::Failed => {
+                    failed = failed.saturating_add(1);
+                    if let Some(pid) = member_pid {
+                        failed_members.insert(pid);
+                    } else {
+                        unscoped_failures = unscoped_failures.saturating_add(1);
+                    }
+                }
+                ActuatorDecisionOutcome::Reverted => {
+                    reverted = reverted.saturating_add(1);
+                    if let Some(pid) = member_pid {
+                        reverted_members.insert(pid);
+                    }
+                }
+                ActuatorDecisionOutcome::NoOp => no_op = no_op.saturating_add(1),
+                _ => {}
+            }
+        }
+        self.admission.record_applied(applied);
+        self.admission.record_reverted(reverted);
+        self.admission
+            .record_members_applied(applied_members.len() as u64);
+        self.admission
+            .record_members_reverted(reverted_members.len() as u64);
+        self.admission.record_failed(failed);
+        let unrecovered_failures = unscoped_failures.saturating_add(
+            failed_members
+                .difference(&applied_members)
+                .count()
+                .min(u64::MAX as usize) as u64,
+        );
+        self.admission.record_health_failed(unrecovered_failures);
+        self.admission.record_noop(no_op);
+    }
+
+    pub fn decide_external(
+        &mut self,
+        intent: &ReflexIntent,
+        safety: ReflexSafetyContext,
+    ) -> ReflexDecision {
+        self.admission.decide(intent, safety)
+    }
+
+    pub fn allows_current_actuation(&self, decision: ReflexDecision) -> bool {
+        reflex_decision_allows_actuation(decision, self.admission.rollout().phase)
+    }
+
+    pub fn phase(&self) -> ReflexRolloutPhase {
+        self.admission.rollout().phase
+    }
+
+    fn sync_reflex_metrics(&self, state: &SharedState, current_cycle: u64) {
+        let rollout = self.admission.rollout();
+        let counters = self.admission.counters();
+        let reasoning = self
+            .reasoning
+            .as_ref()
+            .map(LatestReasoningWorker::stats)
+            .unwrap_or_default();
+        let mut metrics = state.metrics.lock_recover();
+        metrics.metrics.reflex_enabled = rollout.enabled;
+        metrics.metrics.reflex_phase = rollout.phase.as_str().to_string();
+        metrics.metrics.reflex_blocker = rollout.blocker.clone();
+        metrics.metrics.reflex_shadow_cycles = rollout.shadow_cycles;
+        metrics.metrics.reflex_valid_cycles = rollout.valid_cycles;
+        metrics.metrics.reflex_invalid_samples_total = rollout.invalid_samples;
+        metrics.metrics.reflex_baseline_p95_ms = rollout.baseline_p95_ms();
+        metrics.metrics.reflex_candidate_p95_ms = rollout.candidate_p95_ms();
+        metrics.metrics.reflex_baseline_churn = rollout.baseline_churn();
+        metrics.metrics.reflex_candidate_churn = rollout.candidate_churn();
+        metrics.metrics.reflex_proposed_total = counters.proposed;
+        metrics.metrics.reflex_admitted_total = counters.admitted;
+        metrics.metrics.reflex_applied_total = counters.applied;
+        metrics.metrics.reflex_shadowed_total = counters.shadowed;
+        metrics.metrics.reflex_omitted_total = counters.omitted;
+        metrics.metrics.reflex_noop_total = counters.no_op;
+        metrics.metrics.reflex_vetoed_total = counters.vetoed;
+        metrics.metrics.reflex_reverted_total = counters.reverted;
+        metrics.metrics.reflex_failed_total = counters.failed;
+        metrics.metrics.reflex_protected_blocked_total = counters.protected_blocked;
+        metrics.metrics.reflex_last_decision_latency_us = counters.last_decision_latency_us;
+        metrics.metrics.reflex_reasoning_submitted_total = reasoning.submitted;
+        metrics.metrics.reflex_reasoning_dropped_total = reasoning.dropped;
+        metrics.metrics.reflex_reasoning_completed_total = reasoning.completed;
+        metrics.metrics.reflex_reasoning_failed_total = reasoning.failed;
+        metrics.metrics.reflex_reasoning_deadline_misses_total = reasoning.deadline_misses;
+        metrics.metrics.reflex_reasoning_identity_mismatches_total = reasoning.identity_mismatches;
+        metrics.metrics.reflex_reasoning_last_result_age_cycles =
+            if reasoning.last_result_cycle == 0 {
+                0
+            } else {
+                current_cycle.saturating_sub(reasoning.last_result_cycle)
+            };
+        metrics.metrics.reflex_reasoning_last_latency_us = reasoning.last_latency_us;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn observe_health(
+        &mut self,
+        state: &SharedState,
+        cycle: u64,
+        expected_profile: &str,
+        compiled_profile: &str,
+        effective_profile: &str,
+        paused: bool,
+    ) {
+        let (p95_cycle_ms, rollback_failures_total) = {
+            let metrics = state.metrics.lock_recover();
+            (metrics.metrics.p95_cycle_ms, metrics.metrics.reverts_failed)
+        };
+        let counters = self.admission.counters().clone();
+        self.admission.observe_health(ReflexHealthSample {
+            cycle,
+            p95_cycle_ms,
+            applied_total: counters.members_applied,
+            reverted_total: counters.members_reverted,
+            protected_admissions_total: counters.protected_admitted,
+            failures_total: counters.health_failures,
+            rollback_failures_total,
+            expected_profile: expected_profile.to_string(),
+            compiled_profile: compiled_profile.to_string(),
+            effective_profile: effective_profile.to_string(),
+            paused,
+        });
+        self.sync_reflex_metrics(state, cycle);
+    }
+
+    pub fn rollout_state(&self) -> &ReflexRolloutState {
+        self.admission.rollout()
+    }
+
     fn preview_ttl_band(
         &self,
         contextual_bias: ContextualActionBias,
@@ -410,6 +959,14 @@ impl AccelerationLeaseBroker {
     }
 }
 
+fn compiled_reflex_profile() -> &'static str {
+    if cfg!(feature = "adaptive-multicore") {
+        "adaptive-multicore"
+    } else {
+        "sequential"
+    }
+}
+
 fn candidate_precedes(lhs: &AccelerationCandidate, rhs: &AccelerationCandidate) -> bool {
     lhs.score > rhs.score || (lhs.score == rhs.score && lhs.pid < rhs.pid)
 }
@@ -451,6 +1008,17 @@ fn is_build_member(name: &str) -> bool {
         )
 }
 
+fn acceleration_member_is_protected(name: &str, apple_owned: bool) -> bool {
+    apple_owned
+        || hard_protected_contains(name)
+        || ProcessInterventionClass::for_name(name) == ProcessInterventionClass::ProtectedSystem
+}
+
+fn acceleration_pid_is_apple_owned(pid: u32) -> bool {
+    ProcessIdentity::from_pid(pid)
+        .is_some_and(|_| apollo_engine::engine::apple_owned::is_apple_owned(pid))
+}
+
 fn build_target_score(snapshot: &ProcessSnapshot) -> f64 {
     let lower = snapshot.name.to_ascii_lowercase();
     let coordinator = matches!(
@@ -470,7 +1038,10 @@ fn select_build_target(snapshots: &[ProcessSnapshot]) -> Option<u32> {
     for snapshot in snapshots {
         if snapshot.is_zombie
             || !is_build_member(&snapshot.name)
-            || hard_protected_contains(&snapshot.name)
+            || acceleration_member_is_protected(
+                &snapshot.name,
+                acceleration_pid_is_apple_owned(snapshot.pid),
+            )
             || !can_boost(&snapshot.name)
         {
             continue;
@@ -555,7 +1126,10 @@ fn select_acceleration_family(
         for snapshot in snapshots {
             if snapshot.is_zombie
                 || !is_build_member(&snapshot.name)
-                || hard_protected_contains(&snapshot.name)
+                || acceleration_member_is_protected(
+                    &snapshot.name,
+                    acceleration_pid_is_apple_owned(snapshot.pid),
+                )
                 || !can_boost(&snapshot.name)
             {
                 continue;
@@ -617,11 +1191,12 @@ fn select_acceleration_family(
         let Some(snapshot) = by_pid.get(&pid).copied() else {
             continue;
         };
-        if snapshot.is_zombie || hard_protected_contains(&snapshot.name) {
-            continue;
-        }
-        let intervention = ProcessInterventionClass::for_name(&snapshot.name);
-        if intervention == ProcessInterventionClass::ProtectedSystem {
+        if snapshot.is_zombie
+            || acceleration_member_is_protected(
+                &snapshot.name,
+                acceleration_pid_is_apple_owned(snapshot.pid),
+            )
+        {
             continue;
         }
         // Chromium gets only the existing foreground-tier inheritance. The
@@ -739,13 +1314,13 @@ fn acquire_acceleration_lease(
     selection: AccelerationSelection,
     reason: InteractionReason,
     ttl_decision: LeaseTtlDecision,
-    allow_io_promotion: bool,
+    ttl: Duration,
+    lane_admission: AccelerationLaneAdmission,
     io_bias: ContextualActionBias,
     now: Instant,
     cycle: u64,
 ) -> (CycleDecisionEvents, bool) {
     let mut decision_events = CycleDecisionEvents::default();
-    let ttl = ttl_decision.band.ttl(reason);
     let ledger_ttl = ttl.saturating_add(LEDGER_GRACE);
     let mut identity_skips = 0u64;
     let mut capability_skips = 0u64;
@@ -755,6 +1330,20 @@ fn acquire_acceleration_lease(
     let mut identity_recheck_failed = false;
     let mut prepared = Vec::with_capacity(selection.members.len());
     for candidate in selection.members {
+        if acceleration_member_is_protected(
+            &candidate.name,
+            acceleration_pid_is_apple_owned(candidate.pid),
+        ) {
+            decision_events.push(acceleration_member_event(
+                candidate.pid,
+                &candidate.name,
+                AccelerationMemberEffect::TaskQos,
+                cycle,
+                ActuatorDecisionOutcome::Blocked,
+                "member became protected before acceleration",
+            ));
+            continue;
+        }
         if let Some(identity) = ProcessIdentity::from_pid(candidate.pid) {
             let task_effect =
                 apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid: candidate.pid };
@@ -789,7 +1378,7 @@ fn acquire_acceleration_lease(
         .map(|(candidate, _, _, _)| (candidate.pid, candidate.name.clone()))
         .collect();
     let mut qos = state.mach_qos.lock_recover();
-    let io_outcomes = if allow_io_promotion {
+    let io_outcomes = if lane_admission.io_release {
         let mut outcomes = Vec::with_capacity(prepared.len());
         for (candidate, identity, _, _) in &prepared {
             if reverify_member_identity(identity) {
@@ -866,7 +1455,16 @@ fn acquire_acceleration_lease(
         }
         let mut policy_lease = None;
         let mut task_qos_mutated = false;
-        if task_conflict {
+        if !lane_admission.task_qos {
+            decision_events.push(acceleration_member_event(
+                candidate.pid,
+                &candidate.name,
+                AccelerationMemberEffect::TaskQos,
+                cycle,
+                ActuatorDecisionOutcome::Vetoed,
+                "reflex task QoS lane not admitted",
+            ));
+        } else if task_conflict {
             decision_events.push(acceleration_member_event(
                 candidate.pid,
                 &candidate.name,
@@ -915,6 +1513,16 @@ fn acquire_acceleration_lease(
             }
         }
         let prior_nice = if task_qos_mutated {
+            None
+        } else if !lane_admission.nice {
+            decision_events.push(acceleration_member_event(
+                candidate.pid,
+                &candidate.name,
+                AccelerationMemberEffect::Nice,
+                cycle,
+                ActuatorDecisionOutcome::Vetoed,
+                "reflex nice lane not admitted",
+            ));
             None
         } else if nice_conflict {
             decision_events.push(acceleration_member_event(
@@ -995,6 +1603,10 @@ fn acquire_acceleration_lease(
     }
 
     let member_count = members.len() as u32;
+    let task_qos_applied = members
+        .iter()
+        .filter(|member| member.task_qos_mutated)
+        .count() as u64;
     if member_count > 0 {}
     {
         let mut metrics = state.metrics.lock_recover();
@@ -1010,6 +1622,10 @@ fn acquire_acceleration_lease(
             .metrics
             .acceleration_lease_nice_fallbacks_total
             .saturating_add(nice_fallbacks);
+        metrics.metrics.acceleration_lease_task_qos_applied_total = metrics
+            .metrics
+            .acceleration_lease_task_qos_applied_total
+            .saturating_add(task_qos_applied);
         metrics.metrics.acceleration_lease_nice_failures_total = metrics
             .metrics
             .acceleration_lease_nice_failures_total
@@ -1094,7 +1710,7 @@ fn acquire_acceleration_lease(
                 members,
                 acquired_at: now,
                 expires_at: now + ttl,
-                hard_deadline: now + MAX_CONTINUOUS_LEASE,
+                hard_deadline: now + reason.max_continuous(),
                 reason,
                 ttl_band: ttl_decision.band,
                 ttl_exploratory: ttl_decision.exploratory,
@@ -1123,21 +1739,30 @@ fn update_acceleration_lease_inner(
     foreground_pid: Option<u32>,
     build_phase: BuildPhase,
     idle_secs: f64,
+    acceleration_hint: Option<AccelerationHint>,
     process_tree: &ProcessTree,
     snapshots: &[ProcessSnapshot],
     io_shaper: &mut IoShaper,
     world_model: &WorldModel,
     workload: &str,
+    model_signals: ReflexModelSignals,
     cycle: u64,
     exploration_scheduler: &mut ExplorationScheduler,
     exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
 ) -> CycleDecisionEvents {
     let mut decision_events = CycleDecisionEvents::default();
     let now = Instant::now();
-    let reason = controller.select_reason(fluidity_state, build_phase, idle_secs);
+    let acceleration_hint = acceleration_hint.filter(|hint| hint.valid_for(foreground_pid));
+    let legacy_reason = controller.select_reason(fluidity_state, build_phase, idle_secs);
+    let reason = select_acceleration_reason(legacy_reason, acceleration_hint);
     let target_pid = match reason {
         Some(InteractionReason::AppLaunch) => fluidity_state.launch_pid.or(foreground_pid),
         Some(InteractionReason::BuildStart) => select_build_target(snapshots).or(foreground_pid),
+        Some(InteractionReason::WebNavigation | InteractionReason::NetworkActivity) => {
+            acceleration_hint
+                .map(|hint| hint.target_pid)
+                .or(foreground_pid)
+        }
         _ => foreground_pid,
     };
     let target_root = target_pid.map(|pid| {
@@ -1170,6 +1795,27 @@ fn update_acceleration_lease_inner(
         decision_events.extend_buffer(&release_acceleration_lease(controller, state, cycle));
     }
 
+    let reasoning_identity = target_root
+        .and_then(ProcessIdentity::from_pid)
+        .map(|identity| ReasoningIdentity {
+            pid: identity.pid,
+            start_sec: identity.start_sec,
+            start_usec: identity.start_usec,
+        });
+    let reasoning_advice = reasoning_identity
+        .map(|identity| controller.current_reasoning_advice(cycle, identity))
+        .unwrap_or_default();
+    if let Some(identity) = reasoning_identity {
+        controller.refresh_reasoning(
+            cycle,
+            identity,
+            world_model,
+            workload,
+            reason.is_some(),
+            model_signals,
+        );
+    }
+
     if reason.is_none()
         || target_pid.is_none()
         || controller.cooldown_until.is_some_and(|until| now < until)
@@ -1177,17 +1823,14 @@ fn update_acceleration_lease_inner(
         return decision_events;
     }
 
-    // Context search is bounded but still unnecessary on idle cycles. Query
-    // only after a specialist interaction signal has passed the local gates.
-    let interaction_bias =
-        world_model.contextual_action_bias("interaction_qos:foreground", workload);
-    let io_bias = world_model.contextual_action_bias("io_shaping:interactive_release", workload);
-    let learned_ttl_band = learned_lease_ttl_band(world_model, workload);
+    let interaction_bias = reasoning_advice.interaction_bias;
+    let io_bias = reasoning_advice.io_bias;
+    let learned_ttl_band = reasoning_advice.learned_ttl_band;
 
     if let (Some(reason), Some(pid), Some(root_pid)) = (reason, target_pid, target_root) {
         if let Some(active) = controller.active.as_mut() {
             if active.root_pid == root_pid {
-                let ttl = active.ttl_band.ttl(reason);
+                let ttl = hinted_ttl(active.ttl_band, reason, acceleration_hint);
                 active.expires_at = (now + ttl).min(active.hard_deadline);
                 active.reason = reason;
                 decision_events.extend_buffer(&refresh_owned_effects(active, now, cycle));
@@ -1287,6 +1930,45 @@ fn update_acceleration_lease_inner(
                     .as_ref()
                     .map(|approval| approval.metadata.arm),
             );
+            let lane_admission = decide_acceleration_lanes(
+                controller,
+                identity.as_ref(),
+                reason,
+                cycle,
+                hinted_ttl(ttl_decision.band, reason, acceleration_hint)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64,
+                ReflexSafetyContext {
+                    identity_present: gates.identity_present,
+                    identity_start_nonzero: gates.identity_start_nonzero,
+                    identity_recheck_ok: gates.identity_recheck_ok,
+                    target_protected: gates.target_protected,
+                    target_apple_owned: gates.target_apple_owned,
+                    capability_available: true,
+                    kill_switch: gates.kill_switch || gates.daemon_shutdown,
+                    thermal_force_ecores: thermal_action.force_ecores
+                        || !gates.thermal_available
+                        || !gates.thermal_nominal,
+                    existing_conflict: gates.effect_owner_conflict,
+                },
+                &reasoning_advice,
+            );
+            if !lane_admission.task_qos && !lane_admission.nice && !lane_admission.io_release {
+                if let Some(approval) = exploration_approval.take() {
+                    exploration_scheduler.cancel(
+                        approval.metadata.correlation,
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                    );
+                }
+                decision_events.push(acceleration_event(
+                    "interaction_qos:foreground",
+                    selection_root_pid,
+                    cycle,
+                    ActuatorDecisionOutcome::NoOp,
+                    "all reflex acceleration lanes omitted",
+                ));
+                return decision_events;
+            }
             let (acquired, identity_recheck_failed) = acquire_acceleration_lease(
                 state,
                 controller,
@@ -1294,7 +1976,8 @@ fn update_acceleration_lease_inner(
                 selection,
                 reason,
                 ttl_decision,
-                contextual_io_release_allowed(io_bias),
+                hinted_ttl(ttl_decision.band, reason, acceleration_hint),
+                lane_admission,
                 io_bias,
                 now,
                 cycle,
@@ -1360,11 +2043,13 @@ pub fn update_acceleration_lease(
     foreground_pid: Option<u32>,
     build_phase: BuildPhase,
     idle_secs: f64,
+    acceleration_hint: Option<AccelerationHint>,
     process_tree: &ProcessTree,
     snapshots: &[ProcessSnapshot],
     io_shaper: &mut IoShaper,
     world_model: &WorldModel,
     workload: &str,
+    model_signals: ReflexModelSignals,
     cycle: u64,
     exploration_scheduler: &mut ExplorationScheduler,
     exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
@@ -1381,11 +2066,13 @@ pub fn update_acceleration_lease(
         foreground_pid,
         build_phase,
         idle_secs,
+        acceleration_hint,
         process_tree,
         snapshots,
         io_shaper,
         world_model,
         workload,
+        model_signals,
         cycle,
         exploration_scheduler,
         exploration_environment,
@@ -1419,6 +2106,15 @@ pub fn update_acceleration_lease(
             "lease deadline reached",
         ));
     }
+    // The World Model is immutable throughout this tick, so forecasts
+    // captured here still represent the pre-learning decision state even
+    // though the audited mutation receipt has already been produced.
+    let forecasts = capture_acceleration_forecasts(&output.decision_events, |action_key| {
+        crate::daemon_dispatch_tick::decision_time_forecasts(world_model, action_key, workload, 30)
+    });
+    output.decision_events.attach_predictions(&forecasts);
+    controller.record_outcomes(&output.decision_events);
+    controller.sync_reflex_metrics(state, cycle);
     output
 }
 
@@ -1647,6 +2343,20 @@ pub fn release_acceleration_lease(
     decision_events
 }
 
+/// External lifecycle entry point. The cycle-integrated path records the
+/// returned events once at its boundary; shutdown and pause paths use this
+/// wrapper so apply/revert counters cannot be double-counted.
+pub fn release_acceleration_lease_recorded(
+    controller: &mut AccelerationLeaseBroker,
+    state: &SharedState,
+    cycle: u64,
+) -> CycleDecisionEvents {
+    let events = release_acceleration_lease(controller, state, cycle);
+    controller.record_outcomes(&events);
+    controller.sync_reflex_metrics(state, cycle);
+    events
+}
+
 #[cfg(test)]
 mod interaction_qos_tests {
     use super::*;
@@ -1665,6 +2375,76 @@ mod interaction_qos_tests {
         assert_eq!(event.proposal.action_key, "interaction_qos:foreground");
         assert_eq!(event.proposal.target, "pid:42");
         assert_eq!(event.proposal.proposed_cycle, 15);
+    }
+
+    #[test]
+    fn apple_owned_members_are_blocked_even_when_the_root_is_user_owned() {
+        assert!(acceleration_member_is_protected("helper", true));
+        assert!(acceleration_member_is_protected("WindowServer", false));
+        assert!(!acceleration_member_is_protected("Editor Helper", false));
+    }
+
+    #[test]
+    fn reflex_churn_counts_members_instead_of_each_effect_receipt() {
+        let mut controller = AccelerationLeaseBroker::new(true, 500, "test");
+        let mut events = CycleDecisionEvents::default();
+        events.push(acceleration_member_event(
+            42,
+            "Editor",
+            AccelerationMemberEffect::TaskQos,
+            1,
+            ActuatorDecisionOutcome::Applied,
+            "task qos",
+        ));
+        events.push(acceleration_member_event(
+            42,
+            "Editor",
+            AccelerationMemberEffect::Nice,
+            1,
+            ActuatorDecisionOutcome::Applied,
+            "nice",
+        ));
+        events.push(acceleration_member_event(
+            42,
+            "Editor",
+            AccelerationMemberEffect::TaskQos,
+            1,
+            ActuatorDecisionOutcome::Failed,
+            "task qos unavailable; nice recovered",
+        ));
+        events.push(acceleration_member_event(
+            43,
+            "Other",
+            AccelerationMemberEffect::TaskQos,
+            1,
+            ActuatorDecisionOutcome::Failed,
+            "no fallback applied",
+        ));
+        events.push(acceleration_member_event(
+            42,
+            "Editor",
+            AccelerationMemberEffect::TaskQos,
+            2,
+            ActuatorDecisionOutcome::Reverted,
+            "task qos",
+        ));
+        events.push(acceleration_member_event(
+            42,
+            "Editor",
+            AccelerationMemberEffect::Nice,
+            2,
+            ActuatorDecisionOutcome::Reverted,
+            "nice",
+        ));
+
+        controller.record_outcomes(&events);
+
+        assert_eq!(controller.admission.counters().applied, 2);
+        assert_eq!(controller.admission.counters().reverted, 2);
+        assert_eq!(controller.admission.counters().failed, 2);
+        assert_eq!(controller.admission.counters().health_failures, 1);
+        assert_eq!(controller.admission.counters().members_applied, 1);
+        assert_eq!(controller.admission.counters().members_reverted, 1);
     }
 
     #[test]
@@ -1691,6 +2471,60 @@ mod interaction_qos_tests {
         assert_eq!(nice.proposal.action_key, "interaction_qos:nice");
         assert_eq!(nice.proposal.target, "Compiler:pid:43");
         assert_eq!(nice.outcome, ActuatorDecisionOutcome::Failed);
+    }
+
+    #[test]
+    fn applied_acceleration_events_capture_decision_time_forecasts_once_per_action() {
+        let mut events = CycleDecisionEvents::default();
+        events.push(acceleration_member_event(
+            42,
+            "Editor",
+            AccelerationMemberEffect::Nice,
+            15,
+            ActuatorDecisionOutcome::Applied,
+            "nice applied",
+        ));
+        events.push(acceleration_member_event(
+            43,
+            "Editor Helper",
+            AccelerationMemberEffect::Nice,
+            15,
+            ActuatorDecisionOutcome::Applied,
+            "nice applied",
+        ));
+        events.push(acceleration_event(
+            "interaction_qos:foreground",
+            42,
+            15,
+            ActuatorDecisionOutcome::Blocked,
+            "blocked",
+        ));
+        let mut calls = 0;
+
+        let forecasts = capture_acceleration_forecasts(&events, |_action_key| {
+            calls += 1;
+            vec![apollo_engine::engine::decision_ledger::PredictionRecord {
+                source: "world-model".to_string(),
+                expected_utility: 0.03,
+                uncertainty: 0.2,
+                horizon_cycles: 30,
+                ..Default::default()
+            }]
+        });
+        let attached = events.attach_predictions(&forecasts);
+
+        assert_eq!(calls, 1);
+        assert_eq!(attached, 2);
+        assert!(events.as_slice()[0]
+            .proposal
+            .predictions
+            .iter()
+            .any(|prediction| prediction.source == "world-model"));
+        assert!(events.as_slice()[2].proposal.predictions.is_empty());
+        assert_eq!(
+            forecasts.keys().next().map(String::as_str),
+            Some("interaction_qos:nice")
+        );
     }
 
     #[test]
@@ -2607,7 +3441,16 @@ pub fn drain_effect_decay(
 
 #[cfg(test)]
 mod tests {
-    use super::{ns_to_ceil_us, sum_frozen_ram_mb};
+    use super::{
+        decide_acceleration_lanes, evaluate_reflex_reasoning, ns_to_ceil_us,
+        reflex_advice_from_bias, reflex_decision_allows_actuation, select_acceleration_reason,
+        sum_frozen_ram_mb, AccelerationHint, AccelerationHintKind, AccelerationLeaseBroker,
+        InteractionReason, LeaseTtlBand, ReflexModelSignals, ReflexReasoningAdvice,
+        ReflexReasoningPayload,
+    };
+    use apollo_engine::engine::process_identity::ProcessIdentity;
+    use apollo_engine::engine::reflex::{ReflexRolloutPhase, ReflexSafetyContext, ReflexSource};
+    use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
     use std::collections::HashMap;
     use sysinfo::System;
 
@@ -2686,5 +3529,192 @@ mod tests {
             (result - 0.0).abs() < f64::EPSILON,
             "value type must be ignored, got {result}"
         );
+    }
+
+    #[test]
+    fn reflex_shadow_never_changes_legacy_actuation() {
+        use apollo_engine::engine::reflex::{ReflexBlocker, ReflexDecision, ReflexRolloutPhase};
+
+        for decision in [
+            ReflexDecision::Shadow,
+            ReflexDecision::Admit,
+            ReflexDecision::Veto(ReflexBlocker::DecisiveModelVeto),
+            ReflexDecision::Skipped(ReflexBlocker::IdentityMismatch),
+        ] {
+            assert!(reflex_decision_allows_actuation(
+                decision,
+                ReflexRolloutPhase::Shadow,
+            ));
+        }
+    }
+
+    #[test]
+    fn active_reflex_blocks_vetoes_and_skips() {
+        use apollo_engine::engine::reflex::{ReflexBlocker, ReflexDecision, ReflexRolloutPhase};
+
+        assert!(reflex_decision_allows_actuation(
+            ReflexDecision::Admit,
+            ReflexRolloutPhase::Active,
+        ));
+        assert!(!reflex_decision_allows_actuation(
+            ReflexDecision::Veto(ReflexBlocker::DecisiveModelVeto),
+            ReflexRolloutPhase::Active,
+        ));
+        assert!(!reflex_decision_allows_actuation(
+            ReflexDecision::Skipped(ReflexBlocker::IdentityMismatch),
+            ReflexRolloutPhase::Active,
+        ));
+    }
+
+    #[test]
+    fn interaction_reasons_map_to_typed_reflex_triggers() {
+        use apollo_engine::engine::reflex::ReflexTrigger;
+
+        assert_eq!(
+            InteractionReason::Input.reflex_trigger(),
+            ReflexTrigger::Input
+        );
+        assert_eq!(
+            InteractionReason::WindowOperation.reflex_trigger(),
+            ReflexTrigger::WindowOperation
+        );
+        assert_eq!(
+            InteractionReason::BuildStart.reflex_trigger(),
+            ReflexTrigger::BuildStart
+        );
+        assert_eq!(
+            InteractionReason::AppLaunch.reflex_trigger(),
+            ReflexTrigger::AppLaunch
+        );
+        assert_eq!(
+            InteractionReason::WebNavigation.reflex_trigger(),
+            ReflexTrigger::WebNavigation
+        );
+        assert_eq!(
+            InteractionReason::NetworkActivity.reflex_trigger(),
+            ReflexTrigger::NetworkActivity
+        );
+    }
+
+    #[test]
+    fn flow_hint_supersedes_plain_input_but_not_launch_or_build() {
+        let hint = AccelerationHint {
+            kind: AccelerationHintKind::NetworkActivity,
+            target_pid: 42,
+            ttl_ms: 1_200,
+        };
+        assert_eq!(
+            select_acceleration_reason(Some(InteractionReason::Input), Some(hint)),
+            Some(InteractionReason::NetworkActivity)
+        );
+        assert_eq!(
+            select_acceleration_reason(Some(InteractionReason::AppLaunch), Some(hint)),
+            Some(InteractionReason::AppLaunch)
+        );
+        assert_eq!(
+            select_acceleration_reason(Some(InteractionReason::BuildStart), Some(hint)),
+            Some(InteractionReason::BuildStart)
+        );
+    }
+
+    #[test]
+    fn compact_model_signals_support_but_do_not_authorize_reflexes() {
+        let advice = evaluate_reflex_reasoning(ReflexReasoningPayload {
+            world_model: WorldModel::default(),
+            workload: "interactive".to_string(),
+            signals: ReflexModelSignals {
+                nars_reliability: 0.95,
+                mpc_urgency: 0.80,
+                mpc_recommendation: 2,
+                causal_confidence: 0.90,
+                markov_confidence: 0.75,
+            },
+        });
+
+        assert!(advice.sources.contains(&ReflexSource::Nars));
+        assert!(advice.sources.contains(&ReflexSource::Mpc));
+        assert!(advice.sources.contains(&ReflexSource::Causal));
+        assert!(advice.sources.contains(&ReflexSource::Markov));
+        assert_eq!(advice.learned_ttl_band, Some(LeaseTtlBand::Long));
+        let bounded = reflex_advice_from_bias(advice.interaction_bias, &advice.sources);
+        assert!(!bounded.authoritative);
+    }
+
+    #[test]
+    fn acceleration_lanes_use_all_three_closed_catalog_actions() {
+        let mut broker = AccelerationLeaseBroker::new(true, 500, "adaptive-multicore");
+        broker.admission = apollo_engine::engine::reflex::ReflexBroker::active_for_test();
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_sec: 100,
+            start_usec: 7,
+            name: "Editor".to_string(),
+        };
+        let safety = ReflexSafetyContext {
+            identity_present: true,
+            identity_start_nonzero: true,
+            identity_recheck_ok: true,
+            capability_available: true,
+            ..ReflexSafetyContext::default()
+        };
+        let lanes = decide_acceleration_lanes(
+            &mut broker,
+            Some(&identity),
+            InteractionReason::Input,
+            7,
+            1_600,
+            safety,
+            &ReflexReasoningAdvice::default(),
+        );
+
+        assert_eq!(broker.phase(), ReflexRolloutPhase::Active);
+        assert!(lanes.task_qos);
+        assert!(lanes.nice);
+        assert!(lanes.io_release);
+        assert_eq!(broker.admission.counters().proposed, 3);
+        assert_eq!(broker.admission.counters().admitted, 3);
+    }
+
+    #[test]
+    fn decisive_io_model_can_only_veto_the_io_lane() {
+        let mut broker = AccelerationLeaseBroker::new(true, 500, "adaptive-multicore");
+        broker.admission = apollo_engine::engine::reflex::ReflexBroker::active_for_test();
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_sec: 100,
+            start_usec: 7,
+            name: "Editor".to_string(),
+        };
+        let safety = ReflexSafetyContext {
+            identity_present: true,
+            identity_start_nonzero: true,
+            identity_recheck_ok: true,
+            capability_available: true,
+            ..ReflexSafetyContext::default()
+        };
+        let advice = ReflexReasoningAdvice {
+            io_bias: ContextualActionBias {
+                score: -0.8,
+                model_observations: 100,
+                authoritative: true,
+                ..ContextualActionBias::default()
+            },
+            ..ReflexReasoningAdvice::default()
+        };
+
+        let lanes = decide_acceleration_lanes(
+            &mut broker,
+            Some(&identity),
+            InteractionReason::Input,
+            8,
+            1_600,
+            safety,
+            &advice,
+        );
+
+        assert!(lanes.task_qos);
+        assert!(lanes.nice);
+        assert!(!lanes.io_release);
+        assert_eq!(broker.admission.counters().vetoed, 1);
     }
 }

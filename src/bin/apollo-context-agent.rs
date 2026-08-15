@@ -6,14 +6,31 @@
 use std::thread;
 use std::time::Duration;
 
-use apollo_engine::engine::context_agent::{send_once, ContextCollector};
+use apollo_engine::engine::context_agent::{send_once, send_webflow_once, ContextCollector};
+use apollo_engine::engine::webflow_native::ContextWebFlowServer;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 
 fn main() {
+    let _ = thread::Builder::new()
+        .name("apollo-webflow-agent".to_string())
+        .spawn(run_webflow_ingress);
     let mut collector = ContextCollector::new();
     loop {
         let _ = send_once(&mut collector);
         thread::sleep(SAMPLE_INTERVAL);
+    }
+}
+
+fn run_webflow_ingress() {
+    loop {
+        match ContextWebFlowServer::bind_default() {
+            Ok(server) => loop {
+                if server.serve_once(send_webflow_once).is_err() {
+                    thread::sleep(Duration::from_millis(50));
+                }
+            },
+            Err(_) => thread::sleep(Duration::from_secs(1)),
+        }
     }
 }

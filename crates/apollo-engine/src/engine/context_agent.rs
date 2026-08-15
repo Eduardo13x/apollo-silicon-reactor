@@ -20,6 +20,7 @@ use crate::engine::coreaudio_active;
 use crate::engine::daemon_helpers::socket_path;
 use crate::engine::protocol::DaemonRequest;
 use crate::engine::user_context;
+use crate::engine::webflow_types::{WebFlowEvent, MAX_WEBFLOW_MESSAGE_BYTES};
 
 pub const CONTEXT_SCHEMA_VERSION: u16 = 1;
 pub const MAX_CONTEXT_PAYLOAD_BYTES: usize = 4 * 1024;
@@ -261,8 +262,8 @@ pub fn validate_context_payload(bytes: &[u8]) -> Result<ContextSummary, ContextV
     if bytes.len() > MAX_CONTEXT_PAYLOAD_BYTES {
         return Err(ContextValidationError::PayloadTooLarge);
     }
-    let wire: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|_| ContextValidationError::MalformedPayload)?;
+    let wire: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|_| ContextValidationError::MalformedPayload)?;
     let Some(object) = wire.as_object() else {
         return Err(ContextValidationError::MalformedPayload);
     };
@@ -277,8 +278,8 @@ pub fn validate_context_payload(bytes: &[u8]) -> Result<ContextSummary, ContextV
     if payload.keys().any(|key| key != "summary") || !payload.contains_key("summary") {
         return Err(ContextValidationError::MalformedPayload);
     }
-    let request: DaemonRequest = serde_json::from_value(wire)
-        .map_err(|_| ContextValidationError::MalformedPayload)?;
+    let request: DaemonRequest =
+        serde_json::from_value(wire).map_err(|_| ContextValidationError::MalformedPayload)?;
     match request {
         DaemonRequest::SubmitContext { summary } => {
             summary.validate()?;
@@ -321,7 +322,9 @@ impl fmt::Display for ContextValidationError {
                 formatter.write_str("context monotonic time must be nonzero")
             }
             Self::InvalidQuality(field) => write!(formatter, "{field} must be finite in [0, 1]"),
-            Self::SerializationFailed => formatter.write_str("context payload serialization failed"),
+            Self::SerializationFailed => {
+                formatter.write_str("context payload serialization failed")
+            }
             Self::MalformedPayload => formatter.write_str("malformed context payload"),
             Self::EpochRegression => formatter.write_str("context epoch regressed"),
             Self::SequenceReplay => formatter.write_str("context sequence was replayed"),
@@ -374,17 +377,29 @@ impl AntiReplayStore {
 pub struct ContextAgentState {
     replay: AntiReplayStore,
     latest: Option<ContextSummary>,
+    last_received_at: Option<Instant>,
 }
 
 impl ContextAgentState {
     pub fn accept(&mut self, summary: ContextSummary) -> Result<(), ContextValidationError> {
         self.replay.accept(summary)?;
         self.latest = Some(summary);
+        self.last_received_at = Some(Instant::now());
         Ok(())
     }
 
     pub fn latest(&self) -> Option<ContextSummary> {
         self.latest
+    }
+
+    pub fn latest_fresh(&self, maximum_age: Duration) -> Option<ContextSummary> {
+        self.last_received_at
+            .filter(|received| received.elapsed() <= maximum_age)
+            .and(self.latest)
+    }
+
+    pub fn age(&self) -> Option<Duration> {
+        self.last_received_at.map(|received| received.elapsed())
     }
 
     pub const fn replay(&self) -> AntiReplayStore {
@@ -556,6 +571,25 @@ pub fn send_once(collector: &mut ContextCollector) -> io::Result<()> {
     let bytes = summary
         .bounded_request_bytes()
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    send_daemon_request(&bytes)
+}
+
+pub fn send_webflow_once(event: WebFlowEvent) -> io::Result<()> {
+    event
+        .validate()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let bytes = serde_json::to_vec(&DaemonRequest::SubmitWebFlow { event })
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if bytes.len() > MAX_WEBFLOW_MESSAGE_BYTES + 1_024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "WebFlow daemon request exceeds bound",
+        ));
+    }
+    send_daemon_request(&bytes)
+}
+
+fn send_daemon_request(bytes: &[u8]) -> io::Result<()> {
     let mut stream = UnixStream::connect(socket_path())?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;

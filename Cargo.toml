@@ -34,8 +34,9 @@ edition = "2021"
 
 [features]
 default = []
-# Enabled by the hardware-aware build scripts on 10+ core Apple Silicon.
-# Keeps the measured sequential path for M1-class systems.
+# Compiled into every M1-baseline Apple Silicon artifact. Runtime capability
+# discovery keeps M1-class systems sequential and enables bounded workers only
+# where the measured topology benefits.
 adaptive-multicore = ["sysinfo/multithread", "dep:rayon"]
 
 [lib]

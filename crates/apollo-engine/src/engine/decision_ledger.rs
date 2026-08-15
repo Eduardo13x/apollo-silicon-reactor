@@ -139,7 +139,7 @@ impl ReceiptAttribution {
         }
     }
 
-    fn grants_local_authority(&self) -> bool {
+    pub fn grants_local_authority(&self) -> bool {
         matches!(self, Self::Local { source } if !source.is_empty())
     }
 

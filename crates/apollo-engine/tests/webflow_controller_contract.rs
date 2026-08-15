@@ -69,7 +69,10 @@ fn duplicate_and_out_of_order_events_never_renew_the_lease() {
     let old = controller.tick(input(1_040), [event(2, 3, 1, WebFlowPhase::Committed)]);
     assert_eq!(duplicate.counters.duplicate, 1);
     assert_eq!(old.counters.out_of_order, 1);
-    assert_eq!(duplicate.observation.last_phase, Some(WebFlowPhase::Started));
+    assert_eq!(
+        duplicate.observation.last_phase,
+        Some(WebFlowPhase::Started)
+    );
     assert_eq!(old.observation.last_phase, Some(WebFlowPhase::Started));
 }
 
@@ -128,7 +131,10 @@ fn exact_extension_event_supersedes_inferred_event_for_same_navigation() {
     inferred.event.source = WebFlowSource::DaemonInference;
     controller.tick(input(1_020), [inferred]);
     let exact = controller.tick(input(1_040), [event(2, 3, 2, WebFlowPhase::Committed)]);
-    assert_eq!(exact.observation.source, Some(WebFlowSource::ExtensionLifecycle));
+    assert_eq!(
+        exact.observation.source,
+        Some(WebFlowSource::ExtensionLifecycle)
+    );
     assert_eq!(exact.observation.active_navigations, 1);
 }
 

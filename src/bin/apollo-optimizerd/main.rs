@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use apollo_engine::engine::platform::{MacOsPlatformAdapter, PlatformAdapter};
 
 mod adaptive_overhead;
 /// Global stop flag for signal handlers (SIGTERM/SIGINT).
@@ -52,12 +54,17 @@ mod daemon_turbo_manager;
 mod daemon_wake_handler;
 mod daemon_wake_unfreeze;
 mod daemon_warn_limits;
+mod heterogeneous_tick;
 mod learning_tick;
 mod local_policy_learning;
 mod main_loop_msg;
 mod metrics_reporter;
+mod microexperiment_tick;
+mod networkflow_tick;
 mod process_enrichment;
 mod socket_handler;
+mod value_scheduler_tick;
+mod webflow_tick;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -188,11 +195,11 @@ use apollo_engine::engine::daemon_helpers::{
     holt_winters_path, hop_groups_path, installation_id_path, journal_path, kill_switch_path,
     learned_state_path, load_frozen_state, load_governor_state, load_wake_state, markov_path,
     merge_seed_into, metrics_path, overflow_history_path, parse_profile, pid_start_time,
-    predictive_agent_path, remove_crash_sentinel, rl_threshold_path, signal_intelligence_path,
-    skills_path, socket_path, telemetry_output_dir, temporal_histograms_path, timeline_path,
-    unfreeze_outcome_events, unfreeze_pids_outcome, unfreeze_pids_verified_outcome,
-    wake_state_path, write_frozen_state, write_governor_state, AsyncCommandMetric,
-    AsyncCommandQueue, AsyncCommandSubmitError,
+    predictive_agent_path, reflex_state_path, remove_crash_sentinel, rl_threshold_path,
+    signal_intelligence_path, skills_path, socket_path, telemetry_output_dir,
+    temporal_histograms_path, timeline_path, unfreeze_outcome_events, unfreeze_pids_outcome,
+    unfreeze_pids_verified_outcome, wake_state_path, write_frozen_state, write_governor_state,
+    AsyncCommandMetric, AsyncCommandQueue, AsyncCommandSubmitError,
 };
 use apollo_engine::engine::focus_markov::FocusMarkov;
 use apollo_engine::engine::foreground::{ForegroundDetector, ForegroundState};
@@ -237,7 +244,7 @@ use apollo_engine::engine::thermal_interrupt::{
 };
 use apollo_engine::engine::types::{
     EnergyConsumerInfo, ForegroundAppInfo, FreezeSource, FrozenEntry, FrozenPidEntry,
-    FrozenStatePersisted, LatencyTarget, RootAction, RuntimeMetrics, SafetyPolicy,
+    FrozenStatePersisted, HardPath, LatencyTarget, RootAction, RuntimeMetrics, SafetyPolicy,
 };
 use apollo_engine::engine::usage_model::{usage_model_path_root, UsageModel};
 use apollo_engine::engine::user_profile::{UserProfile, UserProfilePersisted};
@@ -538,6 +545,8 @@ fn main() -> anyhow::Result<()> {
             // sysinfo initializes Rayon's global pool on its first process census.
             // Configure it before startup recovery performs any such census.
             let parallel_runtime = daemon_init::configure_parallel_runtime();
+            let mut platform_adapter = MacOsPlatformAdapter::detect();
+            let mut runtime_capability_graph = platform_adapter.probe();
             let profile = parse_profile(&profile);
             let is_root = unsafe { libc::geteuid() } == 0;
             let caps = detect_capabilities();
@@ -569,6 +578,7 @@ fn main() -> anyhow::Result<()> {
             );
             let config_path = PathBuf::from("/etc/apollo-optimizer/config.toml");
             let repo_cfg = load_repo_config(&config_path);
+            let reflex_cfg = repo_cfg.reflex.clone();
             let learned_policy_path = policy_path_root(is_root);
             let feedback_path = feedback_path_root(is_root);
 
@@ -986,6 +996,24 @@ fn main() -> anyhow::Result<()> {
                 let mut metrics = state.metrics.lock_recover();
                 metrics.metrics.parallel_runtime_enabled = parallel_runtime.enabled;
                 metrics.metrics.parallel_worker_threads = parallel_runtime.worker_threads;
+                metrics.metrics.parallel_expected_profile =
+                    parallel_runtime.build.expected_profile.clone();
+                metrics.metrics.parallel_compiled_profile =
+                    parallel_runtime.build.compiled_profile.clone();
+                metrics.metrics.parallel_effective_profile =
+                    parallel_runtime.build.effective_profile.clone();
+                metrics.metrics.parallel_feature_compiled =
+                    parallel_runtime.build.adaptive_feature_compiled;
+                metrics.metrics.parallel_max_worker_threads =
+                    parallel_runtime.build.max_worker_threads;
+                metrics.metrics.parallel_disabled_reason =
+                    parallel_runtime.build.disabled_reason.clone();
+                metrics.metrics.parallel_worker_qos_intent =
+                    parallel_runtime.build.worker_qos_intent.clone();
+                metrics.metrics.parallel_worker_qos_status =
+                    parallel_runtime.build.worker_qos_status.clone();
+                metrics.metrics.parallel_worker_qos_failures =
+                    parallel_runtime.build.worker_qos_failures;
             }
             tracing::info!(
                 enabled = parallel_runtime.enabled,
@@ -1271,7 +1299,17 @@ fn main() -> anyhow::Result<()> {
             let mut markov_shadow = daemon_markov_tick::MarkovShadowTracker::default();
             let mut markov_hit_count: u32 = 0;
             let mut markov_miss_count: u32 = 0;
-            let mut acceleration_lease = daemon_cycle_tail::AccelerationLeaseBroker::default();
+            let reflex_state_json = HardPath::read_to_string_limited(
+                std::path::Path::new(reflex_state_path()),
+                64 * 1024,
+            )
+            .ok();
+            let mut acceleration_lease = daemon_cycle_tail::ReflexBroker::restore(
+                reflex_cfg.enabled,
+                reflex_cfg.effective_shadow_cycles(),
+                &parallel_runtime.build.compiled_profile,
+                reflex_state_json.as_deref(),
+            );
             // Restored pending trial skill from the previous run (if daemon crashed mid-trial).
             let mut restored_trial_skill: Option<(String, f64)> = None;
             // Restored arousal state — applied after arousal_state is declared below.
@@ -1285,11 +1323,13 @@ fn main() -> anyhow::Result<()> {
                 apollo_engine::engine::meta_cognition::MetaCognition,
             > = None;
             let mut restored_local_consolidator: Option<LocalConsolidator> = None;
+            let mut restored_microexperiment_lab = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
                 restored_local_consolidator = learned.local_consolidator.clone();
+                restored_microexperiment_lab = learned.microexperiment_lab.clone();
                 if let Some(persisted) = learned.exploration_scheduler.clone() {
                     let (restored, disposition) =
                         apollo_engine::engine::exploration_scheduler::ExplorationScheduler::restore(
@@ -1626,7 +1666,24 @@ fn main() -> anyhow::Result<()> {
             );
             let mut gpu_imagination =
                 apollo_engine::engine::gpu_imagination::GpuImaginationWorker::spawn_metal_only();
+            let mut gpu_context_epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(1)
+                ^ u64::from(std::process::id());
             let mut overhead_governor = adaptive_overhead::AdaptiveOverheadGovernor::default();
+            let mut value_scheduler_runtime =
+                value_scheduler_tick::ValueSchedulerRuntime::new(runtime_capability_graph.revision);
+            let mut webflow_runtime = webflow_tick::WebFlowRuntime::new(
+                apollo_engine::engine::webflow_controller::WebFlowRolloutPhase::Shadow,
+            );
+            let mut networkflow_runtime = networkflow_tick::NetworkFlowRuntime::new();
+            let mut heterogeneous_runtime: Option<heterogeneous_tick::HeterogeneousRuntime> = None;
+            let mut heterogeneous_workload_id = 0_u64;
+            let mut microexperiment_runtime = microexperiment_tick::MicroexperimentRuntime::new(
+                exploration_origin,
+                restored_microexperiment_lab,
+            );
             // Feed-forward pressure relief counter [Hellerstein 2004].
             // Set to N when tabs close / heavy app terminates; decrements each cycle.
             // While > 0, reactor_weight is reduced (anticipate pressure drop).
@@ -1706,8 +1763,11 @@ fn main() -> anyhow::Result<()> {
             let mut dry_run_batch: Vec<u8> = Vec::with_capacity(1024);
             let mut dry_run_batch_count: u32 = 0;
             const DRY_RUN_BATCH_SIZE: u32 = 16;
-            // Gate network_monitor.tick() to every ~10s since netstat is blocking.
+            // Direct kernel TCP deltas are sampled at 1 Hz and shared by the
+            // universal flow controller, governor, and metrics.
             let mut last_netstat_tick = Instant::now() - Duration::from_secs(10);
+            let mut last_network_flow_stats =
+                apollo_engine::engine::network_monitor::TcpStats::default();
             // B.2 replayd gate (2026-06-09): TTL-cached (6s) proc-table scan
             // for active screen capture (replayd / screencaptureui /
             // ScreenSharingAgent). Feeds the SysctlGovernor realtime gate so
@@ -2034,12 +2094,16 @@ fn main() -> anyhow::Result<()> {
                 // [Nygard 2018 §5] eliminate non-observable work from benchmark path.
                 if !dry_run && Path::new(kill_switch_path()).exists() {
                     if let Some(lease) = last_markov_prethaw.take() {
-                        let report =
-                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        let report = daemon_markov_tick::release_markov_prewarm_recorded(
+                            lease,
+                            &state,
+                            cycle_count,
+                            &mut acceleration_lease,
+                        );
                         cycle_decision_events.extend_buffer(&report.decision_events);
                     }
                     cycle_decision_events.extend_buffer(
-                        &daemon_cycle_tail::release_acceleration_lease(
+                        &daemon_cycle_tail::release_acceleration_lease_recorded(
                             &mut acceleration_lease,
                             &state,
                             cycle_count,
@@ -2278,13 +2342,20 @@ fn main() -> anyhow::Result<()> {
                     &wake_state_path,
                 );
                 if wake_just_detected {
+                    gpu_imagination.invalidate_for_wake();
+                    gpu_context_epoch = gpu_context_epoch.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                    world_model.invalidate_gpu_advice(gpu_context_epoch);
                     if let Some(lease) = last_markov_prethaw.take() {
-                        let report =
-                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        let report = daemon_markov_tick::release_markov_prewarm_recorded(
+                            lease,
+                            &state,
+                            cycle_count,
+                            &mut acceleration_lease,
+                        );
                         cycle_decision_events.extend_buffer(&report.decision_events);
                     }
                     cycle_decision_events.extend_buffer(
-                        &daemon_cycle_tail::release_acceleration_lease(
+                        &daemon_cycle_tail::release_acceleration_lease_recorded(
                             &mut acceleration_lease,
                             &state,
                             cycle_count,
@@ -2297,12 +2368,16 @@ fn main() -> anyhow::Result<()> {
                 }
                 if sleep_notifier.is_sleeping() {
                     if let Some(lease) = last_markov_prethaw.take() {
-                        let report =
-                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        let report = daemon_markov_tick::release_markov_prewarm_recorded(
+                            lease,
+                            &state,
+                            cycle_count,
+                            &mut acceleration_lease,
+                        );
                         cycle_decision_events.extend_buffer(&report.decision_events);
                     }
                     cycle_decision_events.extend_buffer(
-                        &daemon_cycle_tail::release_acceleration_lease(
+                        &daemon_cycle_tail::release_acceleration_lease_recorded(
                             &mut acceleration_lease,
                             &state,
                             cycle_count,
@@ -2311,6 +2386,13 @@ fn main() -> anyhow::Result<()> {
                     exploration_scheduler.cancel_active(
                         apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
                     );
+                }
+
+                if wake_just_detected || cycle_count.is_multiple_of(256) {
+                    let reprobed = platform_adapter.probe();
+                    if reprobed.revision != runtime_capability_graph.revision {
+                        runtime_capability_graph = reprobed;
+                    }
                 }
 
                 // Display-Off Turbo: Android Doze-like power management.
@@ -2412,13 +2494,356 @@ fn main() -> anyhow::Result<()> {
                 let foreground_app = fg_state.name().map(|s| s.to_string());
                 let foreground_pid = fg_state.pid();
                 let foreground_idle = fg_state.is_idle();
-
-                // Build once before prediction so the Markov accelerator can
-                // bound coalition work to the predicted app's process family.
-                // The same immutable tree is reused throughout the cycle.
+                // Build once early enough for both universal network sensing
+                // and the existing Markov/acceleration paths.
                 let _t_tree_start = Instant::now();
                 let process_tree = daemon_process_collector::build_process_tree(&collector);
                 let process_tree_nanos = _t_tree_start.elapsed().as_nanos();
+                let context_summary = state.latest_context_summary();
+                let context_audio_active = context_summary.and_then(|summary| {
+                    use apollo_engine::engine::context_agent::TriState;
+                    match summary.audio_output {
+                        TriState::Yes => Some(true),
+                        TriState::No => Some(false),
+                        TriState::Unknown => None,
+                    }
+                });
+                let context_permissions_bits = context_summary.map_or(0, |summary| {
+                    (summary.permissions.screen_capture as u16)
+                        | ((summary.permissions.microphone as u16) << 2)
+                        | ((summary.permissions.accessibility as u16) << 4)
+                        | ((summary.permissions.input_monitoring as u16) << 6)
+                });
+                let interaction_active = !foreground_idle
+                    || context_summary.is_some_and(|summary| summary.interaction_q >= 0.05);
+                if last_netstat_tick.elapsed() >= Duration::from_secs(1) {
+                    last_network_flow_stats = network_monitor.tick();
+                    last_netstat_tick = Instant::now();
+                }
+                let network_traffic = last_network_flow_stats.flow_sample();
+                let tcp_sample_age_ms = last_netstat_tick
+                    .elapsed()
+                    .as_millis()
+                    .min(u128::from(u64::MAX)) as u64;
+                let webflow_now_ms = apollo_engine::engine::webflow_types::webflow_monotonic_ms();
+                let webflow_events = apollo_engine::engine::webflow_types::drain_process_webflow(
+                    apollo_engine::engine::webflow_types::MAX_WEBFLOW_EVENTS_PER_CYCLE,
+                );
+                let foreground_browser = foreground_app
+                    .as_deref()
+                    .is_some_and(webflow_tick::is_supported_browser);
+                let traffic_active = network_traffic
+                    .send_bps
+                    .saturating_add(network_traffic.recv_bps)
+                    >= apollo_engine::engine::network_flow::GENERIC_FLOW_MIN_TRAFFIC_BPS
+                    || network_traffic.new_connections > 0;
+                let should_probe_foreground_sockets = webflow_events.is_empty()
+                    && interaction_active
+                    && traffic_active
+                    && foreground_pid.is_some();
+                let foreground_socket_active = if should_probe_foreground_sockets {
+                    let candidates = networkflow_tick::bounded_family_candidates(
+                        &process_tree,
+                        foreground_pid.expect("probe requires foreground PID"),
+                    );
+                    !apollo_engine::engine::activity_sensor::pids_with_open_sockets(&candidates, 1)
+                        .is_empty()
+                } else {
+                    false
+                };
+                let browser_socket_active = foreground_browser
+                    && foreground_socket_active
+                    && webflow_runtime.needs_daemon_inference_probe(webflow_now_ms);
+                let low_power = state
+                    .hardware
+                    .lock_recover()
+                    .last_hw_snapshot
+                    .as_ref()
+                    .is_some_and(
+                    apollo_engine::engine::iokit_sensors::IOKitSensorReader::is_battery_critical,
+                );
+                let sleeping = sleep_notifier.is_sleeping();
+                let kill_switch = Path::new(kill_switch_path()).exists();
+                let thermal_constrained = matches!(
+                    snapshot
+                        .pressure
+                        .thermal_level
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "serious" | "high" | "critical"
+                );
+                let (webflow_control_p95_ms, webflow_failures, webflow_rollback_failures) = {
+                    let metrics = state.metrics.lock_recover();
+                    (
+                        metrics.metrics.p95_cycle_ms,
+                        metrics.metrics.reflex_failed_total,
+                        metrics.metrics.reverts_failed,
+                    )
+                };
+                let webflow_output = webflow_runtime.tick(webflow_tick::WebFlowCycleInput {
+                    now_ms: webflow_now_ms,
+                    events: &webflow_events,
+                    foreground_browser,
+                    foreground_identity_available: foreground_pid.is_some(),
+                    interaction_active,
+                    browser_socket_active,
+                    pressure_constrained: snapshot.pressure.memory_pressure >= 0.85,
+                    thermal_constrained,
+                    low_power,
+                    sleeping,
+                    kill_switch,
+                    session_revision: context_summary.map_or(1, |summary| summary.daemon_epoch),
+                    control_p95_ms: webflow_control_p95_ms,
+                    profile_matches: parallel_runtime.build.expected_profile
+                        == parallel_runtime.build.effective_profile,
+                    failures_total: webflow_failures,
+                    rollback_failures_total: webflow_rollback_failures,
+                    protected_actions_total: 0,
+                });
+                let networkflow_output =
+                    networkflow_runtime.tick(networkflow_tick::NetworkFlowCycleInput {
+                        now_ms: webflow_now_ms,
+                        session_revision: context_summary.map_or(1, |summary| summary.daemon_epoch),
+                        foreground_pid,
+                        interaction_active,
+                        foreground_socket_active,
+                        traffic: network_traffic,
+                        tcp_sample_age_ms,
+                        exact_web_active: webflow_output.observation.active_navigations > 0,
+                        pressure_constrained: snapshot.pressure.memory_pressure >= 0.85,
+                        thermal_constrained,
+                        low_power,
+                        sleeping,
+                        kill_switch,
+                    });
+                {
+                    use apollo_engine::engine::webflow_types::WebFlowSource;
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.webflow_mode = match webflow_output.observation.source {
+                        Some(WebFlowSource::ExtensionVitals) => "vitals",
+                        Some(WebFlowSource::ExtensionLifecycle) => "lifecycle",
+                        Some(WebFlowSource::DaemonInference) => "inferred",
+                        None => "unavailable",
+                    }
+                    .to_string();
+                    metrics.metrics.webflow_phase =
+                        format!("{:?}", webflow_output.rollout).to_ascii_lowercase();
+                    metrics.metrics.webflow_blocker = webflow_output.rollout_blocker.to_string();
+                    metrics.metrics.webflow_valid_health_cycles =
+                        webflow_output.valid_health_cycles;
+                    metrics.metrics.webflow_active_navigations =
+                        webflow_output.observation.active_navigations;
+                    metrics.metrics.webflow_proposed_total = webflow_output.counters.proposed;
+                    metrics.metrics.webflow_admitted_total = webflow_output.counters.admitted;
+                    metrics.metrics.webflow_skipped_total = webflow_output.counters.skipped;
+                    metrics.metrics.network_flow_active = networkflow_output.observation.active;
+                    metrics.metrics.network_flow_traffic_bps =
+                        networkflow_output.observation.traffic_bps;
+                    metrics.metrics.network_flow_confidence_q =
+                        networkflow_output.observation.confidence_q;
+                    metrics.metrics.network_flow_proposed_total =
+                        networkflow_output.counters.proposals;
+                    metrics.metrics.network_flow_started_total = networkflow_output.counters.starts;
+                    metrics.metrics.network_flow_renewed_total =
+                        networkflow_output.counters.renewals;
+                    metrics.metrics.network_flow_skipped_total =
+                        networkflow_output.counters.skipped;
+                    metrics.metrics.network_flow_suppressed_exact_total =
+                        networkflow_output.counters.suppressed_exact;
+                    metrics.metrics.network_flow_hard_cap_total =
+                        networkflow_output.counters.hard_cap_expirations;
+                }
+
+                // Option C starts observationally: one immutable cycle identity
+                // and one global value plan, with no change to legacy execution.
+                let value_metrics =
+                    value_scheduler_runtime.tick(value_scheduler_tick::ValueSchedulerTickInput {
+                        cycle: cycle_count,
+                        overhead_level: overhead_budget.level,
+                        allow_speculation: overhead_budget.allow_speculation,
+                        holt_cadence: overhead_budget.holt_winters.cadence,
+                        page_reclaim_cadence: overhead_budget.page_reclaim.cadence,
+                        pressure: snapshot.pressure.memory_pressure,
+                        pressure_age: pressure_collector.data_age(),
+                        thermal_level: &snapshot.pressure.thermal_level,
+                        interaction_active,
+                        context_epoch: context_summary.map(|summary| summary.daemon_epoch),
+                        context_visual_q: context_summary.map(|summary| summary.visual_change_q),
+                        context_interaction_q: context_summary.map(|summary| summary.interaction_q),
+                        context_audio_active,
+                        context_permissions_bits,
+                        workload: foreground_app.as_deref().unwrap_or("idle"),
+                        capability_revision: runtime_capability_graph.revision,
+                        kill_switch,
+                        sleeping,
+                        profile_matches: parallel_runtime.build.expected_profile
+                            == parallel_runtime.build.effective_profile,
+                        p95_cycle_ms: overhead_input.p95_cycle_ms,
+                        holt_cost_ms: overhead_input.holt_winters_avg_ms,
+                        page_reclaim_cost_ms: overhead_input.page_reclaim_avg_ms,
+                        webflow_events: &webflow_output.mesh_events,
+                        webflow_observation: Some(webflow_output.observation),
+                        network_observation: Some(networkflow_output.observation),
+                    });
+                let fabric_metrics = value_metrics.world_snapshot.as_ref().map(|world| {
+                    if heterogeneous_runtime.is_none() {
+                        heterogeneous_runtime =
+                            Some(heterogeneous_tick::HeterogeneousRuntime::new(world));
+                    }
+                    let transition = if heterogeneous_workload_id != 0
+                        && heterogeneous_workload_id != world.identity.workload_id
+                    {
+                        1.0
+                    } else {
+                        context_summary.map_or(0.0, |summary| summary.visual_change_q)
+                    };
+                    heterogeneous_workload_id = world.identity.workload_id;
+                    heterogeneous_runtime
+                        .as_mut()
+                        .expect("heterogeneous runtime initialized")
+                        .tick(heterogeneous_tick::HeterogeneousTickInput {
+                            world: Arc::clone(world),
+                            cpu_utilization: snapshot.cpu.global_usage as f64 / 100.0,
+                            pressure: snapshot.pressure.memory_pressure,
+                            p95_cycle_ms: overhead_input.p95_cycle_ms,
+                            transition,
+                            interaction: context_summary
+                                .map_or(if interaction_active { 1.0 } else { 0.0 }, |summary| {
+                                    summary.interaction_q
+                                }),
+                            optional_allowed: overhead_budget.allow_speculation,
+                            thermal_nominal: snapshot.pressure.thermal_level == "nominal",
+                        })
+                });
+                world_model.set_runtime_cycle(cycle_count);
+                {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.value_scheduler_phase = value_metrics.phase;
+                    metrics.metrics.value_scheduler_blocker = value_metrics.blocker;
+                    metrics.metrics.value_scheduler_valid_cycles = value_metrics.valid_cycles;
+                    metrics.metrics.value_scheduler_shadow_cycles =
+                        value_metrics.shadow_cycles_required;
+                    metrics.metrics.value_snapshot_epoch = value_metrics.snapshot_epoch;
+                    metrics.metrics.value_snapshot_revision = value_metrics.snapshot_revision;
+                    metrics.metrics.value_scheduler_registered_jobs = value_metrics.registered_jobs;
+                    metrics.metrics.value_scheduler_eligible_jobs = value_metrics.eligible_jobs;
+                    metrics.metrics.value_scheduler_selected_jobs = value_metrics.selected_jobs;
+                    metrics.metrics.value_scheduler_selected_total = value_metrics.selected_total;
+                    metrics.metrics.value_scheduler_budget_us = value_metrics.budget_us;
+                    metrics.metrics.value_scheduler_predicted_us = value_metrics.predicted_us;
+                    metrics.metrics.value_scheduler_selection_latency_us =
+                        value_metrics.selection_latency_us;
+                    metrics.metrics.value_scheduler_max_selection_latency_us =
+                        value_metrics.max_selection_latency_us;
+                    metrics.metrics.value_scheduler_budget_skips_total =
+                        value_metrics.budget_skips_total;
+                    metrics.metrics.value_scheduler_capacity_skips_total =
+                        value_metrics.capacity_skips_total;
+                    metrics.metrics.value_scheduler_invalid_samples_total =
+                        value_metrics.invalid_samples_total;
+                    if let Some(fabric) = fabric_metrics.as_ref() {
+                        metrics.metrics.fabric_phase = fabric.phase.clone();
+                        metrics.metrics.fabric_blocker = fabric.blocker.clone();
+                        metrics.metrics.fabric_workers_active = fabric.workers_active;
+                        metrics.metrics.fabric_qos_failures = fabric.qos_failures;
+                        metrics.metrics.fabric_result_drops = fabric.result_drops;
+                        metrics.metrics.fabric_submitted_total = fabric.submitted_total;
+                        metrics.metrics.fabric_completed_total = fabric.completed_total;
+                        metrics.metrics.fabric_cancelled_total = fabric.cancelled_total;
+                        metrics.metrics.fabric_stale_total = fabric.stale_total;
+                        metrics.metrics.fabric_deadline_misses_total = fabric.deadline_misses_total;
+                        metrics.metrics.fabric_dispatch_skips_total = fabric.dispatch_skips_total;
+                        metrics.metrics.fabric_eligible_total = fabric.eligible_total;
+                        metrics.metrics.fabric_evaluation_total = fabric.evaluation_total;
+                        metrics.metrics.fabric_last_latency_us = fabric.last_latency_us;
+                        metrics.metrics.fabric_control_p95_baseline_ms =
+                            fabric.control_p95_baseline_ms;
+                        metrics.metrics.fabric_cpu_percent = fabric.fabric_cpu_percent;
+                        metrics.metrics.fabric_rss_delta_bytes = fabric.rss_delta_bytes;
+                        metrics.metrics.coreml_model_available = fabric.coreml_model_available;
+                        metrics.metrics.coreml_requested_backend = fabric.coreml_requested.clone();
+                        metrics.metrics.coreml_effective_backend = fabric.coreml_effective.clone();
+                        metrics.metrics.coreml_ane_execution_measured =
+                            fabric.ane_execution_measured;
+                        metrics.metrics.coreml_circuit_state = fabric.coreml_circuit.clone();
+                        metrics.metrics.temporal_prediction_backend =
+                            fabric.prediction_backend.clone();
+                        metrics.metrics.temporal_prediction_load = fabric.prediction_load;
+                        metrics.metrics.temporal_prediction_transition =
+                            fabric.prediction_transition;
+                        metrics.metrics.temporal_prediction_pressure = fabric.prediction_pressure;
+                        metrics.metrics.temporal_prediction_p95 = fabric.prediction_p95;
+                        metrics.metrics.temporal_prediction_authoritative =
+                            fabric.prediction_authoritative;
+                    }
+                }
+
+                let (interaction_activations, markov_applied, user_call, user_audio, degraded) = {
+                    let metrics = state.metrics.lock_recover();
+                    (
+                        metrics.metrics.interaction_qos_activations,
+                        metrics.metrics.markov_prewarm_applied,
+                        metrics.metrics.user_call_in_progress,
+                        metrics.metrics.user_audio_active,
+                        metrics.metrics.fluidity_degraded,
+                    )
+                };
+                let micro_metrics =
+                    microexperiment_runtime.tick(microexperiment_tick::MicroexperimentTickInput {
+                        cycle: cycle_count,
+                        interaction_activations,
+                        markov_applied,
+                        workload: foreground_app.as_deref().unwrap_or("idle"),
+                        inherited_safe: !Path::new(kill_switch_path()).exists()
+                            && !sleep_notifier.is_sleeping()
+                            && snapshot.pressure.memory_pressure.is_finite()
+                            && snapshot.pressure.memory_pressure < 0.55
+                            && matches!(
+                                snapshot
+                                    .pressure
+                                    .thermal_level
+                                    .to_ascii_lowercase()
+                                    .as_str(),
+                                "nominal" | "normal"
+                            )
+                            && !user_call
+                            && !user_audio
+                            && !degraded
+                            && parallel_runtime.build.expected_profile
+                                == parallel_runtime.build.effective_profile,
+                    });
+                {
+                    let mut metrics = state.metrics.lock_recover();
+                    metrics.metrics.microexperiment_phase = micro_metrics.phase;
+                    metrics.metrics.microexperiment_blocker = micro_metrics.blocker;
+                    metrics.metrics.microexperiment_restore = micro_metrics.restore;
+                    metrics.metrics.microexperiment_proposed_total = micro_metrics.proposed_total;
+                    metrics.metrics.microexperiment_eligible_total = micro_metrics.eligible_total;
+                    metrics.metrics.microexperiment_randomized_total =
+                        micro_metrics.randomized_total;
+                    metrics.metrics.microexperiment_shadow_would_open_total =
+                        micro_metrics.shadow_would_open_total;
+                    metrics.metrics.microexperiment_open_pairs = micro_metrics.open_pairs;
+                    metrics.metrics.microexperiment_completed_pairs = micro_metrics.completed_pairs;
+                    metrics.metrics.microexperiment_control_endpoints_total =
+                        micro_metrics.control_endpoints_total;
+                    metrics.metrics.microexperiment_treatment_endpoints_total =
+                        micro_metrics.treatment_endpoints_total;
+                    metrics.metrics.microexperiment_complete_horizons_total =
+                        micro_metrics.complete_horizons_total;
+                    metrics.metrics.microexperiment_rollback_closed_total =
+                        micro_metrics.rollback_closed_total;
+                    metrics.metrics.microexperiment_pair_gold_total = micro_metrics.pair_gold_total;
+                    metrics.metrics.microexperiment_effective_total = micro_metrics.effective_total;
+                    metrics.metrics.microexperiment_harmful_total = micro_metrics.harmful_total;
+                    metrics.metrics.microexperiment_confounded_total =
+                        micro_metrics.confounded_total;
+                    metrics.metrics.microexperiment_interrupted_total =
+                        micro_metrics.interrupted_total;
+                    metrics.metrics.microexperiment_synthetic_quarantined_total =
+                        micro_metrics.synthetic_quarantined_total;
+                    metrics.metrics.microexperiment_mean_effect = micro_metrics.mean_effect;
+                }
 
                 // FocusMarkov miss check, Markov observe+pre-warm, universal pre-thaw, temporal predictor.
                 // Extracted to daemon_markov_tick::run_markov_tick (Wave 29).
@@ -2458,6 +2883,7 @@ fn main() -> anyhow::Result<()> {
                     &mut cache_warmer,
                     &frozen_state_path,
                     &world_model,
+                    &mut acceleration_lease,
                     &mut exploration_scheduler,
                     &mut markov_exploration_environment,
                 );
@@ -2804,6 +3230,13 @@ fn main() -> anyhow::Result<()> {
                 // specialists that already passed their own safety gates.
                 world_model.attach_local_consolidation(
                     local_consolidator.view_for_installation(installation_id),
+                );
+                let calibration_summary = telemetry_medallion.model_calibration().summary();
+                world_model.attach_unified_trust(
+                    telemetry_medallion.authoritative_gold_decision_count() as u64,
+                    calibration_summary.validated_models as u64,
+                    calibration_summary.trusted_models as u64,
+                    calibration_summary.degraded_models as u64,
                 );
                 let deliberation_workload = world_model
                     .latest_context()
@@ -3581,6 +4014,19 @@ fn main() -> anyhow::Result<()> {
                     let (mode, _confidence) = classify_workload_mode(&features);
                     mode
                 };
+                if let Some(fabric) = fabric_metrics
+                    .as_ref()
+                    .filter(|fabric| fabric.prediction_authoritative)
+                {
+                    let _ = world_model.attach_fabric_prediction(
+                        cycle_count,
+                        workload_mode.as_str(),
+                        fabric.prediction_load,
+                        fabric.prediction_transition,
+                        fabric.prediction_pressure,
+                        fabric.prediction_p95,
+                    );
+                }
 
                 // Workload-onset: fired once when transitioning INTO Build mode.
                 // Lets the governor proactively switch to AggressiveRoot before
@@ -5276,12 +5722,8 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
 
-                // Sysctl Governor: reactive tuning based on TCP health, memory pressure, and workload.
-                // Gate netstat to every ~10s since the main loop now cycles every 500ms-2s.
-                if last_netstat_tick.elapsed() >= Duration::from_secs(10) {
-                    let _ = network_monitor.tick();
-                    last_netstat_tick = Instant::now();
-                }
+                // Sysctl Governor reuses the direct-kernel TCP sample refreshed
+                // above; no second probe or subprocess occurs here.
                 // WebRTC guard (2026-06-09 prod incident): both default
                 // audio devices running = full-duplex realtime call.
                 // Inhibits TCP buffer scale-down and delayed_ack=3.
@@ -5942,7 +6384,7 @@ fn main() -> anyhow::Result<()> {
                             .metrics
                             .ioreport_gpu_pct
                             .max(fluidity_state.gpu_render_load as f64),
-                        gpu_watts: metrics.metrics.energy_gpu_watts.unwrap_or(0.0),
+                        gpu_watts: metrics.metrics.energy_gpu_watts,
                         thermal_nominal: snapshot.pressure.thermal_level == "nominal",
                         app_launching: metrics.metrics.app_launching,
                         fluidity_degraded: metrics.metrics.fluidity_degraded,
@@ -5956,6 +6398,21 @@ fn main() -> anyhow::Result<()> {
                         &metrics.metrics,
                     )
                 };
+                let gpu_context_revision = gpu_context_epoch
+                    ^ ((parallel_runtime.worker_threads as u64) << 32)
+                    ^ (u64::from(gpu_gate.thermal_nominal) << 8)
+                    ^ (u64::from(gpu_gate.gpu_load >= 0.20) << 7)
+                    ^ (u64::from(gpu_gate.memory_pressure >= 0.55) << 6)
+                    ^ (u64::from(gpu_gate.app_launching) << 5)
+                    ^ (u64::from(gpu_gate.fluidity_degraded) << 4)
+                    ^ (u64::from(!gpu_gate.speculation_allowed) << 3)
+                    ^ (u64::from(gpu_gate.gpu_watts.is_some()) << 2)
+                    ^ u64::from(
+                        gpu_gate
+                            .gpu_watts
+                            .is_some_and(|watts| !watts.is_finite() || watts >= 2.5),
+                    );
+                world_model.set_gpu_context_revision(gpu_context_revision);
                 let (final_actions, plan_report) =
                     daemon_dispatch_tick::plan_action_intents_with_gpu(
                         final_actions,
@@ -5966,6 +6423,7 @@ fn main() -> anyhow::Result<()> {
                         gpu_gate.fluidity_degraded,
                         daemon_dispatch_tick::GpuPlannerRuntime {
                             cycle: cycle_count,
+                            context_revision: gpu_context_revision,
                             worker: &mut gpu_imagination,
                             gate: gpu_gate,
                             external_candidates: gpu_external_candidates,
@@ -5986,6 +6444,11 @@ fn main() -> anyhow::Result<()> {
                         cycle_count,
                     );
                 }
+                let gpu_circuit_state = gpu_imagination.circuit_state().as_str().to_string();
+                let gpu_circuit_reason = gpu_imagination
+                    .quarantine_reason()
+                    .unwrap_or("")
+                    .to_string();
                 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.action_planner_proposed_total = metrics
@@ -6076,6 +6539,8 @@ fn main() -> anyhow::Result<()> {
                         plan_report.gpu_imagination_backend.clone();
                     metrics.metrics.gpu_imagination_device =
                         plan_report.gpu_imagination_device.clone();
+                    metrics.metrics.gpu_imagination_circuit_state = gpu_circuit_state;
+                    metrics.metrics.gpu_imagination_circuit_reason = gpu_circuit_reason;
                     metrics.metrics.gpu_imagination_last_submit_outcome =
                         plan_report.gpu_imagination_submit_outcome.clone();
                     if let Some(error) = plan_report.gpu_imagination_error.as_ref() {
@@ -6230,6 +6695,48 @@ fn main() -> anyhow::Result<()> {
                         learnable_params.fluidity_degraded_threshold,
                     )
                 };
+                let markov_confidence = state
+                    .metrics
+                    .lock_recover()
+                    .metrics
+                    .markov_prediction_confidence;
+                let reflex_model_signals = daemon_cycle_tail::ReflexModelSignals {
+                    nars_reliability: (1.0 - lctx.outcome_tracker.nars_drift_score())
+                        .clamp(0.0, 1.0),
+                    mpc_urgency: signal_digest.urgency.clamp(0.0, 1.0),
+                    mpc_recommendation: signal_digest.mpc_recommendation,
+                    causal_confidence: causal_confidence
+                        .values()
+                        .copied()
+                        .map(f64::from)
+                        .filter(|value| value.is_finite())
+                        .fold(0.0, f64::max)
+                        .clamp(0.0, 1.0),
+                    markov_confidence: if markov_confidence.is_finite() {
+                        markov_confidence.clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    },
+                };
+                let flow_acceleration_hint = webflow_output
+                    .intent
+                    .filter(|_| webflow_output.admitted)
+                    .and_then(|intent| {
+                        foreground_pid.map(|target_pid| daemon_cycle_tail::AccelerationHint {
+                            kind: daemon_cycle_tail::AccelerationHintKind::WebNavigation,
+                            target_pid,
+                            ttl_ms: intent.ttl_ms,
+                        })
+                    })
+                    .or_else(|| {
+                        networkflow_output.intent.map(|intent| {
+                            daemon_cycle_tail::AccelerationHint {
+                                kind: daemon_cycle_tail::AccelerationHintKind::NetworkActivity,
+                                target_pid: intent.target_pid,
+                                ttl_ms: intent.ttl_ms,
+                            }
+                        })
+                    });
                 let acceleration_output = daemon_cycle_tail::update_acceleration_lease(
                     &state,
                     &mut acceleration_lease,
@@ -6238,17 +6745,18 @@ fn main() -> anyhow::Result<()> {
                     foreground_pid,
                     build_tracker.phase,
                     user_context.idle_secs,
+                    flow_acceleration_hint,
                     &process_tree,
                     &proc_snaps,
                     &mut io_shaper,
                     &world_model,
                     workload_mode.as_str(),
+                    reflex_model_signals,
                     cycle_count,
                     &mut exploration_scheduler,
                     &mut qos_exploration_environment,
                 );
                 cycle_decision_events.extend_buffer(&acceleration_output.decision_events);
-
                 // Snapshot causal QoS preferences before exec_outcomes consumes final_actions.
                 // FreezeProcess actions for CPU-dominant processes will be upgraded to
                 // ThrottleProcess(aggressive=true) — QoS Background tier is less invasive
@@ -6315,6 +6823,7 @@ fn main() -> anyhow::Result<()> {
                         foreground_pid,
                         exploration_scheduler: &mut exploration_scheduler,
                         telemetry_medallion: &mut telemetry_medallion,
+                        reflex_broker: Some(&mut acceleration_lease),
                         exploration_environment: &mut dispatch_exploration_environment,
                     });
                     (
@@ -6326,6 +6835,21 @@ fn main() -> anyhow::Result<()> {
                 causal_qos_upgrades_cycle += causal_qos_upgrades;
                 cycle_decision_events
                     .extend_buffer_at_cycle(&exec_outcomes.decision_events, cycle_count);
+                acceleration_lease.observe_health(
+                    &state,
+                    cycle_count,
+                    &parallel_runtime.build.expected_profile,
+                    &parallel_runtime.build.compiled_profile,
+                    &parallel_runtime.build.effective_profile,
+                    dry_run,
+                );
+                if cycle_count % 100 == 0 {
+                    write_json(
+                        std::path::Path::new(reflex_state_path()),
+                        acceleration_lease.rollout_state(),
+                        Some(0o600),
+                    );
+                }
 
                 for holdout in &counterfactual_holdouts {
                     tracing::debug!(
@@ -6506,12 +7030,16 @@ fn main() -> anyhow::Result<()> {
                 let cognitive_pause = prev_cog_decision.as_ref().is_some_and(|d| d.pause_learning);
                 if cognitive_pause {
                     if let Some(lease) = last_markov_prethaw.take() {
-                        let report =
-                            daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                        let report = daemon_markov_tick::release_markov_prewarm_recorded(
+                            lease,
+                            &state,
+                            cycle_count,
+                            &mut acceleration_lease,
+                        );
                         cycle_decision_events.extend_buffer(&report.decision_events);
                     }
                     cycle_decision_events.extend_buffer(
-                        &daemon_cycle_tail::release_acceleration_lease(
+                        &daemon_cycle_tail::release_acceleration_lease_recorded(
                             &mut acceleration_lease,
                             &state,
                             cycle_count,
@@ -6701,6 +7229,9 @@ fn main() -> anyhow::Result<()> {
                 // learning_tick.rs for readability; behaviour is unchanged.
                 // Skipped when UCHS recovery mode active (cognitive_pause).
                 if !cognitive_pause {
+                    let microexperiment_checkpoint = cycle_count
+                        .is_multiple_of(100)
+                        .then(|| microexperiment_runtime.persisted());
                     learning_tick::run_learning_tick(
                         &snapshot,
                         &cycle_hw_snap,
@@ -6735,6 +7266,7 @@ fn main() -> anyhow::Result<()> {
                         &cognitive_state.meta_cognition,
                         &local_consolidator,
                         &exploration_scheduler,
+                        microexperiment_checkpoint.as_ref(),
                     );
                     // Apply ws_spike_threshold / fluidity_degraded_threshold from LearnableParams.
                     // Keeps fluidity detection calibrated with learned values.
@@ -7292,10 +7824,15 @@ fn main() -> anyhow::Result<()> {
                 );
             }
             if let Some(lease) = last_markov_prethaw.take() {
-                let report = daemon_markov_tick::release_markov_prewarm(lease, &state, cycle_count);
+                let report = daemon_markov_tick::release_markov_prewarm_recorded(
+                    lease,
+                    &state,
+                    cycle_count,
+                    &mut acceleration_lease,
+                );
                 shutdown_decision_events.extend_buffer(&report.decision_events);
             }
-            let acceleration_events = daemon_cycle_tail::release_acceleration_lease(
+            let acceleration_events = daemon_cycle_tail::release_acceleration_lease_recorded(
                 &mut acceleration_lease,
                 &state,
                 cycle_count,
@@ -7452,6 +7989,11 @@ fn main() -> anyhow::Result<()> {
             focus_markov.persist();
             holt_winters.persist(&hw_path);
             signal_intel.persist(std::path::Path::new(signal_intelligence_path()));
+            write_json(
+                std::path::Path::new(reflex_state_path()),
+                acceleration_lease.rollout_state(),
+                Some(0o600),
+            );
             // On clean shutdown, clear the pending trial: the result can't be measured
             // reliably after a restart since system pressure state will differ.
             let frozen_snap_shutdown: FrozenStatePersisted = {
@@ -7496,6 +8038,7 @@ fn main() -> anyhow::Result<()> {
                     medallion_state: Some(learning_pipeline.medallion_snapshot()),
                     telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
                     exploration_scheduler: Some(exploration_scheduler.persisted()),
+                    microexperiment_lab: Some(microexperiment_runtime.persisted()),
                 },
             );
 

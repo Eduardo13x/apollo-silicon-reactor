@@ -1,34 +1,21 @@
 #!/bin/bash
-# Quick redeploy: build, copy, sign, restart daemon, show logs.
-# Usage: sudo ./scripts/redeploy.sh
+# Quick compatibility entry point: build, atomically deploy the complete fabric,
+# then show status. The privileged helper owns all system writes.
+# Usage: ./scripts/redeploy.sh
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 source scripts/hardware-build-profile.sh
 
 echo "── Build release..."
-cargo build --release ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1 | tail -3
+"$PWD/scripts/build-release.sh" 2>&1 | tail -4
+apollo_verify_build_manifest
 
-echo "── Kill old daemon..."
-killall apollo-optimizerd 2>/dev/null || true
-sleep 1
+echo "── Deploy complete fabric..."
+"$PWD/scripts/deploy.sh"
 
-echo "── Copy binary..."
-cp -f target/release/apollo-optimizerd /usr/local/libexec/apollo-optimizerd
-codesign --force --sign - /usr/local/libexec/apollo-optimizerd
-echo "   MD5: $(md5 -q /usr/local/libexec/apollo-optimizerd)"
-
-echo "── Truncate logs..."
-truncate -s 0 /var/log/apollo-optimizer.out.log /var/log/apollo-optimizer.err.log
-
-echo "── Restart daemon..."
-launchctl kickstart -k system/com.eduardocortez.systemoptimizerd 2>/dev/null || \
-  launchctl kickstart system/com.eduardocortez.systemoptimizerd 2>/dev/null || \
-  echo "   kickstart failed, trying load..." && \
-  launchctl load /Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist 2>/dev/null || true
-
-echo "── Waiting 12s for daemon to cycle..."
-sleep 12
+echo "── Waiting 3s for daemon to cycle..."
+sleep 3
 
 echo ""
 echo "══ PROCESS ══"

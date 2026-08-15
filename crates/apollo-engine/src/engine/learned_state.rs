@@ -26,6 +26,7 @@ use crate::engine::exploration_scheduler::ExplorationSchedulerPersisted;
 use crate::engine::local_consolidation::LocalConsolidator;
 use crate::engine::maintenance_state::MaintenanceState;
 use crate::engine::meta_cognition::MetaCognition;
+use crate::engine::microexperiment_lab::MicroexperimentLabPersisted;
 use crate::engine::nars_belief::{ArousalState, DriftDetector};
 use crate::engine::nested_learner::NestedLearner;
 use crate::engine::neuromodulator::NeuroState;
@@ -583,6 +584,11 @@ pub struct LearnedState {
     /// intentionally absent and are never resumed after restart.
     #[serde(default)]
     pub exploration_scheduler: Option<ExplorationSchedulerPersisted>,
+
+    /// Bounded paired-experiment evidence. Open pairs are persisted only so a
+    /// restart can terminalize them as interrupted; they are never resumed.
+    #[serde(default)]
+    pub microexperiment_lab: Option<MicroexperimentLabPersisted>,
 }
 
 /// Live snapshots that are owned outside the core learning context but belong
@@ -599,6 +605,7 @@ pub struct LearnedStateSupplement {
     pub medallion_state: Option<DataMedallionPersisted>,
     pub telemetry_medallion_state: Option<TelemetryMedallionPersisted>,
     pub exploration_scheduler: Option<ExplorationSchedulerPersisted>,
+    pub microexperiment_lab: Option<MicroexperimentLabPersisted>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -723,6 +730,9 @@ impl LearnedState {
         if self.exploration_scheduler.is_none() {
             self.exploration_scheduler = previous.exploration_scheduler;
         }
+        if self.microexperiment_lab.is_none() {
+            self.microexperiment_lab = previous.microexperiment_lab;
+        }
     }
 
     /// Collect snapshots from all live components into a single struct.
@@ -777,6 +787,7 @@ impl LearnedState {
             // field directly (or use a future CLI tool).
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         }
     }
 
@@ -1155,6 +1166,7 @@ impl LearnedState {
         state.medallion_state = supplement.medallion_state;
         state.telemetry_medallion_state = supplement.telemetry_medallion_state;
         state.exploration_scheduler = supplement.exploration_scheduler;
+        state.microexperiment_lab = supplement.microexperiment_lab;
         // Components not owned by this checkpoint keep their last committed
         // snapshot. Load and parse once, then merge all such fields in memory.
         if let Some(previous) = Self::load(path) {
@@ -1961,6 +1973,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -2000,6 +2013,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         state.self_improve();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -2037,6 +2051,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         assert_eq!(
             state
@@ -2093,6 +2108,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         state.self_improve();
         assert_eq!(
@@ -2144,6 +2160,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         state.validate();
         let si = state.signal_intelligence.as_ref().unwrap();
@@ -2198,6 +2215,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         state.validate();
         let ot = state.outcome_tracker.as_ref().unwrap();
@@ -2578,6 +2596,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         seed.persist(&tmp);
         let loaded = LearnedState::load_local_consolidator(&tmp)
@@ -2650,6 +2669,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         let migrated = try_migrate(0, state);
         assert_eq!(
@@ -2694,6 +2714,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         let migrated = try_migrate(1, state);
         assert_eq!(migrated.version, CURRENT_SCHEMA_VERSION);
@@ -2866,6 +2887,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         blank.persist(&path);
 
@@ -3022,6 +3044,7 @@ mod tests {
             companion_graph: None,
             policy_aggregator_mode: None,
             exploration_scheduler: None,
+            microexperiment_lab: None,
         };
         let mut lp = LearnableParams::default();
         let pre = lp.zone_alpha;

@@ -3,12 +3,18 @@ set -euo pipefail
 
 LABEL="com.eduardocortez.systemoptimizerd"
 PLIST_DST="/Library/LaunchDaemons/com.eduardocortez.systemoptimizerd.plist"
+CONTEXT_LABEL="com.eduardocortez.apollo-context-agent"
+CONTEXT_PLIST_DST="/Library/LaunchAgents/com.eduardocortez.apollo-context-agent.plist"
 
 # ── 1. Graceful stop: ctl sends panic-restore (unfreezes + reverts sysctls) ──
 if command -v /usr/local/bin/apollo-optimizerctl >/dev/null 2>&1; then
     sudo /usr/local/bin/apollo-optimizerctl panic-restore 2>/dev/null || true
 fi
 sudo launchctl bootout system/$LABEL >/dev/null 2>&1 || true
+CONSOLE_UID="$(stat -f %u /dev/console 2>/dev/null || true)"
+if [[ "$CONSOLE_UID" =~ ^[0-9]+$ ]] && [[ "$CONSOLE_UID" -gt 0 ]]; then
+    sudo launchctl bootout "gui/$CONSOLE_UID/$CONTEXT_LABEL" >/dev/null 2>&1 || true
+fi
 sleep 1  # give daemon cleanup path a moment to finish
 
 # ── 2. Emergency SIGCONT for any still-frozen processes ──────────────────────
@@ -40,8 +46,11 @@ if sudo test -f "$SYSCTL_DEFAULTS"; then
 fi
 
 # ── 4. Remove binaries and launchd artifacts ──────────────────────────────────
-sudo rm -f "$PLIST_DST"
-sudo rm -f /usr/local/libexec/apollo-optimizerd /usr/local/bin/apollo-optimizerctl
+sudo rm -f "$PLIST_DST" "$CONTEXT_PLIST_DST"
+sudo rm -f /usr/local/libexec/apollo-optimizerd /usr/local/bin/apollo-optimizerctl \
+    /usr/local/libexec/apollo-context-agent \
+    /usr/local/libexec/apollo-web-bridge \
+    /usr/local/share/apollo/models/apollo-temporal-v1.mlmodel
 sudo rm -f /var/run/apollo-optimizer.sock /var/run/apollo.disable
 
 # ── 5. Remove log files ───────────────────────────────────────────────────────

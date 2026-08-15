@@ -19,25 +19,30 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source scripts/hardware-build-profile.sh
 
 # Component 1: build (50 if ok, 0 if not)
 BUILD_OK=0
-if cargo build --release --bin apollo-optimizerd >/dev/null 2>&1; then
+if cargo build --release --bin apollo-optimizerd \
+    ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} >/dev/null 2>&1; then
     BUILD_OK=50
 fi
 
-# Component 2: tests passed (apollo-engine lib)
+# Component 2: profile-matched workspace libs + Reflex contract
 TESTS_PASSED=0
 if [ "$BUILD_OK" -gt 0 ]; then
-    TESTS_PASSED=$(cargo test -p apollo-engine --lib 2>&1 | \
+    TESTS_PASSED=$(cargo test --workspace --lib --test reflex_contract \
+        ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1 | \
         grep -oE "[0-9]+ passed" | head -1 | awk '{print $1}')
     TESTS_PASSED=${TESTS_PASSED:-0}
     [ "$TESTS_PASSED" -gt 3000 ] && TESTS_PASSED=3000
 fi
 
 # Component 3: clippy warnings (lower = better)
-CLIPPY_WARNINGS=$(cargo clippy --all-targets 2>&1 | \
-    grep -c "^warning:" || echo 0)
+CLIPPY_WARNINGS=$(cargo clippy --workspace --all-targets \
+    ${APOLLO_CARGO_FEATURE_ARGS[@]+"${APOLLO_CARGO_FEATURE_ARGS[@]}"} 2>&1 | \
+    grep -c "^warning:" || true)
+CLIPPY_WARNINGS=${CLIPPY_WARNINGS:-0}
 CLIPPY_SCORE=$(( (50 - CLIPPY_WARNINGS) * 2 ))
 
 # Component 4: wired phases — count distinct LSE_COUNTERS.{inc,add}_*

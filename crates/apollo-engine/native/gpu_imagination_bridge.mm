@@ -22,6 +22,8 @@ typedef struct {
 @property(nonatomic, strong) id<MTLDevice> device;
 @property(nonatomic, strong) id<MTLCommandQueue> queue;
 @property(nonatomic, strong) id<MTLComputePipelineState> pipeline;
+@property(nonatomic, strong) id<MTLBuffer> candidateBuffer;
+@property(nonatomic, strong) id<MTLBuffer> outputBuffer;
 @end
 
 @implementation ApolloGpuImaginationContext
@@ -84,6 +86,9 @@ kernel void apollo_imagine(
 }
 )METAL";
 
+static const uint32_t kApolloMaxCandidates = 24;
+static const uint32_t kApolloMaxSamplesPerCandidate = 4096;
+
 static void apollo_copy_error(char *out, size_t capacity, NSString *message) {
     if (out == NULL || capacity == 0) {
         return;
@@ -136,6 +141,19 @@ extern "C" void *apollo_gpu_imagination_create(char *error_out,
         context.device = device;
         context.queue = queue;
         context.pipeline = pipeline;
+        context.candidateBuffer =
+            [device newBufferWithLength:(NSUInteger)kApolloMaxCandidates *
+                                        sizeof(ApolloGpuCandidate)
+                                options:MTLResourceStorageModeShared];
+        context.outputBuffer =
+            [device newBufferWithLength:(NSUInteger)kApolloMaxCandidates *
+                                        kApolloMaxSamplesPerCandidate * sizeof(float)
+                                options:MTLResourceStorageModeShared];
+        if (context.candidateBuffer == nil || context.outputBuffer == nil) {
+            apollo_copy_error(error_out, error_capacity,
+                              @"Metal shared buffer allocation failed");
+            return NULL;
+        }
         return (__bridge_retained void *)context;
     }
 }
@@ -181,7 +199,9 @@ extern "C" int apollo_gpu_imagination_run(void *raw_context,
         return -1;
     }
     const uint64_t total = (uint64_t)candidate_count * samples_per_candidate;
-    if (total > UINT32_MAX || total > SIZE_MAX / sizeof(float)) {
+    if (candidate_count > kApolloMaxCandidates ||
+        samples_per_candidate > kApolloMaxSamplesPerCandidate ||
+        total > UINT32_MAX || total > SIZE_MAX / sizeof(float)) {
         return -2;
     }
 
@@ -191,19 +211,15 @@ extern "C" int apollo_gpu_imagination_run(void *raw_context,
         const NSUInteger candidate_bytes =
             (NSUInteger)candidate_count * sizeof(ApolloGpuCandidate);
         const NSUInteger output_bytes = (NSUInteger)total * sizeof(float);
-        id<MTLBuffer> candidate_buffer =
-            [context.device newBufferWithBytes:candidates
-                                        length:candidate_bytes
-                                       options:MTLResourceStorageModeShared];
-        id<MTLBuffer> output_buffer =
-            [context.device newBufferWithLength:output_bytes
-                                        options:MTLResourceStorageModeShared];
+        id<MTLBuffer> candidate_buffer = context.candidateBuffer;
+        id<MTLBuffer> output_buffer = context.outputBuffer;
         id<MTLCommandBuffer> command_buffer = [context.queue commandBuffer];
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (candidate_buffer == nil || output_buffer == nil ||
             command_buffer == nil || encoder == nil) {
             return -3;
         }
+        memcpy(candidate_buffer.contents, candidates, candidate_bytes);
 
         ApolloGpuConfig config = {candidate_count, samples_per_candidate, seed, 0};
         [encoder setComputePipelineState:context.pipeline];

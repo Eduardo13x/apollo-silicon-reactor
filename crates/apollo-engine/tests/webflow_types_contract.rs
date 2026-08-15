@@ -1,7 +1,7 @@
 use apollo_engine::engine::webflow_types::{
-    OpaqueBucket, OpaqueId, WebFlowErrorClass, WebFlowEvent, WebFlowIngress, WebFlowMetrics,
-    WebFlowPhase, WebFlowSource, MAX_WEBFLOW_INGRESS_EVENTS, MAX_WEBFLOW_MESSAGE_BYTES,
-    WEBFLOW_SCHEMA_VERSION,
+    accept_process_webflow_at, drain_process_webflow, OpaqueBucket, OpaqueId, WebFlowErrorClass,
+    WebFlowEvent, WebFlowIngress, WebFlowMetrics, WebFlowPhase, WebFlowSource,
+    MAX_WEBFLOW_INGRESS_EVENTS, MAX_WEBFLOW_MESSAGE_BYTES, WEBFLOW_SCHEMA_VERSION,
 };
 
 fn id(value: u8) -> OpaqueId {
@@ -31,7 +31,10 @@ fn valid_event_roundtrips_below_wire_limit_without_content_fields() {
     for forbidden in [
         "url", "title", "text", "cookie", "header", "body", "dom", "origin",
     ] {
-        assert!(!json.to_ascii_lowercase().contains(forbidden), "{forbidden}");
+        assert!(
+            !json.to_ascii_lowercase().contains(forbidden),
+            "{forbidden}"
+        );
     }
     let decoded = WebFlowEvent::from_bounded_json(&bytes).expect("roundtrip");
     assert_eq!(decoded, event);
@@ -79,4 +82,14 @@ fn legacy_metrics_fields_remain_optional_not_zero_filled() {
     assert_eq!(event.metrics.ttfb_ms, None);
     assert_eq!(event.metrics.lcp_ms, None);
     assert_eq!(event.metrics.transfer_bytes, None);
+}
+
+#[test]
+fn process_ingress_accepts_valid_events_and_drains_with_receipt_time() {
+    drain_process_webflow(MAX_WEBFLOW_INGRESS_EVENTS);
+    assert!(accept_process_webflow_at(valid_event(99), 42).is_accepted());
+    let drained = drain_process_webflow(1);
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].received_at_ms, 42);
+    assert_eq!(drained[0].event.sequence, 99);
 }

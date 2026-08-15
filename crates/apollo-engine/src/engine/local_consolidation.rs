@@ -405,6 +405,7 @@ mod tests {
             installation_id: InstallationId(7),
             horizon_cycles: 10,
             tier: EvidenceTier::Gold,
+            provenance: crate::engine::telemetry_medallion::EvidenceProvenance::ObservedLocal,
             quality: 0.95,
             raw_utility_delta: utility,
             counterfactual_delta: 0.0,

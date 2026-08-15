@@ -1,6 +1,6 @@
 use apollo_engine::engine::coreml_predictor::{
     cpu_oracle_predict, CoreMlBackend, CoreMlPredictor, Prediction, PredictorBackend,
-    TemporalFeatureVector, MAX_TEMPORAL_FEATURES, MODEL_HASH, SCHEMA_VERSION,
+    PredictorStatus, TemporalFeatureVector, MAX_TEMPORAL_FEATURES, MODEL_HASH, SCHEMA_VERSION,
     TEMPORAL_FEATURE_COUNT, TEMPORAL_SCHEMA_HASH,
 };
 
@@ -18,6 +18,22 @@ fn temporal_schema_is_versioned_bounded_and_finite() {
 
     assert!(sanitized.as_slice().iter().all(|value| value.is_finite()));
     assert_eq!(sanitized.schema_version(), SCHEMA_VERSION);
+}
+
+#[test]
+fn cpu_only_coreml_is_not_accelerator_evidence() {
+    let status = PredictorStatus {
+        backend: PredictorBackend::CoreMl,
+        requested_backend: CoreMlBackend::CpuAndNeuralEngine,
+        effective_backend: Some(CoreMlBackend::CpuOnly),
+        model_available: true,
+        ane_execution_measured: false,
+        schema_hash: TEMPORAL_SCHEMA_HASH,
+        model_hash: MODEL_HASH,
+        reason: None,
+    };
+
+    assert!(!status.accelerator_backend_available());
 }
 
 #[test]
@@ -67,4 +83,24 @@ fn cpu_oracle_predictor_reports_no_unmeasured_ane_execution() {
     assert_eq!(status.effective_backend, None);
     assert!(!status.ane_execution_measured);
     assert_eq!(predictor.predict(&features), cpu_oracle_predict(&features));
+}
+
+#[test]
+fn configured_coreml_model_matches_the_cpu_oracle() {
+    if std::env::var_os("APOLLO_COREML_MODEL_PATH").is_none() {
+        return;
+    }
+    let features = TemporalFeatureVector::new([0.1; TEMPORAL_FEATURE_COUNT]);
+    let oracle = cpu_oracle_predict(&features);
+    let predictor = CoreMlPredictor::new();
+    let status = predictor.status();
+    assert!(status.model_available, "{:?}", status.reason);
+    let predicted = predictor.predict(&features);
+    for (left, right) in oracle.as_array().into_iter().zip(predicted.as_array()) {
+        assert!(
+            (left - right).abs() <= 0.000_1,
+            "oracle={left} coreml={right}"
+        );
+    }
+    assert!(!predictor.status().ane_execution_measured);
 }

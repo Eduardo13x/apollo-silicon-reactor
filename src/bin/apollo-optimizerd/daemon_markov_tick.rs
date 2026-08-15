@@ -35,11 +35,17 @@ use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::mach_qos::{LatencyTier, SchedulingTier, ThroughputTier};
 use apollo_engine::engine::process_identity::ProcessIdentity;
 use apollo_engine::engine::process_tree::ProcessTree;
+use apollo_engine::engine::reflex::{
+    ReflexActionKind, ReflexAdvice, ReflexDecision, ReflexIntent, ReflexSafetyContext,
+    ReflexSource, ReflexTarget, ReflexTrigger,
+};
 use apollo_engine::engine::safety::hard_protected_contains;
 use apollo_engine::engine::telemetry_medallion::ActuatorFamily;
 use apollo_engine::engine::temporal_predictor::TemporalPredictor;
 use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
 use chrono::{Timelike, Utc};
+
+use crate::daemon_cycle_tail::ReflexBroker;
 
 const TEMPORAL_PREWARM_COOLDOWN_SECS: u64 = 120;
 
@@ -79,6 +85,25 @@ fn markov_target_gates(
     });
     gates.target_apple_owned = pid.is_none_or(apollo_engine::engine::apple_owned::is_apple_owned);
     gates
+}
+
+fn temporal_reflex_safety(
+    gates: &ExplorationGates,
+    identity: &ProcessIdentity,
+    capability_available: bool,
+    identity_recheck_ok: bool,
+) -> ReflexSafetyContext {
+    ReflexSafetyContext {
+        identity_present: gates.identity_present,
+        identity_start_nonzero: gates.identity_start_nonzero,
+        identity_recheck_ok: gates.identity_recheck_ok && identity_recheck_ok,
+        target_protected: gates.target_protected || hard_protected_contains(&identity.name),
+        target_apple_owned: gates.target_apple_owned,
+        capability_available,
+        kill_switch: gates.kill_switch || gates.daemon_shutdown,
+        thermal_force_ecores: !gates.thermal_available || !gates.thermal_nominal,
+        existing_conflict: gates.effect_owner_conflict || gates.coalition_conflict,
+    }
 }
 
 fn markov_event(
@@ -140,10 +165,22 @@ struct MarkovShadowLease {
 struct PrewarmedMember {
     pid: u32,
     name: String,
+    start_sec: u64,
+    start_usec: u64,
     prior_jetsam: i32,
     jetsam_applied: bool,
     tier_applied: bool,
     task_qos_applied: bool,
+}
+
+fn markov_member_matches_identity(member: &PrewarmedMember, current: &ProcessIdentity) -> bool {
+    current.pid == member.pid
+        && current.matches(Some(&member.name), member.start_sec, member.start_usec)
+}
+
+fn reverify_prewarmed_member(member: &PrewarmedMember) -> bool {
+    ProcessIdentity::from_pid(member.pid)
+        .is_some_and(|current| markov_member_matches_identity(member, &current))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -197,6 +234,61 @@ fn markov_exploration_admission(
     }
 }
 
+fn markov_reflex_intent(
+    identity: &ProcessIdentity,
+    cycle: u64,
+    lease_secs: f64,
+    bias: ContextualActionBias,
+) -> Option<ReflexIntent> {
+    let observations = bias
+        .model_observations
+        .saturating_add(bias.episodic_observations);
+    let confidence = if observations == 0 {
+        0.0
+    } else {
+        f64::from(observations) / (f64::from(observations) + 10.0)
+    };
+    let mut sources = vec![ReflexSource::Markov];
+    if bias.is_informative() {
+        sources.push(ReflexSource::WorldModel);
+    }
+    if bias.has_gpu_influence() {
+        sources.push(ReflexSource::Gpu);
+    }
+    let ttl_ms = (lease_secs.clamp(0.1, 12.0) * 1_000.0).round() as u64;
+    ReflexIntent::new(
+        ReflexActionKind::MarkovPrewarm,
+        Some(ReflexTarget {
+            pid: identity.pid,
+            start_sec: identity.start_sec,
+            start_usec: identity.start_usec,
+            name: identity.name.clone(),
+        }),
+        ReflexTrigger::Prediction,
+        ReflexSource::Markov,
+        cycle,
+        ttl_ms,
+    )
+    .ok()
+    .map(|intent| {
+        intent.with_advice(ReflexAdvice {
+            score: bias.score,
+            lower_bound: (bias.score - 0.05).clamp(-1.0, 1.0),
+            upper_bound: (bias.score + 0.05).clamp(-1.0, 1.0),
+            confidence,
+            authoritative: bias.authoritative,
+            sources,
+        })
+    })
+}
+
+fn reflex_blocker(decision: ReflexDecision) -> Option<&'static str> {
+    match decision {
+        ReflexDecision::Veto(blocker) | ReflexDecision::Skipped(blocker) => Some(blocker.as_str()),
+        ReflexDecision::Shadow | ReflexDecision::Admit => None,
+    }
+}
+
 /// Run FocusMarkov + temporal predictor for this cycle.
 ///
 /// # Parameters
@@ -234,6 +326,7 @@ pub fn run_markov_tick(
     cache_warmer: &mut CacheWarmer,
     frozen_state_path: &Path,
     world_model: &WorldModel,
+    reflex_broker: &mut ReflexBroker,
     exploration_scheduler: &mut ExplorationScheduler,
     exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
 ) -> MarkovTickOutput {
@@ -418,6 +511,8 @@ pub fn run_markov_tick(
     if let Some(ref pred) = markov_prediction {
         let elapsed = focus_markov.elapsed_dwell_secs();
         let time_to_switch = pred.avg_dwell_secs - elapsed;
+        let (prediction_eta_secs, prediction_overdue_secs) =
+            normalize_markov_timing(time_to_switch);
         let horizon_5s = pred.confidence_within(elapsed, 5.0);
         let horizon_30s = pred.confidence_within(elapsed, 30.0);
         let horizon_2m = pred.confidence_within(elapsed, 120.0);
@@ -486,6 +581,10 @@ pub fn run_markov_tick(
             &pred.app_name,
             calibration_context,
         );
+        let base_lease_secs = contextual_prewarm_lease_secs(
+            (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0),
+            contextual_bias,
+        );
         let mut blocker = prewarm_blocker(
             pred.probability,
             time_to_switch,
@@ -493,11 +592,38 @@ pub fn run_markov_tick(
             probability_floor,
             admission,
         );
+        if prewarm_eligible {
+            if let Some((identity, intent)) = identity.as_ref().and_then(|identity| {
+                markov_reflex_intent(identity, cycle_count, base_lease_secs, contextual_bias)
+                    .map(|intent| (identity, intent))
+            }) {
+                let decision = reflex_broker.decide_external(
+                    &intent,
+                    ReflexSafetyContext {
+                        identity_present: gates.identity_present,
+                        identity_start_nonzero: gates.identity_start_nonzero,
+                        identity_recheck_ok: gates.identity_recheck_ok
+                            && reverify_member_identity(identity),
+                        target_protected: gates.target_protected,
+                        target_apple_owned: gates.target_apple_owned,
+                        capability_available: cache_warm_allowed,
+                        kill_switch: gates.kill_switch || gates.daemon_shutdown,
+                        thermal_force_ecores: !gates.thermal_available || !gates.thermal_nominal,
+                        existing_conflict: gates.effect_owner_conflict,
+                    },
+                );
+                if !reflex_broker.allows_current_actuation(decision) {
+                    prewarm_eligible = false;
+                    blocker = reflex_blocker(decision).unwrap_or("reflex-blocked");
+                }
+            }
+        }
         {
             let mut metrics = state.metrics.lock_recover();
             metrics.metrics.markov_prediction_app = pred.app_name.clone();
             metrics.metrics.markov_prediction_confidence = pred.probability;
-            metrics.metrics.markov_prediction_eta_secs = time_to_switch;
+            metrics.metrics.markov_prediction_eta_secs = prediction_eta_secs;
+            metrics.metrics.markov_prediction_overdue_secs = prediction_overdue_secs;
             metrics.metrics.markov_prediction_5s = horizon_5s;
             metrics.metrics.markov_prediction_30s = horizon_30s;
             metrics.metrics.markov_prediction_2m = horizon_2m;
@@ -601,10 +727,13 @@ pub fn run_markov_tick(
                     })
                     .count();
                 let applied = !members.is_empty();
-                let lease_secs = contextual_prewarm_lease_secs(
-                    (time_to_switch.max(0.0) + 5.0).clamp(5.0, 20.0),
-                    contextual_bias,
-                );
+                let lease_secs = if reflex_broker.phase()
+                    == apollo_engine::engine::reflex::ReflexRolloutPhase::Active
+                {
+                    base_lease_secs.min(12.0)
+                } else {
+                    base_lease_secs
+                };
                 let acquired_at = Instant::now();
                 let mut exploration = exploration_approval.and_then(|approval| {
                     if applied {
@@ -754,6 +883,7 @@ pub fn run_markov_tick(
         metrics.metrics.markov_prediction_app.clear();
         metrics.metrics.markov_prediction_confidence = 0.0;
         metrics.metrics.markov_prediction_eta_secs = 0.0;
+        metrics.metrics.markov_prediction_overdue_secs = 0.0;
         metrics.metrics.markov_prediction_5s = 0.0;
         metrics.metrics.markov_prediction_30s = 0.0;
         metrics.metrics.markov_prediction_2m = 0.0;
@@ -904,41 +1034,94 @@ pub fn run_markov_tick(
                     markov_shadow.temporal_last_app.as_deref() != Some(tpred.app_name.as_str());
                 if cooldown_open || candidate_changed {
                     if let Some(pid) = find_running_pid(collector, &tpred.app_name) {
-                        let forecasts = crate::daemon_dispatch_tick::decision_time_forecasts(
-                            world_model,
-                            "markov_prewarm:predicted_app",
-                            &workload,
-                            120,
+                        let identity = ProcessIdentity::from_pid(pid);
+                        let (temporal_environment, _) = exploration_environment();
+                        let temporal_gates = markov_target_gates(
+                            temporal_environment,
+                            Some(pid),
+                            &tpred.app_name,
+                            identity.as_ref(),
+                            false,
                         );
-                        let bytes = cache_warmer.warm_pid(pid);
-                        let mut event = markov_event(
-                            tpred.app_name.clone(),
-                            cycle_count,
-                            if bytes > 0 {
-                                ActuatorDecisionOutcome::Applied
-                            } else {
-                                ActuatorDecisionOutcome::NoOp
-                            },
-                            format!("temporal_cache_bytes={bytes}"),
-                        );
-                        for forecast in forecasts {
-                            event = event.with_prediction(forecast);
+                        let reflex_allowed = match identity.as_ref() {
+                            None => {
+                                reflex_broker.phase()
+                                    == apollo_engine::engine::reflex::ReflexRolloutPhase::Shadow
+                                    && !temporal_gates.kill_switch
+                                    && !temporal_gates.daemon_shutdown
+                                    && temporal_gates.thermal_available
+                                    && temporal_gates.thermal_nominal
+                                    && !temporal_gates.effect_owner_conflict
+                                    && !temporal_gates.coalition_conflict
+                            }
+                            Some(identity) => {
+                                let intent = markov_reflex_intent(
+                                    identity,
+                                    cycle_count,
+                                    12.0,
+                                    contextual_bias,
+                                );
+                                if let Some(intent) = intent {
+                                    let decision = reflex_broker.decide_external(
+                                        &intent,
+                                        temporal_reflex_safety(
+                                            &temporal_gates,
+                                            identity,
+                                            cache_warm_allowed,
+                                            reverify_member_identity(identity),
+                                        ),
+                                    );
+                                    reflex_broker.allows_current_actuation(decision)
+                                } else {
+                                    reflex_broker.phase()
+                                        == apollo_engine::engine::reflex::ReflexRolloutPhase::Shadow
+                                }
+                            }
+                        };
+                        if !reflex_allowed {
+                            decision_events.push(markov_event(
+                                tpred.app_name.clone(),
+                                cycle_count,
+                                ActuatorDecisionOutcome::Blocked,
+                                "reflex admission blocked temporal prewarm",
+                            ));
+                        } else {
+                            let forecasts = crate::daemon_dispatch_tick::decision_time_forecasts(
+                                world_model,
+                                "markov_prewarm:predicted_app",
+                                &workload,
+                                120,
+                            );
+                            let bytes = cache_warmer.warm_pid(pid);
+                            let mut event = markov_event(
+                                tpred.app_name.clone(),
+                                cycle_count,
+                                if bytes > 0 {
+                                    ActuatorDecisionOutcome::Applied
+                                } else {
+                                    ActuatorDecisionOutcome::NoOp
+                                },
+                                format!("temporal_cache_bytes={bytes}"),
+                            );
+                            for forecast in forecasts {
+                                event = event.with_prediction(forecast);
+                            }
+                            decision_events.push(event);
+                            markov_shadow.temporal_last_app = Some(tpred.app_name.clone());
+                            markov_shadow.temporal_last_at = Some(Instant::now());
+                            let mut metrics = state.metrics.lock_recover();
+                            metrics.metrics.temporal_prewarm_attempts =
+                                metrics.metrics.temporal_prewarm_attempts.saturating_add(1);
+                            metrics.metrics.temporal_prewarm_applied = metrics
+                                .metrics
+                                .temporal_prewarm_applied
+                                .saturating_add(u64::from(bytes > 0));
+                            metrics.metrics.temporal_prewarm_cache_bytes = metrics
+                                .metrics
+                                .temporal_prewarm_cache_bytes
+                                .saturating_add(bytes);
+                            metrics.metrics.temporal_prewarm_last_app = tpred.app_name.clone();
                         }
-                        decision_events.push(event);
-                        markov_shadow.temporal_last_app = Some(tpred.app_name.clone());
-                        markov_shadow.temporal_last_at = Some(Instant::now());
-                        let mut metrics = state.metrics.lock_recover();
-                        metrics.metrics.temporal_prewarm_attempts =
-                            metrics.metrics.temporal_prewarm_attempts.saturating_add(1);
-                        metrics.metrics.temporal_prewarm_applied = metrics
-                            .metrics
-                            .temporal_prewarm_applied
-                            .saturating_add(u64::from(bytes > 0));
-                        metrics.metrics.temporal_prewarm_cache_bytes = metrics
-                            .metrics
-                            .temporal_prewarm_cache_bytes
-                            .saturating_add(bytes);
-                        metrics.metrics.temporal_prewarm_last_app = tpred.app_name.clone();
                     }
                 }
             }
@@ -948,6 +1131,7 @@ pub fn run_markov_tick(
         let _ = foreground_pid;
     }
 
+    reflex_broker.record_outcomes_for_prefix(&decision_events, "markov_prewarm:");
     MarkovTickOutput {
         temporal_hour,
         temporal_weekday,
@@ -1248,7 +1432,6 @@ fn acquire_coalition_prewarm(
         total_cache_bytes = total_cache_bytes.saturating_add(cache_bytes);
         let unfrozen = thawed.contains(&pid);
 
-        let (warm_sec, _) = apollo_engine::engine::daemon_helpers::pid_start_time(pid);
         if jetsam_applied {
             apollo_engine::engine::effect_ledger::record_global(
                 apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
@@ -1256,7 +1439,7 @@ fn acquire_coalition_prewarm(
                     prior: prior_jetsam,
                 },
                 apollo_engine::engine::effect_ledger::DEFAULT_TTL,
-                warm_sec,
+                identity.start_sec,
                 "markov coalition pre-warm: jetsam FOREGROUND",
             );
         }
@@ -1264,7 +1447,7 @@ fn acquire_coalition_prewarm(
             apollo_engine::engine::effect_ledger::record_global(
                 apollo_engine::engine::effect_ledger::AppliedEffect::MachTier { pid },
                 apollo_engine::engine::effect_ledger::DEFAULT_TTL,
-                warm_sec,
+                identity.start_sec,
                 "markov coalition pre-warm: Foreground tier",
             );
         }
@@ -1272,7 +1455,7 @@ fn acquire_coalition_prewarm(
             apollo_engine::engine::effect_ledger::record_global(
                 apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS { pid },
                 apollo_engine::engine::effect_ledger::DEFAULT_TTL,
-                warm_sec,
+                identity.start_sec,
                 "markov coalition pre-warm: interactive task QoS",
             );
         }
@@ -1281,6 +1464,8 @@ fn acquire_coalition_prewarm(
             members.push(PrewarmedMember {
                 pid,
                 name,
+                start_sec: identity.start_sec,
+                start_usec: identity.start_usec,
                 prior_jetsam,
                 jetsam_applied,
                 tier_applied,
@@ -1360,6 +1545,13 @@ fn contextual_prewarm_lease_secs(base_secs: f64, bias: ContextualActionBias) -> 
 
 fn prediction_window_open(probability: f64, time_to_switch: f64) -> bool {
     probability >= 0.50 && time_to_switch.is_finite() && (-2.0..=12.0).contains(&time_to_switch)
+}
+
+fn normalize_markov_timing(time_to_switch: f64) -> (f64, f64) {
+    if !time_to_switch.is_finite() {
+        return (0.0, 0.0);
+    }
+    (time_to_switch.max(0.0), (-time_to_switch).max(0.0))
 }
 
 fn shadow_lease_resolution(
@@ -1474,6 +1666,59 @@ pub fn release_markov_prewarm(
     let exploration = lease.exploration.clone();
     let exploration_target = lease.predicted_app.clone();
     for member in lease.members {
+        if !reverify_prewarmed_member(&member) {
+            if member.jetsam_applied {
+                apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                    &apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
+                        pid: member.pid,
+                        prior: member.prior_jetsam,
+                    },
+                    "markov coalition pre-warm: jetsam FOREGROUND",
+                );
+                decision_events.push(markov_member_effect_event(
+                    member.pid,
+                    &member.name,
+                    MarkovMemberEffect::Jetsam,
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    "process identity changed before jetsam rollback",
+                ));
+            }
+            if member.tier_applied {
+                apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                    &apollo_engine::engine::effect_ledger::AppliedEffect::MachTier {
+                        pid: member.pid,
+                    },
+                    "markov coalition pre-warm: Foreground tier",
+                );
+                decision_events.push(markov_member_effect_event(
+                    member.pid,
+                    &member.name,
+                    MarkovMemberEffect::MachTier,
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    "process identity changed before Mach tier rollback",
+                ));
+            }
+            if member.task_qos_applied {
+                apollo_engine::engine::effect_ledger::forget_global_if_justification(
+                    &apollo_engine::engine::effect_ledger::AppliedEffect::TaskQoS {
+                        pid: member.pid,
+                    },
+                    "markov coalition pre-warm: interactive task QoS",
+                );
+                decision_events.push(markov_member_effect_event(
+                    member.pid,
+                    &member.name,
+                    MarkovMemberEffect::TaskQos,
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    "process identity changed before task QoS rollback",
+                ));
+            }
+            state.mach_qos.lock_recover().remove(member.pid);
+            continue;
+        }
         if member.jetsam_applied {
             let effect = apollo_engine::engine::effect_ledger::AppliedEffect::JetsamPriority {
                 pid: member.pid,
@@ -1703,6 +1948,17 @@ pub fn release_markov_prewarm(
     }
 }
 
+pub fn release_markov_prewarm_recorded(
+    lease: MarkovPrewarmLease,
+    state: &SharedState,
+    cycle_count: u64,
+    reflex_broker: &mut ReflexBroker,
+) -> MarkovReleaseReport {
+    let report = release_markov_prewarm(lease, state, cycle_count);
+    reflex_broker.record_outcomes_for_prefix(&report.decision_events, "markov_prewarm:");
+    report
+}
+
 /// Anti-ratchet (2026-06-10): what jetsam priority to restore after a
 /// missed pre-warm prediction. `-1` is the "prior unreadable" sentinel —
 /// in that case we skip the jetsam revert (writing a guessed band could
@@ -1721,6 +1977,13 @@ fn cache_warm_allowed_at(pressure: f64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markov_timing_separates_remaining_eta_from_stale_age() {
+        assert_eq!(normalize_markov_timing(12.5), (12.5, 0.0));
+        assert_eq!(normalize_markov_timing(-333.0), (0.0, 333.0));
+        assert_eq!(normalize_markov_timing(f64::NAN), (0.0, 0.0));
+    }
     use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
 
     fn lease(expires_at: Instant, activated: bool) -> MarkovPrewarmLease {
@@ -1731,6 +1994,8 @@ mod tests {
             members: vec![PrewarmedMember {
                 pid: 42,
                 name: "Terminal Helper".to_string(),
+                start_sec: 100,
+                start_usec: 7,
                 prior_jetsam: 2,
                 jetsam_applied: true,
                 tier_applied: true,
@@ -1782,6 +2047,33 @@ mod tests {
     }
 
     #[test]
+    fn markov_member_rollback_requires_the_original_process_identity() {
+        let member = PrewarmedMember {
+            pid: 42,
+            name: "Terminal Helper".to_string(),
+            start_sec: 100,
+            start_usec: 7,
+            prior_jetsam: 2,
+            jetsam_applied: true,
+            tier_applied: true,
+            task_qos_applied: true,
+        };
+        let same = ProcessIdentity {
+            pid: 42,
+            name: "Terminal Helper".to_string(),
+            start_sec: 100,
+            start_usec: 7,
+        };
+        let recycled = ProcessIdentity {
+            start_sec: 101,
+            ..same.clone()
+        };
+
+        assert!(markov_member_matches_identity(&member, &same));
+        assert!(!markov_member_matches_identity(&member, &recycled));
+    }
+
+    #[test]
     fn markov_event_carries_prediction_and_cycle() {
         let event = markov_event(
             "Terminal",
@@ -1793,6 +2085,47 @@ mod tests {
         assert_eq!(event.proposal.action_key, "markov_prewarm:predicted_app");
         assert_eq!(event.proposal.target, "Terminal");
         assert_eq!(event.proposal.proposed_cycle, 31);
+    }
+
+    #[test]
+    fn markov_reflex_intent_carries_process_identity_and_bounded_ttl() {
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_sec: 100,
+            start_usec: 7,
+            name: "Editor".to_string(),
+        };
+        let intent = markov_reflex_intent(&identity, 31, 20.0, ContextualActionBias::default())
+            .expect("valid Markov intent");
+
+        assert_eq!(intent.action, ReflexActionKind::MarkovPrewarm);
+        assert_eq!(intent.trigger, ReflexTrigger::Prediction);
+        assert_eq!(intent.primary_source, ReflexSource::Markov);
+        assert_eq!(intent.cycle, 31);
+        assert_eq!(intent.ttl_ms, 12_000);
+        assert_eq!(intent.target.expect("target").start_sec, 100);
+    }
+
+    #[test]
+    fn temporal_reflex_safety_inherits_environment_blockers() {
+        let identity = ProcessIdentity {
+            pid: 42,
+            start_sec: 100,
+            start_usec: 7,
+            name: "Editor".to_string(),
+        };
+        let mut gates = ExplorationGates::healthy();
+        gates.kill_switch = true;
+        gates.thermal_nominal = false;
+        gates.effect_owner_conflict = true;
+
+        let safety = temporal_reflex_safety(&gates, &identity, true, true);
+
+        assert!(safety.kill_switch);
+        assert!(safety.thermal_force_ecores);
+        assert!(safety.existing_conflict);
+        assert!(safety.identity_present);
+        assert!(safety.identity_recheck_ok);
     }
 
     #[test]

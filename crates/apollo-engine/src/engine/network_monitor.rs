@@ -50,6 +50,33 @@ impl Default for TcpStats {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetworkTrafficSample {
+    pub send_bps: u64,
+    pub recv_bps: u64,
+    pub new_connections: u32,
+}
+
+impl TcpStats {
+    /// Convert the already-collected kernel delta into a controller sample.
+    /// No process, socket, or network probe occurs here.
+    pub fn flow_sample(&self) -> NetworkTrafficSample {
+        let elapsed_ns = self.elapsed.as_nanos();
+        if elapsed_ns == 0 {
+            return NetworkTrafficSample::default();
+        }
+        let per_second = |bytes: u64| {
+            (u128::from(bytes).saturating_mul(1_000_000_000) / elapsed_ns).min(u128::from(u64::MAX))
+                as u64
+        };
+        NetworkTrafficSample {
+            send_bps: per_second(self.bytes_sent),
+            recv_bps: per_second(self.bytes_recv),
+            new_connections: self.connections.min(u64::from(u32::MAX)) as u32,
+        }
+    }
+}
+
 // ── Raw cumulative counters (internal) ───────────────────────────────────────
 
 /// Cumulative counters straight from `netstat -s -p tcp`.

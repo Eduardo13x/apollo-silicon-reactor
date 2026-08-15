@@ -125,6 +125,7 @@ fn fresh_state(ot: OutcomeTrackerPersisted, arousal: Option<ArousalState>) -> Le
         companion_graph: None,
         policy_aggregator_mode: None,
         exploration_scheduler: None,
+        microexperiment_lab: None,
     }
 }
 

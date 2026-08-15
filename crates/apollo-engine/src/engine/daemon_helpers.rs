@@ -105,6 +105,19 @@ pub fn metrics_path() -> &'static str {
     }
 }
 
+pub fn reflex_state_path() -> &'static str {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var("APOLLO_REFLEX_STATE_PATH").unwrap_or_else(|_| {
+            if is_root() {
+                "/var/lib/apollo/reflex_state.json".to_string()
+            } else {
+                "/tmp/apollo-reflex_state.json".to_string()
+            }
+        })
+    })
+}
+
 /// Per-cycle telemetry archive (Phase 1.5a — MLP router unblock).
 /// Distinct file from `runtime_metrics.json` (which is the current snapshot).
 /// Mirrors the root-vs-non-root split of every other state file.
