@@ -866,14 +866,18 @@ where
                 let (lock, _) = &*worker_shared;
                 let mut mailbox = lock.lock().unwrap_or_else(|error| error.into_inner());
                 if !mailbox.shutdown {
-                    mailbox.latest = Some(result);
-                    worker_stats.completed.fetch_add(1, Ordering::Relaxed);
-                    worker_stats
-                        .last_latency_us
-                        .store(latency_us, Ordering::Relaxed);
-                    worker_stats
-                        .last_result_cycle
-                        .store(snapshot.cycle, Ordering::Relaxed);
+                    if mailbox.pending.is_some() {
+                        worker_stats.dropped.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        mailbox.latest = Some(result);
+                        worker_stats.completed.fetch_add(1, Ordering::Relaxed);
+                        worker_stats
+                            .last_latency_us
+                            .store(latency_us, Ordering::Relaxed);
+                        worker_stats
+                            .last_result_cycle
+                            .store(snapshot.cycle, Ordering::Relaxed);
+                    }
                 }
             })?;
         Ok(Self {
@@ -935,6 +939,26 @@ where
             return ReasoningLookup::Stale { age_cycles };
         }
         ReasoningLookup::Fresh(result.clone())
+    }
+
+    /// Returns the age of the currently reusable result without waiting for
+    /// the worker. Results outside the two-cycle contract are removed once so
+    /// telemetry cannot advertise data that consumers would reject.
+    pub fn latest_age_cycles(&self, current_cycle: u64) -> Option<u64> {
+        let (lock, _) = &*self.shared;
+        let mut mailbox = match lock.try_lock() {
+            Ok(mailbox) => mailbox,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        let result = mailbox.latest.as_ref()?;
+        let age_cycles = current_cycle.saturating_sub(result.cycle);
+        if current_cycle < result.cycle || age_cycles > 2 {
+            self.stats.deadline_misses.fetch_add(1, Ordering::Relaxed);
+            mailbox.latest.take();
+            return None;
+        }
+        Some(age_cycles)
     }
 
     pub fn stats(&self) -> ReasoningWorkerStats {

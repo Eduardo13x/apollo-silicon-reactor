@@ -35,6 +35,12 @@ pub mod mach_sys {
     #![allow(non_upper_case_globals, dead_code)]
 
     pub const KERN_SUCCESS: i32 = 0;
+    pub const KERN_PROTECTION_FAILURE: i32 = 2;
+    pub const KERN_NO_SPACE: i32 = 3;
+    pub const KERN_INVALID_ARGUMENT: i32 = 4;
+    pub const KERN_FAILURE: i32 = 5;
+    pub const KERN_RESOURCE_SHORTAGE: i32 = 6;
+    pub const KERN_NO_ACCESS: i32 = 8;
     pub const MACH_PORT_NULL: u32 = 0;
 
     /// task_category_policy role values
@@ -365,6 +371,194 @@ pub struct QoSOutcome {
     pub error: Option<String>,
 }
 
+/// Mach stage that produced a fine-grained QoS diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachQoSStage {
+    TaskForPid,
+    ThreadEnumeration,
+    ThreadLatencyPolicySet,
+    ThreadThroughputPolicySet,
+}
+
+/// Stable interpretation of a non-zero Mach return code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachQoSFailureKind {
+    /// The kernel denied authority to inspect or modify the target.
+    Restricted,
+    /// The request itself was invalid, including a stale thread index.
+    InvalidRequest,
+    /// The kernel could not provide a temporary resource for the operation.
+    ResourceUnavailable,
+    /// A non-authority kernel failure that must not be hidden as a restriction.
+    KernelError,
+}
+
+/// Terminal state of one per-thread QoS attempt.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MachQoSTerminal {
+    #[default]
+    NotAttempted,
+    PermanentlyBlocked,
+    TaskAccessFailed,
+    ThreadEnumerationFailed,
+    ThreadListEmpty,
+    ThreadIndexOutOfRange,
+    PolicySetCompleted,
+    UnsupportedPlatform,
+}
+
+/// Exact return codes from each stage of a per-thread QoS operation.
+///
+/// `None` means the stage did not run. A recorded zero is materially
+/// different: the stage ran and returned `KERN_SUCCESS`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MachQoSDiagnostics {
+    pub task_for_pid: Option<i32>,
+    pub thread_enumeration: Option<i32>,
+    pub thread_latency_policy_set: Option<i32>,
+    pub thread_throughput_policy_set: Option<i32>,
+    pub terminal: MachQoSTerminal,
+}
+
+impl MachQoSDiagnostics {
+    pub fn code_for(&self, stage: MachQoSStage) -> Option<i32> {
+        match stage {
+            MachQoSStage::TaskForPid => self.task_for_pid,
+            MachQoSStage::ThreadEnumeration => self.thread_enumeration,
+            MachQoSStage::ThreadLatencyPolicySet => self.thread_latency_policy_set,
+            MachQoSStage::ThreadThroughputPolicySet => self.thread_throughput_policy_set,
+        }
+    }
+
+    pub fn failed_stage(&self) -> Option<MachQoSStage> {
+        [
+            MachQoSStage::TaskForPid,
+            MachQoSStage::ThreadEnumeration,
+            MachQoSStage::ThreadLatencyPolicySet,
+            MachQoSStage::ThreadThroughputPolicySet,
+        ]
+        .into_iter()
+        .find(|stage| {
+            self.code_for(*stage)
+                .is_some_and(|code| code != mach_sys::KERN_SUCCESS)
+        })
+    }
+
+    pub fn failure_kind(&self) -> Option<MachQoSFailureKind> {
+        if self.terminal == MachQoSTerminal::PermanentlyBlocked {
+            return Some(MachQoSFailureKind::Restricted);
+        }
+        if self.terminal == MachQoSTerminal::ThreadIndexOutOfRange {
+            return Some(MachQoSFailureKind::InvalidRequest);
+        }
+        if self.terminal == MachQoSTerminal::ThreadListEmpty
+            || self.terminal == MachQoSTerminal::UnsupportedPlatform
+            || (self.terminal == MachQoSTerminal::TaskAccessFailed && self.failed_stage().is_none())
+        {
+            return Some(MachQoSFailureKind::ResourceUnavailable);
+        }
+        self.failed_stage().map(|stage| {
+            classify_mach_failure(
+                stage,
+                self.code_for(stage)
+                    .expect("failed stage always retains its exact return code"),
+            )
+        })
+    }
+
+    /// Stable, compact receipt for journals and decision-event detail.
+    pub fn compact(&self) -> String {
+        fn code(value: Option<i32>) -> String {
+            value.map_or_else(|| "not-run".to_string(), |value| value.to_string())
+        }
+        format!(
+            "task_for_pid={},task_threads={},thread_policy_set(latency={},throughput={}),terminal={:?},class={:?}",
+            code(self.task_for_pid),
+            code(self.thread_enumeration),
+            code(self.thread_latency_policy_set),
+            code(self.thread_throughput_policy_set),
+            self.terminal,
+            self.failure_kind()
+        )
+    }
+}
+
+/// Honest per-thread QoS receipt. `mutated` means at least one thread policy
+/// reached `KERN_SUCCESS`; `partial` means exactly one of the two policies did.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ThreadQoSOutcome {
+    pub mutated: bool,
+    pub partial: bool,
+    pub applied_policies: u8,
+    pub diagnostics: MachQoSDiagnostics,
+}
+
+impl ThreadQoSOutcome {
+    pub fn from_diagnostics(diagnostics: MachQoSDiagnostics) -> Self {
+        let applied_policies = [
+            diagnostics.thread_latency_policy_set,
+            diagnostics.thread_throughput_policy_set,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|code| *code == mach_sys::KERN_SUCCESS)
+        .count() as u8;
+        Self {
+            mutated: applied_policies > 0,
+            partial: applied_policies == 1,
+            applied_policies,
+            diagnostics,
+        }
+    }
+
+    pub fn failure_kind(&self) -> Option<MachQoSFailureKind> {
+        self.diagnostics.failure_kind()
+    }
+
+    /// Compatibility rule for the historical boolean API: known policy
+    /// blocks remain silent successful skips, while attempted failures remain
+    /// false. New callers should consume `mutated` and `diagnostics` instead.
+    pub fn legacy_success(&self) -> bool {
+        self.mutated || self.diagnostics.terminal == MachQoSTerminal::PermanentlyBlocked
+    }
+}
+
+fn classify_mach_failure(stage: MachQoSStage, code: i32) -> MachQoSFailureKind {
+    match code {
+        mach_sys::KERN_PROTECTION_FAILURE | mach_sys::KERN_NO_ACCESS => {
+            MachQoSFailureKind::Restricted
+        }
+        // Darwin commonly collapses task_for_pid entitlement/hardened-runtime
+        // denial into generic KERN_FAILURE. At later stages the same value is
+        // not proof of an authority denial and remains a real kernel error.
+        mach_sys::KERN_FAILURE if stage == MachQoSStage::TaskForPid => {
+            MachQoSFailureKind::Restricted
+        }
+        mach_sys::KERN_INVALID_ARGUMENT => MachQoSFailureKind::InvalidRequest,
+        mach_sys::KERN_NO_SPACE | mach_sys::KERN_RESOURCE_SHORTAGE => {
+            MachQoSFailureKind::ResourceUnavailable
+        }
+        _ => MachQoSFailureKind::KernelError,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn release_thread_list(thread_list: *mut ffi::MachPortT, thread_count: ffi::MachMsgTypeNumberT) {
+    if thread_list.is_null() || thread_count == 0 {
+        return;
+    }
+    unsafe {
+        for index in 0..thread_count {
+            ffi::mach_port_deallocate(ffi::mach_task_self(), *thread_list.add(index as usize));
+        }
+        let list_size = thread_count as usize * std::mem::size_of::<ffi::MachPortT>();
+        ffi::vm_deallocate(ffi::mach_task_self(), thread_list as usize, list_size);
+    }
+}
+
 /// Exact audit disposition for a tier request. The legacy `QoSOutcome`
 /// intentionally masks protected and first-failure paths as successful skips;
 /// direct actuator owners use this companion value for honest receipts.
@@ -453,6 +647,12 @@ pub struct MachQoSManager {
     app_napped: HashSet<u32>,
     /// Cached IO tier per PID — skip task_for_pid when tier unchanged.
     io_tier_cache: HashMap<u32, i32>,
+    /// Last synchronous per-thread receipt and its request identity. The
+    /// identity prevents a concurrent caller from consuming another PID's
+    /// diagnostic in the gap after the mediator releases the outer lock.
+    last_thread_qos_outcome:
+        std::sync::Mutex<Option<(u64, u32, u32, ThreadTier, ThreadQoSOutcome)>>,
+    thread_qos_generation: std::sync::atomic::AtomicU64,
 }
 
 impl MachQoSManager {
@@ -464,6 +664,8 @@ impl MachQoSManager {
             prev_thread_cpu: HashMap::new(),
             app_napped: HashSet::new(),
             io_tier_cache: HashMap::new(),
+            last_thread_qos_outcome: std::sync::Mutex::new(None),
+            thread_qos_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -941,45 +1143,132 @@ impl MachQoSManager {
         }
     }
 
-    /// Apply a per-thread QoS tier to a specific thread within a process.
-    /// Returns true on success, false if the thread or process is unavailable.
-    #[cfg(target_os = "macos")]
+    /// Apply a per-thread QoS tier while preserving the historical boolean
+    /// contract used by `ThreadPolicyEffector`.
     pub fn set_thread_qos(&self, pid: u32, thread_idx: u32, tier: ThreadTier) -> bool {
+        self.set_thread_qos_audited(pid, thread_idx, tier)
+            .legacy_success()
+    }
+
+    /// Apply per-thread QoS and retain the exact Mach result from every stage.
+    ///
+    /// No thread operation is attempted unless `task_for_pid` returned a
+    /// non-null task port. This is intentionally not a privilege bypass: when
+    /// task access is restricted, callers receive an honest restriction and
+    /// may choose a non-Mach fallback such as a reversible nice adjustment.
+    pub fn set_thread_qos_audited(
+        &self,
+        pid: u32,
+        thread_idx: u32,
+        tier: ThreadTier,
+    ) -> ThreadQoSOutcome {
+        let outcome = self.apply_thread_qos_audited(pid, thread_idx, tier);
+        let generation = self
+            .thread_qos_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1);
+        *self
+            .last_thread_qos_outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((generation, pid, thread_idx, tier, outcome.clone()));
+        outcome
+    }
+
+    pub fn thread_qos_generation(&self) -> u64 {
+        self.thread_qos_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Return the last receipt only when it belongs to this exact request.
+    /// A mismatch fails closed instead of attributing another worker's result.
+    pub fn thread_qos_outcome_for(
+        &self,
+        generation: u64,
+        pid: u32,
+        thread_idx: u32,
+        tier: ThreadTier,
+    ) -> Option<ThreadQoSOutcome> {
+        self.last_thread_qos_outcome
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .filter(
+                |(stored_generation, stored_pid, stored_idx, stored_tier, _)| {
+                    *stored_generation == generation
+                        && *stored_pid == pid
+                        && *stored_idx == thread_idx
+                        && *stored_tier == tier
+                },
+            )
+            .map(|(_, _, _, _, outcome)| outcome.clone())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn apply_thread_qos_audited(
+        &self,
+        pid: u32,
+        thread_idx: u32,
+        tier: ThreadTier,
+    ) -> ThreadQoSOutcome {
+        use self::ffi::*;
+        use self::mach_sys::*;
+
         if self.permanently_blocked.contains(&pid) {
-            return true; // silently skip
+            return ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+                terminal: MachQoSTerminal::PermanentlyBlocked,
+                ..MachQoSDiagnostics::default()
+            });
         }
 
         unsafe {
-            use self::ffi::*;
-            use self::mach_sys::*;
-
             let mut task_port: MachPortT = MACH_PORT_NULL;
-            let kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
-            if kr != KERN_SUCCESS {
-                return false;
+            let task_kr = task_for_pid(mach_task_self(), pid as i32, &mut task_port);
+            if task_kr != KERN_SUCCESS || task_port == MACH_PORT_NULL {
+                if task_port != MACH_PORT_NULL {
+                    mach_port_deallocate(mach_task_self(), task_port);
+                }
+                return ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+                    task_for_pid: Some(task_kr),
+                    terminal: MachQoSTerminal::TaskAccessFailed,
+                    ..MachQoSDiagnostics::default()
+                });
             }
 
             let mut thread_list: *mut MachPortT = std::ptr::null_mut();
             let mut thread_count: MachMsgTypeNumberT = 0;
-            let kr = task_threads(task_port, &mut thread_list, &mut thread_count);
+            let threads_kr = task_threads(task_port, &mut thread_list, &mut thread_count);
             mach_port_deallocate(mach_task_self(), task_port);
 
-            if kr != KERN_SUCCESS || thread_list.is_null() || thread_idx >= thread_count {
-                if !thread_list.is_null() && thread_count > 0 {
-                    // Deallocate thread ports + list
-                    for i in 0..thread_count {
-                        mach_port_deallocate(mach_task_self(), *thread_list.add(i as usize));
-                    }
-                    let list_size =
-                        (thread_count as u64) * (std::mem::size_of::<MachPortT>() as u64);
-                    vm_deallocate(mach_task_self(), thread_list as usize, list_size as usize);
-                }
-                return false;
+            if threads_kr != KERN_SUCCESS {
+                release_thread_list(thread_list, thread_count);
+                return ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+                    task_for_pid: Some(task_kr),
+                    thread_enumeration: Some(threads_kr),
+                    terminal: MachQoSTerminal::ThreadEnumerationFailed,
+                    ..MachQoSDiagnostics::default()
+                });
+            }
+            if thread_list.is_null() || thread_count == 0 {
+                release_thread_list(thread_list, thread_count);
+                return ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+                    task_for_pid: Some(task_kr),
+                    thread_enumeration: Some(threads_kr),
+                    terminal: MachQoSTerminal::ThreadListEmpty,
+                    ..MachQoSDiagnostics::default()
+                });
+            }
+            if thread_idx >= thread_count {
+                release_thread_list(thread_list, thread_count);
+                return ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+                    task_for_pid: Some(task_kr),
+                    thread_enumeration: Some(threads_kr),
+                    terminal: MachQoSTerminal::ThreadIndexOutOfRange,
+                    ..MachQoSDiagnostics::default()
+                });
             }
 
             let target_thread = *thread_list.add(thread_idx as usize);
-
-            // Apply latency QoS
             let latency_tier = match tier {
                 ThreadTier::Interactive => LATENCY_QOS_TIER_0,
                 ThreadTier::Utility => LATENCY_QOS_TIER_2,
@@ -988,14 +1277,13 @@ impl MachQoSManager {
             let latency_policy = ThreadLatencyQosPolicy {
                 thread_latency_qos_tier: latency_tier,
             };
-            let kr_lat = thread_policy_set(
+            let latency_kr = thread_policy_set(
                 target_thread,
                 THREAD_LATENCY_QOS_POLICY,
                 &latency_policy as *const _ as *const std::ffi::c_void,
                 THREAD_LATENCY_QOS_POLICY_COUNT,
             );
 
-            // Apply throughput QoS
             let throughput_tier = match tier {
                 ThreadTier::Interactive => THROUGHPUT_QOS_TIER_0,
                 ThreadTier::Utility => THROUGHPUT_QOS_TIER_2,
@@ -1004,28 +1292,35 @@ impl MachQoSManager {
             let throughput_policy = ThreadThroughputQosPolicy {
                 thread_throughput_qos_tier: throughput_tier,
             };
-            let kr_thr = thread_policy_set(
+            let throughput_kr = thread_policy_set(
                 target_thread,
                 THREAD_THROUGHPUT_QOS_POLICY,
                 &throughput_policy as *const _ as *const std::ffi::c_void,
                 THREAD_THROUGHPUT_QOS_POLICY_COUNT,
             );
+            release_thread_list(thread_list, thread_count);
 
-            // Deallocate all thread ports and the list.
-            for i in 0..thread_count {
-                mach_port_deallocate(mach_task_self(), *thread_list.add(i as usize));
-            }
-            let list_size = (thread_count as u64) * (std::mem::size_of::<MachPortT>() as u64);
-            vm_deallocate(mach_task_self(), thread_list as usize, list_size as usize);
-
-            // Success if at least one policy applied (thread may have died mid-call).
-            kr_lat == KERN_SUCCESS || kr_thr == KERN_SUCCESS
+            ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+                task_for_pid: Some(task_kr),
+                thread_enumeration: Some(threads_kr),
+                thread_latency_policy_set: Some(latency_kr),
+                thread_throughput_policy_set: Some(throughput_kr),
+                terminal: MachQoSTerminal::PolicySetCompleted,
+            })
         }
     }
 
     #[cfg(not(target_os = "macos"))]
-    pub fn set_thread_qos(&self, _pid: u32, _thread_idx: u32, _tier: ThreadTier) -> bool {
-        false
+    fn apply_thread_qos_audited(
+        &self,
+        _pid: u32,
+        _thread_idx: u32,
+        _tier: ThreadTier,
+    ) -> ThreadQoSOutcome {
+        ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+            terminal: MachQoSTerminal::UnsupportedPlatform,
+            ..MachQoSDiagnostics::default()
+        })
     }
 
     /// Assign a thread to a scheduler affinity group on Apple Silicon.
@@ -1980,6 +2275,130 @@ mod tests {
         blocked.mark_blocked(pid);
         let (_, blocked_disposition) = blocked.set_tier_audited(pid, SchedulingTier::Background);
         assert_eq!(blocked_disposition, QoSAuditDisposition::Blocked);
+    }
+
+    #[test]
+    fn mach_qos_diagnostics_preserve_exact_codes_by_stage() {
+        let diagnostics = MachQoSDiagnostics {
+            task_for_pid: Some(0),
+            thread_enumeration: Some(5),
+            thread_latency_policy_set: None,
+            thread_throughput_policy_set: None,
+            terminal: MachQoSTerminal::ThreadEnumerationFailed,
+        };
+
+        assert_eq!(diagnostics.code_for(MachQoSStage::TaskForPid), Some(0));
+        assert_eq!(
+            diagnostics.code_for(MachQoSStage::ThreadEnumeration),
+            Some(5)
+        );
+        assert_eq!(
+            diagnostics.code_for(MachQoSStage::ThreadLatencyPolicySet),
+            None
+        );
+        assert_eq!(
+            diagnostics.failed_stage(),
+            Some(MachQoSStage::ThreadEnumeration)
+        );
+        assert!(diagnostics.compact().contains("task_threads=5"));
+    }
+
+    #[test]
+    fn task_port_authority_denials_are_restrictions_not_kernel_errors() {
+        for code in [
+            mach_sys::KERN_PROTECTION_FAILURE,
+            mach_sys::KERN_FAILURE,
+            mach_sys::KERN_NO_ACCESS,
+        ] {
+            assert_eq!(
+                classify_mach_failure(MachQoSStage::TaskForPid, code),
+                MachQoSFailureKind::Restricted
+            );
+        }
+        assert_eq!(
+            classify_mach_failure(
+                MachQoSStage::ThreadLatencyPolicySet,
+                mach_sys::KERN_INVALID_ARGUMENT
+            ),
+            MachQoSFailureKind::InvalidRequest
+        );
+        assert_eq!(
+            classify_mach_failure(MachQoSStage::ThreadEnumeration, 999),
+            MachQoSFailureKind::KernelError
+        );
+    }
+
+    #[test]
+    fn denied_task_port_never_claims_thread_stages_or_mutation() {
+        let outcome = ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+            task_for_pid: Some(mach_sys::KERN_NO_ACCESS),
+            terminal: MachQoSTerminal::TaskAccessFailed,
+            ..MachQoSDiagnostics::default()
+        });
+
+        assert!(!outcome.mutated);
+        assert_eq!(outcome.diagnostics.thread_enumeration, None);
+        assert_eq!(outcome.diagnostics.thread_latency_policy_set, None);
+        assert_eq!(outcome.diagnostics.thread_throughput_policy_set, None);
+        assert_eq!(outcome.failure_kind(), Some(MachQoSFailureKind::Restricted));
+        assert!(outcome
+            .diagnostics
+            .compact()
+            .contains("task_threads=not-run"));
+    }
+
+    #[test]
+    fn partial_thread_policy_application_is_reported_as_a_real_mutation() {
+        let outcome = ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+            task_for_pid: Some(mach_sys::KERN_SUCCESS),
+            thread_enumeration: Some(mach_sys::KERN_SUCCESS),
+            thread_latency_policy_set: Some(mach_sys::KERN_SUCCESS),
+            thread_throughput_policy_set: Some(mach_sys::KERN_PROTECTION_FAILURE),
+            terminal: MachQoSTerminal::PolicySetCompleted,
+        });
+
+        assert!(outcome.mutated);
+        assert!(outcome.partial);
+        assert_eq!(outcome.applied_policies, 1);
+        assert_eq!(outcome.failure_kind(), Some(MachQoSFailureKind::Restricted));
+    }
+
+    #[test]
+    fn legacy_thread_qos_contract_keeps_known_blocks_as_silent_success() {
+        let outcome = ThreadQoSOutcome::from_diagnostics(MachQoSDiagnostics {
+            terminal: MachQoSTerminal::PermanentlyBlocked,
+            ..MachQoSDiagnostics::default()
+        });
+
+        assert!(!outcome.mutated);
+        assert!(outcome.legacy_success());
+    }
+
+    #[test]
+    fn stored_thread_receipt_is_bound_to_the_exact_request() {
+        let mut manager = MachQoSManager::new();
+        let pid = 8_811_771;
+        manager.mark_blocked(pid);
+        let generation = manager.thread_qos_generation().wrapping_add(1);
+
+        let outcome = manager.set_thread_qos_audited(pid, 3, ThreadTier::Interactive);
+
+        assert_eq!(
+            outcome.diagnostics.terminal,
+            MachQoSTerminal::PermanentlyBlocked
+        );
+        assert!(manager
+            .thread_qos_outcome_for(generation, pid, 3, ThreadTier::Interactive)
+            .is_some());
+        assert!(manager
+            .thread_qos_outcome_for(generation, pid, 4, ThreadTier::Interactive)
+            .is_none());
+        assert!(manager
+            .thread_qos_outcome_for(generation, pid, 3, ThreadTier::Background)
+            .is_none());
+        assert!(manager
+            .thread_qos_outcome_for(generation.wrapping_add(1), pid, 3, ThreadTier::Interactive)
+            .is_none());
     }
 
     use super::*;

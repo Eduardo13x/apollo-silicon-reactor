@@ -317,6 +317,91 @@ fn reasoning_mailbox_overwrites_pending_work_with_latest_snapshot() {
 }
 
 #[test]
+fn reasoning_worker_never_publishes_running_work_superseded_by_a_newer_identity() {
+    #[derive(Default)]
+    struct Gates {
+        first_started: bool,
+        release_first: bool,
+        latest_started: bool,
+        release_latest: bool,
+    }
+
+    let gates = Arc::new((Mutex::new(Gates::default()), Condvar::new()));
+    let worker_gates = Arc::clone(&gates);
+    let worker = LatestReasoningWorker::spawn("reflex-inflight-latest", move |value: u64| {
+        let (lock, condvar) = &*worker_gates;
+        let mut gates = lock.lock().unwrap_or_else(|error| error.into_inner());
+        if value == 1 {
+            gates.first_started = true;
+            condvar.notify_all();
+            while !gates.release_first {
+                gates = condvar
+                    .wait(gates)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        } else {
+            gates.latest_started = true;
+            condvar.notify_all();
+            while !gates.release_latest {
+                gates = condvar
+                    .wait(gates)
+                    .unwrap_or_else(|error| error.into_inner());
+            }
+        }
+        value * 10
+    })
+    .expect("worker starts");
+    let first_identity = reasoning_identity(42, 100);
+    let latest_identity = reasoning_identity(42, 101);
+    assert!(worker.submit(ReasoningSnapshot::new(1, first_identity, 1)));
+
+    {
+        let (lock, condvar) = &*gates;
+        let mut gates = lock.lock().unwrap_or_else(|error| error.into_inner());
+        while !gates.first_started {
+            gates = condvar
+                .wait(gates)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+    assert!(worker.submit(ReasoningSnapshot::new(3, latest_identity, 3)));
+    {
+        let (lock, condvar) = &*gates;
+        let mut gates = lock.lock().unwrap_or_else(|error| error.into_inner());
+        gates.release_first = true;
+        condvar.notify_all();
+        while !gates.latest_started {
+            gates = condvar
+                .wait(gates)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    let superseded_lookup = worker.latest_for(3, latest_identity);
+
+    {
+        let (lock, condvar) = &*gates;
+        let mut gates = lock.lock().unwrap_or_else(|error| error.into_inner());
+        gates.release_latest = true;
+        condvar.notify_all();
+    }
+    assert_eq!(
+        superseded_lookup,
+        ReasoningLookup::Pending,
+        "the completed result for the recycled identity must never be published"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        if let ReasoningLookup::Fresh(result) = worker.latest_for(3, latest_identity) {
+            assert_eq!(result.payload, 30);
+            break;
+        }
+        assert!(Instant::now() < deadline, "latest result not published");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
 fn reasoning_results_accept_age_two_and_reject_age_three_or_other_identity() {
     let worker = LatestReasoningWorker::spawn("reflex-freshness", |value: u64| value + 1)
         .expect("worker starts");
@@ -385,6 +470,24 @@ fn rejected_reasoning_results_are_discarded_after_one_observation() {
         ReasoningLookup::Pending
     );
     assert_eq!(mismatch_worker.stats().identity_mismatches, 1);
+}
+
+#[test]
+fn reasoning_freshness_probe_never_reports_age_above_two_cycles() {
+    let worker = LatestReasoningWorker::spawn("reflex-age-probe", |value: u64| value)
+        .expect("worker starts");
+    let identity = reasoning_identity(42, 100);
+    worker.submit(ReasoningSnapshot::new(8, identity, 9));
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while worker.stats().completed == 0 {
+        assert!(Instant::now() < deadline, "reasoning result not published");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+
+    assert_eq!(worker.latest_age_cycles(10), Some(2));
+    assert_eq!(worker.latest_age_cycles(11), None);
+    assert_eq!(worker.latest_for(11, identity), ReasoningLookup::Pending);
+    assert_eq!(worker.stats().deadline_misses, 1);
 }
 
 #[test]

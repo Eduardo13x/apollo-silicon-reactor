@@ -1,6 +1,6 @@
 use apollo_engine::engine::webflow_controller::{
     WebFlowController, WebFlowCounters, WebFlowIntent, WebFlowRolloutPhase, WebFlowTickInput,
-    WebWorldObservation,
+    WebWorldObservation, MAX_WEBFLOW_EVENT_AGE_MS,
 };
 use apollo_engine::engine::webflow_types::{
     OpaqueId, ReceivedWebFlowEvent, WebFlowEvent, WebFlowMetrics, WebFlowPhase, WebFlowSource,
@@ -96,11 +96,24 @@ impl WebFlowRuntime {
     pub fn tick(&mut self, input: WebFlowCycleInput<'_>) -> WebFlowCycleOutput {
         self.observe_health(input);
         let mut events = input.events.to_vec();
-        let exact_present = events
+        let newest_exact_at_ms = events
             .iter()
-            .any(|received| received.event.source != WebFlowSource::DaemonInference);
-        if exact_present {
-            self.last_exact_at_ms = Some(input.now_ms);
+            .filter(|received| {
+                received.event.source != WebFlowSource::DaemonInference
+                    && received.received_at_ms != 0
+                    && received.received_at_ms <= input.now_ms
+                    && input.now_ms.saturating_sub(received.received_at_ms)
+                        <= MAX_WEBFLOW_EVENT_AGE_MS
+                    && received.event.validate().is_ok()
+            })
+            .map(|received| received.received_at_ms)
+            .max();
+        let exact_present = newest_exact_at_ms.is_some();
+        if let Some(received_at_ms) = newest_exact_at_ms {
+            self.last_exact_at_ms = Some(
+                self.last_exact_at_ms
+                    .map_or(received_at_ms, |previous| previous.max(received_at_ms)),
+            );
         }
         if input.sleeping || input.kill_switch {
             self.inference_active = false;
@@ -328,6 +341,26 @@ mod tests {
             output.observation.source,
             Some(WebFlowSource::ExtensionLifecycle)
         );
+    }
+
+    #[test]
+    fn stale_exact_event_does_not_suppress_fresh_daemon_inference() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Active);
+        let mut stale = exact(1);
+        stale.received_at_ms = 100;
+        let events = [stale];
+        let mut cycle = input(&events);
+        cycle.now_ms = 2_101;
+        cycle.browser_socket_active = true;
+
+        let output = runtime.tick(cycle);
+
+        assert_eq!(output.counters.stale, 1);
+        assert_eq!(
+            output.observation.source,
+            Some(WebFlowSource::DaemonInference)
+        );
+        assert!(output.admitted);
     }
 
     #[test]

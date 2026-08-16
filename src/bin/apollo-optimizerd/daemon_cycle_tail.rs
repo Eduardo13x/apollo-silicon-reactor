@@ -825,6 +825,11 @@ impl AccelerationLeaseBroker {
     fn sync_reflex_metrics(&self, state: &SharedState, current_cycle: u64) {
         let rollout = self.admission.rollout();
         let counters = self.admission.counters();
+        let reasoning_age = self
+            .reasoning
+            .as_ref()
+            .and_then(|worker| worker.latest_age_cycles(current_cycle))
+            .unwrap_or(0);
         let reasoning = self
             .reasoning
             .as_ref()
@@ -858,12 +863,7 @@ impl AccelerationLeaseBroker {
         metrics.metrics.reflex_reasoning_failed_total = reasoning.failed;
         metrics.metrics.reflex_reasoning_deadline_misses_total = reasoning.deadline_misses;
         metrics.metrics.reflex_reasoning_identity_mismatches_total = reasoning.identity_mismatches;
-        metrics.metrics.reflex_reasoning_last_result_age_cycles =
-            if reasoning.last_result_cycle == 0 {
-                0
-            } else {
-                current_cycle.saturating_sub(reasoning.last_result_cycle)
-            };
+        metrics.metrics.reflex_reasoning_last_result_age_cycles = reasoning_age;
         metrics.metrics.reflex_reasoning_last_latency_us = reasoning.last_latency_us;
     }
 

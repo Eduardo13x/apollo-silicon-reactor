@@ -26,6 +26,19 @@ use crate::engine::safety::{
 use crate::engine::types::{CapabilityReport, JournalEntry, RootAction};
 
 const BOOST_EFFECT_TTL: std::time::Duration = std::time::Duration::from_secs(12);
+const THREAD_QOS_NICE_FALLBACK: i32 = -2;
+const THREAD_QOS_FALLBACK_TTL: std::time::Duration = std::time::Duration::from_secs(12);
+
+fn should_use_thread_qos_nice_fallback(
+    tier: ThreadTier,
+    outcome: &crate::engine::mach_qos::ThreadQoSOutcome,
+) -> bool {
+    tier == ThreadTier::Interactive
+        && !outcome.mutated
+        && outcome.failure_kind() == Some(crate::engine::mach_qos::MachQoSFailureKind::Restricted)
+        && outcome.diagnostics.terminal
+            == crate::engine::mach_qos::MachQoSTerminal::TaskAccessFailed
+}
 
 fn record_boost_qos_effects(pid: u32, start_sec: u64, tier_applied: bool, task_qos_applied: bool) {
     if tier_applied {
@@ -557,6 +570,7 @@ pub fn execute_actions(
         // learning or the cross-cycle recently-applied cache.
         let mut action_applied = false;
         let mut async_submission = None;
+        let mut receipt_detail = None;
 
         let decision_reason = match &action {
             RootAction::BoostProcess {
@@ -1482,22 +1496,37 @@ pub fn execute_actions(
                                 let effector = crate::engine::mediator::ThreadPolicyEffector::new(
                                     std::sync::Arc::clone(arc),
                                 );
-                                let (ok, _syscall_us, applied) = effector.apply_raw(
-                                    *pid,
-                                    *thread_index,
-                                    thread_tier,
-                                    *affinity_tag,
-                                );
-                                if ok {
-                                    action_applied = applied > 0;
-                                    out.thread_qos_applied += applied as u64;
-                                    if applied > 0 {
-                                        if tier == "background" {
-                                            out.thread_qos_cold_routes += applied as u64;
-                                        } else {
-                                            out.thread_qos_hot_routes += applied as u64;
-                                        }
+                                let expected_generation = arc
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .thread_qos_generation()
+                                    .wrapping_add(1);
+                                let (_legacy_ok, _syscall_us, _legacy_applied) = effector
+                                    .apply_raw(*pid, *thread_index, thread_tier, *affinity_tag);
+                                let qos_outcome = arc
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .thread_qos_outcome_for(
+                                        expected_generation,
+                                        *pid,
+                                        *thread_index,
+                                        thread_tier,
+                                    );
+                                let qos_diagnostic = qos_outcome
+                                    .as_ref()
+                                    .map(|outcome| outcome.diagnostics.compact())
+                                    .unwrap_or_else(|| "diagnostic=unavailable".to_string());
+                                let qos_mutated =
+                                    qos_outcome.as_ref().is_some_and(|outcome| outcome.mutated);
+                                if qos_mutated {
+                                    action_applied = true;
+                                    out.thread_qos_applied += 1;
+                                    if tier == "background" {
+                                        out.thread_qos_cold_routes += 1;
+                                    } else {
+                                        out.thread_qos_hot_routes += 1;
                                     }
+                                    receipt_detail = Some(format!("thread-qos:{qos_diagnostic}"));
                                     // FIX-4-v2 (2026-06-07): enrollment
                                     // strictly post-syscall — `ok=true`
                                     // means ThreadPolicyEffector observed
@@ -1538,10 +1567,43 @@ pub fn execute_actions(
                                             hard_protected: is_hp,
                                         },
                                     );
+                                } else if qos_outcome.as_ref().is_some_and(|outcome| {
+                                    should_use_thread_qos_nice_fallback(thread_tier, outcome)
+                                }) {
+                                    match set_nice(*pid, THREAD_QOS_NICE_FALLBACK) {
+                                        Ok(Some(prior)) => {
+                                            crate::engine::effect_ledger::record_global(
+                                                crate::engine::effect_ledger::AppliedEffect::Nice {
+                                                    pid: *pid,
+                                                    prior,
+                                                },
+                                                THREAD_QOS_FALLBACK_TTL,
+                                                *start_sec,
+                                                "thread-qos fallback: nice -2",
+                                            );
+                                            action_applied = true;
+                                            receipt_detail = Some(format!(
+                                                "thread-qos:{qos_diagnostic},fallback=nice--2"
+                                            ));
+                                        }
+                                        Ok(None) => {
+                                            let refreshed =
+                                                crate::engine::effect_ledger::refresh_nice_global(
+                                                    *pid,
+                                                    THREAD_QOS_FALLBACK_TTL,
+                                                );
+                                            receipt_detail = Some(format!(
+                                                "thread-qos:{qos_diagnostic},fallback=nice--2,no-op,owned={refreshed}"
+                                            ));
+                                        }
+                                        Err(error) => {
+                                            anyhow::bail!(
+                                                "thread QoS failed ({qos_diagnostic}); nice -2 fallback failed: {error}"
+                                            );
+                                        }
+                                    }
                                 } else {
-                                    // Syscall failed — apply_raw already
-                                    // refused to bump
-                                    // mediator_thread_policy_total. Bump
+                                    // No thread policy mutation was confirmed. Bump
                                     // the phantom-skip counter so the
                                     // delta between "would have enrolled
                                     // pre-fix" and "did not enroll
@@ -1550,7 +1612,7 @@ pub fn execute_actions(
                                     crate::engine::lse_counters::LSE_COUNTERS
                                         .inc_effect_decay_phantom_enroll_skipped();
                                     anyhow::bail!(
-                                        "thread QoS syscall failed for pid={pid},thread={thread_index}"
+                                        "thread QoS failed for pid={pid},thread={thread_index}: {qos_diagnostic}"
                                     );
                                 }
                                 // affinity_tag fallback handled inside
@@ -1592,6 +1654,7 @@ pub fn execute_actions(
             .map(ToString::to_string)
             .or_else(|| out.last_skip.clone())
             .or_else(|| block_reason.map(|reason| format!("{reason:?}")))
+            .or(receipt_detail)
             .unwrap_or_else(|| reason.clone());
         if let Some(submission) = async_submission {
             out.decision_events.push(submission.pending_event(0));
@@ -1980,7 +2043,7 @@ mod tests {
                 pid,
                 name,
                 thread_index: u32::MAX,
-                tier: "interactive".to_string(),
+                tier: "utility".to_string(),
                 affinity_tag: None,
                 reason: "force invalid thread index".to_string(),
                 decision_reason: DecisionReason::PressureContext,
@@ -2006,6 +2069,81 @@ mod tests {
             outcomes.decision_events.as_slice()[0].outcome,
             ActuatorDecisionOutcome::Failed
         );
+        assert!(
+            outcomes
+                .last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("task_for_pid=")
+                    && error.contains("task_threads=")
+                    && error.contains("thread_policy_set")),
+            "thread QoS failure must retain stage diagnostics: {:?}",
+            outcomes.last_error
+        );
+    }
+
+    #[test]
+    fn nice_fallback_is_limited_to_restricted_interactive_thread_qos() {
+        let restricted = crate::engine::mach_qos::ThreadQoSOutcome::from_diagnostics(
+            crate::engine::mach_qos::MachQoSDiagnostics {
+                task_for_pid: Some(crate::engine::mach_qos::mach_sys::KERN_FAILURE),
+                terminal: crate::engine::mach_qos::MachQoSTerminal::TaskAccessFailed,
+                ..Default::default()
+            },
+        );
+        let invalid_index = crate::engine::mach_qos::ThreadQoSOutcome::from_diagnostics(
+            crate::engine::mach_qos::MachQoSDiagnostics {
+                task_for_pid: Some(crate::engine::mach_qos::mach_sys::KERN_SUCCESS),
+                thread_enumeration: Some(crate::engine::mach_qos::mach_sys::KERN_SUCCESS),
+                terminal: crate::engine::mach_qos::MachQoSTerminal::ThreadIndexOutOfRange,
+                ..Default::default()
+            },
+        );
+        let policy_restricted = crate::engine::mach_qos::ThreadQoSOutcome::from_diagnostics(
+            crate::engine::mach_qos::MachQoSDiagnostics {
+                task_for_pid: Some(crate::engine::mach_qos::mach_sys::KERN_SUCCESS),
+                thread_enumeration: Some(crate::engine::mach_qos::mach_sys::KERN_SUCCESS),
+                thread_latency_policy_set: Some(
+                    crate::engine::mach_qos::mach_sys::KERN_PROTECTION_FAILURE,
+                ),
+                thread_throughput_policy_set: Some(
+                    crate::engine::mach_qos::mach_sys::KERN_PROTECTION_FAILURE,
+                ),
+                terminal: crate::engine::mach_qos::MachQoSTerminal::PolicySetCompleted,
+            },
+        );
+
+        assert!(should_use_thread_qos_nice_fallback(
+            ThreadTier::Interactive,
+            &restricted
+        ));
+        assert!(!should_use_thread_qos_nice_fallback(
+            ThreadTier::Background,
+            &restricted
+        ));
+        assert!(!should_use_thread_qos_nice_fallback(
+            ThreadTier::Interactive,
+            &invalid_index
+        ));
+        assert!(!should_use_thread_qos_nice_fallback(
+            ThreadTier::Interactive,
+            &policy_restricted
+        ));
+        let cached_block = crate::engine::mach_qos::ThreadQoSOutcome::from_diagnostics(
+            crate::engine::mach_qos::MachQoSDiagnostics {
+                terminal: crate::engine::mach_qos::MachQoSTerminal::PermanentlyBlocked,
+                ..Default::default()
+            },
+        );
+        assert!(!should_use_thread_qos_nice_fallback(
+            ThreadTier::Interactive,
+            &cached_block
+        ));
+    }
+
+    #[test]
+    fn thread_qos_nice_fallback_stays_conservative_and_short_lived() {
+        assert_eq!(THREAD_QOS_NICE_FALLBACK, -2);
+        assert_eq!(THREAD_QOS_FALLBACK_TTL, std::time::Duration::from_secs(12));
     }
 
     #[test]

@@ -5,7 +5,9 @@ use apollo_engine::engine::cycle_snapshot::{CycleContextSnapshot, SnapshotId, So
 use apollo_engine::engine::event_mesh::{EventEnvelope, EventMesh, EventSource, LifecycleEvent};
 use apollo_engine::engine::network_flow::NetworkWorldObservation;
 use apollo_engine::engine::value_scheduler::{
-    JobId, SchedulerInputs, SchedulerLevel, SchedulerPhase, ValueScheduler,
+    CompletionDisposition, JobCompletion, JobCompletionStatus, JobId, JobPermit,
+    SchedulerHandoffBatch, SchedulerInputs, SchedulerLevel, SchedulerPhase, ValueScheduler,
+    MAX_JOBS,
 };
 use apollo_engine::engine::webflow_controller::WebWorldObservation;
 use apollo_engine::engine::webflow_types::WebFlowEvent;
@@ -85,6 +87,9 @@ pub struct ValueSchedulerRuntime {
     last_context_permissions_bits: u16,
     last_sleeping: bool,
     webflow_source_sequence: u64,
+    handoff_connected: bool,
+    handoff_jobs: [bool; MAX_JOBS],
+    pending_handoff: Option<SchedulerHandoffBatch>,
 }
 
 impl ValueSchedulerRuntime {
@@ -133,10 +138,57 @@ impl ValueSchedulerRuntime {
             last_context_permissions_bits: 0,
             last_sleeping: false,
             webflow_source_sequence: 0,
+            handoff_connected: false,
+            handoff_jobs: [false; MAX_JOBS],
+            pending_handoff: None,
         }
     }
 
+    /// Enables active scheduling only when the daemon also consumes the
+    /// handoff returned by `take_handoff` and sends terminal acknowledgements.
+    pub fn connect_handoff(&mut self) {
+        self.handoff_connected = true;
+        self.handoff_jobs.fill(true);
+    }
+
+    /// Connects only jobs that have a real daemon consumer. Unsupported jobs
+    /// remain observable through registration metrics but never receive a
+    /// permit that would have to be acknowledged without doing useful work.
+    pub fn connect_handoff_jobs(&mut self, jobs: &[JobId]) {
+        self.handoff_jobs.fill(false);
+        for &job in jobs.iter().take(MAX_JOBS) {
+            self.handoff_jobs[job.index()] = true;
+        }
+        self.handoff_connected = self.handoff_jobs.iter().any(|connected| *connected);
+    }
+
+    pub fn take_handoff(&mut self) -> Option<SchedulerHandoffBatch> {
+        let batch = self.pending_handoff.take()?;
+        let claimed_mono_us = self.started_at.elapsed().as_micros() as u64;
+        self.scheduler.claim_handoff(batch, claimed_mono_us)
+    }
+
+    pub fn acknowledge(
+        &mut self,
+        permit: &JobPermit,
+        elapsed_us: u32,
+        status: JobCompletionStatus,
+    ) -> CompletionDisposition {
+        let completion = JobCompletion::from_permit(
+            permit,
+            permit
+                .submitted_mono_us
+                .saturating_add(u64::from(elapsed_us)),
+            elapsed_us,
+            status,
+        );
+        self.scheduler.complete(completion)
+    }
+
     pub fn tick(&mut self, input: ValueSchedulerTickInput<'_>) -> ValueSchedulerTickMetrics {
+        if let Some(unclaimed) = self.pending_handoff.take() {
+            self.scheduler.discard_handoff(unclaimed);
+        }
         let cut_started_us = self.started_at.elapsed().as_micros() as u64;
         let pressure_q = finite_unit_q(input.pressure);
         let pressure = match pressure_q {
@@ -300,11 +352,36 @@ impl ValueSchedulerRuntime {
         snapshot.kill_switch = input.kill_switch;
         snapshot.sleeping = input.sleeping;
 
+        let activation_sample_valid = snapshot.pressure_q().is_some()
+            && snapshot.thermal_q().is_some()
+            && input.profile_matches
+            && input.p95_cycle_ms.is_finite()
+            && input.p95_cycle_ms < 75.0
+            && !input.kill_switch
+            && !input.sleeping;
+        self.scheduler.set_phase(
+            if self.handoff_connected
+                && self.valid_cycles >= SHADOW_CYCLES_REQUIRED
+                && activation_sample_valid
+            {
+                SchedulerPhase::Active
+            } else {
+                SchedulerPhase::Shadow
+            },
+        );
+
         let mut scheduler_inputs = SchedulerInputs::default();
         scheduler_inputs.level = map_level(input.overhead_level);
         scheduler_inputs.kill_switch = input.kill_switch;
         scheduler_inputs.sleeping = input.sleeping;
         set_due_jobs(&mut scheduler_inputs, &input);
+        if self.handoff_connected {
+            for job in JobId::ALL {
+                if !self.handoff_jobs[job.index()] {
+                    scheduler_inputs.set_due(job, false);
+                }
+            }
+        }
         set_cost(
             &mut scheduler_inputs,
             JobId::HoltWintersRefresh,
@@ -340,6 +417,15 @@ impl ValueSchedulerRuntime {
             self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
         }
 
+        if plan.should_execute && sample_valid {
+            self.pending_handoff = SchedulerHandoffBatch::from_plan(&plan);
+        } else if plan.should_execute {
+            if let Some(rejected) = SchedulerHandoffBatch::from_plan(&plan) {
+                self.scheduler.discard_handoff(rejected);
+            }
+            self.scheduler.set_phase(SchedulerPhase::Shadow);
+        }
+
         let blocker = if !input.profile_matches {
             "profile-mismatch"
         } else if snapshot.pressure_q().is_none() {
@@ -352,12 +438,21 @@ impl ValueSchedulerRuntime {
             "selection-latency"
         } else if self.valid_cycles < SHADOW_CYCLES_REQUIRED {
             "collecting-samples"
-        } else {
+        } else if !self.handoff_connected {
             "legacy-bypass"
+        } else if self.scheduler.phase() == SchedulerPhase::Shadow {
+            "shadow-ready"
+        } else {
+            ""
         };
         let scheduler_metrics = self.scheduler.metrics();
         ValueSchedulerTickMetrics {
-            phase: "shadow".to_string(),
+            phase: match self.scheduler.phase() {
+                SchedulerPhase::Active => "active",
+                SchedulerPhase::Shadow => "shadow",
+                SchedulerPhase::Disabled => "disabled",
+            }
+            .to_string(),
             blocker: blocker.to_string(),
             valid_cycles: self.valid_cycles,
             shadow_cycles_required: SHADOW_CYCLES_REQUIRED,
@@ -575,6 +670,14 @@ fn map_level(level: OverheadLevel) -> SchedulerLevel {
     }
 }
 
+pub fn optional_job_allowed(
+    scheduler_active: bool,
+    legacy_allowed: bool,
+    permit_present: bool,
+) -> bool {
+    legacy_allowed && (!scheduler_active || permit_present)
+}
+
 fn finite_unit_q(value: f64) -> Option<u16> {
     value
         .is_finite()
@@ -666,6 +769,90 @@ mod tests {
         assert_eq!(last.valid_cycles, SHADOW_CYCLES_REQUIRED);
         assert_eq!(last.blocker, "legacy-bypass");
         assert_eq!(last.phase, "shadow");
+    }
+
+    #[test]
+    fn connected_handoff_promotes_after_warmup_and_yields_bounded_work() {
+        let mut runtime = ValueSchedulerRuntime::with_epoch(7);
+        runtime.connect_handoff();
+        for cycle in 1..=SHADOW_CYCLES_REQUIRED {
+            let metrics = runtime.tick(input(cycle));
+            assert_eq!(metrics.phase, "shadow");
+        }
+
+        let metrics = runtime.tick(input(SHADOW_CYCLES_REQUIRED + 1));
+        let handoff = runtime.take_handoff().expect("active handoff");
+
+        assert_eq!(metrics.phase, "active");
+        assert!(metrics.blocker.is_empty());
+        assert!(!handoff.is_empty());
+        assert!(handoff.len() <= apollo_engine::engine::value_scheduler::MAX_IN_FLIGHT_OPTIONAL);
+        assert!(runtime.take_handoff().is_none());
+    }
+
+    #[test]
+    fn scoped_handoff_only_yields_jobs_with_real_consumers() {
+        let mut runtime = ValueSchedulerRuntime::with_epoch(7);
+        runtime.connect_handoff_jobs(&[JobId::HardwarePrediction]);
+        for cycle in 1..=SHADOW_CYCLES_REQUIRED {
+            runtime.tick(input(cycle));
+        }
+
+        let metrics = runtime.tick(input(510));
+        let handoff = runtime.take_handoff().expect("hardware handoff");
+
+        assert_eq!(metrics.phase, "active");
+        assert_eq!(handoff.len(), 1);
+        assert_eq!(handoff.permits()[0].job_id(), JobId::HardwarePrediction);
+    }
+
+    #[test]
+    fn active_scheduler_requires_a_permit_while_shadow_preserves_legacy_execution() {
+        assert!(optional_job_allowed(false, true, false));
+        assert!(!optional_job_allowed(true, true, false));
+        assert!(optional_job_allowed(true, true, true));
+        assert!(!optional_job_allowed(true, false, true));
+    }
+
+    #[test]
+    fn terminal_acknowledgement_releases_claimed_work() {
+        let mut runtime = ValueSchedulerRuntime::with_epoch(7);
+        runtime.connect_handoff();
+        for cycle in 1..=SHADOW_CYCLES_REQUIRED + 1 {
+            runtime.tick(input(cycle));
+        }
+        let handoff = runtime.take_handoff().expect("active handoff");
+        let permit = handoff.permits()[0].clone();
+
+        assert_eq!(
+            runtime.acknowledge(&permit, 100, JobCompletionStatus::Succeeded),
+            CompletionDisposition::Accepted
+        );
+        assert_eq!(runtime.scheduler.metrics().success_total, 1);
+        assert!(runtime.scheduler.metrics().in_flight_jobs <= 3);
+    }
+
+    #[test]
+    fn an_unclaimed_batch_is_discarded_before_the_next_plan() {
+        let mut runtime = ValueSchedulerRuntime::with_epoch(7);
+        runtime.connect_handoff();
+        for cycle in 1..=SHADOW_CYCLES_REQUIRED + 1 {
+            runtime.tick(input(cycle));
+        }
+        let selected = runtime
+            .pending_handoff
+            .as_ref()
+            .expect("unclaimed handoff")
+            .len() as u64;
+
+        runtime.tick(input(SHADOW_CYCLES_REQUIRED + 2));
+
+        assert_eq!(
+            runtime.scheduler.metrics().handoff_discarded_total,
+            selected
+        );
+        assert_eq!(runtime.scheduler.metrics().completed_total, 0);
+        assert!(runtime.scheduler.metrics().in_flight_jobs <= 4);
     }
 
     #[test]

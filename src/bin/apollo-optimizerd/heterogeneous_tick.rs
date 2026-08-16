@@ -125,6 +125,10 @@ impl HeterogeneousRuntime {
         }
     }
 
+    pub fn submitted_total(&self) -> u64 {
+        self.metrics.submitted_total
+    }
+
     pub fn tick(&mut self, input: HeterogeneousTickInput) -> HeterogeneousTickMetrics {
         let now_us = monotonic_us();
         let executor_status = self.executor.status();
@@ -615,6 +619,7 @@ mod tests {
         });
         assert_eq!(metrics.phase, "shadow");
         assert!(metrics.submitted_total >= 1);
+        assert_eq!(runtime.submitted_total(), metrics.submitted_total);
         assert!(!metrics.ane_execution_measured);
     }
 

@@ -19,7 +19,50 @@ pub const MAX_COMPLETED_PAIRS: usize = 128;
 pub const MAX_GOLD_DEDUP: usize = 128;
 pub const MAX_SERIALIZED_BYTES: usize = 64 * 1024;
 pub const MAX_ACTION_KEY_BYTES: usize = 96;
+pub const SHADOW_MIN_OPPORTUNITIES: u64 = 500;
+pub const SHADOW_MIN_DURATION_MS: u64 = 15 * 60 * 1_000;
+pub const CANARY_MIN_OPPORTUNITIES: u64 = 500;
+pub const CANARY_PERCENT: u8 = 10;
+pub const ENDPOINT_GRACE_CYCLES: u64 = 12;
 const LAB_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LabPhase {
+    #[default]
+    Shadow,
+    Canary,
+    Active,
+}
+
+impl LabPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shadow => "shadow",
+            Self::Canary => "canary",
+            Self::Active => "active",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LabRolloutConfig {
+    shadow_min_opportunities: u64,
+    shadow_min_duration_ms: u64,
+    canary_percent: u8,
+    canary_min_opportunities: u64,
+}
+
+impl Default for LabRolloutConfig {
+    fn default() -> Self {
+        Self {
+            shadow_min_opportunities: SHADOW_MIN_OPPORTUNITIES,
+            shadow_min_duration_ms: SHADOW_MIN_DURATION_MS,
+            canary_percent: CANARY_PERCENT,
+            canary_min_opportunities: CANARY_MIN_OPPORTUNITIES,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PairId(pub u128);
@@ -157,7 +200,7 @@ impl PairGates {
         }
     }
 
-    fn allows_pair(self) -> bool {
+    pub fn allows_pair(self) -> bool {
         self.experiments_enabled
             && self.privacy_known
             && !self.secure_input
@@ -190,6 +233,29 @@ pub struct PairAssignment {
     pub second: ArmKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CandidateDisposition {
+    Shadow(PairAssignment),
+    CanarySkipped,
+    Opened(PairAssignment),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairDirective {
+    pub pair_id: PairId,
+    pub arm: ArmKind,
+    pub treatment_arm: ExplorationArm,
+    pub family: ActuatorFamily,
+    pub action_class: ActionClass,
+    pub context: ExplorationContext,
+    pub action_key: String,
+    pub stratum_hash: u64,
+    pub issued_cycle: u64,
+    pub complete_not_before_cycle: u64,
+    pub expires_after_cycle: u64,
+    pub rollback_required: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PairEndpoint {
     pub arm: ArmKind,
@@ -207,6 +273,42 @@ pub struct PairEndpoint {
     pub horizon: HorizonClosure,
     pub rollback: RollbackClosure,
     pub utility_micros: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimedPairEndpoint {
+    pub pair_id: PairId,
+    pub issued_cycle: u64,
+    pub completed_cycle: u64,
+    pub endpoint: PairEndpoint,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum PairInvalidationReason {
+    SafetyGate,
+    DeadlineExpired,
+    Confounded,
+    IncompleteHorizon,
+    FailedExecution,
+    FailedRollback,
+    Unauthoritative,
+    ClockRegression,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairInvalidation {
+    pub pair_id: PairId,
+    pub reason: PairInvalidationReason,
+    pub family: ActuatorFamily,
+    pub action_key: String,
+    pub rollback_required: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimedEndpointDisposition {
+    Progress(PairProgress),
+    Invalidated(PairInvalidation),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,6 +339,14 @@ impl From<PersistedPairProgress> for PairProgress {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+struct IssuedArm {
+    arm: ArmKind,
+    issued_cycle: u64,
+    complete_not_before_cycle: u64,
+    expires_after_cycle: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairRecord {
     candidate: PairCandidate,
@@ -245,6 +355,10 @@ struct PairRecord {
     second_endpoint: Option<PairEndpoint>,
     washout_elapsed: u32,
     progress: PersistedPairProgress,
+    #[serde(default)]
+    issued: Option<IssuedArm>,
+    #[serde(default)]
+    washout_started_cycle: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -281,7 +395,7 @@ struct CompletedPairSummary {
     interrupted: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LabMetrics {
     pub proposed_total: u64,
     pub eligible_total: u64,
@@ -297,8 +411,12 @@ pub struct LabMetrics {
     pub interrupted_total: u64,
     pub synthetic_quarantined_total: u64,
     pub shadow_would_open_total: u64,
+    pub invalidated_total: u64,
+    pub deadline_expired_total: u64,
+    pub rollback_failed_total: u64,
     pub open_pairs: usize,
     pub completed_pairs: usize,
+    pub mean_effect: f64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -320,6 +438,9 @@ pub enum LabError {
     WashoutPending,
     Mismatch,
     NotReady,
+    HorizonPending,
+    EndpointNotIssued,
+    DeadlineExpired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +461,7 @@ pub struct MicroexperimentLabPersisted {
     completed: VecDeque<CompletedPairSummary>,
     gold_dedup: VecDeque<PairId>,
     metrics: PersistedMetrics,
+    rollout: PersistedRollout,
     reserved: String,
 }
 
@@ -360,6 +482,37 @@ struct PersistedMetrics {
     interrupted_total: u64,
     synthetic_quarantined_total: u64,
     shadow_would_open_total: u64,
+    invalidated_total: u64,
+    deadline_expired_total: u64,
+    rollback_failed_total: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct PersistedRollout {
+    phase: LabPhase,
+    phase_started_millis: u64,
+    last_monotonic_millis: u64,
+    shadow_eligible: u64,
+    canary_eligible: u64,
+    canary_opened: u64,
+    canary_completed: u64,
+    canary_gold: u64,
+    canary_failures: u64,
+}
+
+impl PersistedRollout {
+    fn reset_to_shadow(&mut self, now_millis: u64) {
+        self.phase = LabPhase::Shadow;
+        self.phase_started_millis = now_millis;
+        self.last_monotonic_millis = now_millis;
+        self.shadow_eligible = 0;
+        self.canary_eligible = 0;
+        self.canary_opened = 0;
+        self.canary_completed = 0;
+        self.canary_gold = 0;
+        self.canary_failures = 0;
+    }
 }
 
 impl Default for MicroexperimentLabPersisted {
@@ -372,6 +525,7 @@ impl Default for MicroexperimentLabPersisted {
             completed: VecDeque::new(),
             gold_dedup: VecDeque::new(),
             metrics: PersistedMetrics::default(),
+            rollout: PersistedRollout::default(),
             reserved: String::new(),
         }
     }
@@ -428,6 +582,8 @@ pub struct MicroexperimentLab {
     gold_dedup: VecDeque<PairId>,
     pending_gold: VecDeque<PairGoldRecord>,
     metrics: PersistedMetrics,
+    rollout: PersistedRollout,
+    rollout_config: LabRolloutConfig,
     last_work: LabWork,
 }
 
@@ -441,6 +597,8 @@ impl MicroexperimentLab {
             gold_dedup: VecDeque::with_capacity(MAX_GOLD_DEDUP),
             pending_gold: VecDeque::with_capacity(MAX_GOLD_DEDUP),
             metrics: PersistedMetrics::default(),
+            rollout: PersistedRollout::default(),
+            rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
         }
     }
@@ -488,6 +646,8 @@ impl MicroexperimentLab {
             second_endpoint: None,
             washout_elapsed: 0,
             progress: PersistedPairProgress::AwaitingFirst,
+            issued: None,
+            washout_started_cycle: None,
         });
         self.next_pair_sequence = next;
         self.metrics.eligible_total = self.metrics.eligible_total.saturating_add(1);
@@ -533,6 +693,241 @@ impl MicroexperimentLab {
             first,
             second,
         })
+    }
+
+    pub fn phase(&self) -> LabPhase {
+        self.rollout.phase
+    }
+
+    pub fn readiness_blocker(&self) -> Option<&'static str> {
+        if self.open.iter().any(|record| record.issued.is_some()) {
+            return Some("awaiting-real-endpoint");
+        }
+        if self
+            .open
+            .iter()
+            .any(|record| record.progress == PersistedPairProgress::Washout)
+        {
+            return Some("washout");
+        }
+        if self
+            .open
+            .iter()
+            .any(|record| record.progress == PersistedPairProgress::ReadyToClose)
+        {
+            return Some("pair-not-closed");
+        }
+        (!self.open.is_empty()).then_some("arm-ready")
+    }
+
+    pub fn consider_candidate(
+        &mut self,
+        candidate: PairCandidate,
+        gates: PairGates,
+        now_millis: u64,
+    ) -> Result<CandidateDisposition, LabError> {
+        if self.rollout.shadow_eligible == 0
+            && self.rollout.canary_eligible == 0
+            && self.rollout.phase_started_millis == 0
+        {
+            self.rollout.phase_started_millis = now_millis;
+        }
+        if now_millis < self.rollout.last_monotonic_millis {
+            self.rollout.reset_to_shadow(now_millis);
+        }
+        self.rollout.last_monotonic_millis = now_millis;
+
+        let disposition = match self.rollout.phase {
+            LabPhase::Shadow => {
+                let assignment = self.evaluate_shadow(candidate, gates)?;
+                self.rollout.shadow_eligible = self.rollout.shadow_eligible.saturating_add(1);
+                CandidateDisposition::Shadow(assignment)
+            }
+            LabPhase::Canary => {
+                let admitted = canary_admitted(&candidate, self.rollout_config.canary_percent);
+                if admitted {
+                    let assignment = self.propose(candidate, gates)?;
+                    self.rollout.canary_eligible = self.rollout.canary_eligible.saturating_add(1);
+                    self.rollout.canary_opened = self.rollout.canary_opened.saturating_add(1);
+                    CandidateDisposition::Opened(assignment)
+                } else {
+                    self.metrics.proposed_total = self.metrics.proposed_total.saturating_add(1);
+                    if !gates.allows_pair() {
+                        return Err(LabError::Gate);
+                    }
+                    if candidate.origin != self.origin {
+                        return Err(LabError::Origin);
+                    }
+                    validate_candidate(&candidate)?;
+                    self.metrics.eligible_total = self.metrics.eligible_total.saturating_add(1);
+                    self.metrics.randomized_total = self.metrics.randomized_total.saturating_add(1);
+                    self.rollout.canary_eligible = self.rollout.canary_eligible.saturating_add(1);
+                    CandidateDisposition::CanarySkipped
+                }
+            }
+            LabPhase::Active => CandidateDisposition::Opened(self.propose(candidate, gates)?),
+        };
+        self.advance_rollout(now_millis, gates.allows_pair());
+        Ok(disposition)
+    }
+
+    pub fn advance_cycle(
+        &mut self,
+        cycle: u64,
+        now_millis: u64,
+        gates: PairGates,
+    ) -> Vec<PairInvalidation> {
+        if now_millis < self.rollout.last_monotonic_millis {
+            let invalidated = self.invalidate_all(PairInvalidationReason::ClockRegression);
+            self.rollout.reset_to_shadow(now_millis);
+            return invalidated;
+        }
+        self.rollout.last_monotonic_millis = now_millis;
+        if !gates.allows_pair() {
+            let invalidated = self.invalidate_all(PairInvalidationReason::SafetyGate);
+            if self.rollout.phase != LabPhase::Shadow || !invalidated.is_empty() {
+                self.rollout.reset_to_shadow(now_millis);
+            }
+            return invalidated;
+        }
+
+        for record in &mut self.open {
+            if record.progress == PersistedPairProgress::Washout {
+                if let Some(started) = record.washout_started_cycle {
+                    let elapsed = cycle.saturating_sub(started);
+                    record.washout_elapsed = elapsed.min(u64::from(u32::MAX)) as u32;
+                    if record.washout_elapsed >= record.candidate.washout_cycles {
+                        record.progress = PersistedPairProgress::AwaitingComplement;
+                        record.washout_started_cycle = None;
+                    }
+                }
+            }
+        }
+        let expired: Vec<_> = self
+            .open
+            .iter()
+            .filter_map(|record| {
+                record
+                    .issued
+                    .filter(|issued| cycle > issued.expires_after_cycle)
+                    .map(|_| record.assignment.id)
+            })
+            .collect();
+        let mut invalidated = Vec::with_capacity(expired.len());
+        for pair_id in expired {
+            if let Ok(record) =
+                self.invalidate_pair(pair_id, PairInvalidationReason::DeadlineExpired)
+            {
+                invalidated.push(record);
+            }
+        }
+        if self.rollout.phase != LabPhase::Shadow && self.rollout.canary_failures > 0 {
+            invalidated.extend(self.invalidate_all(PairInvalidationReason::Unauthoritative));
+            self.rollout.reset_to_shadow(now_millis);
+        }
+        self.advance_rollout(now_millis, true);
+        invalidated
+    }
+
+    pub fn issue_ready_arms(&mut self, cycle: u64, gates: PairGates) -> Vec<PairDirective> {
+        if self.rollout.phase == LabPhase::Shadow || !gates.allows_pair() {
+            return Vec::new();
+        }
+        let mut directives = Vec::with_capacity(self.open.len());
+        for record in &mut self.open {
+            if record.issued.is_some()
+                || !matches!(
+                    record.progress,
+                    PersistedPairProgress::AwaitingFirst
+                        | PersistedPairProgress::AwaitingComplement
+                )
+            {
+                continue;
+            }
+            let arm = match record.progress {
+                PersistedPairProgress::AwaitingFirst => record.assignment.first,
+                PersistedPairProgress::AwaitingComplement => record.assignment.second,
+                _ => continue,
+            };
+            let complete_not_before_cycle =
+                cycle.saturating_add(u64::from(record.candidate.horizon_cycles));
+            let expires_after_cycle =
+                complete_not_before_cycle.saturating_add(ENDPOINT_GRACE_CYCLES);
+            record.issued = Some(IssuedArm {
+                arm,
+                issued_cycle: cycle,
+                complete_not_before_cycle,
+                expires_after_cycle,
+            });
+            directives.push(PairDirective {
+                pair_id: record.assignment.id,
+                arm,
+                treatment_arm: record.candidate.treatment_arm,
+                family: record.candidate.family,
+                action_class: record.candidate.action_class,
+                context: record.candidate.context,
+                action_key: record.candidate.action_key.clone(),
+                stratum_hash: record.candidate.stratum_hash,
+                issued_cycle: cycle,
+                complete_not_before_cycle,
+                expires_after_cycle,
+                rollback_required: arm == ArmKind::Treatment
+                    && record.candidate.family != ActuatorFamily::MarkovPrewarm,
+            });
+        }
+        directives
+    }
+
+    pub fn record_timed_endpoint(
+        &mut self,
+        observation: TimedPairEndpoint,
+    ) -> Result<TimedEndpointDisposition, LabError> {
+        let index = self
+            .find_open(observation.pair_id)
+            .ok_or(LabError::UnknownPair)?;
+        let record = &self.open[index];
+        let issued = record.issued.ok_or(LabError::EndpointNotIssued)?;
+        if observation.issued_cycle != issued.issued_cycle || observation.endpoint.arm != issued.arm
+        {
+            return Err(LabError::Mismatch);
+        }
+        if !endpoint_matches(&record.candidate, &observation.endpoint) {
+            return Err(LabError::Mismatch);
+        }
+        if observation.completed_cycle < issued.complete_not_before_cycle
+            && observation.endpoint.horizon == HorizonClosure::Complete
+        {
+            return Err(LabError::HorizonPending);
+        }
+
+        let reason = endpoint_invalidation_reason(
+            &record.candidate,
+            &observation.endpoint,
+            observation.completed_cycle,
+            issued,
+        );
+        if let Some(reason) = reason {
+            if observation.endpoint.synthetic
+                || !observation.endpoint.observed_local
+                || observation.endpoint.decision_id == 0
+            {
+                self.metrics.synthetic_quarantined_total =
+                    self.metrics.synthetic_quarantined_total.saturating_add(1);
+            }
+            let invalidated = self.invalidate_pair(observation.pair_id, reason)?;
+            return Ok(TimedEndpointDisposition::Invalidated(invalidated));
+        }
+
+        self.open[index].issued = None;
+        let completed_cycle = observation.completed_cycle;
+        let progress = self.record_endpoint(observation.pair_id, observation.endpoint)?;
+        if progress == PairProgress::Washout {
+            let index = self
+                .find_open(observation.pair_id)
+                .ok_or(LabError::UnknownPair)?;
+            self.open[index].washout_started_cycle = Some(completed_cycle);
+        }
+        Ok(TimedEndpointDisposition::Progress(progress))
     }
 
     pub fn record_endpoint(
@@ -600,6 +995,7 @@ impl MicroexperimentLab {
         record.washout_elapsed = record.washout_elapsed.saturating_add(elapsed_cycles);
         if record.washout_elapsed >= record.candidate.washout_cycles {
             record.progress = PersistedPairProgress::AwaitingComplement;
+            record.washout_started_cycle = None;
         }
         Ok(record.progress.into())
     }
@@ -679,11 +1075,82 @@ impl MicroexperimentLab {
             },
             MAX_COMPLETED_PAIRS,
         );
+        match self.rollout.phase {
+            LabPhase::Canary => {
+                self.rollout.canary_completed = self.rollout.canary_completed.saturating_add(1);
+                if closure.evidence == EvidenceClosure::PairGold {
+                    self.rollout.canary_gold = self.rollout.canary_gold.saturating_add(1);
+                }
+                if closure.evidence != EvidenceClosure::PairGold || closure.harmful {
+                    self.rollout.canary_failures = self.rollout.canary_failures.saturating_add(1);
+                }
+            }
+            LabPhase::Active
+                if closure.evidence != EvidenceClosure::PairGold || closure.harmful =>
+            {
+                self.rollout.canary_failures = self.rollout.canary_failures.saturating_add(1);
+            }
+            _ => {}
+        }
+        self.advance_rollout(self.rollout.last_monotonic_millis, true);
         Ok(closure)
     }
 
     pub fn drain_pair_gold(&mut self) -> Vec<PairGoldRecord> {
         self.pending_gold.drain(..).collect()
+    }
+
+    pub fn invalidate_pair(
+        &mut self,
+        pair_id: PairId,
+        reason: PairInvalidationReason,
+    ) -> Result<PairInvalidation, LabError> {
+        let index = self.find_open(pair_id).ok_or(LabError::UnknownPair)?;
+        let record = self.open.swap_remove(index);
+        let rollback_required = rollback_still_required(&record);
+        self.metrics.invalidated_total = self.metrics.invalidated_total.saturating_add(1);
+        self.metrics.interrupted_total = self.metrics.interrupted_total.saturating_add(1);
+        match reason {
+            PairInvalidationReason::DeadlineExpired => {
+                self.metrics.deadline_expired_total =
+                    self.metrics.deadline_expired_total.saturating_add(1)
+            }
+            PairInvalidationReason::FailedRollback => {
+                self.metrics.rollback_failed_total =
+                    self.metrics.rollback_failed_total.saturating_add(1)
+            }
+            PairInvalidationReason::Confounded => {
+                self.metrics.confounded_total = self.metrics.confounded_total.saturating_add(1)
+            }
+            _ => {}
+        }
+        if self.rollout.phase != LabPhase::Shadow {
+            self.rollout.canary_failures = self.rollout.canary_failures.saturating_add(1);
+        }
+        push_bounded(
+            &mut self.completed,
+            CompletedPairSummary {
+                id: pair_id,
+                evidence: EvidenceClosure::Bronze,
+                effect_micros: 0,
+                effective: false,
+                harmful: false,
+                interrupted: true,
+            },
+            MAX_COMPLETED_PAIRS,
+        );
+        Ok(PairInvalidation {
+            pair_id,
+            reason,
+            family: record.candidate.family,
+            action_key: record.candidate.action_key,
+            rollback_required,
+        })
+    }
+
+    #[doc(hidden)]
+    pub fn force_phase_for_test(&mut self, phase: LabPhase) {
+        self.rollout.phase = phase;
     }
 
     pub fn persisted(&self) -> MicroexperimentLabPersisted {
@@ -695,6 +1162,7 @@ impl MicroexperimentLab {
             completed: self.completed.clone(),
             gold_dedup: self.gold_dedup.clone(),
             metrics: self.metrics,
+            rollout: self.rollout,
             reserved: String::new(),
         }
     }
@@ -723,6 +1191,8 @@ impl MicroexperimentLab {
             gold_dedup: persisted.gold_dedup,
             pending_gold: VecDeque::with_capacity(MAX_GOLD_DEDUP),
             metrics: persisted.metrics,
+            rollout: persisted.rollout,
+            rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
         };
         // Completed summaries do not retain both authoritative endpoint
@@ -756,6 +1226,7 @@ impl MicroexperimentLab {
             .interrupted_total
             .saturating_add(interrupted as u64);
         lab.reconcile_authoritative_metrics();
+        lab.rollout.reset_to_shadow(0);
         let disposition = if interrupted == 0 {
             RestoreDisposition::Restored
         } else {
@@ -765,6 +1236,21 @@ impl MicroexperimentLab {
     }
 
     pub fn metrics(&self) -> LabMetrics {
+        let (effect_sum, effect_count) = self
+            .completed
+            .iter()
+            .filter(|summary| summary.evidence == EvidenceClosure::PairGold && !summary.interrupted)
+            .fold((0_i128, 0_u64), |(sum, count), summary| {
+                (
+                    sum.saturating_add(i128::from(summary.effect_micros)),
+                    count.saturating_add(1),
+                )
+            });
+        let mean_effect = if effect_count == 0 {
+            0.0
+        } else {
+            ((effect_sum as f64 / effect_count as f64) / 1_000_000.0).clamp(-1.0, 1.0)
+        };
         LabMetrics {
             proposed_total: self.metrics.proposed_total,
             eligible_total: self.metrics.eligible_total,
@@ -780,8 +1266,12 @@ impl MicroexperimentLab {
             interrupted_total: self.metrics.interrupted_total,
             synthetic_quarantined_total: self.metrics.synthetic_quarantined_total,
             shadow_would_open_total: self.metrics.shadow_would_open_total,
+            invalidated_total: self.metrics.invalidated_total,
+            deadline_expired_total: self.metrics.deadline_expired_total,
+            rollback_failed_total: self.metrics.rollback_failed_total,
             open_pairs: self.open.len(),
             completed_pairs: self.completed.len(),
+            mean_effect,
         }
     }
 
@@ -818,6 +1308,51 @@ impl MicroexperimentLab {
         self.metrics.harmful_total = harmful_total;
     }
 
+    fn invalidate_all(&mut self, reason: PairInvalidationReason) -> Vec<PairInvalidation> {
+        let ids: Vec<_> = self
+            .open
+            .iter()
+            .map(|record| record.assignment.id)
+            .collect();
+        ids.into_iter()
+            .filter_map(|id| self.invalidate_pair(id, reason).ok())
+            .collect()
+    }
+
+    fn advance_rollout(&mut self, now_millis: u64, gates_enabled: bool) {
+        match self.rollout.phase {
+            LabPhase::Shadow
+                if gates_enabled
+                    && self.rollout.shadow_eligible
+                        >= self.rollout_config.shadow_min_opportunities
+                    && now_millis.saturating_sub(self.rollout.phase_started_millis)
+                        >= self.rollout_config.shadow_min_duration_ms =>
+            {
+                self.rollout.phase = LabPhase::Canary;
+                self.rollout.phase_started_millis = now_millis;
+                self.rollout.canary_eligible = 0;
+                self.rollout.canary_opened = 0;
+                self.rollout.canary_completed = 0;
+                self.rollout.canary_gold = 0;
+                self.rollout.canary_failures = 0;
+            }
+            LabPhase::Canary
+                if gates_enabled
+                    && self.rollout.canary_eligible
+                        >= self.rollout_config.canary_min_opportunities
+                    && self.rollout.canary_opened > 0
+                    && self.rollout.canary_completed == self.rollout.canary_opened
+                    && self.rollout.canary_gold == self.rollout.canary_opened
+                    && self.rollout.canary_failures == 0
+                    && self.open.is_empty() =>
+            {
+                self.rollout.phase = LabPhase::Active;
+                self.rollout.phase_started_millis = now_millis;
+            }
+            _ => {}
+        }
+    }
+
     fn find_open(&mut self, id: PairId) -> Option<usize> {
         self.last_work.pairs_examined = 0;
         for (index, record) in self.open.iter().enumerate() {
@@ -828,6 +1363,72 @@ impl MicroexperimentLab {
         }
         None
     }
+}
+
+fn canary_admitted(candidate: &PairCandidate, percent: u8) -> bool {
+    let bucket = candidate.sequence.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        ^ candidate.stratum_hash.rotate_left(17);
+    bucket % 100 < u64::from(percent.min(100))
+}
+
+fn endpoint_invalidation_reason(
+    candidate: &PairCandidate,
+    endpoint: &PairEndpoint,
+    completed_cycle: u64,
+    issued: IssuedArm,
+) -> Option<PairInvalidationReason> {
+    if completed_cycle > issued.expires_after_cycle {
+        return Some(PairInvalidationReason::DeadlineExpired);
+    }
+    if endpoint.synthetic || !endpoint.observed_local || endpoint.decision_id == 0 {
+        return Some(PairInvalidationReason::Unauthoritative);
+    }
+    match endpoint.horizon {
+        HorizonClosure::Confounded => return Some(PairInvalidationReason::Confounded),
+        HorizonClosure::Incomplete => return Some(PairInvalidationReason::IncompleteHorizon),
+        HorizonClosure::Expired => return Some(PairInvalidationReason::DeadlineExpired),
+        HorizonClosure::Complete => {}
+    }
+    let execution_valid = match endpoint.arm {
+        ArmKind::Control => endpoint.execution == ExecutionClosure::NoOp,
+        ArmKind::Treatment => endpoint.execution == ExecutionClosure::Applied,
+    };
+    if !execution_valid {
+        return Some(PairInvalidationReason::FailedExecution);
+    }
+    let rollback_valid = match (candidate.family, endpoint.arm) {
+        (ActuatorFamily::MarkovPrewarm, _) => matches!(
+            endpoint.rollback,
+            RollbackClosure::NotRequiredNonKernel | RollbackClosure::Succeeded
+        ),
+        (_, ArmKind::Control) => matches!(
+            endpoint.rollback,
+            RollbackClosure::NotRequiredNonKernel | RollbackClosure::Succeeded
+        ),
+        (_, ArmKind::Treatment) => endpoint.rollback == RollbackClosure::Succeeded,
+    };
+    (!rollback_valid).then_some(PairInvalidationReason::FailedRollback)
+}
+
+fn rollback_still_required(record: &PairRecord) -> bool {
+    if record.candidate.family == ActuatorFamily::MarkovPrewarm {
+        return false;
+    }
+    if record
+        .issued
+        .is_some_and(|issued| issued.arm == ArmKind::Treatment)
+    {
+        return true;
+    }
+    record
+        .first_endpoint
+        .iter()
+        .chain(record.second_endpoint.iter())
+        .any(|endpoint| {
+            endpoint.arm == ArmKind::Treatment
+                && endpoint.execution == ExecutionClosure::Applied
+                && endpoint.rollback != RollbackClosure::Succeeded
+        })
 }
 
 fn validate_candidate(candidate: &PairCandidate) -> Result<(), LabError> {
@@ -886,10 +1487,7 @@ fn endpoints_are_authoritative(
     control: &PairEndpoint,
     treatment: &PairEndpoint,
 ) -> bool {
-    let control_execution = matches!(
-        control.execution,
-        ExecutionClosure::Applied | ExecutionClosure::NoOp
-    );
+    let control_execution = control.execution == ExecutionClosure::NoOp;
     let rollback_closed = match candidate.family {
         ActuatorFamily::MarkovPrewarm => {
             treatment.rollback == RollbackClosure::NotRequiredNonKernel
@@ -973,5 +1571,296 @@ fn valid_persisted(persisted: &MicroexperimentLabPersisted) -> bool {
                 .second_endpoint
                 .as_ref()
                 .is_none_or(|endpoint| endpoint_matches(&record.candidate, endpoint))
+            && record.issued.is_none_or(|issued| {
+                issued.issued_cycle > 0
+                    && issued.complete_not_before_cycle
+                        >= issued
+                            .issued_cycle
+                            .saturating_add(u64::from(record.candidate.horizon_cycles))
+                    && issued.expires_after_cycle >= issued.complete_not_before_cycle
+                    && match record.progress {
+                        PersistedPairProgress::AwaitingFirst => {
+                            issued.arm == record.assignment.first
+                        }
+                        PersistedPairProgress::AwaitingComplement => {
+                            issued.arm == record.assignment.second
+                        }
+                        PersistedPairProgress::Washout | PersistedPairProgress::ReadyToClose => {
+                            false
+                        }
+                    }
+            })
+            && (record.washout_started_cycle.is_none()
+                || record.progress == PersistedPairProgress::Washout)
     })
+}
+
+#[cfg(test)]
+mod rollout_tests {
+    use super::*;
+    use crate::engine::exploration_scheduler::HardwareIdentity;
+
+    fn origin() -> ExplorationOrigin {
+        ExplorationOrigin {
+            installation_id: 0xA110,
+            hardware: HardwareIdentity {
+                p_core_count: 4,
+                e_core_count: 6,
+                ram_gib: 16,
+            },
+        }
+    }
+
+    fn candidate(sequence: u64) -> PairCandidate {
+        PairCandidate {
+            sequence,
+            origin: origin(),
+            family: ActuatorFamily::InteractionQos,
+            action_class: ActionClass::InteractionForeground,
+            treatment_arm: ExplorationArm::InteractionQosStandard,
+            context: ExplorationContext::Interactive,
+            action_key: "interaction_qos:foreground@standard".to_string(),
+            stratum_hash: sequence.saturating_add(1),
+            horizon_cycles: 4,
+            washout_cycles: 2,
+            minimum_effect_micros: 500,
+        }
+    }
+
+    fn endpoint(
+        candidate: &PairCandidate,
+        directive: &PairDirective,
+        utility_micros: i64,
+    ) -> TimedPairEndpoint {
+        TimedPairEndpoint {
+            pair_id: directive.pair_id,
+            issued_cycle: directive.issued_cycle,
+            completed_cycle: directive.complete_not_before_cycle,
+            endpoint: PairEndpoint {
+                arm: directive.arm,
+                origin: candidate.origin,
+                family: candidate.family,
+                action_class: candidate.action_class,
+                context: candidate.context,
+                action_key: candidate.action_key.clone(),
+                stratum_hash: candidate.stratum_hash,
+                horizon_cycles: candidate.horizon_cycles,
+                decision_id: directive.issued_cycle.saturating_add(1),
+                observed_local: true,
+                synthetic: false,
+                execution: match directive.arm {
+                    ArmKind::Control => ExecutionClosure::NoOp,
+                    ArmKind::Treatment => ExecutionClosure::Applied,
+                },
+                horizon: HorizonClosure::Complete,
+                rollback: RollbackClosure::Succeeded,
+                utility_micros,
+            },
+        }
+    }
+
+    fn active_lab() -> MicroexperimentLab {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout.phase = LabPhase::Active;
+        lab
+    }
+
+    #[test]
+    fn complete_endpoint_before_real_horizon_is_rejected() {
+        let mut lab = active_lab();
+        let candidate = candidate(1);
+        let assignment = lab
+            .propose(candidate.clone(), PairGates::healthy_enabled())
+            .unwrap();
+        let directive = lab
+            .issue_ready_arms(10, PairGates::healthy_enabled())
+            .pop()
+            .unwrap();
+        let mut observation = endpoint(&candidate, &directive, 1_000);
+        observation.completed_cycle = directive.complete_not_before_cycle - 1;
+
+        assert_eq!(
+            lab.record_timed_endpoint(observation),
+            Err(LabError::HorizonPending)
+        );
+        assert_eq!(lab.metrics().pair_gold_total, 0);
+        assert_eq!(lab.metrics().open_pairs, 1);
+        assert_eq!(assignment.id, directive.pair_id);
+    }
+
+    #[test]
+    fn unsafe_cycle_invalidates_inflight_treatment_and_requests_rollback() {
+        let mut lab = active_lab();
+        lab.propose(candidate(1), PairGates::healthy_enabled())
+            .unwrap();
+        let treatment_pair = lab
+            .propose(candidate(2), PairGates::healthy_enabled())
+            .unwrap();
+        let directives = lab.issue_ready_arms(20, PairGates::healthy_enabled());
+        assert_eq!(
+            directives
+                .iter()
+                .find(|directive| directive.pair_id == treatment_pair.id)
+                .unwrap()
+                .arm,
+            ArmKind::Treatment
+        );
+
+        let invalidations = lab.advance_cycle(21, 1_000, PairGates::default());
+        let treatment = invalidations
+            .iter()
+            .find(|record| record.pair_id == treatment_pair.id)
+            .unwrap();
+        assert_eq!(treatment.reason, PairInvalidationReason::SafetyGate);
+        assert!(treatment.rollback_required);
+        assert_eq!(lab.metrics().pair_gold_total, 0);
+        assert_eq!(lab.phase(), LabPhase::Shadow);
+    }
+
+    #[test]
+    fn two_real_horizons_and_washout_close_exactly_one_gold_pair() {
+        let mut lab = active_lab();
+        let candidate = candidate(1);
+        let assignment = lab
+            .propose(candidate.clone(), PairGates::healthy_enabled())
+            .unwrap();
+        let first = lab
+            .issue_ready_arms(10, PairGates::healthy_enabled())
+            .pop()
+            .unwrap();
+        let first_utility = if first.arm == ArmKind::Control {
+            1_000
+        } else {
+            2_000
+        };
+        assert_eq!(
+            lab.record_timed_endpoint(endpoint(&candidate, &first, first_utility))
+                .unwrap(),
+            TimedEndpointDisposition::Progress(PairProgress::Washout)
+        );
+
+        lab.advance_cycle(
+            first.complete_not_before_cycle + u64::from(candidate.washout_cycles),
+            2_000,
+            PairGates::healthy_enabled(),
+        );
+        let second = lab
+            .issue_ready_arms(
+                first.complete_not_before_cycle + u64::from(candidate.washout_cycles),
+                PairGates::healthy_enabled(),
+            )
+            .pop()
+            .unwrap();
+        let second_utility = if second.arm == ArmKind::Control {
+            1_000
+        } else {
+            2_000
+        };
+        assert_eq!(
+            lab.record_timed_endpoint(endpoint(&candidate, &second, second_utility))
+                .unwrap(),
+            TimedEndpointDisposition::Progress(PairProgress::ReadyToClose)
+        );
+        let closure = lab.close_pair(assignment.id).unwrap();
+
+        assert_eq!(closure.evidence, EvidenceClosure::PairGold);
+        assert_eq!(lab.drain_pair_gold().len(), 1);
+        assert_eq!(lab.metrics().pair_gold_total, 1);
+    }
+
+    #[test]
+    fn confounded_real_observation_invalidates_without_gold() {
+        let mut lab = active_lab();
+        let candidate = candidate(1);
+        lab.propose(candidate.clone(), PairGates::healthy_enabled())
+            .unwrap();
+        let directive = lab
+            .issue_ready_arms(10, PairGates::healthy_enabled())
+            .pop()
+            .unwrap();
+        let mut observation = endpoint(&candidate, &directive, 1_000);
+        observation.endpoint.horizon = HorizonClosure::Confounded;
+
+        let disposition = lab.record_timed_endpoint(observation).unwrap();
+        assert!(matches!(
+            disposition,
+            TimedEndpointDisposition::Invalidated(PairInvalidation {
+                reason: PairInvalidationReason::Confounded,
+                ..
+            })
+        ));
+        assert_eq!(lab.metrics().pair_gold_total, 0);
+        assert_eq!(lab.metrics().open_pairs, 0);
+    }
+
+    #[test]
+    fn rollout_reaches_active_only_after_a_real_canary_pair_closes_gold() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 2,
+            shadow_min_duration_ms: 10,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        assert!(matches!(
+            lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 0),
+            Ok(CandidateDisposition::Shadow(_))
+        ));
+        assert!(matches!(
+            lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 10),
+            Ok(CandidateDisposition::Shadow(_))
+        ));
+        assert_eq!(lab.phase(), LabPhase::Canary);
+
+        let candidate = candidate(3);
+        let assignment = match lab
+            .consider_candidate(candidate.clone(), PairGates::healthy_enabled(), 11)
+            .unwrap()
+        {
+            CandidateDisposition::Opened(assignment) => assignment,
+            other => panic!("expected opened canary pair, got {other:?}"),
+        };
+        let first = lab
+            .issue_ready_arms(20, PairGates::healthy_enabled())
+            .pop()
+            .unwrap();
+        let first_utility = if first.arm == ArmKind::Control {
+            1_000
+        } else {
+            2_000
+        };
+        lab.record_timed_endpoint(endpoint(&candidate, &first, first_utility))
+            .unwrap();
+        let second_cycle = first
+            .complete_not_before_cycle
+            .saturating_add(u64::from(candidate.washout_cycles));
+        lab.advance_cycle(second_cycle, 20, PairGates::healthy_enabled());
+        let second = lab
+            .issue_ready_arms(second_cycle, PairGates::healthy_enabled())
+            .pop()
+            .unwrap();
+        let second_utility = if second.arm == ArmKind::Control {
+            1_000
+        } else {
+            2_000
+        };
+        lab.record_timed_endpoint(endpoint(&candidate, &second, second_utility))
+            .unwrap();
+        lab.close_pair(assignment.id).unwrap();
+
+        assert_eq!(lab.phase(), LabPhase::Active);
+        assert_eq!(lab.metrics().pair_gold_total, 1);
+    }
+
+    #[test]
+    fn legacy_checkpoint_without_rollout_fields_restores_in_shadow() {
+        let persisted = MicroexperimentLab::cold_start(origin()).persisted();
+        let mut value = serde_json::to_value(persisted).unwrap();
+        value.as_object_mut().unwrap().remove("rollout");
+        let legacy: MicroexperimentLabPersisted = serde_json::from_value(value).unwrap();
+        let (restored, disposition) = MicroexperimentLab::restore(legacy, origin());
+
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(restored.phase(), LabPhase::Shadow);
+    }
 }

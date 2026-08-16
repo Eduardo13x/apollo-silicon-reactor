@@ -447,6 +447,56 @@ impl Default for SchedulerPlan {
     }
 }
 
+/// Single-consumer, bounded handoff of executable optional work.
+///
+/// Construction is restricted to an executable scheduler plan so shadow
+/// observations can never be mistaken for daemon work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchedulerHandoffBatch {
+    permits: Vec<JobPermit>,
+}
+
+impl SchedulerHandoffBatch {
+    pub fn from_plan(plan: &SchedulerPlan) -> Option<Self> {
+        if !plan.should_execute {
+            return None;
+        }
+        Self::from_permits(plan.permits.clone())
+    }
+
+    fn from_permits(permits: Vec<JobPermit>) -> Option<Self> {
+        if permits.is_empty() || permits.len() > MAX_IN_FLIGHT_OPTIONAL {
+            return None;
+        }
+        let identity = permits[0].identity();
+        let mut jobs = [false; MAX_JOBS];
+        if permits.iter().any(|permit| {
+            let duplicate = jobs[permit.job.index()];
+            jobs[permit.job.index()] = true;
+            !permit.should_execute || permit.identity() != identity || duplicate
+        }) {
+            return None;
+        }
+        Some(Self { permits })
+    }
+
+    pub fn permits(&self) -> &[JobPermit] {
+        &self.permits
+    }
+
+    pub fn len(&self) -> usize {
+        self.permits.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.permits.is_empty()
+    }
+
+    fn into_permits(self) -> Vec<JobPermit> {
+        self.permits
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ValueSchedulerMetrics {
     pub phase: SchedulerPhase,
@@ -464,6 +514,7 @@ pub struct ValueSchedulerMetrics {
     pub success_total: u64,
     pub failed_total: u64,
     pub cancelled_total: u64,
+    pub handoff_discarded_total: u64,
     pub timed_out_total: u64,
     pub expired_active_total: u64,
     pub stale_total: u64,
@@ -497,6 +548,7 @@ impl Default for ValueSchedulerMetrics {
             success_total: 0,
             failed_total: 0,
             cancelled_total: 0,
+            handoff_discarded_total: 0,
             timed_out_total: 0,
             expired_active_total: 0,
             stale_total: 0,
@@ -527,6 +579,12 @@ struct PermitIdentity {
 enum PermitLifecycle {
     Pending,
     Running,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingRelease {
+    Discarded,
+    ClaimExpired,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -821,6 +879,36 @@ impl ValueScheduler {
         true
     }
 
+    /// Atomically claims the still-pending permits in one daemon handoff.
+    /// Expired or superseded permits are omitted and cannot consume capacity.
+    pub fn claim_handoff(
+        &mut self,
+        batch: SchedulerHandoffBatch,
+        claimed_mono_us: u64,
+    ) -> Option<SchedulerHandoffBatch> {
+        let mut claimed = Vec::with_capacity(batch.len());
+        for permit in batch.into_permits() {
+            if claimed_mono_us > permit.deadline_mono_us {
+                self.release_pending(&permit, PendingRelease::ClaimExpired);
+            } else if self.mark_running(&permit) {
+                claimed.push(permit);
+            }
+        }
+        self.refresh_in_flight_metric();
+        SchedulerHandoffBatch::from_permits(claimed)
+    }
+
+    /// Cancels work that was published but never claimed by the daemon.
+    pub fn discard_handoff(&mut self, batch: SchedulerHandoffBatch) -> usize {
+        let discarded = batch
+            .into_permits()
+            .into_iter()
+            .filter(|permit| self.release_pending(permit, PendingRelease::Discarded))
+            .count();
+        self.refresh_in_flight_metric();
+        discarded
+    }
+
     pub fn complete(&mut self, completion: JobCompletion) -> CompletionDisposition {
         let active = self.jobs[completion.job.index()].active;
         let permit_matches = active.is_some_and(|active| {
@@ -854,6 +942,7 @@ impl ValueScheduler {
             // still stale and therefore never reaches a consumer.
             if permit_matches {
                 self.jobs[completion.job.index()].active = None;
+                self.refresh_in_flight_metric();
                 self.metrics.timed_out_total = self.metrics.timed_out_total.saturating_add(1);
                 self.metrics.expired_active_total =
                     self.metrics.expired_active_total.saturating_add(1);
@@ -881,6 +970,7 @@ impl ValueScheduler {
         self.metrics.completions_seen = self.metrics.completions_seen.saturating_add(1);
 
         self.jobs[completion.job.index()].active = None;
+        self.refresh_in_flight_metric();
         self.metrics.completed_total = self.metrics.completed_total.saturating_add(1);
         self.metrics.actual_us = self
             .metrics
@@ -904,6 +994,42 @@ impl ValueScheduler {
             }
         }
         CompletionDisposition::Accepted
+    }
+
+    fn release_pending(&mut self, permit: &JobPermit, release: PendingRelease) -> bool {
+        let active = self.jobs[permit.job.index()].active;
+        let matches = active.is_some_and(|active| {
+            active.lifecycle == PermitLifecycle::Pending
+                && active.identity == permit.identity()
+                && active.generation == permit.generation
+                && active.submitted_mono_us == permit.submitted_mono_us
+                && active.deadline_mono_us == permit.deadline_mono_us
+        });
+        if !matches {
+            return false;
+        }
+
+        self.jobs[permit.job.index()].active = None;
+        match release {
+            PendingRelease::Discarded => {
+                self.metrics.handoff_discarded_total =
+                    self.metrics.handoff_discarded_total.saturating_add(1);
+            }
+            PendingRelease::ClaimExpired => {
+                self.metrics.timed_out_total = self.metrics.timed_out_total.saturating_add(1);
+                self.metrics.expired_active_total =
+                    self.metrics.expired_active_total.saturating_add(1);
+            }
+        }
+        true
+    }
+
+    fn refresh_in_flight_metric(&mut self) {
+        self.metrics.in_flight_jobs = self
+            .jobs
+            .iter()
+            .filter(|state| state.active.is_some())
+            .count() as u64;
     }
 
     fn expire_stale_active(&mut self, current: SnapshotIdentity) {
@@ -1055,12 +1181,82 @@ fn compare_candidates(left: &Candidate, right: &Candidate) -> Ordering {
 
 #[cfg(test)]
 mod tests {
-    use super::checked_next_generation;
+    use super::*;
+    use crate::engine::cycle_snapshot::{CycleContextSnapshot, SnapshotId};
+
+    fn fixture_snapshot(sequence: u64) -> CycleContextSnapshot {
+        CycleContextSnapshot::new(SnapshotId::new(7, sequence), 11, 13, 17).with_cut_times(
+            sequence.saturating_mul(100_000),
+            sequence.saturating_mul(100_000).saturating_add(100),
+        )
+    }
 
     #[test]
     fn checked_generation_rejects_overflow() {
         assert_eq!(checked_next_generation(0), Some(1));
         assert_eq!(checked_next_generation(u64::MAX - 1), Some(u64::MAX));
         assert_eq!(checked_next_generation(u64::MAX), None);
+    }
+
+    #[test]
+    fn executable_plan_exposes_one_bounded_claimable_handoff() {
+        let mut scheduler = ValueScheduler::new(SchedulerPhase::Active);
+        let plan = scheduler.plan(&fixture_snapshot(1), SchedulerInputs::nominal_all_due());
+
+        let batch = SchedulerHandoffBatch::from_plan(&plan).expect("active handoff");
+        assert!(!batch.is_empty());
+        assert!(batch.len() <= MAX_IN_FLIGHT_OPTIONAL);
+        assert!(batch.permits().iter().all(|permit| permit.should_execute));
+
+        let claimed = scheduler
+            .claim_handoff(batch, plan.permits[0].submitted_mono_us.saturating_add(1))
+            .expect("claimed handoff");
+        assert_eq!(claimed.len(), plan.permits.len());
+        assert!(scheduler.metrics().in_flight_jobs <= MAX_IN_FLIGHT_OPTIONAL as u64);
+    }
+
+    #[test]
+    fn shadow_plan_never_exposes_a_handoff() {
+        let mut scheduler = ValueScheduler::new(SchedulerPhase::Shadow);
+        let plan = scheduler.plan(&fixture_snapshot(1), SchedulerInputs::nominal_all_due());
+
+        assert!(!plan.should_execute);
+        assert!(SchedulerHandoffBatch::from_plan(&plan).is_none());
+        assert_eq!(scheduler.metrics().in_flight_jobs, 0);
+    }
+
+    #[test]
+    fn discarding_an_unclaimed_handoff_releases_every_pending_permit() {
+        let mut scheduler = ValueScheduler::new(SchedulerPhase::Active);
+        let plan = scheduler.plan(&fixture_snapshot(1), SchedulerInputs::nominal_all_due());
+        let batch = SchedulerHandoffBatch::from_plan(&plan).expect("active handoff");
+        let selected = batch.len();
+
+        assert_eq!(scheduler.discard_handoff(batch), selected);
+        let next = scheduler.plan(&fixture_snapshot(2), SchedulerInputs::nominal_all_due());
+
+        assert!(!next.permits.is_empty());
+        assert!(next.in_flight_jobs <= MAX_IN_FLIGHT_OPTIONAL);
+        assert_eq!(scheduler.metrics().handoff_discarded_total, selected as u64);
+        assert_eq!(scheduler.metrics().completed_total, 0);
+        assert_eq!(scheduler.metrics().cancelled_total, 0);
+    }
+
+    #[test]
+    fn claiming_after_deadline_rejects_and_releases_the_permit() {
+        let mut scheduler = ValueScheduler::new(SchedulerPhase::Active);
+        let plan = scheduler.plan(
+            &fixture_snapshot(1),
+            SchedulerInputs::with_due_jobs(SchedulerLevel::Nominal, &[JobId::TelemetryFlush]),
+        );
+        let deadline = plan.permits[0].deadline_mono_us;
+        let batch = SchedulerHandoffBatch::from_plan(&plan).expect("active handoff");
+
+        assert!(scheduler
+            .claim_handoff(batch, deadline.saturating_add(1))
+            .is_none());
+        assert_eq!(scheduler.metrics().in_flight_jobs, 0);
+        assert_eq!(scheduler.metrics().timed_out_total, 1);
+        assert_eq!(scheduler.metrics().completed_total, 0);
     }
 }

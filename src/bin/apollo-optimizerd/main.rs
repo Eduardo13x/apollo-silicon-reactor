@@ -1674,6 +1674,9 @@ fn main() -> anyhow::Result<()> {
             let mut overhead_governor = adaptive_overhead::AdaptiveOverheadGovernor::default();
             let mut value_scheduler_runtime =
                 value_scheduler_tick::ValueSchedulerRuntime::new(runtime_capability_graph.revision);
+            value_scheduler_runtime.connect_handoff_jobs(&[
+                apollo_engine::engine::value_scheduler::JobId::HardwarePrediction,
+            ]);
             let mut webflow_runtime = webflow_tick::WebFlowRuntime::new(
                 apollo_engine::engine::webflow_controller::WebFlowRolloutPhase::Shadow,
             );
@@ -2685,6 +2688,22 @@ fn main() -> anyhow::Result<()> {
                         webflow_observation: Some(webflow_output.observation),
                         network_observation: Some(networkflow_output.observation),
                     });
+                let value_scheduler_active = value_metrics.phase == "active";
+                let value_handoff = value_scheduler_runtime.take_handoff();
+                let hardware_prediction_permit = value_handoff.as_ref().and_then(|handoff| {
+                    handoff
+                        .permits()
+                        .iter()
+                        .find(|permit| {
+                            permit.job_id()
+                                == apollo_engine::engine::value_scheduler::JobId::HardwarePrediction
+                        })
+                        .cloned()
+                });
+                let fabric_tick_started = Instant::now();
+                let fabric_submitted_before = heterogeneous_runtime
+                    .as_ref()
+                    .map_or(0, heterogeneous_tick::HeterogeneousRuntime::submitted_total);
                 let fabric_metrics = value_metrics.world_snapshot.as_ref().map(|world| {
                     if heterogeneous_runtime.is_none() {
                         heterogeneous_runtime =
@@ -2711,14 +2730,35 @@ fn main() -> anyhow::Result<()> {
                                 .map_or(if interaction_active { 1.0 } else { 0.0 }, |summary| {
                                     summary.interaction_q
                                 }),
-                            optional_allowed: overhead_budget.allow_speculation,
-                            optional_recovery_healthy: overhead_input.p95_cycle_ms < 60.0
+                            optional_allowed: value_scheduler_tick::optional_job_allowed(
+                                value_scheduler_active,
+                                overhead_budget.allow_speculation,
+                                hardware_prediction_permit.is_some(),
+                            ),
+                            optional_recovery_healthy: !value_scheduler_active
+                                && overhead_input.p95_cycle_ms < 60.0
                                 && overhead_input.reason_avg_ms < 50.0
                                 && overhead_input.memory_pressure < 0.55
                                 && !overhead_input.fluidity_degraded,
                             thermal_nominal: snapshot.pressure.thermal_level == "nominal",
                         })
                 });
+                if let Some(permit) = hardware_prediction_permit.as_ref() {
+                    let elapsed_us = fabric_tick_started
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u32::MAX)) as u32;
+                    let status = match fabric_metrics.as_ref() {
+                        Some(metrics) if metrics.submitted_total > fabric_submitted_before => {
+                            apollo_engine::engine::value_scheduler::JobCompletionStatus::Succeeded
+                        }
+                        Some(_) => {
+                            apollo_engine::engine::value_scheduler::JobCompletionStatus::Cancelled
+                        }
+                        None => apollo_engine::engine::value_scheduler::JobCompletionStatus::Failed,
+                    };
+                    let _ = value_scheduler_runtime.acknowledge(permit, elapsed_us, status);
+                }
                 world_model.set_runtime_cycle(cycle_count);
                 {
                     let mut metrics = state.metrics.lock_recover();
