@@ -741,6 +741,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub microexperiment_phase: String,
     #[serde(default)]
+    pub microexperiment_rollout_progress: u64,
+    #[serde(default)]
+    pub microexperiment_rollout_required: u64,
+    #[serde(default)]
     pub microexperiment_blocker: String,
     #[serde(default)]
     pub microexperiment_restore: String,

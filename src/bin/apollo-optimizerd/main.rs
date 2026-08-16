@@ -2909,6 +2909,10 @@ fn main() -> anyhow::Result<()> {
                 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.microexperiment_phase = micro_metrics.phase;
+                    metrics.metrics.microexperiment_rollout_progress =
+                        micro_metrics.rollout_progress;
+                    metrics.metrics.microexperiment_rollout_required =
+                        micro_metrics.rollout_required;
                     metrics.metrics.microexperiment_blocker = micro_metrics.blocker;
                     metrics.metrics.microexperiment_restore = micro_metrics.restore;
                     metrics.metrics.microexperiment_proposed_total = micro_metrics.proposed_total;

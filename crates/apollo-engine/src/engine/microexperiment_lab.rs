@@ -704,6 +704,24 @@ impl MicroexperimentLab {
         self.rollout.phase
     }
 
+    /// Opportunities counted toward the current phase gate, and the threshold
+    /// they must reach. Without this the remaining wait is invisible: the
+    /// published `*_total` counters are cumulative across restarts and do not
+    /// track the rollout gate.
+    pub fn rollout_progress(&self) -> (u64, u64) {
+        match self.rollout.phase {
+            LabPhase::Shadow => (
+                self.rollout.shadow_eligible,
+                self.rollout_config.shadow_min_opportunities,
+            ),
+            LabPhase::Canary => (
+                self.rollout.canary_eligible,
+                self.rollout_config.canary_min_opportunities,
+            ),
+            LabPhase::Active => (0, 0),
+        }
+    }
+
     pub fn readiness_blocker(&self) -> Option<&'static str> {
         if self.open.iter().any(|record| record.issued.is_some()) {
             return Some("awaiting-real-endpoint");
@@ -1905,6 +1923,34 @@ mod rollout_tests {
             .consider_candidate(candidate(4), PairGates::healthy_enabled(), 511_000)
             .unwrap();
         assert_eq!(restored.phase(), LabPhase::Canary);
+    }
+
+    #[test]
+    fn rollout_progress_reports_the_gate_counter_not_the_cumulative_total() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 4,
+            shadow_min_duration_ms: 10_000,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        assert_eq!(lab.rollout_progress(), (0, 4));
+
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 2_000)
+            .unwrap();
+
+        assert_eq!(lab.rollout_progress(), (2, 4));
+        // The cumulative metric counts the same events but is not the gate.
+        assert_eq!(lab.metrics().eligible_total, 2);
+
+        // After a restart the cumulative total keeps climbing from persisted
+        // state while the gate counter is what actually governs promotion.
+        let (mut restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        restored.rollout_config = lab.rollout_config;
+        assert_eq!(restored.rollout_progress(), (2, 4));
+        assert_eq!(restored.metrics().eligible_total, 2);
     }
 
     #[test]

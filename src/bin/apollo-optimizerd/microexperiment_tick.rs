@@ -44,6 +44,9 @@ pub struct MicroexperimentTickMetrics {
     pub phase: String,
     pub blocker: String,
     pub restore: String,
+    /// Progress toward the current phase gate, and the threshold it needs.
+    pub rollout_progress: u64,
+    pub rollout_required: u64,
     pub proposed_total: u64,
     pub eligible_total: u64,
     pub randomized_total: u64,
@@ -360,6 +363,8 @@ impl MicroexperimentRuntime {
             phase: self.lab.phase().as_str().to_string(),
             blocker: blocker.to_string(),
             restore: self.restore.to_string(),
+            rollout_progress: self.lab.rollout_progress().0,
+            rollout_required: self.lab.rollout_progress().1,
             proposed_total: metrics.proposed_total,
             eligible_total: metrics.eligible_total,
             randomized_total: metrics.randomized_total,

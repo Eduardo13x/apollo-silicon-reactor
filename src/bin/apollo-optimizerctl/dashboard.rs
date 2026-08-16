@@ -591,6 +591,13 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             compact_counter(m.microexperiment_open_pairs),
             compact_counter(m.microexperiment_pair_gold_total),
         ));
+        if m.microexperiment_rollout_required > 0 {
+            lines.push(format!(
+                "       gate {}/{}",
+                compact_counter(m.microexperiment_rollout_progress),
+                compact_counter(m.microexperiment_rollout_required),
+            ));
+        }
         lines.push(format!(
             "       eff{} harm{} q{}",
             compact_counter(m.microexperiment_effective_total),
