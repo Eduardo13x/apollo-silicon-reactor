@@ -18,3 +18,11 @@ evolve/
 .DS_Store
 librust_out.rlib
 .codex/
+.superpowers/
+
+# Python bytecode from scripts/
+__pycache__/
+*.py[cod]
+
+# Local policy scratch, not part of the shipped configuration
+manual-teach-m4-policy.json
