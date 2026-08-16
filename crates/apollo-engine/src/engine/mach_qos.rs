@@ -74,7 +74,13 @@ pub mod mach_sys {
     // Task-level QoS flavors (for direct latency/throughput QoS)
     pub const TASK_POLICY_QOS: i32 = 9;
     pub const TASK_BASE_QOS_POLICY: i32 = 8;
-    pub const TASK_QOS_POLICY_COUNT: u32 = 1;
+    /// XNU derives this as `sizeof(task_qos_policy_data_t) / sizeof(integer_t)`
+    /// and `task_policy_set` returns KERN_INVALID_ARGUMENT when the caller
+    /// passes less. `task_qos_policy_data_t` holds two integers, so a
+    /// hardcoded 1 rejected every task QoS write. Derived here so it cannot
+    /// drift from the struct again.
+    pub const TASK_QOS_POLICY_COUNT: u32 =
+        (std::mem::size_of::<super::ffi::TaskQosPolicy>() / std::mem::size_of::<i32>()) as u32;
 
     // Latency QoS tiers
     pub const LATENCY_QOS_TIER_UNSPECIFIED: i32 = 0;
@@ -2209,6 +2215,21 @@ mod tests {
         // "reset" that XNU rejects (thread stayed RT after focus loss).
         assert_eq!(super::mach_sys::THREAD_EXTENDED_POLICY, 1);
         assert_eq!(super::mach_sys::THREAD_EXTENDED_POLICY_COUNT, 1);
+    }
+
+    #[test]
+    fn task_qos_policy_count_matches_the_struct_xnu_expects() {
+        // A hardcoded 1 here made task_policy_set(QOS) return
+        // KERN_INVALID_ARGUMENT on every call: XNU rejects the flavor when
+        // count < sizeof(task_qos_policy_data_t) / sizeof(integer_t). The
+        // task port was acquired fine, so it surfaced as a silent 100%
+        // fallback to nice() rather than as an error.
+        assert_eq!(super::mach_sys::TASK_QOS_POLICY_COUNT, 2);
+        assert_eq!(
+            std::mem::size_of::<super::ffi::TaskQosPolicy>(),
+            2 * std::mem::size_of::<i32>(),
+            "TaskQosPolicy must stay two integers or the derived count is wrong"
+        );
     }
 
     #[test]
