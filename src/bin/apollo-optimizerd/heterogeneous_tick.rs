@@ -18,9 +18,12 @@ const RUNTIME_DEADLINE_US: u64 = 75_000;
 const MAX_RESULTS_PER_TICK: usize = 8;
 const MAX_CONTROL_P95_MS: f64 = 75.0;
 const MAX_P95_REGRESSION: f64 = 1.10;
-const MAX_RSS_DELTA_BYTES: u64 = 64 * 1024 * 1024;
+const MIN_RSS_DELTA_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_RSS_DELTA_BYTES: u64 = 192 * 1024 * 1024;
+const RSS_MEMORY_DIVISOR: u64 = 128;
 const MAX_IDLE_CPU_PERCENT: f64 = 1.0;
 const SUSTAINED_REGRESSION_CYCLES: u32 = 30;
+const OPTIONAL_RECOVERY_CYCLES: u32 = 30;
 
 #[derive(Debug, Clone)]
 pub struct HeterogeneousTickInput {
@@ -31,6 +34,7 @@ pub struct HeterogeneousTickInput {
     pub transition: f64,
     pub interaction: f64,
     pub optional_allowed: bool,
+    pub optional_recovery_healthy: bool,
     pub thermal_nominal: bool,
 }
 
@@ -84,15 +88,19 @@ pub struct HeterogeneousRuntime {
         Option<(apollo_engine::engine::world_state::WorldIdentity, [f32; 4])>,
     baseline_p95_ms: Option<f64>,
     baseline_rss_bytes: u64,
+    rss_budget_bytes: u64,
     last_worker_runtime_us: u64,
     last_coreml_result_drops: u64,
     last_health_sample_us: u64,
     unhealthy_cycles: u32,
+    optional_recovery_streak: u32,
 }
 
 impl HeterogeneousRuntime {
     pub fn new(initial: &WorldStateSnapshot) -> Self {
         let baseline_rss_bytes = peak_rss_bytes();
+        let physical_memory_bytes = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize")
+            .unwrap_or(8 * 1024 * 1024 * 1024);
         let last_health_sample_us = monotonic_us();
         Self {
             fabric: ComputeFabric::with_config(
@@ -108,10 +116,12 @@ impl HeterogeneousRuntime {
             last_accelerator_prediction: None,
             baseline_p95_ms: None,
             baseline_rss_bytes,
+            rss_budget_bytes: rss_budget_bytes(physical_memory_bytes),
             last_worker_runtime_us: 0,
             last_coreml_result_drops: 0,
             last_health_sample_us,
             unhealthy_cycles: 0,
+            optional_recovery_streak: 0,
         }
     }
 
@@ -138,9 +148,24 @@ impl HeterogeneousRuntime {
             && self.baseline_p95_ms.is_some_and(|baseline| {
                 input.p95_cycle_ms <= (baseline * MAX_P95_REGRESSION).max(1.0)
             });
-        let rss_healthy = self.metrics.rss_delta_bytes <= MAX_RSS_DELTA_BYTES;
+        let rss_healthy = self.metrics.rss_delta_bytes <= self.rss_budget_bytes;
         let idle_cpu_healthy = self.metrics.fabric_cpu_percent <= MAX_IDLE_CPU_PERCENT;
         let promotion_healthy = p95_healthy && rss_healthy && idle_cpu_healthy;
+        if input.optional_allowed {
+            self.optional_recovery_streak = OPTIONAL_RECOVERY_CYCLES;
+        } else if input.optional_recovery_healthy
+            && promotion_healthy
+            && input.thermal_nominal
+            && !input.world.identity.kill_switch
+            && !input.world.identity.sleeping
+            && input.pressure < 0.55
+        {
+            self.optional_recovery_streak = self.optional_recovery_streak.saturating_add(1);
+        } else {
+            self.optional_recovery_streak = 0;
+        }
+        let optional_allowed =
+            input.optional_allowed || self.optional_recovery_streak >= OPTIONAL_RECOVERY_CYCLES;
         self.consume_results(now_us, promotion_healthy);
         let cancelled = self.fabric.update_world_identity(input.world.identity);
         self.account_completions(&cancelled, now_us);
@@ -171,13 +196,13 @@ impl HeterogeneousRuntime {
         );
         self.metrics.ane_execution_measured = executor_status.coreml.ane_execution_measured;
 
-        let blocked = !input.optional_allowed
+        let blocked = !optional_allowed
             || !input.thermal_nominal
             || input.world.identity.kill_switch
             || input.world.identity.sleeping
             || input.pressure >= 0.55
             || !promotion_healthy;
-        self.metrics.blocker = if !input.optional_allowed {
+        self.metrics.blocker = if !optional_allowed {
             "overhead-budget"
         } else if !input.thermal_nominal {
             "thermal"
@@ -509,6 +534,10 @@ fn peak_rss_bytes() -> u64 {
     }
 }
 
+fn rss_budget_bytes(physical_memory_bytes: u64) -> u64 {
+    (physical_memory_bytes / RSS_MEMORY_DIVISOR).clamp(MIN_RSS_DELTA_BYTES, MAX_RSS_DELTA_BYTES)
+}
+
 fn prediction_array(payload: &ComputePayload) -> Option<[f32; 4]> {
     let ComputePayload::Vector(values) = payload else {
         return None;
@@ -581,6 +610,7 @@ mod tests {
             transition: 0.0,
             interaction: 0.5,
             optional_allowed: true,
+            optional_recovery_healthy: true,
             thermal_nominal: true,
         });
         assert_eq!(metrics.phase, "shadow");
@@ -600,6 +630,7 @@ mod tests {
             transition: 0.0,
             interaction: 0.5,
             optional_allowed: true,
+            optional_recovery_healthy: true,
             thermal_nominal: true,
         });
         assert_eq!(metrics.blocker, "memory-pressure");
@@ -618,6 +649,7 @@ mod tests {
             transition: 0.0,
             interaction: 0.5,
             optional_allowed: true,
+            optional_recovery_healthy: true,
             thermal_nominal: true,
         };
         let _ = runtime.tick(input.clone());
@@ -657,5 +689,47 @@ mod tests {
             runtime.fabric.rollout_phase(ComputeBackendId::CoreMl),
             RolloutPhase::Shadow
         );
+    }
+
+    #[test]
+    fn rss_budget_scales_with_physical_memory_but_stays_bounded() {
+        assert_eq!(rss_budget_bytes(8 * 1024 * 1024 * 1024), 64 * 1024 * 1024);
+        assert_eq!(rss_budget_bytes(16 * 1024 * 1024 * 1024), 128 * 1024 * 1024);
+        assert_eq!(rss_budget_bytes(64 * 1024 * 1024 * 1024), 192 * 1024 * 1024);
+    }
+
+    #[test]
+    fn sustained_healthy_cycles_recover_only_the_optional_fabric_lane() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+        let mut last = HeterogeneousTickMetrics::default();
+        for revision in 2..=(OPTIONAL_RECOVERY_CYCLES as u64) {
+            last = runtime.tick(HeterogeneousTickInput {
+                world: world(revision),
+                cpu_utilization: 0.2,
+                pressure: 0.3,
+                p95_cycle_ms: 35.0,
+                transition: 0.0,
+                interaction: 0.5,
+                optional_allowed: false,
+                optional_recovery_healthy: true,
+                thermal_nominal: true,
+            });
+        }
+        assert_eq!(last.blocker, "overhead-budget");
+
+        let recovered = runtime.tick(HeterogeneousTickInput {
+            world: world(OPTIONAL_RECOVERY_CYCLES as u64 + 1),
+            cpu_utilization: 0.2,
+            pressure: 0.3,
+            p95_cycle_ms: 35.0,
+            transition: 0.0,
+            interaction: 0.5,
+            optional_allowed: false,
+            optional_recovery_healthy: true,
+            thermal_nominal: true,
+        });
+        assert_ne!(recovered.blocker, "overhead-budget");
+        assert!(recovered.submitted_total > 0);
     }
 }

@@ -2712,6 +2712,10 @@ fn main() -> anyhow::Result<()> {
                                     summary.interaction_q
                                 }),
                             optional_allowed: overhead_budget.allow_speculation,
+                            optional_recovery_healthy: overhead_input.p95_cycle_ms < 60.0
+                                && overhead_input.reason_avg_ms < 50.0
+                                && overhead_input.memory_pressure < 0.55
+                                && !overhead_input.fluidity_degraded,
                             thermal_nominal: snapshot.pressure.thermal_level == "nominal",
                         })
                 });
