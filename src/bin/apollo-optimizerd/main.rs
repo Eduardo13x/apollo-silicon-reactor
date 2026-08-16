@@ -2928,6 +2928,10 @@ fn main() -> anyhow::Result<()> {
                         endpoint.registered_arms;
                     metrics.metrics.microexperiment_episodes_observed_total =
                         endpoint.observed_episodes;
+                    metrics.metrics.microexperiment_episodes_skipped_idle_total =
+                        endpoint.episodes_skipped_idle;
+                    metrics.metrics.microexperiment_uncatalogued_episodes_total =
+                        endpoint.uncatalogued_episodes;
                     metrics.metrics.microexperiment_decisions_bound_total =
                         endpoint.bound_decisions;
                     metrics.metrics.microexperiment_endpoints_emitted_total =
@@ -7757,21 +7761,28 @@ fn main() -> anyhow::Result<()> {
                 // lab on the next cycle; their measured utility arrives later
                 // still, when the medallion resolves that decision to Gold.
                 microexperiment_runtime.observe_decisions(&resolved_decisions, cycle_count);
+                // Each arm that just acquired a real decision identity opens a
+                // measurement window. The medallion measures that window without
+                // admitting it as evidence, so no learning aggregate moves and
+                // the Gold queue keeps belonging to the causal graph above.
+                for binding in microexperiment_runtime.drain_new_bindings() {
+                    telemetry_medallion.open_lab_utility_window(
+                        binding.decision_id,
+                        binding.family,
+                        u64::from(binding.horizon_cycles),
+                        cycle_count,
+                    );
+                }
                 let microexperiment_utilities: Vec<_> = telemetry_medallion
-                    .drain_new_gold_evidence()
+                    .drain_lab_utility()
                     .into_iter()
-                    .filter_map(|evidence| {
-                        let decision_id = evidence.decision_id?;
-                        evidence.net_utility_delta.is_finite().then(|| {
-                            apollo_engine::engine::microexperiment_endpoints::EndpointUtilitySample {
-                                decision_id: decision_id.0,
-                                utility_micros: (evidence.net_utility_delta.clamp(-1.0, 1.0)
-                                    * 1_000_000.0)
-                                    as i64,
-                                resolved_cycle: evidence.resolved_cycle,
-                                confounded: evidence.confounder_count > 0,
-                            }
-                        })
+                    .map(|sample| {
+                        apollo_engine::engine::microexperiment_endpoints::EndpointUtilitySample {
+                            decision_id: sample.decision_id,
+                            utility_micros: sample.utility_micros,
+                            resolved_cycle: sample.resolved_cycle,
+                            confounded: sample.confounded,
+                        }
                     })
                     .collect();
                 microexperiment_runtime.observe_utilities(&microexperiment_utilities, cycle_count);

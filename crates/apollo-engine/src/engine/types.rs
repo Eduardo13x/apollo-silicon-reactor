@@ -780,6 +780,10 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub microexperiment_episodes_observed_total: u64,
     #[serde(default)]
+    pub microexperiment_episodes_skipped_idle_total: u64,
+    #[serde(default)]
+    pub microexperiment_uncatalogued_episodes_total: u64,
+    #[serde(default)]
     pub microexperiment_decisions_bound_total: u64,
     #[serde(default)]
     pub microexperiment_endpoints_emitted_total: u64,

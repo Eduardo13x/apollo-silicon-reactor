@@ -8,7 +8,7 @@ use apollo_engine::engine::microexperiment_actions::{
     canonical_action_key, family_horizon_cycles, CanonicalAction,
 };
 use apollo_engine::engine::microexperiment_endpoints::{
-    EndpointAdapterCounters, EndpointUtilitySample, MicroexperimentEndpointAdapter,
+    EndpointAdapterCounters, EndpointUtilitySample, MicroexperimentEndpointAdapter, NewArmBinding,
 };
 use apollo_engine::engine::microexperiment_lab::{
     CandidateDisposition, LabError, MicroexperimentLab, MicroexperimentLabPersisted, PairCandidate,
@@ -148,6 +148,12 @@ impl MicroexperimentRuntime {
     /// Feed measured outcomes for decisions already bound to an arm.
     pub fn observe_utilities(&mut self, samples: &[EndpointUtilitySample], cycle: u64) {
         self.adapter.observe_utilities(samples, cycle);
+    }
+
+    /// Arms bound since the previous drain, so the daemon can start measuring
+    /// their outcome window.
+    pub fn drain_new_bindings(&mut self) -> Vec<NewArmBinding> {
+        self.adapter.drain_new_bindings()
     }
 
     pub fn adapter_counters(&self) -> EndpointAdapterCounters {

@@ -834,6 +834,55 @@ struct StagedDecisionEpisode {
     cohort_size: u16,
 }
 
+/// Most arms a microexperiment can have measured at once. Two per open pair.
+pub const MAX_LAB_WINDOWS: usize = 64;
+pub const MAX_LAB_SAMPLES: usize = 64;
+/// Cycles past its horizon that an arm window waits for a closing context
+/// before it is abandoned without a sample.
+pub const LAB_WINDOW_GRACE_CYCLES: u64 = 12;
+
+/// One open measurement window for a microexperiment arm.
+///
+/// This is intentionally *not* a `PendingActuatorEvidence`. A lab arm must be
+/// measured without being admitted as evidence: it never touches
+/// `actuator_issued_total`, `family_stats`, `recent_evidence`, the action
+/// models, the calibration store or the causal dynamics model. It reads
+/// telemetry and nothing else.
+#[derive(Debug, Clone)]
+struct LabUtilityWindow {
+    decision_id: u64,
+    objective: ActuatorObjective,
+    opened_cycle: u64,
+    horizon_cycles: u64,
+    deadline_cycle: u64,
+    before: TelemetryContextSummary,
+}
+
+/// Raw local utility observed across one arm's window.
+///
+/// The value is deliberately **not** counterfactual-adjusted. In a paired
+/// design the complementary arm *is* the counterfactual, so subtracting a
+/// modelled baseline here would discount it twice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LabUtilitySample {
+    pub decision_id: u64,
+    pub utility_micros: i64,
+    pub resolved_cycle: u64,
+    pub confounded: bool,
+    pub quality: f64,
+}
+
+/// Outcome objective for the two families the experiment catalog admits.
+/// Mirrors `decision_episode_spec` so an arm is scored the same way the
+/// corresponding production action would be.
+fn lab_objective(family: ActuatorFamily) -> Option<ActuatorObjective> {
+    match family {
+        ActuatorFamily::InteractionQos => Some(ActuatorObjective::Responsiveness),
+        ActuatorFamily::MarkovPrewarm => Some(ActuatorObjective::Prediction),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct ExternalActuatorCounters {
@@ -1286,6 +1335,11 @@ pub struct TelemetryMedallion {
     last_cycle: u64,
     latest: Option<TelemetryContextSummary>,
     pending_actions: VecDeque<PendingActuatorEvidence>,
+    /// Microexperiment arm windows. Deliberately separate from
+    /// `pending_actions`: a lab arm is measured, never admitted as evidence.
+    lab_windows: VecDeque<LabUtilityWindow>,
+    lab_samples: VecDeque<LabUtilitySample>,
+    lab_windows_expired_total: u64,
     family_stats: BTreeMap<ActuatorFamily, ActuatorFamilyStats>,
     action_models: BTreeMap<String, ActionModelStats>,
     action_models_revision: u64,
@@ -1351,6 +1405,9 @@ impl Default for TelemetryMedallion {
             last_cycle: 0,
             latest: None,
             pending_actions: VecDeque::new(),
+            lab_windows: VecDeque::new(),
+            lab_samples: VecDeque::new(),
+            lab_windows_expired_total: 0,
             family_stats: BTreeMap::new(),
             action_models: BTreeMap::new(),
             action_models_revision: 0,
@@ -1795,6 +1852,9 @@ impl TelemetryMedallion {
             external_deltas.markov_misses,
             external_deltas.interaction_reverts,
         );
+        // Measured against the same admitted context as production evidence,
+        // but kept out of every learning aggregate.
+        self.resolve_lab_windows(&summary, cycle);
 
         let root_cohort_size = applied_root_actions.len();
         let mut issued_this_cycle = (root_cohort_size as u64).saturating_add(staged_issued);
@@ -3210,6 +3270,104 @@ impl TelemetryMedallion {
     /// outcomes after a daemon restart.
     pub fn drain_new_gold_evidence(&mut self) -> Vec<ResolvedActuatorEvidence> {
         self.new_gold_evidence.drain(..).collect()
+    }
+
+    /// Start measuring one microexperiment arm over its horizon.
+    ///
+    /// Returns `false` — and records nothing — when there is no admitted
+    /// context to measure against, the family is outside the experiment
+    /// catalog, the decision is already being measured, or the bounded window
+    /// set is full. Opening a window grants no authority and performs no
+    /// action; it only remembers a telemetry snapshot.
+    pub fn open_lab_utility_window(
+        &mut self,
+        decision_id: u64,
+        family: ActuatorFamily,
+        horizon_cycles: u64,
+        cycle: u64,
+    ) -> bool {
+        if decision_id == 0 || horizon_cycles == 0 || self.lab_windows.len() >= MAX_LAB_WINDOWS {
+            return false;
+        }
+        let Some(objective) = lab_objective(family) else {
+            return false;
+        };
+        let Some(before) = self.latest.clone() else {
+            return false;
+        };
+        if self
+            .lab_windows
+            .iter()
+            .any(|window| window.decision_id == decision_id)
+        {
+            return false;
+        }
+        let deadline_cycle = cycle
+            .saturating_add(horizon_cycles)
+            .saturating_add(LAB_WINDOW_GRACE_CYCLES);
+        self.lab_windows.push_back(LabUtilityWindow {
+            decision_id,
+            objective,
+            opened_cycle: cycle,
+            horizon_cycles,
+            deadline_cycle,
+            before,
+        });
+        true
+    }
+
+    /// Hand over arm measurements closed since the previous call. Like the Gold
+    /// queue this is never persisted, so a restart cannot replay a stale
+    /// measurement as fresh experimental evidence.
+    pub fn drain_lab_utility(&mut self) -> Vec<LabUtilitySample> {
+        self.lab_samples.drain(..).collect()
+    }
+
+    pub fn lab_windows_open(&self) -> usize {
+        self.lab_windows.len()
+    }
+
+    pub fn lab_windows_expired_total(&self) -> u64 {
+        self.lab_windows_expired_total
+    }
+
+    /// Close every arm window that reached its horizon, and drop the ones that
+    /// ran past their grace deadline without a closing context.
+    fn resolve_lab_windows(&mut self, after: &TelemetryContextSummary, cycle: u64) {
+        if self.lab_windows.is_empty() {
+            return;
+        }
+        let mut retained = VecDeque::with_capacity(self.lab_windows.len());
+        while let Some(window) = self.lab_windows.pop_front() {
+            if cycle > window.deadline_cycle {
+                self.lab_windows_expired_total = self.lab_windows_expired_total.saturating_add(1);
+                continue;
+            }
+            if cycle < window.opened_cycle.saturating_add(window.horizon_cycles) {
+                retained.push_back(window);
+                continue;
+            }
+            let before_utility = utility_score(window.objective, &window.before);
+            let after_utility = utility_score(window.objective, after);
+            let raw_delta = (after_utility - before_utility).clamp(-1.0, 1.0);
+            let quality = context_quality(&window.before).min(context_quality(after));
+            let confounded = !raw_delta.is_finite()
+                || quality < 0.85
+                || window.before.workload != after.workload
+                || (window.before.thermal_score - after.thermal_score).abs() > 0.34
+                || after.operation_failures_total > window.before.operation_failures_total;
+            if self.lab_samples.len() >= MAX_LAB_SAMPLES {
+                self.lab_samples.pop_front();
+            }
+            self.lab_samples.push_back(LabUtilitySample {
+                decision_id: window.decision_id,
+                utility_micros: (finite_or_zero(raw_delta) * 1_000_000.0) as i64,
+                resolved_cycle: cycle,
+                confounded,
+                quality,
+            });
+        }
+        self.lab_windows = retained;
     }
 
     pub fn snapshot(&self) -> TelemetryMedallionPersisted {
@@ -4866,6 +5024,111 @@ mod tests {
             natural_drift: 0.0,
             arousal_level: 0.5,
         })
+    }
+
+    #[test]
+    fn a_lab_arm_window_is_measured_without_touching_any_learning_aggregate() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        // A window can only be opened against an admitted Gold context.
+        observe(&mut medallion, 1, &outcomes, &runtime);
+
+        let before = medallion.metrics();
+        let before_resolved = medallion.actuator_resolved_total;
+        let before_issued = medallion.actuator_issued_total;
+        let before_rejected = medallion.actuator_rejected_total;
+        let before_recent = medallion.recent_evidence.len();
+        let before_family = medallion
+            .family_stats
+            .get(&ActuatorFamily::InteractionQos)
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(medallion.open_lab_utility_window(991, ActuatorFamily::InteractionQos, 3, 1));
+        assert_eq!(medallion.lab_windows_open(), 1);
+
+        // Before the horizon there is nothing to hand back.
+        observe(&mut medallion, 2, &outcomes, &runtime);
+        assert!(medallion.drain_lab_utility().is_empty());
+
+        observe(&mut medallion, 4, &outcomes, &runtime);
+        let samples = medallion.drain_lab_utility();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].decision_id, 991);
+        assert_eq!(samples[0].resolved_cycle, 4);
+        assert!(medallion.drain_lab_utility().is_empty(), "drains once");
+        assert_eq!(medallion.lab_windows_open(), 0);
+
+        // Nothing about the learning pipeline moved because of the arm.
+        assert_eq!(medallion.actuator_issued_total, before_issued);
+        assert_eq!(medallion.actuator_resolved_total, before_resolved);
+        assert_eq!(medallion.actuator_rejected_total, before_rejected);
+        assert_eq!(medallion.recent_evidence.len(), before_recent);
+        assert_eq!(
+            medallion
+                .family_stats
+                .get(&ActuatorFamily::InteractionQos)
+                .cloned()
+                .unwrap_or_default(),
+            before_family
+        );
+        let after = medallion.metrics();
+        assert_eq!(after.actuator_gold_total, before.actuator_gold_total);
+        assert_eq!(after.actuator_silver_total, before.actuator_silver_total);
+        assert!(medallion.drain_new_gold_evidence().is_empty());
+        assert_eq!(medallion.authoritative_gold_decision_count(), 0);
+    }
+
+    #[test]
+    fn lab_windows_are_bounded_deduplicated_and_catalogue_only() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        observe(
+            &mut medallion,
+            1,
+            &ExecuteOutcomes::default(),
+            &healthy_runtime(),
+        );
+
+        // Uncatalogued family, zero identity and zero horizon are refused.
+        assert!(!medallion.open_lab_utility_window(1, ActuatorFamily::Boost, 3, 1));
+        assert!(!medallion.open_lab_utility_window(0, ActuatorFamily::InteractionQos, 3, 1));
+        assert!(!medallion.open_lab_utility_window(2, ActuatorFamily::InteractionQos, 0, 1));
+
+        assert!(medallion.open_lab_utility_window(3, ActuatorFamily::MarkovPrewarm, 5, 1));
+        assert!(
+            !medallion.open_lab_utility_window(3, ActuatorFamily::MarkovPrewarm, 5, 1),
+            "one window per decision identity"
+        );
+
+        for id in 100..(100 + MAX_LAB_WINDOWS as u64 + 8) {
+            medallion.open_lab_utility_window(id, ActuatorFamily::InteractionQos, 5, 1);
+        }
+        assert!(medallion.lab_windows_open() <= MAX_LAB_WINDOWS);
+    }
+
+    #[test]
+    fn a_lab_window_past_its_grace_deadline_expires_without_a_sample() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        assert!(medallion.open_lab_utility_window(77, ActuatorFamily::InteractionQos, 3, 1));
+
+        let past_deadline = 1 + 3 + LAB_WINDOW_GRACE_CYCLES + 1;
+        observe(&mut medallion, past_deadline, &outcomes, &runtime);
+        assert!(medallion.drain_lab_utility().is_empty());
+        assert_eq!(medallion.lab_windows_open(), 0);
+        assert_eq!(medallion.lab_windows_expired_total(), 1);
+    }
+
+    #[test]
+    fn a_lab_window_without_an_admitted_context_is_refused() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        assert!(
+            !medallion.open_lab_utility_window(5, ActuatorFamily::InteractionQos, 3, 1),
+            "no admitted telemetry context yet"
+        );
     }
 
     fn local_episode(

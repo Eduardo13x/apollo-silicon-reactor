@@ -603,6 +603,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         ));
         let endpoint_rejects = [
             ("key", m.microexperiment_endpoint_action_mismatch_total),
+            ("uncat", m.microexperiment_uncatalogued_episodes_total),
             ("arm", m.microexperiment_endpoint_unknown_arm_total),
             ("dup", m.microexperiment_endpoint_duplicate_total),
             ("exp", m.microexperiment_endpoint_expired_total),

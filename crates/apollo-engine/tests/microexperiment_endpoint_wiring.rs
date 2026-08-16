@@ -470,8 +470,13 @@ fn a_duplicate_observation_binds_exactly_once() {
     let mut adapter = adapter_with_live_path(1);
     let mut lab = MicroexperimentLab::cold_start(origin());
     open_pair(&mut lab, qos_candidate(1));
-    let directive = issue_one(&mut lab, 10);
-    adapter.register_directives(std::slice::from_ref(&directive), 10);
+    open_pair(&mut lab, qos_candidate(2));
+    let directives = lab.issue_ready_arms(10, PairGates::healthy_enabled());
+    assert_eq!(directives.len(), 2);
+    let directive = directives[0].clone();
+    // A second pair keeps an arm outstanding after the first binds, so the
+    // repeat observation is still examined instead of skipped as idle.
+    adapter.register_directives(&directives, 10);
 
     let observation = episode(
         31,
@@ -576,7 +581,10 @@ fn a_restart_never_reuses_old_observations_as_new_evidence() {
         11,
     );
     assert_eq!(restarted.counters().bound_decisions, 0);
-    assert_eq!(restarted.counters().rejected_unknown_arm, 1);
+    // A fresh generation has no outstanding arm, so the batch is skipped
+    // wholesale — the old observation is not evidence for anything.
+    assert_eq!(restarted.counters().episodes_skipped_idle, 1);
+    assert_eq!(restarted.counters().rejected_unknown_arm, 0);
     assert!(restarted.drain_ready().is_empty());
     assert!(!restarted.contract_ready(11, 7));
 }
@@ -994,4 +1002,102 @@ fn the_exploration_catalog_admits_a_control_arm_for_both_lab_families() {
         origin()
     )
     .is_err());
+}
+
+// ── Rejection counters stay diagnostic ───────────────────────────────────────
+
+/// Regression guard for a defect production surfaced: with no arm open, every
+/// episode of the cycle was classified as a rejection (374 key + 266 authority
+/// = all 640 observed), burying the one signal those counters exist for.
+#[test]
+fn routine_traffic_never_inflates_the_rejection_counters() {
+    let mut adapter = adapter_with_live_path(1);
+
+    // A realistic cycle batch: mostly uncatalogued families, plus real
+    // interaction_qos and markov decisions that no arm is waiting on.
+    let batch = vec![
+        episode(1, "boost:Editor", DecisionLifecycle::Applied, 2, None),
+        episode(2, "throttle:Helper", DecisionLifecycle::Applied, 2, None),
+        episode(3, "freeze:Worker", DecisionLifecycle::NoOp, 2, None),
+        episode(4, "coordinated:batch", DecisionLifecycle::Applied, 2, None),
+        episode(
+            5,
+            "interaction_qos:foreground@standard",
+            DecisionLifecycle::Reverted,
+            2,
+            Some(treatment_metadata()),
+        ),
+        episode(
+            6,
+            "markov_prewarm:predicted_app",
+            DecisionLifecycle::NoOp,
+            2,
+            None,
+        ),
+    ];
+
+    // No arm outstanding: the whole batch is skipped, not classified.
+    adapter.observe_episodes(&batch, 2);
+    let idle = adapter.counters();
+    assert_eq!(idle.episodes_skipped_idle, 6);
+    assert_eq!(idle.observed_episodes, 0);
+    assert_eq!(idle.rejected_action_mismatch, 0);
+    assert_eq!(idle.rejected_authority, 0);
+    assert_eq!(idle.rejected_unknown_arm, 0);
+
+    // With an arm open, uncatalogued families are counted as routine traffic
+    // and still never touch a rejection counter.
+    let mut lab = MicroexperimentLab::cold_start(origin());
+    open_pair(&mut lab, qos_candidate(1));
+    let directive = issue_one(&mut lab, 10);
+    adapter.register_directives(std::slice::from_ref(&directive), 10);
+    adapter.observe_episodes(&batch, 11);
+
+    let busy = adapter.counters();
+    assert_eq!(busy.observed_episodes, 6);
+    assert_eq!(
+        busy.uncatalogued_episodes, 4,
+        "boost/throttle/freeze/coordinated"
+    );
+    assert_eq!(
+        busy.rejected_action_mismatch, 0,
+        "an uncatalogued family is not a key mismatch"
+    );
+    // The open arm is Control; the two catalogued episodes are a treatment and
+    // an unattributed markov no-op, so neither can bind.
+    assert_eq!(busy.bound_decisions, 0);
+    assert!(
+        busy.rejected_unknown_arm + busy.rejected_authority == 2,
+        "only the two catalogued episodes are classified"
+    );
+}
+
+/// A genuine key mismatch must remain visible rather than being absorbed as
+/// routine traffic — this is the counter that would have caught the original
+/// `markov:cache-only` vs `markov_prewarm:predicted_app` break.
+#[test]
+fn a_retired_key_on_an_open_arm_is_reported_not_absorbed() {
+    let mut adapter = adapter_with_live_path(1);
+    let mut lab = MicroexperimentLab::cold_start(origin());
+    open_pair(&mut lab, qos_candidate(1));
+    let directive = issue_one(&mut lab, 10);
+    adapter.register_directives(std::slice::from_ref(&directive), 10);
+
+    adapter.observe_episodes(
+        &[episode(
+            9,
+            LEGACY_MARKOV_KEY,
+            DecisionLifecycle::NoOp,
+            11,
+            Some(control_metadata()),
+        )],
+        11,
+    );
+    let counters = adapter.counters();
+    assert_eq!(counters.bound_decisions, 0);
+    assert_eq!(
+        counters.uncatalogued_episodes, 1,
+        "the retired key is refused and surfaces separately from real traffic"
+    );
+    assert_eq!(counters.rejected_authority, 0);
 }

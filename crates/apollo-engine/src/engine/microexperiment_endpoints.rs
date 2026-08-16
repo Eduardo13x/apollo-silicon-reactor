@@ -80,7 +80,13 @@ pub enum EndpointReject {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EndpointAdapterCounters {
     pub registered_arms: u64,
+    /// Episodes actually examined, i.e. seen while at least one arm was open.
     pub observed_episodes: u64,
+    /// Episodes skipped wholesale because no arm was outstanding.
+    pub episodes_skipped_idle: u64,
+    /// Examined episodes whose family is outside the experiment catalog. This
+    /// is routine traffic, not a failure.
+    pub uncatalogued_episodes: u64,
     pub bound_decisions: u64,
     pub emitted_endpoints: u64,
     pub pending_utility: u64,
@@ -97,9 +103,19 @@ pub struct EndpointAdapterCounters {
     pub rollback_failed: u64,
 }
 
+/// One arm that just acquired a real decision identity. The caller opens an
+/// outcome-measurement window for it; the adapter itself measures nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NewArmBinding {
+    pub decision_id: u64,
+    pub family: ActuatorFamily,
+    pub horizon_cycles: u32,
+}
+
 /// Measured outcome for one decision identity. The daemon derives these from
-/// `TelemetryMedallion::drain_new_gold_evidence`, which is fresh-only and never
-/// replays historical outcomes after a restart.
+/// `TelemetryMedallion::drain_lab_utility`, which measures each arm's window
+/// without admitting it as evidence, and is fresh-only so a restart cannot
+/// replay a stale measurement as new experimental evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EndpointUtilitySample {
     pub decision_id: u64,
@@ -142,6 +158,7 @@ pub struct MicroexperimentEndpointAdapter {
     outstanding: VecDeque<OutstandingArm>,
     bound: VecDeque<BoundDecision>,
     ready: VecDeque<TimedPairEndpoint>,
+    new_bindings: VecDeque<NewArmBinding>,
     consumed: VecDeque<u64>,
     last_episode_cycle: Option<u64>,
     counters: EndpointAdapterCounters,
@@ -157,6 +174,7 @@ impl MicroexperimentEndpointAdapter {
             outstanding: VecDeque::with_capacity(MAX_OUTSTANDING_ARMS),
             bound: VecDeque::with_capacity(MAX_BOUND_DECISIONS),
             ready: VecDeque::with_capacity(MAX_READY_ENDPOINTS),
+            new_bindings: VecDeque::with_capacity(MAX_BOUND_DECISIONS),
             consumed: VecDeque::with_capacity(MAX_CONSUMED_DEDUP),
             last_episode_cycle: None,
             counters: EndpointAdapterCounters::default(),
@@ -271,15 +289,38 @@ impl MicroexperimentEndpointAdapter {
 
     /// Drop every arm belonging to a pair the lab already closed or invalidated.
     pub fn forget_pair(&mut self, pair_id: PairId) {
+        let dropped: Vec<u64> = self
+            .bound
+            .iter()
+            .filter(|bound| bound.arm.pair_id == pair_id)
+            .map(|bound| bound.decision_id)
+            .collect();
         self.outstanding.retain(|arm| arm.pair_id != pair_id);
         self.bound.retain(|bound| bound.arm.pair_id != pair_id);
         self.ready.retain(|ready| ready.pair_id != pair_id);
+        self.new_bindings
+            .retain(|binding| !dropped.contains(&binding.decision_id));
     }
 
     /// Bind resolved decisions from the previous cycle to outstanding arms.
     /// This never emits an endpoint: the measured utility has not resolved yet.
+    ///
+    /// A rejection counter is only meaningful for a decision the lab was
+    /// actually waiting on. With no outstanding arm — the normal state in
+    /// Shadow — the whole batch is skipped rather than classified, so
+    /// `rejected_action_mismatch` keeps meaning "a real key mismatch" instead
+    /// of drowning in the routine `boost:`/`throttle:` traffic every cycle
+    /// carries. It also keeps the hot path free of per-episode parsing when no
+    /// experiment is open.
     pub fn observe_episodes(&mut self, episodes: &[ResolvedDecisionEpisode], cycle: u64) {
         self.last_episode_cycle = Some(cycle);
+        if self.outstanding.is_empty() {
+            self.counters.episodes_skipped_idle = self
+                .counters
+                .episodes_skipped_idle
+                .saturating_add(episodes.len() as u64);
+            return;
+        }
         for episode in episodes {
             self.counters.observed_episodes = self.counters.observed_episodes.saturating_add(1);
             if let Err(reject) = self.bind_episode(episode, cycle) {
@@ -296,8 +337,26 @@ impl MicroexperimentEndpointAdapter {
         if episode.id.0 == 0 {
             return Err(EndpointReject::IncompleteMetadata);
         }
-        let canonical = parse_action_key(&episode.envelope.action_key)
-            .map_err(|_| EndpointReject::ActionKeyMismatch)?;
+        // An uncatalogued family is not a mismatch: most decisions in a cycle
+        // are simply outside the experiment catalog. Only a key that names a
+        // catalogued family can be a genuine identity failure.
+        let canonical = match parse_action_key(&episode.envelope.action_key) {
+            Ok(canonical) => canonical,
+            Err(_) => {
+                self.counters.uncatalogued_episodes =
+                    self.counters.uncatalogued_episodes.saturating_add(1);
+                return Ok(());
+            }
+        };
+        // Nothing is waiting on this action, so there is no experiment to
+        // contaminate and nothing to diagnose.
+        if !self
+            .outstanding
+            .iter()
+            .any(|arm| arm.canonical.matches(canonical))
+        {
+            return Err(EndpointReject::UnknownArm);
+        }
         if self.consumed.contains(&episode.id.0)
             || self
                 .bound
@@ -341,6 +400,15 @@ impl MicroexperimentEndpointAdapter {
             }
             _ => {}
         }
+        push_bounded(
+            &mut self.new_bindings,
+            NewArmBinding {
+                decision_id: episode.id.0,
+                family: arm.family,
+                horizon_cycles: arm.horizon_cycles,
+            },
+            MAX_BOUND_DECISIONS,
+        );
         self.bound.push_back(BoundDecision {
             arm,
             decision_id: episode.id.0,
@@ -428,6 +496,12 @@ impl MicroexperimentEndpointAdapter {
     /// Hand the lab every endpoint that closed since the previous drain.
     pub fn drain_ready(&mut self) -> Vec<TimedPairEndpoint> {
         self.ready.drain(..).collect()
+    }
+
+    /// Arms bound since the previous drain, so the caller can start measuring
+    /// their outcome window. Draining twice yields each binding once.
+    pub fn drain_new_bindings(&mut self) -> Vec<NewArmBinding> {
+        self.new_bindings.drain(..).collect()
     }
 
     fn count_reject(&mut self, reject: EndpointReject) {
