@@ -1074,6 +1074,10 @@ pub struct RuntimeMetrics {
     pub acceleration_lease_task_port_denied_total: u64,
     #[serde(default)]
     pub acceleration_lease_qos_write_rejected_total: u64,
+    /// Last kern_return text from a rejected task QoS write, so the cause is
+    /// diagnosable without journal access.
+    #[serde(default)]
+    pub acceleration_lease_qos_write_error: String,
     #[serde(default)]
     pub acceleration_lease_nice_fallbacks_total: u64,
     #[serde(default)]

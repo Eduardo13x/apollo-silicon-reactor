@@ -773,6 +773,15 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 format_number(m.acceleration_lease_task_port_denied_total),
                 format_number(m.acceleration_lease_qos_write_rejected_total),
             ));
+            if !m.acceleration_lease_qos_write_error.is_empty() {
+                lines.push(format!(
+                    "       {}",
+                    m.acceleration_lease_qos_write_error
+                        .chars()
+                        .take(52)
+                        .collect::<String>()
+                ));
+            }
         }
         if !m.interaction_qos_ttl_band.is_empty() {
             lines.push(format!(
