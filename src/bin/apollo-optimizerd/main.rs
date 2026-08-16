@@ -2832,7 +2832,13 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.fluidity_degraded,
                     )
                 };
-                let micro_metrics =
+                // Presence of the opt-in file is the only way a pair ever
+                // mutates anything. Absent, the lab stays a Shadow diagnostic.
+                let experiments_opted_in =
+                    Path::new(apollo_engine::engine::daemon_helpers::experiments_opt_in_path())
+                        .exists();
+                let capture_active = screen_capture_cache.check();
+                let micro_output =
                     microexperiment_runtime.tick(microexperiment_tick::MicroexperimentTickInput {
                         cycle: cycle_count,
                         interaction_activations,
@@ -2855,7 +2861,28 @@ fn main() -> anyhow::Result<()> {
                             && !degraded
                             && parallel_runtime.build.expected_profile
                                 == parallel_runtime.build.effective_profile,
+                        experiments_enabled: experiments_opted_in,
+                        // Privacy posture counts as known only once the daemon
+                        // can actually read the sensitive-context signals it
+                        // gates on.
+                        privacy_known: experiments_opted_in,
+                        secure_input: false,
+                        screen_capture: capture_active,
+                        camera_active: user_audio,
+                        sensitive_context: user_call,
                     });
+                let micro_metrics = micro_output.metrics;
+                for gold in &micro_output.pair_gold {
+                    tracing::info!(
+                        action_key = %gold.action_key,
+                        control_decision_id = gold.control_decision_id,
+                        treatment_decision_id = gold.treatment_decision_id,
+                        effect_micros = gold.effect_micros,
+                        effective = gold.effective,
+                        harmful = gold.harmful,
+                        "microexperiment pair gold closed"
+                    );
+                }
                 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.microexperiment_phase = micro_metrics.phase;
@@ -2887,7 +2914,67 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.microexperiment_synthetic_quarantined_total =
                         micro_metrics.synthetic_quarantined_total;
                     metrics.metrics.microexperiment_mean_effect = micro_metrics.mean_effect;
+                    metrics.metrics.microexperiment_invalidated_total =
+                        micro_metrics.invalidated_total;
+                    metrics.metrics.microexperiment_deadline_expired_total =
+                        micro_metrics.deadline_expired_total;
+                    metrics.metrics.microexperiment_rollback_failed_total =
+                        micro_metrics.rollback_failed_total;
+
+                    let endpoint = microexperiment_runtime.adapter_counters();
+                    metrics.metrics.microexperiment_endpoint_contract_ready =
+                        microexperiment_runtime.endpoint_contract_ready(cycle_count);
+                    metrics.metrics.microexperiment_arms_registered_total =
+                        endpoint.registered_arms;
+                    metrics.metrics.microexperiment_episodes_observed_total =
+                        endpoint.observed_episodes;
+                    metrics.metrics.microexperiment_decisions_bound_total =
+                        endpoint.bound_decisions;
+                    metrics.metrics.microexperiment_endpoints_emitted_total =
+                        endpoint.emitted_endpoints;
+                    metrics.metrics.microexperiment_endpoints_pending_utility =
+                        endpoint.pending_utility;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_action_mismatch_total =
+                        endpoint.rejected_action_mismatch;
+                    metrics.metrics.microexperiment_endpoint_unknown_arm_total =
+                        endpoint.rejected_unknown_arm;
+                    metrics.metrics.microexperiment_endpoint_duplicate_total =
+                        endpoint.rejected_duplicate;
+                    metrics.metrics.microexperiment_endpoint_expired_total =
+                        endpoint.rejected_expired;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_epoch_rejected_total = endpoint.rejected_epoch;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_authority_rejected_total =
+                        endpoint.rejected_authority;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_incomplete_metadata_total =
+                        endpoint.rejected_incomplete_metadata;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_capacity_drops_total = endpoint.dropped_capacity;
+                    metrics.metrics.microexperiment_endpoint_arms_expired_total =
+                        endpoint.expired_arms;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_rollback_observed_total =
+                        endpoint.rollback_observed;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_rollback_failed_total = endpoint.rollback_failed;
+                    metrics.metrics.microexperiment_control_withholds_total =
+                        apollo_engine::engine::microexperiment_endpoints::control_withholds_total();
                 }
+                // The lab's control requests are advisory only: an actuator may
+                // decline to take a lease, never take one it was not going to.
+                apollo_engine::engine::microexperiment_endpoints::publish_control_withholds(
+                    &microexperiment_runtime.control_withhold_requests(),
+                );
 
                 // FocusMarkov miss check, Markov observe+pre-warm, universal pre-thaw, temporal predictor.
                 // Extracted to daemon_markov_tick::run_markov_tick (Wave 29).
@@ -7665,6 +7752,29 @@ fn main() -> anyhow::Result<()> {
                 let resolved_decisions =
                     decision_ledger.ingest_cycle_events(&mut cycle_decision_events);
                 telemetry_medallion.stage_decision_episodes(&resolved_decisions);
+
+                // Endpoint wire, cycle tail. Decisions resolved now reach the
+                // lab on the next cycle; their measured utility arrives later
+                // still, when the medallion resolves that decision to Gold.
+                microexperiment_runtime.observe_decisions(&resolved_decisions, cycle_count);
+                let microexperiment_utilities: Vec<_> = telemetry_medallion
+                    .drain_new_gold_evidence()
+                    .into_iter()
+                    .filter_map(|evidence| {
+                        let decision_id = evidence.decision_id?;
+                        evidence.net_utility_delta.is_finite().then(|| {
+                            apollo_engine::engine::microexperiment_endpoints::EndpointUtilitySample {
+                                decision_id: decision_id.0,
+                                utility_micros: (evidence.net_utility_delta.clamp(-1.0, 1.0)
+                                    * 1_000_000.0)
+                                    as i64,
+                                resolved_cycle: evidence.resolved_cycle,
+                                confounded: evidence.confounder_count > 0,
+                            }
+                        })
+                    })
+                    .collect();
+                microexperiment_runtime.observe_utilities(&microexperiment_utilities, cycle_count);
 
                 // Push estado a suscriptores activos (menubar, etc.)
                 socket_handler::broadcast_current_status(&state);

@@ -73,6 +73,23 @@ pub fn kill_switch_path() -> &'static str {
     })
 }
 
+/// Explicit opt-in for the paired Microexperiment Lab. Absent by default, so
+/// the lab stays in its diagnostic Shadow phase unless the operator creates the
+/// file. It is the mirror image of the kill switch: presence enables, absence
+/// abstains.
+pub fn experiments_opt_in_path() -> &'static str {
+    static CACHED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| {
+        std::env::var("APOLLO_EXPERIMENTS_OPT_IN_PATH").unwrap_or_else(|_| {
+            if is_root() {
+                "/var/lib/apollo/experiments.enable".to_string()
+            } else {
+                "/tmp/apollo-experiments.enable".to_string()
+            }
+        })
+    })
+}
+
 pub fn journal_path() -> &'static str {
     if is_root() {
         "/var/lib/apollo/journal.jsonl"

@@ -770,6 +770,51 @@ pub struct RuntimeMetrics {
     pub microexperiment_synthetic_quarantined_total: u64,
     #[serde(default)]
     pub microexperiment_mean_effect: f64,
+    /// Endpoint-wire observability. Every rejection reason has its own counter
+    /// so a stalled circuit names its own cause instead of collapsing into one
+    /// generic "blocked" total.
+    #[serde(default)]
+    pub microexperiment_endpoint_contract_ready: bool,
+    #[serde(default)]
+    pub microexperiment_arms_registered_total: u64,
+    #[serde(default)]
+    pub microexperiment_episodes_observed_total: u64,
+    #[serde(default)]
+    pub microexperiment_decisions_bound_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoints_emitted_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoints_pending_utility: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_action_mismatch_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_unknown_arm_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_duplicate_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_expired_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_epoch_rejected_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_authority_rejected_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_incomplete_metadata_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_capacity_drops_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_arms_expired_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_rollback_observed_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_rollback_failed_total: u64,
+    #[serde(default)]
+    pub microexperiment_control_withholds_total: u64,
+    #[serde(default)]
+    pub microexperiment_invalidated_total: u64,
+    #[serde(default)]
+    pub microexperiment_deadline_expired_total: u64,
+    #[serde(default)]
+    pub microexperiment_rollback_failed_total: u64,
     #[serde(default)]
     pub metrics_disk_writes_total: u64,
     #[serde(default)]

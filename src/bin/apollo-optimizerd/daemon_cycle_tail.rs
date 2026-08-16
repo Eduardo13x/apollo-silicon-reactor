@@ -358,6 +358,68 @@ fn capture_acceleration_forecasts(
     forecasts
 }
 
+/// Decline one interaction QoS lease so the lab can observe a control window.
+///
+/// Returns `None` — and changes nothing — unless every one of these holds:
+/// the lab published an open control arm for this exact catalogued action, the
+/// exploration scheduler admits a `Control` candidate under the same gates the
+/// treatment path uses, and the commit succeeds. The result is a withhold: no
+/// syscall, no lease, no kernel state, and one `NoOp` decision event carrying
+/// the control metadata the endpoint adapter needs.
+fn withhold_interaction_lease_for_control(
+    exploration_scheduler: &mut apollo_engine::engine::exploration_scheduler::ExplorationScheduler,
+    gates: &apollo_engine::engine::exploration_scheduler::ExplorationGates,
+    now: apollo_engine::engine::exploration_scheduler::TimePoint,
+    root_pid: u32,
+    cycle: u64,
+) -> Option<CycleDecisionEvents> {
+    use apollo_engine::engine::microexperiment_actions::{parse_action_key, ActionVariant};
+    use apollo_engine::engine::microexperiment_endpoints::{
+        control_withhold_requested, record_control_withhold,
+    };
+
+    let arm = exploration_scheduler.interaction_arm();
+    let band = match arm {
+        ExplorationArm::InteractionQosShort => ActionVariant::Short,
+        ExplorationArm::InteractionQosStandard => ActionVariant::Standard,
+        ExplorationArm::InteractionQosLong => ActionVariant::Long,
+        _ => return None,
+    };
+    let action_key = format!("interaction_qos:foreground@{}", band.as_str());
+    let action = parse_action_key(&action_key).ok()?;
+    if !control_withhold_requested(action) {
+        return None;
+    }
+    let candidate = ExplorationCandidate::new(
+        ActuatorFamily::InteractionQos,
+        ExplorationMode::Control,
+        arm,
+        ActionClass::InteractionForeground,
+        ExplorationContext::Interactive,
+        exploration_scheduler.origin(),
+    )
+    .ok()?;
+    let approval = exploration_scheduler.request(&candidate, gates, now).ok()?;
+    let metadata = exploration_scheduler.commit_metadata(
+        approval.metadata.correlation,
+        now,
+        CommitEvidence::OmissionEndpointOpened,
+    )?;
+    record_control_withhold();
+    let mut events = CycleDecisionEvents::default();
+    events.push(
+        acceleration_event(
+            &action_key,
+            root_pid,
+            cycle,
+            ActuatorDecisionOutcome::NoOp,
+            "control arm: acceleration lease deliberately withheld",
+        )
+        .with_exploration(metadata),
+    );
+    Some(events)
+}
+
 fn acceleration_event(
     action_key: &str,
     pid: u32,
@@ -1863,6 +1925,21 @@ fn update_acceleration_lease_inner(
             let (request_gates, request_now) = exploration_environment();
             let gates =
                 acceleration_target_gates(request_gates, &selection, identity.as_ref(), snapshots);
+            // Control arm: when the Microexperiment Lab has an open control
+            // window for exactly this action, decline the lease this once so
+            // the withheld outcome becomes observable. This performs no effect,
+            // still passes every exploration gate, budget and cooldown, and is
+            // skipped entirely when the mask is empty.
+            if let Some(events) = withhold_interaction_lease_for_control(
+                exploration_scheduler,
+                &gates,
+                request_now,
+                selection_root_pid,
+                cycle,
+            ) {
+                decision_events.extend_buffer(&events);
+                return decision_events;
+            }
             let mut exploration_approval = ExplorationCandidate::new(
                 ActuatorFamily::InteractionQos,
                 ExplorationMode::Treatment,

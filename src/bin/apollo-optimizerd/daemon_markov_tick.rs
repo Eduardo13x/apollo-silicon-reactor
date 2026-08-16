@@ -106,6 +106,64 @@ fn temporal_reflex_safety(
     }
 }
 
+/// Decline one speculative pre-warm so the lab can observe a control window.
+///
+/// Changes nothing unless the lab published an open control arm for
+/// `markov_prewarm:predicted_app` and the exploration scheduler admits a
+/// `Control` candidate under the same gates the treatment path uses. Returns
+/// `true` when the pre-warm was withheld.
+fn withhold_markov_prewarm_for_control(
+    exploration_scheduler: &mut apollo_engine::engine::exploration_scheduler::ExplorationScheduler,
+    gates: &apollo_engine::engine::exploration_scheduler::ExplorationGates,
+    now: apollo_engine::engine::exploration_scheduler::TimePoint,
+    predicted_app: &str,
+    cycle: u64,
+    decision_events: &mut CycleDecisionEvents,
+) -> bool {
+    use apollo_engine::engine::microexperiment_actions::parse_action_key;
+    use apollo_engine::engine::microexperiment_endpoints::{
+        control_withhold_requested, record_control_withhold,
+    };
+
+    let Ok(action) = parse_action_key("markov_prewarm:predicted_app") else {
+        return false;
+    };
+    if !control_withhold_requested(action) {
+        return false;
+    }
+    let Ok(candidate) = ExplorationCandidate::new(
+        ActuatorFamily::MarkovPrewarm,
+        ExplorationMode::Control,
+        ExplorationArm::MarkovCacheOnly,
+        ActionClass::MarkovPredictedApp,
+        ExplorationContext::Background,
+        exploration_scheduler.origin(),
+    ) else {
+        return false;
+    };
+    let Ok(approval) = exploration_scheduler.request(&candidate, gates, now) else {
+        return false;
+    };
+    let Some(metadata) = exploration_scheduler.commit_metadata(
+        approval.metadata.correlation,
+        now,
+        CommitEvidence::OmissionEndpointOpened,
+    ) else {
+        return false;
+    };
+    record_control_withhold();
+    decision_events.push(
+        markov_event(
+            predicted_app.to_string(),
+            cycle,
+            ActuatorDecisionOutcome::NoOp,
+            "control arm: cache-only pre-warm deliberately withheld",
+        )
+        .with_exploration(metadata),
+    );
+    true
+}
+
 fn markov_event(
     target: impl Into<String>,
     cycle: u64,
@@ -570,9 +628,24 @@ pub fn run_markov_tick(
         } else {
             None
         };
+        // Control arm: decline one pre-warm the daemon was about to speculate
+        // on, so the lab can observe the withheld outcome. Pre-warm is pure
+        // speculation, so withholding it removes work rather than adding any.
+        let markov_control_withheld = if base_eligible && exploration_approval.is_none() {
+            withhold_markov_prewarm_for_control(
+                exploration_scheduler,
+                &gates,
+                request_now,
+                &pred.app_name,
+                cycle_count,
+                &mut decision_events,
+            )
+        } else {
+            false
+        };
         let (specialist_allowed, allow_kernel_acceleration) =
             markov_exploration_admission(admission, exploration_approval.is_some());
-        let mut prewarm_eligible = base_eligible && specialist_allowed;
+        let mut prewarm_eligible = base_eligible && specialist_allowed && !markov_control_withheld;
         // Cache-only probes may test a cold/new context. Reversible acceleration
         // remains reserved for mature transition evidence.
         markov_acceleration_allowed = allow_kernel_acceleration && cache_warm_allowed;

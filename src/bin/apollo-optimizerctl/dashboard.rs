@@ -587,6 +587,56 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             compact_counter(m.microexperiment_harmful_total),
             compact_counter(m.microexperiment_synthetic_quarantined_total),
         ));
+        // Endpoint wire. `wire` is the contract state; the rest separate the
+        // stages so a stalled circuit names its own cause.
+        lines.push(format!(
+            "       wire{} arm{} bind{} end{} wait{}",
+            if m.microexperiment_endpoint_contract_ready {
+                "+"
+            } else {
+                "-"
+            },
+            compact_counter(m.microexperiment_arms_registered_total),
+            compact_counter(m.microexperiment_decisions_bound_total),
+            compact_counter(m.microexperiment_endpoints_emitted_total),
+            compact_counter(m.microexperiment_endpoints_pending_utility),
+        ));
+        let endpoint_rejects = [
+            ("key", m.microexperiment_endpoint_action_mismatch_total),
+            ("arm", m.microexperiment_endpoint_unknown_arm_total),
+            ("dup", m.microexperiment_endpoint_duplicate_total),
+            ("exp", m.microexperiment_endpoint_expired_total),
+            ("epo", m.microexperiment_endpoint_epoch_rejected_total),
+            ("aut", m.microexperiment_endpoint_authority_rejected_total),
+            ("met", m.microexperiment_endpoint_incomplete_metadata_total),
+            ("cap", m.microexperiment_endpoint_capacity_drops_total),
+        ];
+        let rejects = endpoint_rejects
+            .iter()
+            .filter(|(_, total)| *total > 0)
+            .map(|(label, total)| format!("{label}{}", compact_counter(*total)))
+            .collect::<Vec<_>>();
+        if !rejects.is_empty() {
+            lines.push(format!("       rej {}", rejects.join(" ")));
+        }
+        if m.microexperiment_control_withholds_total > 0
+            || m.microexperiment_endpoint_rollback_failed_total > 0
+        {
+            lines.push(format!(
+                "       hold{} rbk{}/{}",
+                compact_counter(m.microexperiment_control_withholds_total),
+                compact_counter(m.microexperiment_endpoint_rollback_observed_total),
+                compact_counter(m.microexperiment_endpoint_rollback_failed_total),
+            ));
+        }
+        if m.microexperiment_invalidated_total > 0 {
+            lines.push(format!(
+                "       inv{} dl{} rbf{}",
+                compact_counter(m.microexperiment_invalidated_total),
+                compact_counter(m.microexperiment_deadline_expired_total),
+                compact_counter(m.microexperiment_rollback_failed_total),
+            ));
+        }
         if !m.microexperiment_blocker.is_empty()
             && m.microexperiment_blocker != "shadow-observed"
             && m.microexperiment_blocker != "no-candidates"
