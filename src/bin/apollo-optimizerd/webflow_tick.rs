@@ -63,6 +63,12 @@ impl VitalsWindow {
     fn inp_p95_ms(&self) -> Option<f64> {
         vitals_p95(&self.inp_ms.iter().copied().collect::<Vec<_>>())
     }
+
+    /// Widest sample count backing the published p95s, so a reader can tell a
+    /// three-sample guess from a settled measurement.
+    fn samples(&self) -> u64 {
+        self.lcp_ms.len().max(self.inp_ms.len()) as u64
+    }
 }
 
 pub fn is_supported_browser(name: &str) -> bool {
@@ -119,6 +125,8 @@ pub struct WebFlowCycleOutput {
     /// reported at least one sample of that metric.
     pub lcp_p95_ms: Option<f64>,
     pub inp_p95_ms: Option<f64>,
+    /// Samples behind those p95s.
+    pub vitals_samples: u64,
 }
 
 pub struct WebFlowRuntime {
@@ -267,6 +275,7 @@ impl WebFlowRuntime {
             rollout_blocker: self.rollout_blocker,
             lcp_p95_ms: self.vitals.lcp_p95_ms(),
             inp_p95_ms: self.vitals.inp_p95_ms(),
+            vitals_samples: self.vitals.samples(),
         }
     }
 
@@ -478,6 +487,31 @@ mod tests {
 
         assert_eq!(output.lcp_p95_ms, Some(1_200.0));
         assert_eq!(output.inp_p95_ms, Some(180.0));
+    }
+
+    #[test]
+    fn the_sample_count_travels_with_the_p95_so_a_guess_is_distinguishable() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        assert_eq!(runtime.tick(input(&[])).vitals_samples, 0);
+
+        let output = runtime.tick(input(&[with_vitals(1, Some(1_200), Some(180))]));
+        assert_eq!(output.vitals_samples, 1);
+        assert_eq!(output.lcp_p95_ms, Some(1_200.0));
+
+        for sequence in 2..=10 {
+            runtime.tick(input(&[with_vitals(sequence, Some(1_200), Some(180))]));
+        }
+        assert_eq!(runtime.vitals.samples(), 10);
+
+        // Never exceeds the window, and drops with it on invalidation.
+        for sequence in 11..=(MAX_VITALS_SAMPLES as u64 * 2) {
+            runtime.tick(input(&[with_vitals(sequence, Some(1_200), None)]));
+        }
+        assert_eq!(runtime.vitals.samples(), MAX_VITALS_SAMPLES as u64);
+
+        let mut sleeping = input(&[]);
+        sleeping.sleeping = true;
+        assert_eq!(runtime.tick(sleeping).vitals_samples, 0);
     }
 
     #[test]

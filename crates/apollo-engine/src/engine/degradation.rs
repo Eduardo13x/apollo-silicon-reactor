@@ -49,8 +49,13 @@ impl OperationMode {
     }
 
     /// Returns true if sysctl writes are permitted.
+    ///
+    /// Full only. This previously claimed Conservative as well, contradicting
+    /// both the tier's own doc comment ("unfreeze + QoS hints") and the filter
+    /// that actually runs. Nothing called it, so the laxer claim never took
+    /// effect — it was a trap for whoever wired it first.
     pub fn allows_sysctl(&self) -> bool {
-        matches!(self, Self::Full | Self::Conservative)
+        matches!(self, Self::Full)
     }
 
     /// Returns true if QoS hint actions are permitted.
@@ -58,9 +63,47 @@ impl OperationMode {
         matches!(self, Self::Full | Self::Conservative)
     }
 
-    /// Returns true if unfreeze actions should always proceed regardless of tier.
+    /// Returns true if priority boosts are permitted. Boost is grouped with
+    /// QoS hints: it raises a process's standing without stopping anything.
+    pub fn allows_boost(&self) -> bool {
+        matches!(self, Self::Full | Self::Conservative)
+    }
+
+    /// Returns true if unfreeze actions are permitted.
+    ///
+    /// Unfreeze is the one action Emergency still runs, because releasing
+    /// stopped processes is how the tier recovers. Observe is the exception:
+    /// it means "no actions at all", including safe ones.
     pub fn allows_unfreeze(&self) -> bool {
-        true // unfreeze is always safe
+        !matches!(self, Self::Observe)
+    }
+
+    /// Returns true if the invasive system-wide actions are permitted:
+    /// jetsam tier writes, Spotlight toggles, daemon quarantine.
+    pub fn allows_system_intervention(&self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Single source of truth for what a tier admits.
+    ///
+    /// The action pipeline used to re-derive this inline, which let the
+    /// predicates above drift away from the policy that actually ran. The
+    /// match is deliberately exhaustive: a new `RootAction` variant will fail
+    /// to compile here until someone decides which tier may execute it, rather
+    /// than silently inheriting a default.
+    pub fn admits(&self, action: &crate::engine::action_types::RootAction) -> bool {
+        use crate::engine::action_types::RootAction;
+        match action {
+            RootAction::FreezeProcess { .. } => self.allows_freeze(),
+            RootAction::ThrottleProcess { .. } => self.allows_throttle(),
+            RootAction::UnfreezeProcess { .. } => self.allows_unfreeze(),
+            RootAction::BoostProcess { .. } => self.allows_boost(),
+            RootAction::SetThreadQoS { .. } => self.allows_qos(),
+            RootAction::SetSysctl(_) => self.allows_sysctl(),
+            RootAction::SetMemorystatus { .. }
+            | RootAction::ToggleSpotlight { .. }
+            | RootAction::QuarantineDaemon { .. } => self.allows_system_intervention(),
+        }
     }
 }
 
@@ -333,6 +376,18 @@ mod tests {
         assert_eq!(ctrl.mode, OperationMode::Observe);
     }
 
+    /// Two expectations here changed when these predicates were made the
+    /// single source of truth for the action pipeline:
+    ///
+    /// - `Conservative.allows_sysctl()` was `true`
+    /// - `Observe.allows_unfreeze()` was `true`
+    ///
+    /// Neither predicate had a caller, so neither described production. The
+    /// pipeline's own inline filter was the only policy that ran, and it
+    /// blocked sysctl in Conservative and blocked everything in Observe.
+    /// Aligning the predicates to the filter keeps production behaviour byte
+    /// for byte; aligning the filter to the predicates would have loosened
+    /// safety in two places at once.
     #[test]
     fn operation_mode_flags() {
         assert!(OperationMode::Full.allows_freeze());
@@ -341,11 +396,11 @@ mod tests {
         assert!(!OperationMode::Emergency.allows_freeze());
 
         assert!(OperationMode::Full.allows_sysctl());
-        assert!(OperationMode::Conservative.allows_sysctl());
+        assert!(!OperationMode::Conservative.allows_sysctl());
         assert!(!OperationMode::Observe.allows_sysctl());
 
         assert!(OperationMode::Emergency.allows_unfreeze());
-        assert!(OperationMode::Observe.allows_unfreeze());
+        assert!(!OperationMode::Observe.allows_unfreeze());
     }
 
     #[test]
@@ -354,5 +409,101 @@ mod tests {
         assert_eq!(OperationMode::Conservative.as_str(), "conservative");
         assert_eq!(OperationMode::Observe.as_str(), "observe");
         assert_eq!(OperationMode::Emergency.as_str(), "emergency");
+    }
+
+    fn sample_actions() -> Vec<crate::engine::action_types::RootAction> {
+        use crate::engine::action_types::{RootAction, SetSysctlAction};
+        use crate::engine::audit_types::DecisionReason;
+        vec![
+            RootAction::FreezeProcess {
+                pid: 1,
+                name: "x".into(),
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+                start_sec: 1,
+                start_usec: 1,
+            },
+            RootAction::ThrottleProcess {
+                pid: 1,
+                name: "x".into(),
+                aggressive: false,
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+                start_sec: 1,
+                start_usec: 1,
+            },
+            RootAction::UnfreezeProcess {
+                pid: 1,
+                name: "x".into(),
+                reason: "r".into(),
+                decision_reason: DecisionReason::PressureContext,
+                start_sec: 1,
+                start_usec: 1,
+            },
+            RootAction::SetSysctl(SetSysctlAction::new_clamped(
+                "vm.compressor_mode",
+                "4",
+                "test",
+                DecisionReason::PressureContext,
+            )),
+        ]
+    }
+
+    /// Pins `admits` to the policy the action pipeline enforced inline before
+    /// the two copies were merged. Any drift here is a real behaviour change,
+    /// not a refactor.
+    #[test]
+    fn admits_reproduces_the_tier_policy_the_pipeline_enforced() {
+        use crate::engine::action_types::RootAction;
+        for action in sample_actions() {
+            // Full admits everything.
+            assert!(OperationMode::Full.admits(&action));
+            // Observe admits nothing at all, safe actions included.
+            assert!(!OperationMode::Observe.admits(&action));
+            // Emergency admits unfreeze and nothing else.
+            assert_eq!(
+                OperationMode::Emergency.admits(&action),
+                matches!(action, RootAction::UnfreezeProcess { .. })
+            );
+            // Conservative admits unfreeze / thread QoS / boost only. In
+            // particular it must NOT admit sysctl, which the old
+            // `allows_sysctl` wrongly claimed.
+            assert_eq!(
+                OperationMode::Conservative.admits(&action),
+                matches!(
+                    action,
+                    RootAction::UnfreezeProcess { .. }
+                        | RootAction::SetThreadQoS { .. }
+                        | RootAction::BoostProcess { .. }
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn the_granular_predicates_agree_with_admits() {
+        for mode in [
+            OperationMode::Full,
+            OperationMode::Conservative,
+            OperationMode::Observe,
+            OperationMode::Emergency,
+        ] {
+            for action in sample_actions() {
+                let expected = match &action {
+                    crate::engine::action_types::RootAction::FreezeProcess { .. } => {
+                        mode.allows_freeze()
+                    }
+                    crate::engine::action_types::RootAction::ThrottleProcess { .. } => {
+                        mode.allows_throttle()
+                    }
+                    crate::engine::action_types::RootAction::UnfreezeProcess { .. } => {
+                        mode.allows_unfreeze()
+                    }
+                    crate::engine::action_types::RootAction::SetSysctl(_) => mode.allows_sysctl(),
+                    _ => continue,
+                };
+                assert_eq!(mode.admits(&action), expected, "{mode:?}");
+            }
+        }
     }
 }

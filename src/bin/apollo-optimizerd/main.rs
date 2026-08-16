@@ -2644,6 +2644,7 @@ fn main() -> anyhow::Result<()> {
                     // forever because nothing copied them out.
                     metrics.metrics.browser_lcp_p95_ms = webflow_output.lcp_p95_ms;
                     metrics.metrics.browser_inp_p95_ms = webflow_output.inp_p95_ms;
+                    metrics.metrics.browser_latency_samples = webflow_output.vitals_samples;
                     metrics.metrics.network_flow_active = networkflow_output.observation.active;
                     metrics.metrics.network_flow_traffic_bps =
                         networkflow_output.observation.traffic_bps;

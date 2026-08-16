@@ -541,6 +541,9 @@ pub struct RuntimeMetrics {
     pub browser_lcp_p95_ms: Option<f64>,
     #[serde(default)]
     pub browser_inp_p95_ms: Option<f64>,
+    /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
+    /// p95 over a full window are very different claims, and reading one as
+    /// the other already produced a bogus 120000ms LCP once.
     #[serde(default)]
     pub browser_latency_samples: u64,
     /// Cycle-local decision events dropped by bounded producer/merge buffers.
@@ -838,7 +841,6 @@ pub struct RuntimeMetrics {
     pub refresh_duration_ms: f64,
     pub memory_budget_duration_ms: f64,
     pub reactor_duration_ms: f64,
-    pub lock_wait_duration_ms: f64,
     pub throttle_reverted: u64,
     pub reactor_pulses: u64,
     pub effective_profile: OptimizationProfile,
@@ -1262,8 +1264,6 @@ pub struct RuntimeMetrics {
     pub parallel_worker_qos_status: String,
     #[serde(default)]
     pub parallel_worker_qos_failures: u64,
-    #[serde(default)]
-    pub invalid_sysctl_value_denied: u64,
     #[serde(default)]
     pub journal_rotations: u64,
     #[serde(default)]

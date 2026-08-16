@@ -55,10 +55,6 @@ pub struct LockFreeMetrics {
 
     // Core cycle counters
     pub cycles: AtomicU64,
-    pub actions_applied: AtomicU64,
-    pub freezes: AtomicU64,
-    pub unfreezes: AtomicU64,
-    pub throttles: AtomicU64,
     pub throttle_reverted: AtomicU64,
     pub signals_sent: AtomicU64,
 
@@ -774,10 +770,6 @@ impl LockFreeMetrics {
         Self {
             epoch: AtomicU64::new(0),
             cycles: AtomicU64::new(0),
-            actions_applied: AtomicU64::new(0),
-            freezes: AtomicU64::new(0),
-            unfreezes: AtomicU64::new(0),
-            throttles: AtomicU64::new(0),
             throttle_reverted: AtomicU64::new(0),
             signals_sent: AtomicU64::new(0),
             hw_warnings: AtomicU64::new(0),
@@ -1159,25 +1151,9 @@ impl LockFreeMetrics {
     }
 
     #[inline(always)]
-    pub fn add_actions(&self, n: u64) {
-        self.actions_applied.fetch_add(n, Ordering::Relaxed);
-    }
-
     #[inline(always)]
-    pub fn inc_freezes(&self) {
-        self.freezes.fetch_add(1, Ordering::Relaxed);
-    }
-
     #[inline(always)]
-    pub fn inc_unfreezes(&self) {
-        self.unfreezes.fetch_add(1, Ordering::Relaxed);
-    }
-
     #[inline(always)]
-    pub fn inc_throttles(&self) {
-        self.throttles.fetch_add(1, Ordering::Relaxed);
-    }
-
     #[inline(always)]
     pub fn inc_hw_warning(&self) {
         self.hw_warnings.fetch_add(1, Ordering::Relaxed);
@@ -1286,10 +1262,6 @@ impl LockFreeMetrics {
         MetricsSnapshot {
             epoch,
             cycles: self.cycles.load(Ordering::Relaxed),
-            actions_applied: self.actions_applied.load(Ordering::Relaxed),
-            freezes: self.freezes.load(Ordering::Relaxed),
-            unfreezes: self.unfreezes.load(Ordering::Relaxed),
-            throttles: self.throttles.load(Ordering::Relaxed),
             throttle_reverted: self.throttle_reverted.load(Ordering::Relaxed),
             signals_sent: self.signals_sent.load(Ordering::Relaxed),
             hw_warnings: self.hw_warnings.load(Ordering::Relaxed),
@@ -2005,10 +1977,6 @@ unsafe impl Sync for LockFreeMetrics {}
 pub struct MetricsSnapshot {
     pub epoch: u64,
     pub cycles: u64,
-    pub actions_applied: u64,
-    pub freezes: u64,
-    pub unfreezes: u64,
-    pub throttles: u64,
     pub throttle_reverted: u64,
     pub signals_sent: u64,
     pub hw_warnings: u64,
@@ -2300,14 +2268,12 @@ mod tests {
         let m = LockFreeMetrics::new();
         m.inc_cycles();
         m.inc_cycles();
-        m.inc_freezes();
-        m.add_actions(5);
+        m.inc_pid_recycle_block();
         m.commit();
 
         let snap = m.snapshot();
         assert_eq!(snap.cycles, 2);
-        assert_eq!(snap.freezes, 1);
-        assert_eq!(snap.actions_applied, 5);
+        assert_eq!(snap.pid_recycle_blocks_total, 1);
         assert_eq!(snap.epoch, 1);
     }
 
@@ -2347,9 +2313,8 @@ mod tests {
                 thread::spawn(move || {
                     for _ in 0..5_000 {
                         m.inc_cycles();
-                        m.inc_freezes();
-                        m.inc_throttles();
-                        m.add_actions(1);
+                        m.inc_pid_recycle_block();
+                        m.inc_mediator_block();
                         if i % 4 == 0 {
                             m.inc_hw_warning();
                         }
@@ -2365,9 +2330,8 @@ mod tests {
 
         let snap = m.snapshot();
         assert_eq!(snap.cycles, 16 * 5_000);
-        assert_eq!(snap.freezes, 16 * 5_000);
-        assert_eq!(snap.throttles, 16 * 5_000);
-        assert_eq!(snap.actions_applied, 16 * 5_000);
+        assert_eq!(snap.pid_recycle_blocks_total, 16 * 5_000);
+        assert_eq!(snap.mediator_blocks_total, 16 * 5_000);
         assert_eq!(snap.hw_warnings, 4 * 5_000); // 4 threads (i % 4 == 0)
     }
 

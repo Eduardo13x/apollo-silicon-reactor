@@ -809,12 +809,16 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.webflow_proposed_total),
             format_number(m.webflow_admitted_total),
         ));
+        // The sample count is part of the reading: a p95 over a handful of
+        // samples is a guess, and reading one as settled produced a bogus
+        // 120000ms LCP once.
+        let n = m.browser_latency_samples;
         if let (Some(lcp), Some(inp)) = (m.browser_lcp_p95_ms, m.browser_inp_p95_ms) {
-            lines.push(format!("       vitals LCP{lcp:.0}ms INP{inp:.0}ms"));
+            lines.push(format!("       vitals LCP{lcp:.0}ms INP{inp:.0}ms n{n}"));
         } else if let Some(lcp) = m.browser_lcp_p95_ms {
-            lines.push(format!("       vitals LCP{lcp:.0}ms INP-"));
+            lines.push(format!("       vitals LCP{lcp:.0}ms INP- n{n}"));
         } else if let Some(inp) = m.browser_inp_p95_ms {
-            lines.push(format!("       vitals LCP- INP{inp:.0}ms"));
+            lines.push(format!("       vitals LCP- INP{inp:.0}ms n{n}"));
         }
         if !m.webflow_phase.is_empty() {
             lines.push(format!(
