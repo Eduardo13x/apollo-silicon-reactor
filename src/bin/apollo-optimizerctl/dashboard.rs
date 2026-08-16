@@ -501,6 +501,16 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.value_scheduler_predicted_us / 1_000,
             m.value_scheduler_budget_us / 1_000,
         ));
+        if m.value_scheduler_invalid_samples_total > 0 {
+            lines.push(format!(
+                "       inv{} unhealthy{} seq{} feat{} pub{}",
+                compact_counter(m.value_scheduler_invalid_samples_total),
+                compact_counter(m.value_scheduler_invalid_unhealthy_total),
+                compact_counter(m.value_scheduler_invalid_sequence_total),
+                compact_counter(m.value_scheduler_invalid_features_total),
+                compact_counter(m.value_scheduler_invalid_publication_total),
+            ));
+        }
         if !m.value_scheduler_blocker.is_empty() && m.value_scheduler_blocker != "shadow-ready" {
             lines.push(format!(
                 "       block {}",
@@ -748,6 +758,15 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.acceleration_lease_nice_fallbacks_total),
             format_number(m.acceleration_lease_capability_skips_total),
         ));
+        if m.acceleration_lease_task_port_denied_total > 0
+            || m.acceleration_lease_qos_write_rejected_total > 0
+        {
+            lines.push(format!(
+                "       skip port{} write{}",
+                format_number(m.acceleration_lease_task_port_denied_total),
+                format_number(m.acceleration_lease_qos_write_rejected_total),
+            ));
+        }
         if !m.interaction_qos_ttl_band.is_empty() {
             lines.push(format!(
                 "       ttl {} {}ms {} exp{}",
@@ -774,6 +793,13 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.webflow_proposed_total),
             format_number(m.webflow_admitted_total),
         ));
+        if let (Some(lcp), Some(inp)) = (m.browser_lcp_p95_ms, m.browser_inp_p95_ms) {
+            lines.push(format!("       vitals LCP{lcp:.0}ms INP{inp:.0}ms"));
+        } else if let Some(lcp) = m.browser_lcp_p95_ms {
+            lines.push(format!("       vitals LCP{lcp:.0}ms INP-"));
+        } else if let Some(inp) = m.browser_inp_p95_ms {
+            lines.push(format!("       vitals LCP- INP{inp:.0}ms"));
+        }
         if !m.webflow_phase.is_empty() {
             lines.push(format!(
                 "       {} G{} {}",
@@ -1114,6 +1140,15 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 m.world_model_gpu_calibration_quality * 100.0,
                 m.world_model_gpu_calibration_mae * 100.0
             ));
+            if m.world_model_gpu_rejected_total > 0 {
+                lines.push(format!(
+                    "       rej{} evict{} unused{} bronze{}",
+                    format_number(m.world_model_gpu_rejected_total),
+                    format_number(m.world_model_gpu_evicted_total),
+                    format_number(m.world_model_gpu_unused_total),
+                    format_number(m.world_model_gpu_bronze_rejected_total),
+                ));
+            }
         }
     }
     if !m.system_deliberation_mode.is_empty() {

@@ -670,6 +670,14 @@ pub struct RuntimeMetrics {
     pub value_scheduler_capacity_skips_total: u64,
     #[serde(default)]
     pub value_scheduler_invalid_samples_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_unhealthy_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_sequence_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_features_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_publication_total: u64,
     /// Operational heterogeneous-compute telemetry. These fields are not AIS
     /// evidence and cannot authorize actions.
     #[serde(default)]
@@ -1058,6 +1066,10 @@ pub struct RuntimeMetrics {
     pub acceleration_lease_identity_skips_total: u64,
     #[serde(default)]
     pub acceleration_lease_capability_skips_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_task_port_denied_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_qos_write_rejected_total: u64,
     #[serde(default)]
     pub acceleration_lease_nice_fallbacks_total: u64,
     #[serde(default)]
@@ -2036,6 +2048,12 @@ pub struct RuntimeMetrics {
     pub world_model_gpu_gold_total: u64,
     #[serde(default)]
     pub world_model_gpu_rejected_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_evicted_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_unused_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_bronze_rejected_total: u64,
     #[serde(default)]
     pub world_model_gpu_pending_total: u64,
     #[serde(default)]

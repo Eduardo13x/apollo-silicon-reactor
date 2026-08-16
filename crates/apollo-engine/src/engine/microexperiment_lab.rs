@@ -585,6 +585,10 @@ pub struct MicroexperimentLab {
     rollout: PersistedRollout,
     rollout_config: LabRolloutConfig,
     last_work: LabWork,
+    /// Whether the phase clock has been armed against this boot's monotonic
+    /// clock. Deliberately not persisted: `phase_started_millis` alone cannot
+    /// express "unarmed", because 0 is also a legitimate `now_millis`.
+    phase_clock_armed: bool,
 }
 
 impl MicroexperimentLab {
@@ -600,6 +604,7 @@ impl MicroexperimentLab {
             rollout: PersistedRollout::default(),
             rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
+            phase_clock_armed: false,
         }
     }
 
@@ -726,11 +731,13 @@ impl MicroexperimentLab {
         gates: PairGates,
         now_millis: u64,
     ) -> Result<CandidateDisposition, LabError> {
-        if self.rollout.shadow_eligible == 0
-            && self.rollout.canary_eligible == 0
-            && self.rollout.phase_started_millis == 0
-        {
+        // Arms the phase clock on the first candidate of this boot. A restore
+        // carries `shadow_eligible` forward, so the eligibility counters cannot
+        // serve as the "unarmed" signal any more, and `phase_started_millis`
+        // cannot either because 0 is a legitimate `now_millis`.
+        if !self.phase_clock_armed {
             self.rollout.phase_started_millis = now_millis;
+            self.phase_clock_armed = true;
         }
         if now_millis < self.rollout.last_monotonic_millis {
             self.rollout.reset_to_shadow(now_millis);
@@ -1194,6 +1201,7 @@ impl MicroexperimentLab {
             rollout: persisted.rollout,
             rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
+            phase_clock_armed: false,
         };
         // Completed summaries do not retain both authoritative endpoint
         // receipts. On restart they remain useful history, but they cannot
@@ -1226,7 +1234,14 @@ impl MicroexperimentLab {
             .interrupted_total
             .saturating_add(interrupted as u64);
         lab.reconcile_authoritative_metrics();
+        // A restart never resumes Canary or Active: mutation authority must be
+        // re-earned. The count of observed shadow opportunities is durable
+        // evidence about the host and is carried forward, but the duration gate
+        // re-arms from this boot because `now_millis` is monotonic-since-boot
+        // and would otherwise be satisfied instantly.
+        let shadow_eligible = lab.rollout.shadow_eligible;
         lab.rollout.reset_to_shadow(0);
+        lab.rollout.shadow_eligible = shadow_eligible;
         let disposition = if interrupted == 0 {
             RestoreDisposition::Restored
         } else {
@@ -1850,6 +1865,67 @@ mod rollout_tests {
 
         assert_eq!(lab.phase(), LabPhase::Active);
         assert_eq!(lab.metrics().pair_gold_total, 1);
+    }
+
+    #[test]
+    fn a_restart_keeps_shadow_progress_but_re_earns_the_duration_gate() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 2,
+            shadow_min_duration_ms: 10_000,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 2_000)
+            .unwrap();
+        assert_eq!(lab.phase(), LabPhase::Shadow);
+
+        let (mut restored, disposition) = MicroexperimentLab::restore(lab.persisted(), origin());
+        restored.rollout_config = lab.rollout_config;
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(restored.phase(), LabPhase::Shadow);
+        // The opportunity count survives; it is durable evidence about the host.
+        assert_eq!(restored.rollout.shadow_eligible, 2);
+
+        // The duration gate must NOT be instantly satisfiable after restore:
+        // the phase clock re-arms on the first candidate of the new boot.
+        restored
+            .consider_candidate(candidate(3), PairGates::healthy_enabled(), 500_000)
+            .unwrap();
+        assert_eq!(
+            restored.phase(),
+            LabPhase::Shadow,
+            "restore must not let a monotonic clock satisfy the duration gate instantly"
+        );
+
+        // Once the minimum duration genuinely elapses on this boot, it promotes.
+        restored
+            .consider_candidate(candidate(4), PairGates::healthy_enabled(), 511_000)
+            .unwrap();
+        assert_eq!(restored.phase(), LabPhase::Canary);
+    }
+
+    #[test]
+    fn a_restart_never_resumes_mutation_authority() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 1,
+            shadow_min_duration_ms: 0,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 10)
+            .unwrap();
+        assert_eq!(lab.phase(), LabPhase::Canary);
+
+        let (mut restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+
+        assert_eq!(restored.phase(), LabPhase::Shadow);
+        assert!(restored
+            .issue_ready_arms(1, PairGates::healthy_enabled())
+            .is_empty());
     }
 
     #[test]

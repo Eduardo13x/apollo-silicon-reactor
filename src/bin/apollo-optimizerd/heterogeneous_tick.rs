@@ -33,7 +33,15 @@ pub struct HeterogeneousTickInput {
     pub p95_cycle_ms: f64,
     pub transition: f64,
     pub interaction: f64,
+    /// Normalized network throughput. `io_pressure` is a weighted input of the
+    /// temporal model and is named in TEMPORAL_SCHEMA_HASH, but was fed a
+    /// hardcoded 0.0 until the network observation was routed here.
+    pub io_pressure: f64,
     pub optional_allowed: bool,
+    /// True when the adaptive overhead governor itself permits speculation.
+    /// Distinguishes "the budget said no" from "this job was not due this
+    /// cycle", which `optional_allowed` alone conflates.
+    pub budget_allows_speculation: bool,
     pub optional_recovery_healthy: bool,
     pub thermal_nominal: bool,
 }
@@ -207,7 +215,14 @@ impl HeterogeneousRuntime {
             || input.pressure >= 0.55
             || !promotion_healthy;
         self.metrics.blocker = if !optional_allowed {
-            "overhead-budget"
+            // Steady state on a healthy host is "this job was not due this
+            // cycle", not a budget denial. Reporting both as overhead-budget
+            // made a working fabric look permanently throttled.
+            if input.budget_allows_speculation {
+                "not-scheduled"
+            } else {
+                "overhead-budget"
+            }
         } else if !input.thermal_nominal {
             "thermal"
         } else if input.world.identity.kill_switch {
@@ -250,7 +265,7 @@ impl HeterogeneousRuntime {
                 p95: unit(input.p95_cycle_ms / 75.0),
                 cpu_utilization: unit(input.cpu_utilization),
                 memory_pressure: unit(input.pressure),
-                io_pressure: 0.0,
+                io_pressure: unit(input.io_pressure),
                 thermal_pressure: if input.thermal_nominal { 0.0 } else { 1.0 },
                 run_queue: unit(input.cpu_utilization),
                 active_work: unit(input.interaction),
@@ -613,7 +628,9 @@ mod tests {
             p95_cycle_ms: 35.0,
             transition: 0.0,
             interaction: 0.5,
+            io_pressure: 0.0,
             optional_allowed: true,
+            budget_allows_speculation: true,
             optional_recovery_healthy: true,
             thermal_nominal: true,
         });
@@ -621,6 +638,79 @@ mod tests {
         assert!(metrics.submitted_total >= 1);
         assert_eq!(runtime.submitted_total(), metrics.submitted_total);
         assert!(!metrics.ane_execution_measured);
+    }
+
+    fn tick_input(
+        io_pressure: f64,
+        optional_allowed: bool,
+        budget: bool,
+    ) -> HeterogeneousTickInput {
+        HeterogeneousTickInput {
+            world: world(2),
+            cpu_utilization: 0.2,
+            pressure: 0.3,
+            p95_cycle_ms: 35.0,
+            transition: 0.0,
+            interaction: 0.5,
+            io_pressure,
+            optional_allowed,
+            budget_allows_speculation: budget,
+            optional_recovery_healthy: true,
+            thermal_nominal: true,
+        }
+    }
+
+    #[test]
+    fn network_throughput_reaches_the_temporal_model_instead_of_a_hardcoded_zero() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+
+        runtime.tick(tick_input(0.75, true, true));
+
+        let observed = runtime
+            .previous_observation
+            .expect("an admitted cycle records its observation");
+        assert!(
+            (observed.io_pressure - 0.75).abs() < f32::EPSILON,
+            "io_pressure is a weighted temporal feature and must carry the network signal, got {}",
+            observed.io_pressure
+        );
+    }
+
+    #[test]
+    fn an_idle_network_still_reports_zero_io_pressure() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+
+        runtime.tick(tick_input(0.0, true, true));
+
+        assert_eq!(runtime.previous_observation.unwrap().io_pressure, 0.0);
+    }
+
+    #[test]
+    fn io_pressure_is_clamped_so_a_traffic_spike_cannot_escape_the_unit_range() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+
+        runtime.tick(tick_input(42.0, true, true));
+
+        assert_eq!(runtime.previous_observation.unwrap().io_pressure, 1.0);
+    }
+
+    #[test]
+    fn an_unscheduled_cycle_is_not_reported_as_a_budget_denial() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+
+        // No permit this cycle, but the overhead governor still allows
+        // speculation: that is scheduling, not throttling.
+        let metrics = runtime.tick(tick_input(0.0, false, true));
+        assert_eq!(metrics.blocker, "not-scheduled");
+
+        // The governor itself denying speculation keeps the budget label.
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+        let metrics = runtime.tick(tick_input(0.0, false, false));
+        assert_eq!(metrics.blocker, "overhead-budget");
     }
 
     #[test]
@@ -634,7 +724,9 @@ mod tests {
             p95_cycle_ms: 35.0,
             transition: 0.0,
             interaction: 0.5,
+            io_pressure: 0.0,
             optional_allowed: true,
+            budget_allows_speculation: true,
             optional_recovery_healthy: true,
             thermal_nominal: true,
         });
@@ -653,7 +745,9 @@ mod tests {
             p95_cycle_ms: 35.0,
             transition: 0.0,
             interaction: 0.5,
+            io_pressure: 0.0,
             optional_allowed: true,
+            budget_allows_speculation: true,
             optional_recovery_healthy: true,
             thermal_nominal: true,
         };
@@ -716,7 +810,9 @@ mod tests {
                 p95_cycle_ms: 35.0,
                 transition: 0.0,
                 interaction: 0.5,
+                io_pressure: 0.0,
                 optional_allowed: false,
+                budget_allows_speculation: false,
                 optional_recovery_healthy: true,
                 thermal_nominal: true,
             });
@@ -730,7 +826,9 @@ mod tests {
             p95_cycle_ms: 35.0,
             transition: 0.0,
             interaction: 0.5,
+            io_pressure: 0.0,
             optional_allowed: false,
+            budget_allows_speculation: false,
             optional_recovery_healthy: true,
             thermal_nominal: true,
         });

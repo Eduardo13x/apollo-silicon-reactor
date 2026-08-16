@@ -2639,6 +2639,11 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.webflow_proposed_total = webflow_output.counters.proposed;
                     metrics.metrics.webflow_admitted_total = webflow_output.counters.admitted;
                     metrics.metrics.webflow_skipped_total = webflow_output.counters.skipped;
+                    // The extension already reports LCP/INP inside
+                    // WebFlowMetrics; before this these fields stayed None
+                    // forever because nothing copied them out.
+                    metrics.metrics.browser_lcp_p95_ms = webflow_output.lcp_p95_ms;
+                    metrics.metrics.browser_inp_p95_ms = webflow_output.inp_p95_ms;
                     metrics.metrics.network_flow_active = networkflow_output.observation.active;
                     metrics.metrics.network_flow_traffic_bps =
                         networkflow_output.observation.traffic_bps;
@@ -2730,11 +2735,21 @@ fn main() -> anyhow::Result<()> {
                                 .map_or(if interaction_active { 1.0 } else { 0.0 }, |summary| {
                                     summary.interaction_q
                                 }),
+                            // Same normalization the published world feature
+                            // vector already uses, so the model and the
+                            // snapshot agree on what "io pressure" means.
+                            io_pressure: world
+                                .network
+                                .filter(|flow| flow.sample_fresh)
+                                .map_or(0.0, |flow| {
+                                    flow.traffic_bps as f64 / (8.0 * 1024.0 * 1024.0)
+                                }),
                             optional_allowed: value_scheduler_tick::optional_job_allowed(
                                 value_scheduler_active,
                                 overhead_budget.allow_speculation,
                                 hardware_prediction_permit.is_some(),
                             ),
+                            budget_allows_speculation: overhead_budget.allow_speculation,
                             optional_recovery_healthy: !value_scheduler_active
                                 && overhead_input.p95_cycle_ms < 60.0
                                 && overhead_input.reason_avg_ms < 50.0
@@ -2785,6 +2800,14 @@ fn main() -> anyhow::Result<()> {
                         value_metrics.capacity_skips_total;
                     metrics.metrics.value_scheduler_invalid_samples_total =
                         value_metrics.invalid_samples_total;
+                    metrics.metrics.value_scheduler_invalid_unhealthy_total =
+                        value_metrics.invalid_unhealthy_total;
+                    metrics.metrics.value_scheduler_invalid_sequence_total =
+                        value_metrics.invalid_sequence_total;
+                    metrics.metrics.value_scheduler_invalid_features_total =
+                        value_metrics.invalid_features_total;
+                    metrics.metrics.value_scheduler_invalid_publication_total =
+                        value_metrics.invalid_publication_total;
                     if let Some(fabric) = fabric_metrics.as_ref() {
                         metrics.metrics.fabric_phase = fabric.phase.clone();
                         metrics.metrics.fabric_blocker = fabric.blocker.clone();

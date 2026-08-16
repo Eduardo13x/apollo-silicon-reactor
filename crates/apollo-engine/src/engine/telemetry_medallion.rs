@@ -1161,6 +1161,12 @@ pub struct TelemetryMedallionMetrics {
     pub gpu_prediction_silver_total: u64,
     pub gpu_prediction_gold_total: u64,
     pub gpu_prediction_rejected_total: u64,
+    /// Breakdown of `gpu_prediction_rejected_total`, which conflates a
+    /// capacity eviction, advice nobody consumed, and a Bronze-tier
+    /// calibration refusal. Only the last is a model-quality signal.
+    pub gpu_prediction_evicted_total: u64,
+    pub gpu_prediction_unused_total: u64,
+    pub gpu_prediction_bronze_rejected_total: u64,
     pub gpu_prediction_pending_total: u64,
     pub gpu_prediction_calibrated_models: u64,
     pub gpu_prediction_mean_absolute_error: f64,
@@ -1266,6 +1272,12 @@ pub struct TelemetryMedallionPersisted {
     pub gpu_prediction_gold_total: u64,
     #[serde(default)]
     pub gpu_prediction_rejected_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_evicted_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_unused_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_bronze_rejected_total: u64,
 }
 
 struct BoundedEvidenceVisitor<const MAX: usize>(PhantomData<ResolvedActuatorEvidence>);
@@ -1381,6 +1393,9 @@ pub struct TelemetryMedallion {
     gpu_prediction_silver_total: u64,
     gpu_prediction_gold_total: u64,
     gpu_prediction_rejected_total: u64,
+    gpu_prediction_evicted_total: u64,
+    gpu_prediction_unused_total: u64,
+    gpu_prediction_bronze_rejected_total: u64,
 }
 
 impl Default for TelemetryMedallion {
@@ -1449,6 +1464,9 @@ impl Default for TelemetryMedallion {
             gpu_prediction_silver_total: 0,
             gpu_prediction_gold_total: 0,
             gpu_prediction_rejected_total: 0,
+            gpu_prediction_evicted_total: 0,
+            gpu_prediction_unused_total: 0,
+            gpu_prediction_bronze_rejected_total: 0,
         }
     }
 }
@@ -1531,6 +1549,8 @@ impl TelemetryMedallion {
             {
                 self.gpu_prediction_rejected_total =
                     self.gpu_prediction_rejected_total.saturating_add(1);
+                self.gpu_prediction_evicted_total =
+                    self.gpu_prediction_evicted_total.saturating_add(1);
             }
             self.gpu_predictions.push_back(GpuPredictionEvidence {
                 generation: result.generation,
@@ -1581,6 +1601,7 @@ impl TelemetryMedallion {
             prediction.resolved_cycle = Some(cycle);
             self.gpu_prediction_rejected_total =
                 self.gpu_prediction_rejected_total.saturating_add(1);
+            self.gpu_prediction_unused_total = self.gpu_prediction_unused_total.saturating_add(1);
         }
     }
 
@@ -1739,6 +1760,8 @@ impl TelemetryMedallion {
         if calibration_tier == EvidenceTier::Bronze {
             self.gpu_prediction_rejected_total =
                 self.gpu_prediction_rejected_total.saturating_add(1);
+            self.gpu_prediction_bronze_rejected_total =
+                self.gpu_prediction_bronze_rejected_total.saturating_add(1);
             return;
         }
         let signed_error = evidence.net_utility_delta - prediction.mean_gain;
@@ -2971,6 +2994,9 @@ impl TelemetryMedallion {
             gpu_prediction_silver_total: self.gpu_prediction_silver_total,
             gpu_prediction_gold_total: self.gpu_prediction_gold_total,
             gpu_prediction_rejected_total: self.gpu_prediction_rejected_total,
+            gpu_prediction_evicted_total: self.gpu_prediction_evicted_total,
+            gpu_prediction_unused_total: self.gpu_prediction_unused_total,
+            gpu_prediction_bronze_rejected_total: self.gpu_prediction_bronze_rejected_total,
             gpu_prediction_pending_total: self
                 .gpu_predictions
                 .iter()
@@ -3422,6 +3448,9 @@ impl TelemetryMedallion {
             gpu_prediction_silver_total: self.gpu_prediction_silver_total,
             gpu_prediction_gold_total: self.gpu_prediction_gold_total,
             gpu_prediction_rejected_total: self.gpu_prediction_rejected_total,
+            gpu_prediction_evicted_total: self.gpu_prediction_evicted_total,
+            gpu_prediction_unused_total: self.gpu_prediction_unused_total,
+            gpu_prediction_bronze_rejected_total: self.gpu_prediction_bronze_rejected_total,
         }
     }
 
@@ -3779,11 +3808,26 @@ impl TelemetryMedallion {
                 .gpu_prediction_rejected_total
                 .saturating_add(abandoned)
                 .min(self.gpu_prediction_bronze_total);
+            // Predictions abandoned by the restart were never consumed, so
+            // they belong to the unused bucket.
+            self.gpu_prediction_evicted_total = state
+                .gpu_prediction_evicted_total
+                .min(self.gpu_prediction_rejected_total);
+            self.gpu_prediction_unused_total = state
+                .gpu_prediction_unused_total
+                .saturating_add(abandoned)
+                .min(self.gpu_prediction_rejected_total);
+            self.gpu_prediction_bronze_rejected_total = state
+                .gpu_prediction_bronze_rejected_total
+                .min(self.gpu_prediction_rejected_total);
         } else {
             self.gpu_prediction_bronze_total = 0;
             self.gpu_prediction_silver_total = 0;
             self.gpu_prediction_gold_total = 0;
             self.gpu_prediction_rejected_total = 0;
+            self.gpu_prediction_evicted_total = 0;
+            self.gpu_prediction_unused_total = 0;
+            self.gpu_prediction_bronze_rejected_total = 0;
         }
         if !same_origin {
             for evidence in &mut self.recent_evidence {
@@ -3829,6 +3873,9 @@ impl TelemetryMedallion {
             self.gpu_prediction_silver_total = 0;
             self.gpu_prediction_gold_total = 0;
             self.gpu_prediction_rejected_total = 0;
+            self.gpu_prediction_evicted_total = 0;
+            self.gpu_prediction_unused_total = 0;
+            self.gpu_prediction_bronze_rejected_total = 0;
         }
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
         self.controlled_models_revision = self.controlled_models_revision.wrapping_add(1);

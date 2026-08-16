@@ -1386,6 +1386,11 @@ fn acquire_acceleration_lease(
     let ledger_ttl = ttl.saturating_add(LEDGER_GRACE);
     let mut identity_skips = 0u64;
     let mut capability_skips = 0u64;
+    // capability_skips stays the sum for compatibility; these two split it by
+    // cause. task_for_pid denial (SIP / hardened runtime) and a task port that
+    // accepts the call but does not mutate are different problems.
+    let mut task_port_denied = 0u64;
+    let mut qos_write_rejected = 0u64;
     let mut nice_fallbacks = 0u64;
     let mut nice_failures = 0u64;
     let mut conflict_skips = 0u64;
@@ -1561,9 +1566,11 @@ fn acquire_acceleration_lease(
                     policy_lease = Some(lease);
                 } else {
                     capability_skips = capability_skips.saturating_add(1);
+                    qos_write_rejected = qos_write_rejected.saturating_add(1);
                 }
             } else {
                 capability_skips = capability_skips.saturating_add(1);
+                task_port_denied = task_port_denied.saturating_add(1);
                 decision_events.push(acceleration_member_event(
                     candidate.pid,
                     &candidate.name,
@@ -1680,6 +1687,14 @@ fn acquire_acceleration_lease(
             .metrics
             .acceleration_lease_capability_skips_total
             .saturating_add(capability_skips);
+        metrics.metrics.acceleration_lease_task_port_denied_total = metrics
+            .metrics
+            .acceleration_lease_task_port_denied_total
+            .saturating_add(task_port_denied);
+        metrics.metrics.acceleration_lease_qos_write_rejected_total = metrics
+            .metrics
+            .acceleration_lease_qos_write_rejected_total
+            .saturating_add(qos_write_rejected);
         metrics.metrics.acceleration_lease_nice_fallbacks_total = metrics
             .metrics
             .acceleration_lease_nice_fallbacks_total

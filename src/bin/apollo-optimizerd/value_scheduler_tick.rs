@@ -67,6 +67,12 @@ pub struct ValueSchedulerTickMetrics {
     pub budget_skips_total: u64,
     pub capacity_skips_total: u64,
     pub invalid_samples_total: u64,
+    /// Breakdown of `invalid_samples_total`, which previously conflated an
+    /// unhealthy control sample with three distinct world-publication faults.
+    pub invalid_unhealthy_total: u64,
+    pub invalid_sequence_total: u64,
+    pub invalid_features_total: u64,
+    pub invalid_publication_total: u64,
     pub world_snapshot: Option<Arc<WorldStateSnapshot>>,
 }
 
@@ -77,6 +83,10 @@ pub struct ValueSchedulerRuntime {
     started_at: Instant,
     valid_cycles: u64,
     invalid_samples_total: u64,
+    invalid_unhealthy_total: u64,
+    invalid_sequence_total: u64,
+    invalid_features_total: u64,
+    invalid_publication_total: u64,
     last_workload_id: u64,
     process_revision: u64,
     last_thermal_q: Option<u16>,
@@ -128,6 +138,10 @@ impl ValueSchedulerRuntime {
             started_at: Instant::now(),
             valid_cycles: 0,
             invalid_samples_total: 0,
+            invalid_unhealthy_total: 0,
+            invalid_sequence_total: 0,
+            invalid_features_total: 0,
+            invalid_publication_total: 0,
             last_workload_id: 0,
             process_revision: 1,
             last_thermal_q: None,
@@ -281,6 +295,7 @@ impl ValueSchedulerRuntime {
         let current = self.world_publisher.latest();
         let Some(world_revision) = current.identity.revision.checked_add(1) else {
             self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+            self.invalid_sequence_total = self.invalid_sequence_total.saturating_add(1);
             return self.rejected_metrics("snapshot-sequence-exhausted");
         };
         let features = match FeatureStore::try_new(
@@ -302,6 +317,7 @@ impl ValueSchedulerRuntime {
             Ok(features) => features,
             Err(_) => {
                 self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+                self.invalid_features_total = self.invalid_features_total.saturating_add(1);
                 return self.rejected_metrics("invalid-feature-vector");
             }
         };
@@ -333,6 +349,7 @@ impl ValueSchedulerRuntime {
             Ok(world) => world,
             Err(_) => {
                 self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+                self.invalid_publication_total = self.invalid_publication_total.saturating_add(1);
                 return self.rejected_metrics("snapshot-publication-failed");
             }
         };
@@ -415,6 +432,7 @@ impl ValueSchedulerRuntime {
             self.valid_cycles = self.valid_cycles.saturating_add(1);
         } else {
             self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+            self.invalid_unhealthy_total = self.invalid_unhealthy_total.saturating_add(1);
         }
 
         if plan.should_execute && sample_valid {
@@ -469,6 +487,10 @@ impl ValueSchedulerRuntime {
             budget_skips_total: scheduler_metrics.budget_skipped_total,
             capacity_skips_total: scheduler_metrics.capacity_skipped_total,
             invalid_samples_total: self.invalid_samples_total,
+            invalid_unhealthy_total: self.invalid_unhealthy_total,
+            invalid_sequence_total: self.invalid_sequence_total,
+            invalid_features_total: self.invalid_features_total,
+            invalid_publication_total: self.invalid_publication_total,
             world_snapshot: Some(Arc::clone(&world)),
         }
     }
@@ -479,6 +501,10 @@ impl ValueSchedulerRuntime {
             blocker: blocker.to_string(),
             shadow_cycles_required: SHADOW_CYCLES_REQUIRED,
             invalid_samples_total: self.invalid_samples_total,
+            invalid_unhealthy_total: self.invalid_unhealthy_total,
+            invalid_sequence_total: self.invalid_sequence_total,
+            invalid_features_total: self.invalid_features_total,
+            invalid_publication_total: self.invalid_publication_total,
             ..ValueSchedulerTickMetrics::default()
         }
     }
