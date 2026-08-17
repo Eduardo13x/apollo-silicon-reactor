@@ -845,7 +845,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         }
         if !m.interaction_qos_ttl_band.is_empty() {
             lines.push(format!(
-                "       ttl {} {}ms {} exp{}",
+                "       ttl {} {}ms {}{}",
                 m.interaction_qos_ttl_band,
                 m.interaction_qos_ttl_ms,
                 if m.interaction_qos_ttl_exploratory {
@@ -853,7 +853,14 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 } else {
                     "policy"
                 },
-                format_number(m.interaction_qos_parameter_explorations_total),
+                if m.interaction_qos_parameter_explorations_total > 0 {
+                    format!(
+                        " x{}",
+                        compact_counter(m.interaction_qos_parameter_explorations_total)
+                    )
+                } else {
+                    String::new()
+                },
             ));
         }
     }
@@ -874,11 +881,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         // 120000ms LCP once.
         let n = m.browser_latency_samples;
         if let (Some(lcp), Some(inp)) = (m.browser_lcp_p95_ms, m.browser_inp_p95_ms) {
-            lines.push(format!("       vitals LCP{lcp:.0}ms INP{inp:.0}ms n{n}"));
+            lines.push(format!("       vitals LCP{lcp:.0} INP{inp:.0} n{n}"));
         } else if let Some(lcp) = m.browser_lcp_p95_ms {
-            lines.push(format!("       vitals LCP{lcp:.0}ms INP- n{n}"));
+            lines.push(format!("       vitals LCP{lcp:.0} INP- n{n}"));
         } else if let Some(inp) = m.browser_inp_p95_ms {
-            lines.push(format!("       vitals LCP- INP{inp:.0}ms n{n}"));
+            lines.push(format!("       vitals LCP- INP{inp:.0} n{n}"));
         }
         if !m.webflow_phase.is_empty() {
             lines.push(format!(
@@ -895,13 +902,16 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if m.network_flow_proposed_total > 0 || m.network_flow_active {
         lines.push(format!(
-            "Net+   {} {:.1}MB/s P{} R{} X{}",
+            "Net+   {} {:.1}MB/s",
             if m.network_flow_active {
                 "active"
             } else {
                 "idle"
             },
             m.network_flow_traffic_bps as f64 / 1_000_000.0,
+        ));
+        lines.push(format!(
+            "       P{} R{} X{}",
             format_number(m.network_flow_proposed_total),
             format_number(m.network_flow_renewed_total),
             format_number(m.network_flow_suppressed_exact_total),
@@ -1213,7 +1223,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format!("{}/{}", m.gpu_imagination_backend, circuit)
         };
         lines.push(format!(
-            "GPU-I  {} J{} S{} t{:.2}ms",
+            "GPU-I  {} J{} S{} t{:.1}ms",
             backend_health,
             format_number(m.gpu_imagination_jobs_completed_total),
             format_number(m.gpu_imagination_samples_total),
@@ -1258,7 +1268,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format!(
                 "{}:{} {:+.2}%",
                 scope,
-                action.chars().take(5).collect::<String>(),
+                action.chars().take(3).collect::<String>(),
                 m.gpu_imagination_last_influence_support * 100.0
             )
         };
@@ -1270,10 +1280,13 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         ));
         if m.world_model_gpu_bronze_total > 0 {
             lines.push(format!(
-                "GPU-M  B{} S{} G{} P{} M{} q{:.0}% e{:.1}%",
+                "GPU-M  B{} S{} G{}",
                 format_number(m.world_model_gpu_bronze_total),
                 format_number(m.world_model_gpu_silver_total),
                 format_number(m.world_model_gpu_gold_total),
+            ));
+            lines.push(format!(
+                "       P{} M{} q{:.0}% e{:.1}%",
                 format_number(m.world_model_gpu_pending_total),
                 format_number(m.world_model_gpu_calibrated_models),
                 m.world_model_gpu_calibration_quality * 100.0,
@@ -1288,10 +1301,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             if m.world_model_gpu_rejected_total > 0 {
                 lines.push(format!(
                     "       rej{} ev{} un{} br{}",
-                    format_number(m.world_model_gpu_rejected_total),
-                    format_number(m.world_model_gpu_evicted_total),
-                    format_number(m.world_model_gpu_unused_total),
-                    format_number(m.world_model_gpu_bronze_rejected_total),
+                    compact_counter(m.world_model_gpu_rejected_total),
+                    compact_counter(m.world_model_gpu_evicted_total),
+                    compact_counter(m.world_model_gpu_unused_total),
+                    compact_counter(m.world_model_gpu_bronze_rejected_total),
                 ));
                 // Rejections older than the breakdown. Without this the three
                 // buckets look like they should sum to `rej` and do not.
@@ -1326,12 +1339,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.system_deliberation_local_families,
         ));
         lines.push(format!(
-            "S2>S1  G{} +{}/-{} n{} s{} c{:.0}%",
+            "S2>S1  G{} +{}/-{} n{} c{:.0}%",
             compact_counter(m.local_consolidations),
             compact_counter(m.local_consolidation_improvements),
             compact_counter(m.local_consolidation_regressions),
             compact_counter(m.local_consolidation_neutral),
-            compact_counter(m.local_consolidation_system1_updates),
             m.system_deliberation_local_confidence * 100.0,
         ));
     }
@@ -1393,22 +1405,28 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         ));
     }
     if !m.markov_prediction_app.is_empty() {
-        let app: String = m.markov_prediction_app.chars().take(11).collect();
+        let app: String = m.markov_prediction_app.chars().take(7).collect();
         let timing = if m.markov_prediction_overdue_secs > 0.0 {
             format!("stale{:.0}s", m.markov_prediction_overdue_secs)
         } else {
             format!("eta{:.0}s", m.markov_prediction_eta_secs)
         };
         lines.push(format!(
-            "Mk-P   {} {:.0}% {} {}",
+            "Mk-P   {} {:.0}% {}",
             app,
             m.markov_prediction_confidence * 100.0,
             timing,
+        ));
+        lines.push(format!(
+            "       {}",
             if m.markov_prewarm_blocker.is_empty() {
                 m.markov_prewarm_admission.as_str()
             } else {
                 m.markov_prewarm_blocker.as_str()
             }
+            .chars()
+            .take(24)
+            .collect::<String>()
         ));
         lines.push(format!(
             "Mk-H 5s{:.0} 30s{:.0} 2m{:.0} 10m{:.0}",
@@ -2285,7 +2303,7 @@ mod tests {
 
         assert!(render_think_q(&status)
             .iter()
-            .any(|line| line == "Mk-P   Alacritty 53% stale333s confidence"));
+            .any(|line| line == "Mk-P   Alacrit 53% stale333s"));
     }
 
     #[test]
@@ -2309,6 +2327,61 @@ mod tests {
             .any(|line| line == "WM wait immature4 uncertain2"));
         assert!(think.iter().any(|line| line == "Mk-H 5s5 30s25 2m70 10m80"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn every_think_row_fits_the_quadrant_at_production_magnitudes() {
+        // Values taken from a live daemon. Rows only render when their
+        // subsystem has data, which is why the older width assertions never
+        // reached them and eight of them displaced the box border.
+        let mut status = dashboard_status();
+        let m = &mut status.metrics;
+        m.interaction_qos_ttl_band = "standard".to_string();
+        m.interaction_qos_ttl_ms = 1_200;
+        m.interaction_qos_ttl_exploratory = false;
+        m.interaction_qos_parameter_explorations_total = 0;
+        m.browser_latency_samples = 64;
+        m.browser_lcp_p95_ms = Some(2_168.0);
+        m.browser_inp_p95_ms = Some(464.0);
+        m.network_flow_active = false;
+        m.network_flow_traffic_bps = 0;
+        m.network_flow_proposed_total = 320;
+        m.network_flow_renewed_total = 200;
+        m.network_flow_suppressed_exact_total = 149;
+        m.gpu_imagination_root_rank_uses_total = 5;
+        m.gpu_imagination_contextual_uses_total = 769;
+        m.world_model_gpu_bronze_total = 294_952;
+        m.world_model_gpu_silver_total = 5_393;
+        m.world_model_gpu_gold_total = 2_275;
+        m.world_model_gpu_pending_total = 10;
+        m.world_model_gpu_calibrated_models = 8;
+        m.world_model_gpu_calibration_quality = 0.54;
+        m.world_model_gpu_calibration_mae = 0.082;
+        m.world_model_gpu_rejected_total = 290_313;
+        m.world_model_gpu_evicted_total = 0;
+        m.world_model_gpu_unused_total = 44_635;
+        m.world_model_gpu_bronze_rejected_total = 456;
+        m.world_model_gpu_unclassified_rejections = 245_222;
+        m.local_consolidations = 233;
+        m.local_consolidation_improvements = 82;
+        m.local_consolidation_regressions = 130;
+        m.local_consolidation_neutral = 20;
+        m.local_consolidation_system1_updates = 848;
+        m.system_deliberation_local_confidence = 0.94;
+        m.markov_prediction_app = "Brave Browser".to_string();
+        m.markov_prediction_confidence = 0.53;
+        m.markov_prediction_eta_secs = 204.0;
+
+        let think = render_think_q(&status);
+        let over: Vec<String> = think
+            .iter()
+            .filter(|line| display_width(line) > QW)
+            .map(|line| format!("{} ({})", line, display_width(line)))
+            .collect();
+        assert!(
+            over.is_empty(),
+            "rows overflow the {QW}-column quadrant: {over:#?}\nall rows: {think:#?}"
+        );
     }
 
     #[test]
@@ -2817,17 +2890,15 @@ mod tests {
         assert!(think.iter().any(|line| line == "MPC-D  P17 R9 A3 B8 u7.1%"));
         assert!(think
             .iter()
-            .any(|line| line == "GPU-I  metal J3 S196,608 t0.42ms"));
+            .any(|line| line == "GPU-I  metal J3 S196,608 t0.4ms"));
         assert!(think.iter().any(|line| line == "GPU+   boost p82% d+1.2%"));
         assert!(think
             .iter()
-            .any(|line| line == "GPU-U  R4 C9 markov:marko +1.20%"));
+            .any(|line| line == "GPU-U  R4 C9 markov:mar +1.20%"));
         assert!(think
             .iter()
             .any(|line| line == "Delib  cal S1 c78% G24 g3 F1"));
-        assert!(think
-            .iter()
-            .any(|line| line == "S2>S1  G12 +8/-2 n2 s20 c66%"));
+        assert!(think.iter().any(|line| line == "S2>S1  G12 +8/-2 n2 c66%"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2852,9 +2923,7 @@ mod tests {
 
         let think = render_think_q(&status);
 
-        assert!(think
-            .iter()
-            .any(|line| line == "GPU-I  metal J0 S0 t0.00ms"));
+        assert!(think.iter().any(|line| line == "GPU-I  metal J0 S0 t0.0ms"));
         assert!(think.iter().any(|line| line == "GPU-G  no-candidates"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
@@ -2876,9 +2945,7 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Web    lifecycle N1 P12/A4"));
-        assert!(think
-            .iter()
-            .any(|line| line == "Net+   active 2.4MB/s P8 R6 X3"));
+        assert!(think.iter().any(|line| line == "Net+   active 2.4MB/s"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2892,7 +2959,7 @@ mod tests {
 
         assert!(think
             .iter()
-            .any(|line| line == "GPU-I  metal/H J0 S0 t0.00ms"));
+            .any(|line| line == "GPU-I  metal/H J0 S0 t0.0ms"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
