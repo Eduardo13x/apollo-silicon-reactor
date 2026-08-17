@@ -46,7 +46,29 @@ impl PlatformProbe {
             cpu(CapabilityId::CpuInteractive, self.performance_cpus),
             cpu(CapabilityId::CpuUtility, self.efficiency_cpus),
             CapabilityNode::boolean(CapabilityId::GpuCompute, self.gpu_compute),
-            CapabilityNode::boolean(CapabilityId::MlInference, self.core_ml),
+            // Core ML loads and returns correct output, so the capability is
+            // real and stays usable. It is Degraded rather than Detected
+            // because it has not earned promotion on the model Apollo actually
+            // ships: a bounded probe measured the lane at ~400x the
+            // deterministic CPU oracle that produces the same four outputs to
+            // 1e-4, and Core ML publishes no per-inference dispatch target, so
+            // no accelerator use can be confirmed either.
+            //
+            // Degraded is the honest middle: the lane remains available for a
+            // model large enough to amortise dispatch overhead, while the graph
+            // records that on a 16-feature model it demonstrated no benefit.
+            // Promotion back to Detected belongs to new evidence, not to a
+            // larger request.
+            CapabilityNode {
+                id: CapabilityId::MlInference,
+                state: if self.core_ml {
+                    CapabilityState::Degraded
+                } else {
+                    CapabilityState::Unavailable
+                },
+                capacity: if self.core_ml { Some(1) } else { None },
+                unit: CapacityUnit::Boolean,
+            },
             memory,
             CapabilityNode::boolean(CapabilityId::SensorPressure, self.sysctl),
             CapabilityNode::boolean(CapabilityId::SensorThermal, cfg!(target_os = "macos")),
@@ -253,5 +275,69 @@ impl PlatformAdapter for MacOsPlatformAdapter {
             })
             .map(|node| node.id)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(core_ml: bool) -> PlatformProbe {
+        PlatformProbe {
+            logical_cpus: 8,
+            performance_cpus: Some(4),
+            efficiency_cpus: Some(4),
+            memory_bytes: Some(8 * 1024 * 1024 * 1024),
+            gpu_compute: true,
+            core_ml,
+            unified_memory: true,
+            is_root: true,
+            task_policy: true,
+            sysctl: true,
+            memorystatus: true,
+            memory_pressure_send: false,
+            spotlight: true,
+            time_machine: true,
+        }
+    }
+
+    /// The Core ML lane stays usable but must not present itself as a
+    /// promoted capability.
+    ///
+    /// It produces the same four outputs as `cpu_oracle_predict` (pinned to
+    /// 1e-4 by `configured_coreml_model_matches_the_cpu_oracle`) at roughly
+    /// 400x the latency, measured by the bounded probe in
+    /// `tests/coreml_backend_probe.rs`, and Core ML publishes no
+    /// per-inference dispatch target, so no accelerator use can be confirmed.
+    ///
+    /// Degraded records that without disabling the lane: a larger future model
+    /// may well amortise the dispatch cost. Flipping this back to Detected is
+    /// a claim that new evidence exists, so it should require editing this
+    /// test.
+    #[test]
+    fn core_ml_is_usable_but_not_promoted_while_it_shows_no_benefit() {
+        let nodes = probe(true).nodes();
+        let ml = nodes
+            .iter()
+            .find(|node| node.id == CapabilityId::MlInference)
+            .expect("the graph always carries an ML inference node");
+
+        assert_eq!(ml.state, CapabilityState::Degraded);
+        assert!(
+            ml.state.usable(),
+            "degraded must keep the lane selectable, not disable it"
+        );
+    }
+
+    #[test]
+    fn absent_core_ml_is_unavailable_rather_than_degraded() {
+        let nodes = probe(false).nodes();
+        let ml = nodes
+            .iter()
+            .find(|node| node.id == CapabilityId::MlInference)
+            .expect("the graph always carries an ML inference node");
+
+        assert_eq!(ml.state, CapabilityState::Unavailable);
+        assert!(!ml.state.usable());
     }
 }
