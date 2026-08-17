@@ -998,13 +998,22 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if m.world_model_decision_credit_sources > 0 {
         lines.push(format!(
-            "AU {:+.1}% {} {:+.1}% n{}",
+            // `~` marks a leader below the engine's own prior weight of 8:
+            // `source_authority_score` shrinks it by n/(n+8), so at n=3 the
+            // printed score enters decisions at roughly a quarter of its face
+            // value. Without the mark the raw figure reads as settled.
+            "AU {:+.1}% {} {:+.1}%{} n{}",
             m.world_model_apollo_utility * 100.0,
             m.world_model_decision_credit_leader
                 .chars()
                 .take(9)
                 .collect::<String>(),
             m.world_model_decision_credit_leader_score * 100.0,
+            if m.world_model_decision_credit_leader_observations < 8 {
+                "~"
+            } else {
+                ""
+            },
             compact_counter(u64::from(m.world_model_decision_credit_leader_observations)),
         ));
     }
@@ -1784,6 +1793,18 @@ fn learning_percent(value: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
+/// Coverage collapses to `0%` under `{:.0}` for anything below 0.5%, which
+/// cannot be told apart from a genuine zero. A rate that is small but real is
+/// reported as such.
+fn coverage_percent(value: Option<f64>) -> String {
+    match value.filter(|value| value.is_finite()) {
+        None => "--".to_string(),
+        Some(value) if value <= 0.0 => "0%".to_string(),
+        Some(value) if value < 0.005 => "<1%".to_string(),
+        Some(value) => format!("{:.0}%", (value * 100.0).clamp(0.0, 100.0)),
+    }
+}
+
 fn utility_percent(value: Option<f64>) -> String {
     value
         .filter(|value| value.is_finite())
@@ -1850,14 +1871,22 @@ fn render_learning_band(status: &DaemonStatus) -> Vec<String> {
     let worst = if trust.worst_producer.is_empty() || trust.worst_action.is_empty() {
         "Worst  none with local Gold calibration".to_string()
     } else {
-        format!(
-            "Worst  {}/{}@{} MAE {} cov {}",
-            trust.worst_producer,
-            trust.worst_action,
-            trust.worst_horizon,
+        // Build the numbers first and give the identity whatever room is left.
+        // Trimming the other way round truncates a value mid-digit — "cov <1"
+        // instead of "cov <1%" — which is worse than a shortened name.
+        let tail = format!(
+            " MAE {} n{} cov {}",
             learning_percent(trust.worst_normalized_mae),
-            learning_percent(trust.worst_coverage),
-        )
+            format_number(trust.worst_sample_count),
+            coverage_percent(trust.worst_coverage),
+        );
+        let identity = format!(
+            "{}/{}@{}",
+            trust.worst_producer, trust.worst_action, trust.worst_horizon
+        );
+        let room = CW.saturating_sub("Worst  ".len() + tail.chars().count());
+        let identity: String = identity.chars().take(room).collect();
+        format!("Worst  {identity}{tail}")
     };
     let latest = &metrics.latest_resolved_episode;
     let latest = if !latest.present {
@@ -2104,7 +2133,7 @@ mod tests {
         let lines = render_learning_band(&status);
         assert_eq!(
             lines[1],
-            "Worst  world-model/boost:action@5s MAE 12% cov 90%"
+            "Worst  world-model/boost:action@5s MAE 12% n0 cov 90%"
         );
         assert_eq!(
             lines[2],
@@ -2276,6 +2305,65 @@ mod tests {
             .any(|line| line == "WM wait immature4 uncertain2"));
         assert!(think.iter().any(|line| line == "Mk-H 5s5 30s25 2m70 10m80"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn a_small_but_real_coverage_is_not_rounded_down_to_zero() {
+        assert_eq!(coverage_percent(None), "--");
+        assert_eq!(coverage_percent(Some(0.0)), "0%");
+        assert_eq!(
+            coverage_percent(Some(0.004)),
+            "<1%",
+            "a rate below half a percent must not be indistinguishable from zero"
+        );
+        assert_eq!(coverage_percent(Some(0.9)), "90%");
+    }
+
+    #[test]
+    fn the_worst_calibrated_model_reports_the_samples_behind_its_error() {
+        let mut status = dashboard_status();
+        status.metrics.trust_inventory.worst_producer = "world-model".to_string();
+        status.metrics.trust_inventory.worst_action = "interaction_qos:task_qos".to_string();
+        status.metrics.trust_inventory.worst_horizon = "30s".to_string();
+        status.metrics.trust_inventory.worst_normalized_mae = Some(0.10);
+        status.metrics.trust_inventory.worst_coverage = Some(0.004);
+        status.metrics.trust_inventory.worst_sample_count = 37;
+
+        let rendered = render_learning_band(&status);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line
+                    == "Worst  world-model/interaction_qos:task_qos@30 MAE 10% n37 cov <1%"),
+            "MAE must carry its sample count and coverage its real magnitude: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_credit_leader_below_the_prior_weight_is_marked_low_sample() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_decision_credit_sources = 16;
+        status.metrics.world_model_decision_credit_leader = "predictive_profile".to_string();
+        status.metrics.world_model_decision_credit_leader_score = 0.745;
+        status
+            .metrics
+            .world_model_decision_credit_leader_observations = 3;
+        status.metrics.world_model_apollo_utility = -0.016;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line.contains("+74.5%~ n3")),
+            "a leader shrunk to a quarter of face value must say so: {think:?}"
+        );
+
+        status
+            .metrics
+            .world_model_decision_credit_leader_observations = 40;
+        let settled = render_think_q(&status);
+        assert!(
+            settled.iter().any(|line| line.contains("+74.5% n40")),
+            "a mature leader carries no marker: {settled:?}"
+        );
     }
 
     #[test]
