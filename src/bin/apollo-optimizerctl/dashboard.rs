@@ -637,9 +637,9 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             // this phase. Printing 0 reads as a measured failure rather than a
             // quantity that is not yet defined.
             if m.microexperiment_phase == "shadow" && m.microexperiment_pair_gold_total == 0 {
-                "Gold n/a".to_string()
+                "Gn/a".to_string()
             } else {
-                format!("Gold{}", compact_counter(m.microexperiment_pair_gold_total))
+                format!("G{}", compact_counter(m.microexperiment_pair_gold_total))
             },
         ));
         if m.microexperiment_rollout_required > 0 {
@@ -666,7 +666,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         // Endpoint wire. `wire` is the contract state; the rest separate the
         // stages so a stalled circuit names its own cause.
         lines.push(format!(
-            "       wire{} arm{} bind{} end{} wait{}",
+            "       wire{} arm{} bind{} end{} wt{}",
             if m.microexperiment_endpoint_contract_ready {
                 "+"
             } else {
@@ -1169,11 +1169,14 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             _ => "protected",
         };
         lines.push(format!(
-            "WM-DYN {} A{} R{}/{} V{} e{:.1}%",
+            "WM-DYN {} A{} R{}/{}",
             phase,
             format_number(m.world_model_dynamics_authoritative_models),
             format_number(m.world_model_dynamics_ranking_models),
             format_number(m.world_model_dynamics_ready_models),
+        ));
+        lines.push(format!(
+            "       V{} e{:.1}%",
             format_number(m.world_model_dynamics_validation_samples),
             m.world_model_dynamics_validation_mae * 100.0
         ));
@@ -2309,6 +2312,32 @@ mod tests {
     }
 
     #[test]
+    fn the_lab_and_dynamics_rows_fit_the_quadrant_with_real_values() {
+        // Both rows render only when their subsystem has data, so the existing
+        // width assertions never reached them and they overflowed the box in
+        // production. These are the shapes actually observed on the daemon.
+        let mut status = dashboard_status();
+        status.metrics.microexperiment_phase = "shadow".to_string();
+        status.metrics.microexperiment_shadow_would_open_total = 2_000;
+        status.metrics.microexperiment_open_pairs = 0;
+        status.metrics.microexperiment_pair_gold_total = 0;
+        status.metrics.world_model_dynamics_action_models = 255;
+        status.metrics.world_model_dynamics_phase = "trusted".to_string();
+        status.metrics.world_model_dynamics_authoritative_models = 21;
+        status.metrics.world_model_dynamics_ranking_models = 48;
+        status.metrics.world_model_dynamics_ready_models = 67;
+        status.metrics.world_model_dynamics_validation_samples = 22_287;
+        status.metrics.world_model_dynamics_validation_mae = 0.05;
+
+        let think = render_think_q(&status);
+        let over: Vec<_> = think
+            .iter()
+            .filter(|line| display_width(line) > QW)
+            .collect();
+        assert!(over.is_empty(), "rows overflow the quadrant: {over:?}");
+    }
+
+    #[test]
     fn no_two_think_quadrant_rows_share_a_label() {
         // Two rows under one label are indistinguishable to a reader. This
         // caught `WM-E` (evidence flow vs episodic) and `Causal` (imagination
@@ -2784,9 +2813,7 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Seq-E  boost>markov_prewarm"));
-        assert!(think
-            .iter()
-            .any(|line| line == "WM-DYN shadow A0 R4/6 V42 e3.2%"));
+        assert!(think.iter().any(|line| line == "WM-DYN shadow A0 R4/6"));
         assert!(think.iter().any(|line| line == "MPC-D  P17 R9 A3 B8 u7.1%"));
         assert!(think
             .iter()
