@@ -1145,6 +1145,15 @@ pub struct TelemetryMedallionMetrics {
     pub actuator_expired_total: u64,
     pub actuator_mean_quality: f64,
     pub actuator_mean_utility: f64,
+    /// Action-model capacity accounting. `capacity` is the hard ceiling, so a
+    /// `len` that sits on it means every newly observed key destroys a learned
+    /// one — the difference between "still maturing" and "repeatedly reborn".
+    pub action_model_len: u64,
+    pub action_model_capacity: u64,
+    pub action_model_evictions_total: u64,
+    pub action_model_births_total: u64,
+    pub action_model_evidence_updates_total: u64,
+    pub action_model_last_evidence_cycle: u64,
     pub apollo_utility_ema: f64,
     pub decision_credit_sources: u64,
     pub decision_credit_leader_score: f64,
@@ -1222,6 +1231,14 @@ pub struct TelemetryMedallionPersisted {
     pub family_stats: BTreeMap<ActuatorFamily, ActuatorFamilyStats>,
     #[serde(default)]
     pub action_models: BTreeMap<String, ActionModelStats>,
+    #[serde(default)]
+    pub action_model_evictions_total: u64,
+    #[serde(default)]
+    pub action_model_births_total: u64,
+    #[serde(default)]
+    pub action_model_evidence_updates_total: u64,
+    #[serde(default)]
+    pub action_model_last_evidence_cycle: u64,
     #[serde(default, deserialize_with = "deserialize_recent_evidence")]
     pub recent_evidence: Vec<ResolvedActuatorEvidence>,
     #[serde(default, deserialize_with = "deserialize_episodic_evidence")]
@@ -1369,6 +1386,13 @@ pub struct TelemetryMedallion {
     family_stats: BTreeMap<ActuatorFamily, ActuatorFamilyStats>,
     action_models: BTreeMap<String, ActionModelStats>,
     action_models_revision: u64,
+    /// Capacity accounting for `action_models`. Eviction at `MAX_ACTION_MODELS`
+    /// destroys learned evidence, so it is counted rather than silent: a reborn
+    /// key is otherwise indistinguishable from one patiently maturing.
+    action_model_evictions_total: u64,
+    action_model_births_total: u64,
+    action_model_evidence_updates_total: u64,
+    action_model_last_evidence_cycle: u64,
     recent_evidence: VecDeque<ResolvedActuatorEvidence>,
     episodic_evidence: VecDeque<ResolvedActuatorEvidence>,
     new_gold_evidence: VecDeque<ResolvedActuatorEvidence>,
@@ -1440,6 +1464,10 @@ impl Default for TelemetryMedallion {
             family_stats: BTreeMap::new(),
             action_models: BTreeMap::new(),
             action_models_revision: 0,
+            action_model_evictions_total: 0,
+            action_model_births_total: 0,
+            action_model_evidence_updates_total: 0,
+            action_model_last_evidence_cycle: 0,
             recent_evidence: VecDeque::new(),
             episodic_evidence: VecDeque::new(),
             new_gold_evidence: VecDeque::new(),
@@ -2800,18 +2828,32 @@ impl TelemetryMedallion {
             keys.push(format!("{}|{}", evidence.workload, parent));
         }
         keys.push(format!("{}:*", evidence.family.as_str()));
+        let now_unix = evidence.resolved_timestamp_unix;
         for key in keys {
-            if !self.action_models.contains_key(&key)
-                && self.action_models.len() >= MAX_ACTION_MODELS
-            {
+            let unseen = !self.action_models.contains_key(&key);
+            if unseen && self.action_models.len() >= MAX_ACTION_MODELS {
+                // Rank eviction by decayed evidence — the same currency the
+                // readiness gate spends. Raw `observations` never decay, so
+                // ranking by them keeps long-dead models resident forever while
+                // destroying the young ones that are actually accumulating.
                 if let Some(evict) = self
                     .action_models
                     .iter()
-                    .min_by_key(|(_, stats)| (stats.observations, stats.last_cycle))
+                    .min_by(|left, right| {
+                        left.1
+                            .effective_evidence_at(now_unix)
+                            .total_cmp(&right.1.effective_evidence_at(now_unix))
+                            .then(left.1.last_cycle.cmp(&right.1.last_cycle))
+                    })
                     .map(|(key, _)| key.clone())
                 {
                     self.action_models.remove(&evict);
+                    self.action_model_evictions_total =
+                        self.action_model_evictions_total.saturating_add(1);
                 }
+            }
+            if unseen {
+                self.action_model_births_total = self.action_model_births_total.saturating_add(1);
             }
             let model = self.action_models.entry(key).or_default();
             let previous_mean = model.utility_ema;
@@ -2871,6 +2913,9 @@ impl TelemetryMedallion {
             model.hardware_regime = evidence.hardware_regime;
             model.installation_id = evidence.installation_id;
         }
+        self.action_model_evidence_updates_total =
+            self.action_model_evidence_updates_total.saturating_add(1);
+        self.action_model_last_evidence_cycle = evidence.resolved_cycle;
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
     }
 
@@ -2982,6 +3027,12 @@ impl TelemetryMedallion {
             } else {
                 (self.actuator_utility_sum / self.actuator_resolved_total as f64).clamp(-1.0, 1.0)
             },
+            action_model_len: self.action_models.len() as u64,
+            action_model_capacity: MAX_ACTION_MODELS as u64,
+            action_model_evictions_total: self.action_model_evictions_total,
+            action_model_births_total: self.action_model_births_total,
+            action_model_evidence_updates_total: self.action_model_evidence_updates_total,
+            action_model_last_evidence_cycle: self.action_model_last_evidence_cycle,
             apollo_utility_ema: self.apollo_utility_ema.clamp(-1.0, 1.0),
             decision_credit_sources: self.decision_source_stats.len() as u64,
             decision_credit_leader_score: decision_credit_leader
@@ -3445,6 +3496,10 @@ impl TelemetryMedallion {
             pending_actions: self.pending_actions.iter().cloned().collect(),
             family_stats: self.family_stats.clone(),
             action_models: self.action_models.clone(),
+            action_model_evictions_total: self.action_model_evictions_total,
+            action_model_births_total: self.action_model_births_total,
+            action_model_evidence_updates_total: self.action_model_evidence_updates_total,
+            action_model_last_evidence_cycle: self.action_model_last_evidence_cycle,
             recent_evidence: self.recent_evidence.iter().cloned().collect(),
             episodic_evidence: self.episodic_evidence.iter().cloned().collect(),
             external_counters: self.external_counters.clone(),
@@ -3598,6 +3653,10 @@ impl TelemetryMedallion {
             })
             .take(MAX_ACTION_MODELS)
             .collect();
+        self.action_model_evictions_total = state.action_model_evictions_total;
+        self.action_model_births_total = state.action_model_births_total;
+        self.action_model_evidence_updates_total = state.action_model_evidence_updates_total;
+        self.action_model_last_evidence_cycle = state.action_model_last_evidence_cycle;
         self.recent_evidence = state
             .recent_evidence
             .into_iter()
@@ -6068,6 +6127,192 @@ mod tests {
             confounder_count: 0,
             target_present_after: None,
         }
+    }
+
+    /// Fills `action_models` to the hard ceiling with recently useful models so
+    /// the next unseen key is forced to evict something.
+    fn saturate_action_models(
+        medallion: &mut TelemetryMedallion,
+        now_unix: i64,
+        hardware: HardwareRegime,
+    ) {
+        while medallion.action_models.len() < MAX_ACTION_MODELS {
+            let key = format!("filler:{}", medallion.action_models.len());
+            medallion.action_models.insert(
+                key,
+                ActionModelStats {
+                    observations: 40,
+                    evidence_mass: 40.0,
+                    quality_ema: 0.95,
+                    last_cycle: 500,
+                    last_observed_unix: now_unix,
+                    hardware_regime: hardware,
+                    installation_id: LOCAL_ID,
+                    ..ActionModelStats::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_saturated_map_evicts_the_decayed_model_not_the_young_active_one() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        // A model that was busy long ago and has since decayed to nothing. Its
+        // raw `observations` stay high forever because they never decay.
+        medallion.action_models.insert(
+            "zombie:Ancient".to_string(),
+            ActionModelStats {
+                observations: 5_000,
+                evidence_mass: ACTION_MODEL_EVIDENCE_CAP,
+                quality_ema: 0.95,
+                last_cycle: 1,
+                last_observed_unix: now_unix - 60 * 24 * 60 * 60,
+                hardware_regime: hardware,
+                installation_id: LOCAL_ID,
+                ..ActionModelStats::default()
+            },
+        );
+        // A model observed moments ago that is genuinely accumulating evidence.
+        medallion.action_models.insert(
+            "young:Active".to_string(),
+            ActionModelStats {
+                observations: 3,
+                evidence_mass: 3.0,
+                quality_ema: 0.95,
+                last_cycle: 999,
+                last_observed_unix: now_unix,
+                hardware_regime: hardware,
+                installation_id: LOCAL_ID,
+                ..ActionModelStats::default()
+            },
+        );
+        saturate_action_models(&mut medallion, now_unix, hardware);
+        assert_eq!(medallion.action_models.len(), MAX_ACTION_MODELS);
+
+        let zombie_evidence = medallion
+            .action_models
+            .get("zombie:Ancient")
+            .unwrap()
+            .effective_evidence_at(now_unix);
+        let young_evidence = medallion
+            .action_models
+            .get("young:Active")
+            .unwrap()
+            .effective_evidence_at(now_unix);
+        assert!(
+            zombie_evidence < young_evidence,
+            "the decayed model must carry less usable evidence: {zombie_evidence} vs {young_evidence}"
+        );
+
+        let mut evidence = gold_evidence("boost:Fresh", 0.1, now_unix, hardware);
+        evidence.workload = "general".to_string();
+        medallion.update_action_model(&evidence);
+
+        assert!(
+            medallion.action_models.contains_key("young:Active"),
+            "a young model that is actively accumulating evidence must not be \
+             evicted in favour of one whose evidence has fully decayed"
+        );
+        assert!(
+            !medallion.action_models.contains_key("zombie:Ancient"),
+            "the decayed model is the correct eviction victim"
+        );
+    }
+
+    #[test]
+    fn evicting_a_learned_model_is_counted_rather_than_silent() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        saturate_action_models(&mut medallion, now_unix, hardware);
+        assert_eq!(medallion.metrics().action_model_evictions_total, 0);
+
+        let mut evidence = gold_evidence("boost:Fresh", 0.1, now_unix, hardware);
+        evidence.workload = "general".to_string();
+        medallion.update_action_model(&evidence);
+
+        let metrics = medallion.metrics();
+        assert_eq!(
+            metrics.action_model_len, metrics.action_model_capacity,
+            "the map stays pinned at its ceiling"
+        );
+        assert!(
+            metrics.action_model_evictions_total > 0,
+            "destroying learned evidence must be observable, not silent"
+        );
+        assert!(
+            metrics.action_model_births_total > 0,
+            "the replacement key must be counted as a birth"
+        );
+    }
+
+    #[test]
+    fn evidence_updates_record_when_the_world_model_last_made_progress() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        assert_eq!(medallion.metrics().action_model_evidence_updates_total, 0);
+        assert_eq!(medallion.metrics().action_model_last_evidence_cycle, 0);
+
+        let mut evidence = gold_evidence("boost:Editor", 0.1, now_unix, hardware);
+        evidence.resolved_cycle = 4_242;
+        medallion.update_action_model(&evidence);
+
+        let metrics = medallion.metrics();
+        assert_eq!(metrics.action_model_evidence_updates_total, 1);
+        assert_eq!(metrics.action_model_last_evidence_cycle, 4_242);
+    }
+
+    #[test]
+    fn capacity_accounting_survives_the_persistence_round_trip() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        saturate_action_models(&mut medallion, now_unix, hardware);
+        let mut evidence = gold_evidence("boost:Fresh", 0.1, now_unix, hardware);
+        evidence.workload = "general".to_string();
+        medallion.update_action_model(&evidence);
+        let before = medallion.metrics();
+        assert!(before.action_model_evictions_total > 0);
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(medallion.snapshot());
+        let after = restored.metrics();
+
+        assert_eq!(
+            after.action_model_evictions_total, before.action_model_evictions_total,
+            "capacity pressure history must survive restart"
+        );
+        assert_eq!(
+            after.action_model_births_total,
+            before.action_model_births_total
+        );
+        assert_eq!(
+            after.action_model_evidence_updates_total,
+            before.action_model_evidence_updates_total
+        );
+        assert_eq!(
+            after.action_model_last_evidence_cycle,
+            before.action_model_last_evidence_cycle
+        );
     }
 
     #[test]
