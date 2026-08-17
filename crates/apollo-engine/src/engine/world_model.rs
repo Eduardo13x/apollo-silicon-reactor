@@ -1739,6 +1739,28 @@ fn episode_similarity(left: ActuatorEpisodeContext, right: ActuatorEpisodeContex
     (1.0 - distance / weight.max(f64::EPSILON)).clamp(0.0, 1.0)
 }
 
+/// Convert the decision gate's confidence interval for the *mean* utility into
+/// a prediction interval for a *single* future observation.
+///
+/// `lower_bound`/`upper_bound` are `ema ± Z·σ/√n`: they answer "where is the
+/// true mean". Calibration coverage asks a different question — "will the next
+/// observation land inside" — which needs `ema ± Z·σ`. Publishing the former
+/// where the latter is scored makes the interval up to `√n` too narrow (a
+/// factor of 8 at the evidence cap), so coverage collapses toward zero however
+/// well the model predicts. Multiplying back by `√n` recovers `Z·σ` without
+/// touching the bounds the gate itself spends.
+pub fn predictive_half_width(confidence_half_width: f64, effective_evidence: f64) -> f64 {
+    if !confidence_half_width.is_finite() || confidence_half_width <= 0.0 {
+        return 0.0;
+    }
+    let samples = if effective_evidence.is_finite() {
+        effective_evidence.max(1.0)
+    } else {
+        1.0
+    };
+    confidence_half_width * samples.sqrt()
+}
+
 fn utility_model_status(
     stats: &ActionModelStats,
     now_unix: i64,
@@ -2390,6 +2412,41 @@ mod tests {
             assert_ne!(model.authority_phase(), ModelAuthorityPhase::Trusted);
             assert_eq!(model.utility_ready_actions(), 0);
         }
+    }
+
+    #[test]
+    fn a_prediction_interval_covers_a_draw_the_mean_interval_would_miss() {
+        // Realistic shape from production: sigma 0.20 (MAE 10% of the +/-2
+        // clamp), evidence at the cap. The gate's interval is the standard
+        // error of the mean, eight times too narrow for a single draw.
+        let sigma = 0.20_f64;
+        let evidence = 64.0_f64;
+        let confidence_half = UTILITY_CONFIDENCE_Z * (sigma * sigma / evidence).sqrt();
+        let predictive_half = predictive_half_width(confidence_half, evidence);
+
+        let realized_error = 0.15_f64;
+        assert!(
+            realized_error > confidence_half,
+            "the mean interval ({confidence_half:.4}) misses a draw well inside one sigma"
+        );
+        assert!(
+            realized_error <= predictive_half,
+            "the prediction interval ({predictive_half:.4}) must contain it"
+        );
+        assert!(
+            (predictive_half / confidence_half - evidence.sqrt()).abs() < 1e-9,
+            "widening is exactly sqrt(n)"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_interval_stays_degenerate_rather_than_inventing_width() {
+        assert_eq!(predictive_half_width(0.0, 64.0), 0.0);
+        assert_eq!(predictive_half_width(-1.0, 64.0), 0.0);
+        assert_eq!(predictive_half_width(f64::NAN, 64.0), 0.0);
+        // Fewer than one effective sample must not shrink the interval.
+        assert_eq!(predictive_half_width(0.05, 0.25), 0.05);
+        assert_eq!(predictive_half_width(0.05, f64::NAN), 0.05);
     }
 
     #[test]

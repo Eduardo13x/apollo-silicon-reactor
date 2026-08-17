@@ -1025,7 +1025,14 @@ pub(crate) fn decision_time_forecasts(
 ) -> Vec<PredictionRecord> {
     let mut forecasts = Vec::with_capacity(2);
     if let Some(assessment) = world_model.assess_utility(action_key, workload) {
-        let uncertainty = (assessment.upper_bound - assessment.lower_bound) * 0.5;
+        // Coverage scores whether a single future observation lands inside
+        // this interval, so it must be a prediction interval. The assessment
+        // carries the confidence interval of the mean, which the decision gate
+        // spends and which this must not alter.
+        let uncertainty = apollo_engine::engine::world_model::predictive_half_width(
+            (assessment.upper_bound - assessment.lower_bound) * 0.5,
+            assessment.effective_evidence,
+        );
         if assessment.utility_ema.is_finite()
             && (-1.0..=1.0).contains(&assessment.utility_ema)
             && uncertainty.is_finite()
