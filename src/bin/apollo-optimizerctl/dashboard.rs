@@ -493,11 +493,9 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     if !m.value_scheduler_phase.is_empty() {
         lines.push(format!(
-            "Value  {} obs{} J{}/{} {}/{}ms",
+            "Value  {} obs{} {}/{}ms",
             m.value_scheduler_phase,
             compact_counter(m.value_scheduler_valid_cycles),
-            m.value_scheduler_selected_jobs,
-            m.value_scheduler_registered_jobs,
             m.value_scheduler_predicted_us / 1_000,
             m.value_scheduler_budget_us / 1_000,
         ));
@@ -541,13 +539,27 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             if unattributed > 0 {
                 shown.push(format!("pre{}", compact_counter(unattributed)));
             }
-            for (index, chunk) in shown.chunks(3).enumerate() {
-                lines.push(format!(
-                    "       {}{}",
-                    if index == 0 { "why " } else { "    " },
-                    chunk.join(" ")
-                ));
+            let mut why_lines: Vec<String> = Vec::new();
+            for reason in shown {
+                let fits = why_lines
+                    .last()
+                    .is_some_and(|line| display_width(line) + 1 + display_width(&reason) <= QW);
+                match why_lines.last_mut() {
+                    Some(line) if fits => {
+                        line.push(' ');
+                        line.push_str(&reason);
+                    }
+                    _ => {
+                        let prefix = if why_lines.is_empty() {
+                            "       why "
+                        } else {
+                            "           "
+                        };
+                        why_lines.push(format!("{prefix}{reason}"));
+                    }
+                }
             }
+            lines.extend(why_lines);
         }
         if !m.value_scheduler_blocker.is_empty() && m.value_scheduler_blocker != "shadow-ready" {
             lines.push(format!(
@@ -1055,11 +1067,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     {
         lines.push(format!(
             "WM-X   K{} Q{} O{} P{} C{}",
-            format_number(m.world_model_contextual_markov_total),
-            format_number(m.world_model_contextual_interaction_total),
-            format_number(m.world_model_contextual_io_total),
-            format_number(m.world_model_contextual_predictive_total),
-            format_number(m.world_model_contextual_chromium_total),
+            compact_counter(m.world_model_contextual_markov_total),
+            compact_counter(m.world_model_contextual_interaction_total),
+            compact_counter(m.world_model_contextual_io_total),
+            compact_counter(m.world_model_contextual_predictive_total),
+            compact_counter(m.world_model_contextual_chromium_total),
         ));
         let family = m.world_model_contextual_last_action.split_once(':').map_or(
             m.world_model_contextual_last_action.as_str(),
@@ -2336,6 +2348,20 @@ mod tests {
         // reached them and eight of them displaced the box border.
         let mut status = dashboard_status();
         let m = &mut status.metrics;
+        m.world_model_contextual_markov_total = 10_108;
+        m.world_model_contextual_interaction_total = 800;
+        m.world_model_contextual_io_total = 1;
+        m.world_model_contextual_predictive_total = 1_896;
+        m.world_model_contextual_chromium_total = 106;
+        m.value_scheduler_phase = "active".to_string();
+        m.value_scheduler_valid_cycles = 10_000;
+        m.value_scheduler_registered_jobs = 10;
+        m.value_scheduler_budget_us = 100_000;
+        m.value_scheduler_invalid_samples_total = 618;
+        m.value_scheduler_invalid_unhealthy_total = 618;
+        m.value_scheduler_unhealthy_sleeping_total = 375;
+        m.value_scheduler_unhealthy_thermal_total = 25;
+        m.value_scheduler_unhealthy_p95_total = 218;
         m.interaction_qos_ttl_band = "standard".to_string();
         m.interaction_qos_ttl_ms = 1_200;
         m.interaction_qos_ttl_exploratory = false;
