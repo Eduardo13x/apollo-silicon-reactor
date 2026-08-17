@@ -629,11 +629,18 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     if !m.microexperiment_phase.is_empty() {
         lines.push(format!(
-            "Lab    {} would{} open{} Gold{}",
+            "Lab    {} would{} open{} {}",
             m.microexperiment_phase,
             compact_counter(m.microexperiment_shadow_would_open_total),
             compact_counter(m.microexperiment_open_pairs),
-            compact_counter(m.microexperiment_pair_gold_total),
+            // Shadow issues no arms at all, so a pair can never close Gold in
+            // this phase. Printing 0 reads as a measured failure rather than a
+            // quantity that is not yet defined.
+            if m.microexperiment_phase == "shadow" && m.microexperiment_pair_gold_total == 0 {
+                "Gold n/a".to_string()
+            } else {
+                format!("Gold{}", compact_counter(m.microexperiment_pair_gold_total))
+            },
         ));
         if m.microexperiment_rollout_required > 0 {
             lines.push(format!(
@@ -906,10 +913,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         _ => "protected",
     };
     if m.world_model_actuator_known_models == 0 {
-        lines.push("WM-U   protected · no evidence".to_string());
+        lines.push("WM-UTL protected · no evidence".to_string());
     } else {
         lines.push(format!(
-            "WM-U   {} {}/{}",
+            "WM-UTL {} {}/{}",
             authority_phase,
             format_number(m.world_model_actuator_ready_models),
             format_number(m.world_model_actuator_known_models)
@@ -971,12 +978,12 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     // "Waiting" only means learning is in flight if evidence is still arriving.
     lines.push(if m.world_model_last_evidence_cycle == 0 {
         format!(
-            "WM-E   ev{} no evidence yet",
+            "WM-EV  ev{} no evidence yet",
             compact_counter(m.world_model_evidence_updates_total)
         )
     } else {
         format!(
-            "WM-E   ev{} last c{} idle{}",
+            "WM-EV  ev{} last c{} idle{}",
             compact_counter(m.world_model_evidence_updates_total),
             format_number(m.world_model_last_evidence_cycle),
             compact_counter(m.cycles.saturating_sub(m.world_model_last_evidence_cycle)),
@@ -1152,7 +1159,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             _ => "protected",
         };
         lines.push(format!(
-            "WM-D   {} A{} R{}/{} V{} e{:.1}%",
+            "WM-DYN {} A{} R{}/{} V{} e{:.1}%",
             phase,
             format_number(m.world_model_dynamics_authoritative_models),
             format_number(m.world_model_dynamics_ranking_models),
@@ -2263,7 +2270,7 @@ mod tests {
         status.metrics.markov_prediction_10m = 0.80;
 
         let think = render_think_q(&status);
-        assert!(think.iter().any(|line| line == "WM-U   trusted 1/7"));
+        assert!(think.iter().any(|line| line == "WM-UTL trusted 1/7"));
         assert!(think
             .iter()
             .any(|line| line == "WM wait immature4 uncertain2"));
@@ -2349,7 +2356,7 @@ mod tests {
         assert!(
             think
                 .iter()
-                .any(|line| line == "WM-E   ev20 last c10,870 idle195"),
+                .any(|line| line == "WM-EV  ev20 last c10,870 idle195"),
             "the age of the newest evidence must be visible: {think:?}"
         );
         assert!(think.iter().all(|line| display_width(line) <= QW));
@@ -2364,7 +2371,7 @@ mod tests {
         let think = render_think_q(&status);
         assert!(think
             .iter()
-            .any(|line| line == "WM-E   ev0 no evidence yet"));
+            .any(|line| line == "WM-EV  ev0 no evidence yet"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2624,7 +2631,7 @@ mod tests {
         assert!(think.iter().any(|line| line == "Act    G 8/10 P2 q94%"));
         assert!(think.iter().any(|line| line == "Act+   boost G5/6"));
         assert!(think.iter().any(|line| line == "       eff 4/6 u+3%"));
-        assert!(think.iter().any(|line| line == "WM-U   calibrating 2/7"));
+        assert!(think.iter().any(|line| line == "WM-UTL calibrating 2/7"));
         assert!(think.iter().any(|line| line == "WM-S   V0 rank3"));
         assert!(think.iter().any(|line| line == "CF     R3/4 H2 rank7"));
         assert!(think.iter().any(|line| line == "WM-E   M23 F6 rank9"));
@@ -2639,7 +2646,7 @@ mod tests {
             .any(|line| line == "Seq-E  boost>markov_prewarm"));
         assert!(think
             .iter()
-            .any(|line| line == "WM-D   shadow A0 R4/6 V42 e3.2%"));
+            .any(|line| line == "WM-DYN shadow A0 R4/6 V42 e3.2%"));
         assert!(think.iter().any(|line| line == "MPC-D  P17 R9 A3 B8 u7.1%"));
         assert!(think
             .iter()
@@ -2666,7 +2673,7 @@ mod tests {
 
         assert!(think
             .iter()
-            .any(|line| line == "WM-U   protected · no evidence"));
+            .any(|line| line == "WM-UTL protected · no evidence"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2726,16 +2733,16 @@ mod tests {
     fn think_quadrant_distinguishes_idle_temporal_model_from_cold_start() {
         let mut status = dashboard_status();
         status.metrics.world_model_temporal_memory_samples = 32;
-        status.metrics.world_model_sequence_abstention_reason = "idle_no_accelerator".to_string();
+        status.metrics.world_model_sequence_abstention_reason = "idle_no_latency_work".to_string();
 
         let think = render_think_q(&status);
 
         assert!(think
             .iter()
-            .any(|line| line == "Seq-E  idle_no_accelerator"));
+            .any(|line| line == "Seq-E  idle_no_latency_work"));
         assert!(think
             .iter()
-            .any(|line| line == "Seq-A  idle_no_accelerator"));
+            .any(|line| line == "Seq-A  idle_no_latency_work"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
