@@ -1444,6 +1444,15 @@ pub struct RuntimeMetrics {
     pub ioreport_gpu_pct: f64,
     #[serde(default)]
     pub ioreport_ane_busy: bool,
+    /// Whether IOReport produced a snapshot at all this cycle.
+    ///
+    /// IOReport is deprecated on macOS 26+, where the subscription requires
+    /// Apple-private entitlements a third-party binary cannot hold. Without a
+    /// snapshot the cluster and GPU percentages below are written as zeros —
+    /// this is what separates those placeholders from a genuinely idle
+    /// machine, and no consumer should read them without checking it.
+    #[serde(default)]
+    pub ioreport_available: bool,
     /// IOReport's view of the Neural Engine as an explicit status:
     /// `unavailable` (no ANE channel in this subscription), `measured-idle`,
     /// or `measured-active`.

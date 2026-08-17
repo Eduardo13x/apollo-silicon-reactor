@@ -3773,19 +3773,23 @@ fn main() -> anyhow::Result<()> {
                     // expose cluster fields as unavailable zeros and preserve
                     // package power from the public powermetrics path. Do not
                     // relabel aggregate CPU as P-cluster activity.
+                    // Published unconditionally: derived from the Option, so
+                    // the no-snapshot path — the live one on macOS 26+ — can
+                    // no longer leave the status empty and have it read as
+                    // "no opinion" instead of "the sensor is gone".
+                    metrics.metrics.ioreport_ane_observation =
+                        apollo_engine::engine::ioreport::ane_observation_of(last_ioreport.as_ref())
+                            .to_string();
+                    // Whether the cluster/GPU percentages below are
+                    // measurements at all. The else branch writes zeros the
+                    // comment above already calls "unavailable zeros"; this is
+                    // what tells them apart from a genuinely idle machine.
+                    metrics.metrics.ioreport_available = last_ioreport.is_some();
                     if let Some(ref ir) = last_ioreport {
                         metrics.metrics.ioreport_p_cluster_pct = ir.p_cluster_pct;
                         metrics.metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
                         metrics.metrics.ioreport_gpu_pct = ir.gpu_pct;
                         metrics.metrics.ioreport_ane_busy = ir.ane_busy;
-                        metrics.metrics.ioreport_ane_observation = if !ir.ane_channel_present {
-                            "unavailable"
-                        } else if ir.ane_busy {
-                            "measured-active"
-                        } else {
-                            "measured-idle"
-                        }
-                        .to_string();
                         metrics.metrics.ioreport_cpu_mw = ir.cpu_mw;
                         metrics.metrics.ioreport_total_watts = ir.total_watts();
                     } else {

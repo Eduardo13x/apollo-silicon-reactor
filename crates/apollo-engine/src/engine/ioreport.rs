@@ -130,6 +130,35 @@ pub struct IOReportSnapshot {
     pub amc_bandwidth_pct: f64,
 }
 
+/// Published when no snapshot exists at all — IOReport is deprecated on macOS
+/// 26+, where the subscription needs Apple-private entitlements a third-party
+/// binary cannot hold, so every utilization field is a placeholder zero rather
+/// than a measurement.
+pub const IOREPORT_UNAVAILABLE: &str = "unavailable";
+
+impl IOReportSnapshot {
+    /// This snapshot's Neural Engine evidence as an explicit status.
+    ///
+    /// Free-standing so the caller cannot publish the ANE fields without also
+    /// publishing what they mean: the previous shape left the status unset on
+    /// the no-snapshot path, which rendered as an empty string — precisely the
+    /// "unknown that looks like nothing" this replaces.
+    pub fn ane_observation(&self) -> &'static str {
+        if !self.ane_channel_present {
+            IOREPORT_UNAVAILABLE
+        } else if self.ane_busy {
+            "measured-active"
+        } else {
+            "measured-idle"
+        }
+    }
+}
+
+/// Status for an optional snapshot, so `None` is reported rather than dropped.
+pub fn ane_observation_of(snapshot: Option<&IOReportSnapshot>) -> &'static str {
+    snapshot.map_or(IOREPORT_UNAVAILABLE, IOReportSnapshot::ane_observation)
+}
+
 impl IOReportSnapshot {
     /// Total SoC power in watts.
     pub fn total_watts(&self) -> f64 {
@@ -460,6 +489,32 @@ mod tests {
         assert!(!never_observed.ane_channel_present);
         assert!(measured_idle.ane_channel_present);
         assert!(measured_busy.ane_channel_present && measured_busy.ane_busy);
+    }
+
+    /// The no-snapshot path is the live one on macOS 26+, where IOReport needs
+    /// Apple-private entitlements. Publishing the status only from the
+    /// snapshot branch left it empty there, which reads as "no opinion" rather
+    /// than "the sensor is gone" — the same defect one level up.
+    #[test]
+    fn a_missing_snapshot_reports_unavailable_rather_than_nothing() {
+        assert_eq!(ane_observation_of(None), IOREPORT_UNAVAILABLE);
+        assert!(!ane_observation_of(None).is_empty());
+
+        let idle = IOReportSnapshot {
+            ane_channel_present: true,
+            ..IOReportSnapshot::default()
+        };
+        let busy = IOReportSnapshot {
+            ane_channel_present: true,
+            ane_busy: true,
+            ..IOReportSnapshot::default()
+        };
+        let no_channel = IOReportSnapshot::default();
+
+        assert_eq!(ane_observation_of(Some(&idle)), "measured-idle");
+        assert_eq!(ane_observation_of(Some(&busy)), "measured-active");
+        // A snapshot without an ANE channel is as blind as no snapshot.
+        assert_eq!(ane_observation_of(Some(&no_channel)), IOREPORT_UNAVAILABLE);
     }
 
     #[test]
