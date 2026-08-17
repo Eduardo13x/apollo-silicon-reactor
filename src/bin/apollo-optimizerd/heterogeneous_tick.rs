@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 
 use apollo_engine::engine::compute_fabric::{
@@ -24,9 +24,14 @@ const RSS_MEMORY_DIVISOR: u64 = 128;
 const MAX_IDLE_CPU_PERCENT: f64 = 1.0;
 const SUSTAINED_REGRESSION_CYCLES: u32 = 30;
 const OPTIONAL_RECOVERY_CYCLES: u32 = 30;
-/// Cycles sampled before the control p95 baseline is fixed. One sample made it
-/// a startup lottery; a median over a window is representative of steady state.
-const BASELINE_WARMUP_SAMPLES: usize = 60;
+/// Idle control samples retained for the rolling baseline median. The window
+/// is the entire baseline state, so an expensive boot ages out on its own
+/// rather than being latched for the life of the daemon. Bounded by
+/// construction: 120 f64 ≈ 1 KiB, sorted only on idle cycles.
+const BASELINE_WINDOW_SAMPLES: usize = 120;
+/// Samples required before the baseline arms. Until then the fabric stays
+/// blocked, which is the conservative direction.
+const BASELINE_MIN_SAMPLES: usize = 60;
 /// Consecutive idle cycles required before the baseline may track upward, so
 /// work draining from an earlier cycle cannot inflate the control measurement.
 const BASELINE_IDLE_CYCLES: u32 = 5;
@@ -101,7 +106,7 @@ pub struct HeterogeneousRuntime {
     last_accelerator_prediction:
         Option<(apollo_engine::engine::world_state::WorldIdentity, [f32; 4])>,
     baseline_p95_ms: Option<f64>,
-    baseline_samples: Vec<f64>,
+    baseline_window: VecDeque<f64>,
     baseline_last_submitted: u64,
     baseline_idle_streak: u32,
     baseline_rss_bytes: u64,
@@ -132,7 +137,7 @@ impl HeterogeneousRuntime {
             metrics: HeterogeneousTickMetrics::default(),
             last_accelerator_prediction: None,
             baseline_p95_ms: None,
-            baseline_samples: Vec::with_capacity(BASELINE_WARMUP_SAMPLES),
+            baseline_window: VecDeque::with_capacity(BASELINE_WINDOW_SAMPLES),
             baseline_last_submitted: 0,
             baseline_idle_streak: 0,
             baseline_rss_bytes,
@@ -159,10 +164,19 @@ impl HeterogeneousRuntime {
     /// production at baseline=22ms against a steady-state 37ms, which put the
     /// 1.10x threshold at 24.2ms and held submissions at zero.
     ///
-    /// So: take a median over a warmup window rather than one sample, and while
-    /// the fabric is idle let the baseline track upward. Movement that happens
-    /// with no optional work in flight cannot be a fabric regression. Upward
-    /// only — letting a quiet period lower the bar would recreate the latch.
+    /// Fixing it from a warmup window instead traded that for the opposite
+    /// latch. Boot is expensive — state restore, model load, first Metal warmup
+    /// — so the window measured ~107ms against a 39ms steady state and pinned
+    /// the baseline at `MAX_CONTROL_P95_MS`. That ceiling is also the health
+    /// limit checked independently below, so the guard became inert: every p95
+    /// it would have rejected was already rejected by the ceiling.
+    ///
+    /// So the baseline is a rolling median over a bounded window of idle
+    /// samples. One mechanism, both directions: an expensive boot ages out of
+    /// the window on its own, a median cannot be dragged by a single quiet
+    /// cycle, and a sustained regression still moves it only as fast as the
+    /// window fills. Restricting samples to idle cycles is what keeps the
+    /// fabric's own work out of the measurement it is judged against.
     fn update_control_baseline(&mut self, p95_cycle_ms: f64) {
         if !p95_cycle_ms.is_finite() || p95_cycle_ms <= 0.0 {
             return;
@@ -175,25 +189,23 @@ impl HeterogeneousRuntime {
         };
         self.baseline_last_submitted = self.metrics.submitted_total;
 
-        let Some(baseline) = self.baseline_p95_ms else {
-            if self.baseline_samples.len() < BASELINE_WARMUP_SAMPLES {
-                self.baseline_samples.push(p95_cycle_ms);
-            }
-            if self.baseline_samples.len() >= BASELINE_WARMUP_SAMPLES {
-                let mut sorted = self.baseline_samples.clone();
-                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-                self.baseline_p95_ms = Some(sorted[sorted.len() / 2].min(MAX_CONTROL_P95_MS));
-                self.baseline_samples.clear();
-                self.baseline_samples.shrink_to_fit();
-            }
+        // The baseline is defined as control-loop p95 with no optional work in
+        // flight, so only a sustained idle streak yields an admissible sample:
+        // work draining from an earlier cycle would otherwise be attributed to
+        // the control loop.
+        if self.baseline_idle_streak < BASELINE_IDLE_CYCLES {
             return;
-        };
-
-        // Require a sustained idle streak so work still draining from an
-        // earlier cycle cannot inflate the control baseline.
-        if self.baseline_idle_streak >= BASELINE_IDLE_CYCLES && p95_cycle_ms > baseline {
-            self.baseline_p95_ms = Some(p95_cycle_ms.min(MAX_CONTROL_P95_MS));
         }
+        if self.baseline_window.len() == BASELINE_WINDOW_SAMPLES {
+            self.baseline_window.pop_front();
+        }
+        self.baseline_window.push_back(p95_cycle_ms);
+        if self.baseline_window.len() < BASELINE_MIN_SAMPLES {
+            return;
+        }
+        let mut sorted: Vec<f64> = self.baseline_window.iter().copied().collect();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        self.baseline_p95_ms = Some(sorted[sorted.len() / 2].min(MAX_CONTROL_P95_MS));
     }
 
     pub fn tick(&mut self, input: HeterogeneousTickInput) -> HeterogeneousTickMetrics {
@@ -715,18 +727,90 @@ mod tests {
         }
     }
 
-    /// Closes the control-baseline warmup window so a test can exercise
-    /// steady-state behaviour. Runs with the fabric blocked so the baseline is
-    /// collected from genuinely idle cycles, exactly as in production.
+    /// Cycles needed to arm the baseline: the leading idle streak is consumed
+    /// establishing that the fabric is quiet and yields no samples.
+    const CYCLES_TO_ARM: usize = BASELINE_MIN_SAMPLES + BASELINE_IDLE_CYCLES as usize + 1;
+
+    /// Arms the control baseline so a test can exercise steady-state behaviour.
+    /// Runs with the fabric blocked so the baseline is collected from genuinely
+    /// idle cycles, exactly as in production.
     fn warm_baseline(runtime: &mut HeterogeneousRuntime, p95_cycle_ms: f64) {
-        for _ in 0..=BASELINE_WARMUP_SAMPLES {
-            let mut warm = tick_input(0.0, false, false);
-            warm.p95_cycle_ms = p95_cycle_ms;
-            // Keep the optional-recovery streak at zero so warming the baseline
-            // does not itself unblock the fabric and mask what a test is for.
-            warm.optional_recovery_healthy = false;
-            runtime.tick(warm);
+        feed_control(runtime, p95_cycle_ms, CYCLES_TO_ARM);
+    }
+
+    /// Feeds `cycles` control-loop observations at `p95_cycle_ms` with the
+    /// fabric held idle, which is the only regime the baseline is defined over.
+    fn feed_control(runtime: &mut HeterogeneousRuntime, p95_cycle_ms: f64, cycles: usize) {
+        for _ in 0..cycles {
+            let mut sample = tick_input(0.0, false, false);
+            sample.p95_cycle_ms = p95_cycle_ms;
+            sample.optional_recovery_healthy = false;
+            runtime.tick(sample);
         }
+    }
+
+    /// Boot is expensive — state restore, model load, first Metal warmup — and
+    /// production measured 107ms there against a 39ms steady state. Fixing the
+    /// baseline from that window pinned it at `MAX_CONTROL_P95_MS`, which is
+    /// also the health ceiling on line 213: the guard then cannot express a
+    /// regression at all, because every value it would reject is already above
+    /// the ceiling that rejects independently.
+    #[test]
+    fn the_control_baseline_converges_from_an_expensive_warmup_to_the_steady_regime() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+
+        feed_control(&mut runtime, 110.0, CYCLES_TO_ARM);
+        feed_control(&mut runtime, 39.0, 240);
+
+        let baseline = runtime.baseline_p95_ms.expect("baseline is armed");
+        assert!(
+            (30.0..=50.0).contains(&baseline),
+            "baseline must converge toward the 39ms steady regime, got {baseline}"
+        );
+        assert!(
+            baseline < MAX_CONTROL_P95_MS,
+            "a baseline sitting on the ceiling makes the regression guard inert"
+        );
+    }
+
+    /// Convergence must not become jitter: the baseline is a reference level,
+    /// so one unusually quiet cycle cannot be allowed to drag it down and start
+    /// rejecting healthy work on the next cycle.
+    #[test]
+    fn a_single_quiet_cycle_cannot_drag_the_control_baseline_down() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+        feed_control(&mut runtime, 40.0, CYCLES_TO_ARM + 200);
+        let settled = runtime.baseline_p95_ms.expect("baseline is armed");
+
+        feed_control(&mut runtime, 1.0, 1);
+
+        let after = runtime.baseline_p95_ms.expect("baseline stays armed");
+        assert!(
+            (settled - after).abs() < 1.0,
+            "one 1ms sample moved the baseline {settled} -> {after}"
+        );
+    }
+
+    /// The point of the guard: once the baseline describes the steady regime, a
+    /// sustained control-loop regression must still stop optional work.
+    #[test]
+    fn a_sustained_regression_still_blocks_the_fabric_after_convergence() {
+        let initial = world(1);
+        let mut runtime = HeterogeneousRuntime::new(&initial);
+        feed_control(&mut runtime, 39.0, CYCLES_TO_ARM + 200);
+        let baseline = runtime.baseline_p95_ms.expect("baseline is armed");
+        assert!(baseline < 50.0, "precondition: converged, got {baseline}");
+
+        let mut regressed = tick_input(0.0, true, true);
+        regressed.p95_cycle_ms = baseline * 1.5;
+        let metrics = runtime.tick(regressed);
+
+        assert_eq!(
+            metrics.blocker, "control-p95",
+            "a doubled control p95 must still be refused"
+        );
     }
 
     #[test]
@@ -788,7 +872,7 @@ mod tests {
         );
 
         // Steady state arrives before the warmup window closes.
-        for _ in 0..BASELINE_WARMUP_SAMPLES {
+        for _ in 0..CYCLES_TO_ARM {
             let mut steady = tick_input(0.0, true, true);
             steady.p95_cycle_ms = 37.0;
             runtime.tick(steady);
@@ -801,34 +885,38 @@ mod tests {
         );
     }
 
+    /// Replaces `an_idle_fabric_lets_the_baseline_track_upward_but_never_downward`.
+    ///
+    /// That test pinned a ratchet: upward instantly, downward never. The
+    /// "never downward" half is what pinned the baseline to the ceiling after
+    /// an expensive boot and made the guard inert, so the rule is now a rolling
+    /// median that moves in both directions. What must survive is the property
+    /// the old test actually protected — a quiet spell cannot lower the bar and
+    /// re-lock the fabric — which the median delivers by robustness rather than
+    /// by refusing to move. The upward half is deliberately weakened too: a
+    /// brief rise no longer moves the baseline at all.
     #[test]
-    fn an_idle_fabric_lets_the_baseline_track_upward_but_never_downward() {
+    fn the_baseline_follows_a_sustained_control_shift_and_ignores_brief_ones() {
         let initial = world(1);
         let mut runtime = HeterogeneousRuntime::new(&initial);
-        // Close the warmup window at a low baseline, with the fabric blocked so
-        // it never submits and the idle streak can build.
-        for _ in 0..=BASELINE_WARMUP_SAMPLES {
-            let mut warm = tick_input(0.0, false, false);
-            warm.p95_cycle_ms = 20.0;
-            runtime.tick(warm);
-        }
+        feed_control(&mut runtime, 20.0, CYCLES_TO_ARM);
         assert_eq!(runtime.baseline_p95_ms, Some(20.0));
 
-        // Control p95 genuinely rises while the fabric does nothing: that is a
-        // change in the control condition, not a fabric regression.
-        for _ in 0..(BASELINE_IDLE_CYCLES + 2) {
-            let mut risen = tick_input(0.0, false, false);
-            risen.p95_cycle_ms = 40.0;
-            runtime.tick(risen);
-        }
+        // A brief excursion is not a change in the control condition.
+        feed_control(&mut runtime, 40.0, BASELINE_IDLE_CYCLES as usize + 2);
+        assert_eq!(
+            runtime.baseline_p95_ms,
+            Some(20.0),
+            "a handful of slow cycles must not redefine the control regime"
+        );
+
+        // Sustained, it is: the control loop genuinely got slower while the
+        // fabric did nothing, so the reference level must follow.
+        feed_control(&mut runtime, 40.0, BASELINE_WINDOW_SAMPLES);
         assert_eq!(runtime.baseline_p95_ms, Some(40.0));
 
-        // A quiet period must NOT lower the bar again — that is the latch.
-        for _ in 0..20 {
-            let mut calm = tick_input(0.0, false, false);
-            calm.p95_cycle_ms = 12.0;
-            runtime.tick(calm);
-        }
+        // And a quiet spell must still not lower the bar and re-lock the fabric.
+        feed_control(&mut runtime, 12.0, 20);
         assert_eq!(
             runtime.baseline_p95_ms,
             Some(40.0),
@@ -840,7 +928,7 @@ mod tests {
     fn the_baseline_never_exceeds_the_absolute_control_ceiling() {
         let initial = world(1);
         let mut runtime = HeterogeneousRuntime::new(&initial);
-        for _ in 0..=BASELINE_WARMUP_SAMPLES {
+        for _ in 0..CYCLES_TO_ARM {
             let mut awful = tick_input(0.0, false, false);
             awful.p95_cycle_ms = 5_000.0;
             runtime.tick(awful);
