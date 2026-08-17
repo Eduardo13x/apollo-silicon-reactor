@@ -1335,7 +1335,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     lines.push(format!(
         // This is the pressure-causal imagination model, not the universal
         // actuator-learning stream shown above as `Act` / `Act+`.
-        "Causal {}/{} ready G{} q{:.0}%",
+        "Caus-I {}/{} ready G{} q{:.0}%",
         format_number(m.world_model_ready_actions),
         format_number(m.world_model_curated_actions),
         format_number(m.world_model_gold_evidence),
@@ -1362,7 +1362,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     // Causal Graph
     lines.push(format!(
-        "Causal {} slow",
+        "Caus-G {} slow",
         format_number(m.causal_slow_horizon_count as u64)
     ));
     lines.push(format!(
@@ -2309,6 +2309,57 @@ mod tests {
     }
 
     #[test]
+    fn no_two_think_quadrant_rows_share_a_label() {
+        // Two rows under one label are indistinguishable to a reader. This
+        // caught `WM-E` (evidence flow vs episodic) and `Causal` (imagination
+        // model vs causal graph); it exists so the next one fails here first.
+        // A broadly populated status so most rows render at once.
+        let mut status = dashboard_status();
+        status.metrics.value_scheduler_phase = "active".to_string();
+        status.metrics.value_scheduler_invalid_samples_total = 10;
+        status.metrics.world_model_actuator_known_models = 247;
+        status.metrics.world_model_actuator_ready_models = 21;
+        status.metrics.world_model_readiness_immature = 200;
+        status.metrics.world_model_action_model_capacity = 256;
+        status.metrics.world_model_action_model_len = 256;
+        status.metrics.world_model_last_evidence_cycle = 100;
+        status.metrics.world_model_curated_actions = 3;
+        status.metrics.world_model_ready_actions = 2;
+        status.metrics.world_model_causal_actuator_gold_total = 42;
+        status.metrics.causal_slow_horizon_count = 4;
+        status.metrics.causal_mechanism_count = 1;
+        status.metrics.world_model_dynamics_action_models = 255;
+        status.metrics.world_model_decision_credit_sources = 16;
+        status.metrics.world_model_decision_credit_leader = "predictive".to_string();
+        status.metrics.microexperiment_phase = "shadow".to_string();
+        status.metrics.rl_total_ticks = 5;
+        let think = render_think_q(&status);
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for line in &think {
+            let plain: String = line.replace("\u{1b}[1m", "").replace("\u{1b}[0m", "");
+            // Continuation rows are indented and deliberately share the owner.
+            if plain.starts_with(' ') || plain.starts_with('─') || plain.trim().is_empty() {
+                continue;
+            }
+            let label = plain
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            *seen.entry(label).or_default() += 1;
+        }
+        let collisions: Vec<_> = seen
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(label, count)| format!("{label} x{count}"))
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "duplicate row labels: {collisions:?}\nrendered: {think:?}"
+        );
+    }
+
+    #[test]
     fn a_small_but_real_coverage_is_not_rounded_down_to_zero() {
         assert_eq!(coverage_percent(None), "--");
         assert_eq!(coverage_percent(Some(0.0)), "0%");
@@ -2714,7 +2765,7 @@ mod tests {
         assert!(think.iter().any(|line| line == "Data   G 198/200 q99%"));
         assert!(think
             .iter()
-            .any(|line| line == "Causal 2/3 ready G127 q100%"));
+            .any(|line| line == "Caus-I 2/3 ready G127 q100%"));
         assert!(think.iter().any(|line| line == "Caus+  U42 universal Gold"));
         assert!(think.iter().any(|line| line == "Ctx-L  G490 S7 R3 q98%"));
         assert!(think.iter().any(|line| line == "Act    G 8/10 P2 q94%"));
