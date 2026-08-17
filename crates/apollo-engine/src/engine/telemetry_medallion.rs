@@ -6290,6 +6290,33 @@ mod tests {
     }
 
     #[test]
+    fn state_written_before_capacity_accounting_existed_still_loads() {
+        // The deployed daemon persisted no capacity counters. Loading that file
+        // must succeed and start the counters cold rather than refusing state.
+        let legacy = serde_json::json!({
+            "actuator_evidence_schema_version": ACTUATOR_EVIDENCE_SCHEMA_VERSION,
+            "context_schema_version": TELEMETRY_CONTEXT_SCHEMA_VERSION,
+            "action_models": {
+                "boost:Editor": { "observations": 20, "evidence_mass": 20.0 }
+            }
+        });
+        let persisted: TelemetryMedallionPersisted =
+            serde_json::from_value(legacy).expect("legacy state must deserialize");
+        assert_eq!(persisted.action_model_evictions_total, 0);
+        assert_eq!(persisted.action_model_births_total, 0);
+        assert_eq!(persisted.action_model_evidence_updates_total, 0);
+        assert_eq!(persisted.action_model_last_evidence_cycle, 0);
+
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.restore(persisted);
+        assert!(medallion.action_models().contains_key("boost:Editor"));
+        assert_eq!(
+            medallion.metrics().action_model_capacity,
+            MAX_ACTION_MODELS as u64
+        );
+    }
+
+    #[test]
     fn capacity_accounting_survives_the_persistence_round_trip() {
         let now_unix = 1_900_000_000;
         let hardware = HardwareRegime {
