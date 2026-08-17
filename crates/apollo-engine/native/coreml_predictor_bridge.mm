@@ -17,11 +17,26 @@ static NSString *const kApolloInputName = @"temporal_features";
 static NSString *const kApolloSchemaHashKey = @"apollo_schema_hash";
 static NSString *const kApolloModelHashKey = @"apollo_model_hash";
 
+/// How much is known about where an inference actually executed.
+/// `kApolloAneUnsupported` is the honest state on current macOS: Core ML
+/// accepts a compute-unit request at load and then routes each inference
+/// itself without publishing the unit it chose.
+enum : uint32_t {
+    kApolloAneUnsupported = 0,
+    kApolloAneUnavailable = 1,
+    kApolloAneMeasuredIdle = 2,
+    kApolloAneMeasuredActive = 3,
+};
+
 typedef struct {
     uint32_t requested_backend;
-    uint32_t effective_backend;
+    /// Compute units Core ML accepted at model load. A configuration, not an
+    /// observation of where work ran.
+    uint32_t configured_backend;
     uint32_t model_available;
-    uint32_t ane_execution_measured;
+    /// One of the kApolloAne* codes above. Never a bool: "not implemented"
+    /// must not share a value with "measured, and the ANE stayed idle".
+    uint32_t ane_observation;
     char reason[kApolloReasonCapacity];
 } ApolloCoreMlStatus;
 
@@ -30,7 +45,7 @@ typedef struct {
     std::mutex inference_mutex;
 }
 @property(nonatomic, strong) MLModel *model;
-@property(nonatomic, assign) uint32_t effective_backend;
+@property(nonatomic, assign) uint32_t configured_backend;
 @property(nonatomic, assign) uint32_t feature_count;
 @end
 
@@ -213,13 +228,15 @@ extern "C" void *apollo_coreml_create(uint64_t expected_schema_hash,
                                                        &validation_failure)) {
                 ApolloCoreMlContext *context = [ApolloCoreMlContext new];
                 context.model = model;
-                context.effective_backend = backend_values[index];
+                context.configured_backend = backend_values[index];
                 context.feature_count = feature_count;
                 if (status != nullptr) {
-                    status->effective_backend = backend_values[index];
+                    // What Core ML accepted, not where inference will run.
+                    status->configured_backend = backend_values[index];
                     status->model_available = 1;
-                    // A compute-unit request is not measured proof of ANE use.
-                    status->ane_execution_measured = 0;
+                    // A compute-unit request is not measured proof of ANE use,
+                    // and Core ML exposes no per-inference dispatch target.
+                    status->ane_observation = kApolloAneUnsupported;
                 }
                 return (__bridge_retained void *)context;
             }

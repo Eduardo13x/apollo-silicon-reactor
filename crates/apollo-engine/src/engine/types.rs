@@ -721,10 +721,22 @@ pub struct RuntimeMetrics {
     pub coreml_model_available: bool,
     #[serde(default)]
     pub coreml_requested_backend: String,
+    /// Compute units Core ML accepted at model load — a *configuration*.
+    /// Named `effective` until it was found to read as "where inference ran",
+    /// which no macOS API reports. See `coreml_ane_observation` for what is
+    /// actually known about execution.
     #[serde(default)]
-    pub coreml_effective_backend: String,
+    pub coreml_configured_backend: String,
+    /// Execution-evidence status for the Neural Engine, one of
+    /// `unsupported` / `unavailable` / `measured-idle` / `measured-active`.
+    ///
+    /// Replaces a `bool` that could not tell "we never implemented the
+    /// observation" apart from "we measured it and the ANE stayed idle". Core
+    /// ML routes each inference itself without publishing the unit it chose,
+    /// so `unsupported` is the honest steady state on this platform, and a
+    /// consumer must never read it as evidence either way.
     #[serde(default)]
-    pub coreml_ane_execution_measured: bool,
+    pub coreml_ane_observation: String,
     #[serde(default)]
     pub coreml_circuit_state: String,
     #[serde(default)]

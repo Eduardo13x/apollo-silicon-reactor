@@ -1,7 +1,7 @@
 use apollo_engine::engine::coreml_predictor::{
-    cpu_oracle_predict, CoreMlBackend, CoreMlPredictor, Prediction, PredictorBackend,
-    PredictorStatus, TemporalFeatureVector, MAX_TEMPORAL_FEATURES, MODEL_HASH, SCHEMA_VERSION,
-    TEMPORAL_FEATURE_COUNT, TEMPORAL_SCHEMA_HASH,
+    cpu_oracle_predict, AneObservation, CoreMlBackend, CoreMlPredictor, Prediction,
+    PredictorBackend, PredictorStatus, TemporalFeatureVector, MAX_TEMPORAL_FEATURES, MODEL_HASH,
+    SCHEMA_VERSION, TEMPORAL_FEATURE_COUNT, TEMPORAL_SCHEMA_HASH,
 };
 
 #[test]
@@ -20,14 +20,77 @@ fn temporal_schema_is_versioned_bounded_and_finite() {
     assert_eq!(sanitized.schema_version(), SCHEMA_VERSION);
 }
 
+/// Core ML accepts a compute-unit request at model load and then decides per
+/// inference where work actually runs, without exposing that decision. The
+/// bridge is honest about it — `coreml_predictor_bridge.mm:222` assigns 0 with
+/// the comment "a compute-unit request is not measured proof of ANE use" — but
+/// a `bool` cannot carry that. Downstream, "we never implemented the
+/// observation" and "we measured it and the ANE stayed idle" collapse onto the
+/// same `false`.
+///
+/// The distinction decides real actions: the first says "go build a probe", the
+/// second says "stop paying for this lane". Pin them apart.
+#[test]
+fn an_unimplemented_ane_observation_is_not_evidence_that_the_ane_stayed_idle() {
+    let unobservable = PredictorStatus {
+        backend: PredictorBackend::CoreMl,
+        requested_backend: CoreMlBackend::CpuAndNeuralEngine,
+        configured_backend: Some(CoreMlBackend::CpuAndNeuralEngine),
+        model_available: true,
+        ane_observation: AneObservation::Unsupported,
+        schema_hash: TEMPORAL_SCHEMA_HASH,
+        model_hash: MODEL_HASH,
+        reason: None,
+    };
+    let measured_idle = PredictorStatus {
+        ane_observation: AneObservation::Measured(false),
+        ..unobservable.clone()
+    };
+
+    assert_ne!(unobservable.ane_observation, measured_idle.ane_observation);
+    assert!(!unobservable.ane_observation.is_measurement());
+    assert!(measured_idle.ane_observation.is_measurement());
+    // Neither may be reported as the ANE having run.
+    assert!(!unobservable.ane_observation.ane_active());
+    assert!(!measured_idle.ane_observation.ane_active());
+    // And they must not render identically.
+    assert_ne!(
+        unobservable.ane_observation.as_str(),
+        measured_idle.ane_observation.as_str()
+    );
+}
+
+/// A configured backend is what Core ML accepted at load time. Reporting it
+/// under a name like "effective" invites reading it as where inference ran,
+/// which is the one thing the platform does not tell us.
+#[test]
+fn a_configured_backend_is_never_promoted_to_an_observed_one() {
+    let status = PredictorStatus {
+        backend: PredictorBackend::CoreMl,
+        requested_backend: CoreMlBackend::CpuAndNeuralEngine,
+        configured_backend: Some(CoreMlBackend::CpuAndNeuralEngine),
+        model_available: true,
+        ane_observation: AneObservation::Unsupported,
+        schema_hash: TEMPORAL_SCHEMA_HASH,
+        model_hash: MODEL_HASH,
+        reason: None,
+    };
+
+    // The accelerator *configuration* is available...
+    assert!(status.accelerator_backend_available());
+    // ...which says nothing about the accelerator having executed.
+    assert!(!status.ane_observation.ane_active());
+    assert!(!status.ane_observation.is_measurement());
+}
+
 #[test]
 fn cpu_only_coreml_is_not_accelerator_evidence() {
     let status = PredictorStatus {
         backend: PredictorBackend::CoreMl,
         requested_backend: CoreMlBackend::CpuAndNeuralEngine,
-        effective_backend: Some(CoreMlBackend::CpuOnly),
+        configured_backend: Some(CoreMlBackend::CpuOnly),
         model_available: true,
-        ane_execution_measured: false,
+        ane_observation: AneObservation::Unsupported,
         schema_hash: TEMPORAL_SCHEMA_HASH,
         model_hash: MODEL_HASH,
         reason: None,
@@ -80,8 +143,8 @@ fn cpu_oracle_predictor_reports_no_unmeasured_ane_execution() {
 
     assert_eq!(status.backend, PredictorBackend::CpuOracle);
     assert_eq!(status.requested_backend, CoreMlBackend::CpuAndNeuralEngine);
-    assert_eq!(status.effective_backend, None);
-    assert!(!status.ane_execution_measured);
+    assert_eq!(status.configured_backend, None);
+    assert!(!status.ane_observation.is_measurement());
     assert_eq!(predictor.predict(&features), cpu_oracle_predict(&features));
 }
 
@@ -102,5 +165,5 @@ fn configured_coreml_model_matches_the_cpu_oracle() {
             "oracle={left} coreml={right}"
         );
     }
-    assert!(!predictor.status().ane_execution_measured);
+    assert!(!predictor.status().ane_observation.ane_active());
 }

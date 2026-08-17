@@ -541,12 +541,18 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.fabric_rss_delta_bytes / (1024 * 1024),
             m.fabric_control_p95_baseline_ms,
         ));
-        let ane = if m.coreml_ane_execution_measured {
-            "ok"
-        } else {
-            "?"
+        // `cfg` prefixes the backend so the row cannot be read as "inference
+        // ran here". Core ML publishes no dispatch target, so the ANE column
+        // reports the evidence status verbatim rather than a glyph that a
+        // reader would resolve to "fine" or "broken".
+        let ane = match m.coreml_ane_observation.as_str() {
+            "measured-active" => "run",
+            "measured-idle" => "idle",
+            "unavailable" => "n/a",
+            // Includes the empty string from a daemon predating this field.
+            _ => "unobservable",
         };
-        let ml_backend = match m.coreml_effective_backend.as_str() {
+        let ml_backend = match m.coreml_configured_backend.as_str() {
             "cpu-and-neural-engine" => "cpu+ane",
             "cpu-only" => "cpu",
             "all" => "all",
@@ -554,12 +560,12 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             other => other,
         };
         lines.push(format!(
-            "ML     {} E{}/{} ANE {}",
+            "ML     cfg:{} E{}/{}",
             ml_backend,
             compact_counter(m.fabric_evaluation_total),
             compact_counter(m.fabric_eligible_total),
-            ane,
         ));
+        lines.push(format!("       ANE {ane}"));
         if !m.temporal_prediction_backend.is_empty() {
             lines.push(format!(
                 "Pred   {} {} p95{:.0}%",
@@ -2174,10 +2180,10 @@ mod tests {
         status.metrics.fabric_completed_total = 12;
         status.metrics.fabric_submitted_total = 14;
         status.metrics.fabric_cancelled_total = 1;
-        status.metrics.coreml_effective_backend = "cpu-and-neural-engine".to_string();
+        status.metrics.coreml_configured_backend = "cpu-and-neural-engine".to_string();
         status.metrics.fabric_evaluation_total = 8;
         status.metrics.fabric_eligible_total = 10;
-        status.metrics.coreml_ane_execution_measured = false;
+        status.metrics.coreml_ane_observation = "unsupported".to_string();
         status.metrics.temporal_prediction_backend = "cpu-utility".to_string();
         status.metrics.temporal_prediction_p95 = 0.42;
 
@@ -2185,9 +2191,11 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Fabric shadow W3 C12/14 X1"));
-        assert!(think
-            .iter()
-            .any(|line| line == "ML     cpu+ane E8/10 ANE ?"));
+        // `cfg:` marks the backend as configuration, and the ANE column says
+        // the evidence is missing rather than showing a glyph the reader would
+        // resolve to "fine" or "broken".
+        assert!(think.iter().any(|line| line == "ML     cfg:cpu+ane E8/10"));
+        assert!(think.iter().any(|line| line == "       ANE unobservable"));
         assert!(think
             .iter()
             .any(|line| line == "Pred   cpu-utility shadow p9542%"));

@@ -2830,9 +2830,9 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.fabric_rss_delta_bytes = fabric.rss_delta_bytes;
                         metrics.metrics.coreml_model_available = fabric.coreml_model_available;
                         metrics.metrics.coreml_requested_backend = fabric.coreml_requested.clone();
-                        metrics.metrics.coreml_effective_backend = fabric.coreml_effective.clone();
-                        metrics.metrics.coreml_ane_execution_measured =
-                            fabric.ane_execution_measured;
+                        metrics.metrics.coreml_configured_backend =
+                            fabric.coreml_configured.clone();
+                        metrics.metrics.coreml_ane_observation = fabric.ane_observation.clone();
                         metrics.metrics.coreml_circuit_state = fabric.coreml_circuit.clone();
                         metrics.metrics.temporal_prediction_backend =
                             fabric.prediction_backend.clone();

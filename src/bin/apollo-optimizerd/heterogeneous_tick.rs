@@ -75,8 +75,11 @@ pub struct HeterogeneousTickMetrics {
     pub last_latency_us: u64,
     pub coreml_model_available: bool,
     pub coreml_requested: String,
-    pub coreml_effective: String,
-    pub ane_execution_measured: bool,
+    /// Compute units Core ML accepted at load. A configuration, never an
+    /// observation of where inference ran.
+    pub coreml_configured: String,
+    /// One of unsupported/unavailable/measured-idle/measured-active.
+    pub ane_observation: String,
     pub coreml_circuit: String,
     pub prediction_backend: String,
     pub prediction_load: f64,
@@ -268,11 +271,11 @@ impl HeterogeneousRuntime {
             .requested_backend
             .as_str()
             .to_string();
-        self.metrics.coreml_effective = executor_status.coreml.effective_backend.map_or_else(
+        self.metrics.coreml_configured = executor_status.coreml.configured_backend.map_or_else(
             || "cpu-oracle".to_string(),
             |backend| backend.as_str().to_string(),
         );
-        self.metrics.ane_execution_measured = executor_status.coreml.ane_execution_measured;
+        self.metrics.ane_observation = executor_status.coreml.ane_observation.as_str().to_string();
 
         let blocked = !optional_allowed
             || !input.thermal_nominal
@@ -704,7 +707,10 @@ mod tests {
         assert_eq!(metrics.phase, "shadow");
         assert!(metrics.submitted_total >= 1);
         assert_eq!(runtime.submitted_total(), metrics.submitted_total);
-        assert!(!metrics.ane_execution_measured);
+        assert_eq!(
+            metrics.ane_observation, "unsupported",
+            "Core ML exposes no dispatch target; that is not a measured idle ANE"
+        );
     }
 
     fn tick_input(
