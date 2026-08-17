@@ -1758,7 +1758,12 @@ pub fn predictive_half_width(confidence_half_width: f64, effective_evidence: f64
     } else {
         1.0
     };
-    confidence_half_width * samples.sqrt()
+    // `PredictionRecord::uncertainty` is contractually within (0, 1], and
+    // `valid_predictions` rejects the *entire* prediction set if any member
+    // breaks it. Widening by sqrt(n) can exceed 1.0 for a high-variance model,
+    // so saturate at the contract ceiling: "maximally uncertain" is the honest
+    // reading, and it keeps the other predictions in the set alive.
+    (confidence_half_width * samples.sqrt()).min(1.0)
 }
 
 fn utility_model_status(
@@ -2436,6 +2441,25 @@ mod tests {
         assert!(
             (predictive_half / confidence_half - evidence.sqrt()).abs() < 1e-9,
             "widening is exactly sqrt(n)"
+        );
+    }
+
+    #[test]
+    fn widening_never_breaks_the_prediction_record_contract() {
+        // `valid_predictions` requires uncertainty <= 1.0 and rejects the whole
+        // set on a single violation, so a high-variance model must saturate
+        // rather than silently drop every prediction beside it.
+        let sigma = 0.9_f64;
+        let evidence = 64.0_f64;
+        let confidence_half = UTILITY_CONFIDENCE_Z * (sigma * sigma / evidence).sqrt();
+        let widened = predictive_half_width(confidence_half, evidence);
+        assert!(
+            confidence_half * evidence.sqrt() > 1.0,
+            "setup must actually overflow the contract before clamping"
+        );
+        assert!(
+            widened > 0.0 && widened <= 1.0,
+            "uncertainty must stay inside (0, 1]: got {widened}"
         );
     }
 
