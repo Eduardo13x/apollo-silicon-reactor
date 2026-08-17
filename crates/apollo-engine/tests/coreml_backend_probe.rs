@@ -20,7 +20,7 @@
 //!     cargo test -p apollo-engine --test coreml_backend_probe -- --nocapture
 
 use apollo_engine::engine::coreml_predictor::{
-    cpu_oracle_predict, CoreMlPredictor, PredictorBackend, TemporalFeatureVector,
+    cpu_oracle_predict, CoreMlBackend, CoreMlPredictor, PredictorBackend, TemporalFeatureVector,
     TEMPORAL_FEATURE_COUNT,
 };
 use std::time::Instant;
@@ -107,6 +107,75 @@ fn coreml_lane_latency_against_the_cpu_oracle_it_would_replace() {
                 (left - right).abs() <= 0.000_1,
                 "lanes diverged: coreml={left} oracle={right}"
             );
+        }
+    }
+}
+
+/// Compares the three Core ML compute-unit configurations against each other.
+///
+/// `CoreMlPredictor::new()` walks a fallback ladder and reports whichever
+/// configuration loaded first, so it cannot answer "does asking for the ANE
+/// help?" — every run reports CpuAndNeuralEngine because that is simply first
+/// in the ladder. Pinning each configuration separates the request from the
+/// outcome.
+///
+/// A configuration that will not load falls back to the oracle; that is
+/// reported rather than skipped, because "unavailable on this host" is itself
+/// the answer for that configuration.
+#[test]
+fn core_ml_compute_unit_configurations_measured_against_each_other() {
+    if std::env::var_os("APOLLO_COREML_MODEL_PATH").is_none() {
+        eprintln!("probe skipped: APOLLO_COREML_MODEL_PATH is unset");
+        return;
+    }
+    let inputs = probe_inputs();
+
+    for backend in [
+        CoreMlBackend::CpuOnly,
+        CoreMlBackend::CpuAndNeuralEngine,
+        CoreMlBackend::All,
+    ] {
+        let predictor = CoreMlPredictor::pinned_for_probe(backend);
+        let status = predictor.status();
+        if status.backend != PredictorBackend::CoreMl {
+            println!(
+                "{:<22} did not load ({})",
+                backend.as_str(),
+                status.reason.as_deref().unwrap_or("no reason given")
+            );
+            continue;
+        }
+
+        for index in 0..WARMUP {
+            std::hint::black_box(predictor.predict(&inputs[index % inputs.len()]));
+        }
+        let mut samples = Vec::with_capacity(SAMPLES);
+        for index in 0..SAMPLES {
+            let start = Instant::now();
+            std::hint::black_box(predictor.predict(&inputs[index % inputs.len()]));
+            samples.push(start.elapsed().as_nanos());
+        }
+        let (p50, p95) = percentiles(samples);
+        println!(
+            "{:<22} p50 {p50}ns  p95 {p95}ns  configured={:?} ane={}",
+            backend.as_str(),
+            status.configured_backend,
+            status.ane_observation.as_str(),
+        );
+
+        // Outputs are the model's contract and must not drift with the compute
+        // units requested, or the latency comparison is between different
+        // computations.
+        for features in inputs.iter().take(8) {
+            let predicted = predictor.predict(features).as_array();
+            let oracle = cpu_oracle_predict(features).as_array();
+            for (left, right) in predicted.into_iter().zip(oracle) {
+                assert!(
+                    (left - right).abs() <= 0.000_1,
+                    "{} diverged from the oracle: {left} vs {right}",
+                    backend.as_str()
+                );
+            }
         }
     }
 }

@@ -461,6 +461,60 @@ impl CoreMlPredictor {
         }
     }
 
+    /// Builds a predictor pinned to one compute-unit configuration, for
+    /// measurement only.
+    ///
+    /// `new()` walks a fallback ladder, so it reports whichever configuration
+    /// loaded first and cannot be used to compare configurations against each
+    /// other. This pins one and falls back to the oracle when that exact
+    /// configuration will not load — which is the answer for it.
+    ///
+    /// Not for the normal path: production wants the ladder, so that a host
+    /// missing one configuration still gets a working predictor.
+    pub fn pinned_for_probe(backend: CoreMlBackend) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let mut native_status = NativeCoreMlStatus::default();
+            let context = unsafe {
+                apollo_coreml_create_pinned(
+                    TEMPORAL_SCHEMA_HASH,
+                    MODEL_HASH,
+                    TEMPORAL_FEATURE_COUNT as u32,
+                    backend as u32,
+                    &mut native_status,
+                )
+            };
+            let Some(context) = std::ptr::NonNull::new(context) else {
+                let reason = native_status_reason(&native_status)
+                    .unwrap_or_else(|| format!("{} did not load", backend.as_str()));
+                return Self::oracle_with_reason(&reason);
+            };
+            let status = PredictorStatus {
+                backend: PredictorBackend::CoreMl,
+                requested_backend: backend,
+                configured_backend: coreml_backend(native_status.configured_backend),
+                model_available: native_status.model_available != 0,
+                ane_observation: ane_observation(native_status.ane_observation),
+                schema_hash: TEMPORAL_SCHEMA_HASH,
+                model_hash: MODEL_HASH,
+                reason: native_status_reason(&native_status),
+            };
+            Self {
+                state: Mutex::new(PredictorState {
+                    implementation: PredictorImplementation::CoreMl(NativeCoreMlContext {
+                        context,
+                    }),
+                    status,
+                }),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = backend;
+            Self::oracle_with_reason("Core ML is macOS only")
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn try_coreml() -> Self {
         let mut native_status = NativeCoreMlStatus::default();
@@ -612,6 +666,13 @@ unsafe extern "C" {
         expected_schema_hash: u64,
         expected_model_hash: u64,
         feature_count: u32,
+        status: *mut NativeCoreMlStatus,
+    ) -> *mut c_void;
+    fn apollo_coreml_create_pinned(
+        expected_schema_hash: u64,
+        expected_model_hash: u64,
+        feature_count: u32,
+        pinned_backend: u32,
         status: *mut NativeCoreMlStatus,
     ) -> *mut c_void;
     fn apollo_coreml_destroy(context: *mut c_void);

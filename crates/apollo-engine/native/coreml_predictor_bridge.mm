@@ -185,6 +185,69 @@ static MLModel *apollo_load_model(NSURL *url, MLComputeUnits units, NSError **er
     return [MLModel modelWithContentsOfURL:compiled_url configuration:configuration error:error];
 }
 
+/// Probe entry point: pins one compute-unit configuration instead of walking
+/// the fallback ladder, so a caller can compare configurations against each
+/// other rather than measuring whichever one happened to load first. Returns
+/// null when that exact configuration will not load, which is itself the
+/// answer for that configuration.
+///
+/// `pinned_backend` uses the kApolloCpuAndNeuralEngine/kApolloAll/
+/// kApolloCpuOnly values; anything else is rejected.
+extern "C" void *apollo_coreml_create_pinned(uint64_t expected_schema_hash,
+                                             uint64_t expected_model_hash,
+                                             uint32_t feature_count,
+                                             uint32_t pinned_backend,
+                                             ApolloCoreMlStatus *status) {
+    MLComputeUnits units;
+    switch (pinned_backend) {
+        case kApolloCpuAndNeuralEngine: units = MLComputeUnitsCPUAndNeuralEngine; break;
+        case kApolloAll:                units = MLComputeUnitsAll;                break;
+        case kApolloCpuOnly:            units = MLComputeUnitsCPUOnly;            break;
+        default:
+            apollo_copy_reason(status, @"unknown pinned Core ML backend");
+            return nullptr;
+    }
+    if (status != nullptr) {
+        memset(status, 0, sizeof(*status));
+        status->requested_backend = pinned_backend;
+    }
+    if (feature_count == 0 || feature_count > kApolloMaxFeatureCount) {
+        apollo_copy_reason(status, @"Core ML feature count exceeds the versioned 256-feature bound");
+        return nullptr;
+    }
+    @autoreleasepool {
+        NSString *failure = nil;
+        NSURL *url = apollo_model_url(&failure);
+        if (url == nil) {
+            apollo_copy_reason(status, failure);
+            return nullptr;
+        }
+        NSError *error = nil;
+        MLModel *model = apollo_load_model(url, units, &error);
+        NSString *validation_failure = nil;
+        if (model != nil && apollo_validate_model(model,
+                                                  expected_schema_hash,
+                                                  expected_model_hash,
+                                                  feature_count,
+                                                  &validation_failure)) {
+            ApolloCoreMlContext *context = [ApolloCoreMlContext new];
+            context.model = model;
+            context.configured_backend = pinned_backend;
+            context.feature_count = feature_count;
+            if (status != nullptr) {
+                status->configured_backend = pinned_backend;
+                status->model_available = 1;
+                status->ane_observation = kApolloAneUnsupported;
+            }
+            return (__bridge_retained void *)context;
+        }
+        apollo_copy_reason(status, validation_failure != nil
+            ? validation_failure
+            : apollo_error_message(error, @"Core ML model could not be loaded"));
+        return nullptr;
+    }
+}
+
 extern "C" void *apollo_coreml_create(uint64_t expected_schema_hash,
                                         uint64_t expected_model_hash,
                                         uint32_t feature_count,
