@@ -502,7 +502,13 @@ struct PersistedRollout {
 }
 
 impl PersistedRollout {
-    fn reset_to_shadow(&mut self, now_millis: u64) {
+    /// Returns the shadow gate progress this reset discarded. Callers that are
+    /// not deliberately carrying the value forward must account for it: a
+    /// silent drop is indistinguishable on the dashboard from a host that
+    /// never produced opportunities in the first place.
+    #[must_use]
+    fn reset_to_shadow(&mut self, now_millis: u64) -> u64 {
+        let dropped = self.shadow_eligible;
         self.phase = LabPhase::Shadow;
         self.phase_started_millis = now_millis;
         self.last_monotonic_millis = now_millis;
@@ -512,6 +518,7 @@ impl PersistedRollout {
         self.canary_completed = 0;
         self.canary_gold = 0;
         self.canary_failures = 0;
+        dropped
     }
 }
 
@@ -589,6 +596,18 @@ pub struct MicroexperimentLab {
     /// clock. Deliberately not persisted: `phase_started_millis` alone cannot
     /// express "unarmed", because 0 is also a legitimate `now_millis`.
     phase_clock_armed: bool,
+    /// Shadow gate progress observed at the end of `restore`, before this boot
+    /// ran a single cycle. Not persisted: it describes this boot only.
+    ///
+    /// Without it a gate counter that fell backwards across a restart is
+    /// ambiguous from the dashboard — "the disk held a low value" and "the
+    /// runtime discarded a high one" render identically.
+    restored_progress: u64,
+    /// How many times a runtime reset discarded non-zero gate progress, and
+    /// why the last one fired. Not persisted, and deliberately separate from
+    /// the deliberate reset inside `restore`, which carries its value forward.
+    progress_resets: u64,
+    last_progress_reset_reason: &'static str,
 }
 
 impl MicroexperimentLab {
@@ -605,6 +624,9 @@ impl MicroexperimentLab {
             rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
             phase_clock_armed: false,
+            restored_progress: 0,
+            progress_resets: 0,
+            last_progress_reset_reason: "",
         }
     }
 
@@ -708,6 +730,25 @@ impl MicroexperimentLab {
     /// they must reach. Without this the remaining wait is invisible: the
     /// published `*_total` counters are cumulative across restarts and do not
     /// track the rollout gate.
+    fn note_progress_reset(&mut self, dropped: u64, reason: &'static str) {
+        if dropped == 0 {
+            return;
+        }
+        self.progress_resets = self.progress_resets.saturating_add(1);
+        self.last_progress_reset_reason = reason;
+    }
+
+    /// Boot-scoped provenance for the shadow gate counter: what `restore` left
+    /// in place before the first cycle, how many runtime resets have discarded
+    /// progress since, and the reason of the most recent one.
+    pub fn rollout_provenance(&self) -> (u64, u64, &'static str) {
+        (
+            self.restored_progress,
+            self.progress_resets,
+            self.last_progress_reset_reason,
+        )
+    }
+
     pub fn rollout_progress(&self) -> (u64, u64) {
         match self.rollout.phase {
             LabPhase::Shadow => (
@@ -758,7 +799,8 @@ impl MicroexperimentLab {
             self.phase_clock_armed = true;
         }
         if now_millis < self.rollout.last_monotonic_millis {
-            self.rollout.reset_to_shadow(now_millis);
+            let dropped = self.rollout.reset_to_shadow(now_millis);
+            self.note_progress_reset(dropped, "clock-regression-candidate");
         }
         self.rollout.last_monotonic_millis = now_millis;
 
@@ -804,14 +846,16 @@ impl MicroexperimentLab {
     ) -> Vec<PairInvalidation> {
         if now_millis < self.rollout.last_monotonic_millis {
             let invalidated = self.invalidate_all(PairInvalidationReason::ClockRegression);
-            self.rollout.reset_to_shadow(now_millis);
+            let dropped = self.rollout.reset_to_shadow(now_millis);
+            self.note_progress_reset(dropped, "clock-regression-cycle");
             return invalidated;
         }
         self.rollout.last_monotonic_millis = now_millis;
         if !gates.allows_pair() {
             let invalidated = self.invalidate_all(PairInvalidationReason::SafetyGate);
             if self.rollout.phase != LabPhase::Shadow || !invalidated.is_empty() {
-                self.rollout.reset_to_shadow(now_millis);
+                let dropped = self.rollout.reset_to_shadow(now_millis);
+                self.note_progress_reset(dropped, "safety-gate");
             }
             return invalidated;
         }
@@ -848,7 +892,8 @@ impl MicroexperimentLab {
         }
         if self.rollout.phase != LabPhase::Shadow && self.rollout.canary_failures > 0 {
             invalidated.extend(self.invalidate_all(PairInvalidationReason::Unauthoritative));
-            self.rollout.reset_to_shadow(now_millis);
+            let dropped = self.rollout.reset_to_shadow(now_millis);
+            self.note_progress_reset(dropped, "canary-failure");
         }
         self.advance_rollout(now_millis, true);
         invalidated
@@ -1220,6 +1265,9 @@ impl MicroexperimentLab {
             rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
             phase_clock_armed: false,
+            restored_progress: 0,
+            progress_resets: 0,
+            last_progress_reset_reason: "",
         };
         // Completed summaries do not retain both authoritative endpoint
         // receipts. On restart they remain useful history, but they cannot
@@ -1258,8 +1306,11 @@ impl MicroexperimentLab {
         // re-arms from this boot because `now_millis` is monotonic-since-boot
         // and would otherwise be satisfied instantly.
         let shadow_eligible = lab.rollout.shadow_eligible;
-        lab.rollout.reset_to_shadow(0);
+        let _deliberately_carried_forward = lab.rollout.reset_to_shadow(0);
         lab.rollout.shadow_eligible = shadow_eligible;
+        // Boot-scoped provenance: this is the value the operator should see
+        // published before the new boot has run a cycle.
+        lab.restored_progress = shadow_eligible;
         let disposition = if interrupted == 0 {
             RestoreDisposition::Restored
         } else {
@@ -1923,6 +1974,50 @@ mod rollout_tests {
             .consider_candidate(candidate(4), PairGates::healthy_enabled(), 511_000)
             .unwrap();
         assert_eq!(restored.phase(), LabPhase::Canary);
+    }
+
+    /// The in-memory restore path is covered above. Production does not use
+    /// it: the struct is written into `learned_state.json` and read back, and
+    /// the value the operator actually sees is `rollout_progress()`, published
+    /// after several cycles of the new boot have already run. This pins the
+    /// whole chain — persisted -> serialized -> restored -> published — at the
+    /// production gate size, because a defect anywhere in it looks identical
+    /// from the dashboard: a gate counter that fell backwards after a restart.
+    #[test]
+    fn shadow_progress_survives_the_json_round_trip_and_the_first_cycles() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        for sequence in 1..=413u64 {
+            lab.consider_candidate(
+                candidate(sequence),
+                PairGates::healthy_enabled(),
+                1_000 + sequence,
+            )
+            .unwrap();
+        }
+        assert_eq!(lab.rollout_progress(), (413, SHADOW_MIN_OPPORTUNITIES));
+
+        let encoded = serde_json::to_string(&lab.persisted()).expect("encode");
+        let decoded: MicroexperimentLabPersisted = serde_json::from_str(&encoded).expect("decode");
+        let (mut restored, disposition) = MicroexperimentLab::restore(decoded, origin());
+
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(
+            restored.rollout_progress(),
+            (413, SHADOW_MIN_OPPORTUNITIES),
+            "the gate counter must survive the disk round trip"
+        );
+
+        // The new boot's clock restarts near zero while the persisted rollout
+        // carries millisecond stamps from the previous boot. The early cycles
+        // are exactly where a monotonic-regression reset would fire.
+        for cycle in 1..=5u64 {
+            restored.advance_cycle(cycle, cycle * 300, PairGates::healthy_enabled());
+        }
+        assert_eq!(
+            restored.rollout_progress().0,
+            413,
+            "the first cycles of the new boot must not reset the gate counter"
+        );
     }
 
     #[test]

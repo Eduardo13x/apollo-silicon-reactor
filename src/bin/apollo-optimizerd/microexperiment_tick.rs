@@ -47,6 +47,13 @@ pub struct MicroexperimentTickMetrics {
     /// Progress toward the current phase gate, and the threshold it needs.
     pub rollout_progress: u64,
     pub rollout_required: u64,
+    /// Provenance for `rollout_progress`, scoped to this boot: what `restore`
+    /// handed over before the first cycle, and how many runtime resets have
+    /// discarded progress since. Separates "the disk held a low value" from
+    /// "the runtime threw a high one away" — indistinguishable otherwise.
+    pub restored_progress_at_boot: u64,
+    pub progress_resets_total: u64,
+    pub last_progress_reset_reason: String,
     pub proposed_total: u64,
     pub eligible_total: u64,
     pub randomized_total: u64,
@@ -365,6 +372,9 @@ impl MicroexperimentRuntime {
             restore: self.restore.to_string(),
             rollout_progress: self.lab.rollout_progress().0,
             rollout_required: self.lab.rollout_progress().1,
+            restored_progress_at_boot: self.lab.rollout_provenance().0,
+            progress_resets_total: self.lab.rollout_provenance().1,
+            last_progress_reset_reason: self.lab.rollout_provenance().2.to_string(),
             proposed_total: metrics.proposed_total,
             eligible_total: metrics.eligible_total,
             randomized_total: metrics.randomized_total,

@@ -2916,6 +2916,12 @@ fn main() -> anyhow::Result<()> {
                         micro_metrics.rollout_required;
                     metrics.metrics.microexperiment_blocker = micro_metrics.blocker;
                     metrics.metrics.microexperiment_restore = micro_metrics.restore;
+                    metrics.metrics.microexperiment_restored_progress_at_boot =
+                        micro_metrics.restored_progress_at_boot;
+                    metrics.metrics.microexperiment_progress_resets_total =
+                        micro_metrics.progress_resets_total;
+                    metrics.metrics.microexperiment_last_progress_reset_reason =
+                        micro_metrics.last_progress_reset_reason;
                     metrics.metrics.microexperiment_proposed_total = micro_metrics.proposed_total;
                     metrics.metrics.microexperiment_eligible_total = micro_metrics.eligible_total;
                     metrics.metrics.microexperiment_randomized_total =

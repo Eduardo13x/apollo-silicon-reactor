@@ -593,9 +593,17 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         ));
         if m.microexperiment_rollout_required > 0 {
             lines.push(format!(
-                "       gate {}/{}",
+                "       gate {}/{} boot{}",
                 compact_counter(m.microexperiment_rollout_progress),
                 compact_counter(m.microexperiment_rollout_required),
+                compact_counter(m.microexperiment_restored_progress_at_boot),
+            ));
+        }
+        if m.microexperiment_progress_resets_total > 0 {
+            lines.push(format!(
+                "       reset{} {}",
+                compact_counter(m.microexperiment_progress_resets_total),
+                m.microexperiment_last_progress_reset_reason,
             ));
         }
         lines.push(format!(

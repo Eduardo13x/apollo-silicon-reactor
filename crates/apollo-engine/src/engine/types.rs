@@ -747,6 +747,16 @@ pub struct RuntimeMetrics {
     pub microexperiment_rollout_progress: u64,
     #[serde(default)]
     pub microexperiment_rollout_required: u64,
+    /// Boot-scoped provenance for `microexperiment_rollout_progress`. A gate
+    /// counter that fell backwards across a restart cannot be diagnosed from
+    /// the counter alone: these separate "the persisted value was low" from
+    /// "a runtime reset discarded it", and name the reset reason.
+    #[serde(default)]
+    pub microexperiment_restored_progress_at_boot: u64,
+    #[serde(default)]
+    pub microexperiment_progress_resets_total: u64,
+    #[serde(default)]
+    pub microexperiment_last_progress_reset_reason: String,
     #[serde(default)]
     pub microexperiment_blocker: String,
     #[serde(default)]
