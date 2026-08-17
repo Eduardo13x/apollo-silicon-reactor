@@ -400,6 +400,13 @@ fn publish_world_model_metrics(
     let readiness = world_model.utility_readiness_breakdown();
     metrics.world_model_readiness_no_gold = readiness.no_current_gold;
     metrics.world_model_readiness_immature = readiness.immature;
+    metrics.world_model_readiness_dormant = readiness.dormant;
+    metrics.world_model_action_model_len = context.action_model_len;
+    metrics.world_model_action_model_capacity = context.action_model_capacity;
+    metrics.world_model_action_model_evictions_total = context.action_model_evictions_total;
+    metrics.world_model_action_model_births_total = context.action_model_births_total;
+    metrics.world_model_evidence_updates_total = context.action_model_evidence_updates_total;
+    metrics.world_model_last_evidence_cycle = context.action_model_last_evidence_cycle;
     metrics.world_model_readiness_low_quality = readiness.low_quality;
     metrics.world_model_readiness_stale = readiness.stale;
     metrics.world_model_readiness_foreign = readiness.foreign_installation;

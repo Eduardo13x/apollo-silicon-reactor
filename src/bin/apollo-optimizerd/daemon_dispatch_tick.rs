@@ -234,6 +234,9 @@ fn record_world_model_abstention(
         UtilityAbstentionReason::ImmatureEvidence => {
             &mut metrics.world_model_abstention_immature_total
         }
+        UtilityAbstentionReason::DormantEvidence => {
+            &mut metrics.world_model_abstention_dormant_total
+        }
         UtilityAbstentionReason::LowQuality => &mut metrics.world_model_abstention_quality_total,
         UtilityAbstentionReason::StaleEvidence => &mut metrics.world_model_abstention_stale_total,
         UtilityAbstentionReason::ForeignInstallation => {

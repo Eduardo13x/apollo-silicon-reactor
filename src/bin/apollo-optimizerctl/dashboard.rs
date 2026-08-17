@@ -880,6 +880,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     let readiness_reasons = [
         ("no-gold", m.world_model_readiness_no_gold),
         ("immature", m.world_model_readiness_immature),
+        ("dormant", m.world_model_readiness_dormant),
         ("quality", m.world_model_readiness_low_quality),
         ("stale", m.world_model_readiness_stale),
         ("origin", m.world_model_readiness_foreign),
@@ -890,13 +891,59 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     .filter(|(_, count)| *count > 0)
     .map(|(reason, count)| format!("{reason}{}", compact_counter(count)))
     .collect::<Vec<_>>();
-    for (index, reasons) in readiness_reasons.chunks(3).enumerate() {
+    // Greedy wrap rather than a fixed chunk size: the reason list grows, and a
+    // fixed chunk silently overflows the quadrant the first time it does.
+    let mut wait_lines: Vec<String> = Vec::new();
+    for reason in readiness_reasons {
+        let fits = wait_lines
+            .last()
+            .is_some_and(|line| display_width(line) + 1 + display_width(&reason) <= QW);
+        match wait_lines.last_mut() {
+            Some(line) if fits => {
+                line.push(' ');
+                line.push_str(&reason);
+            }
+            _ => {
+                let prefix = if wait_lines.is_empty() {
+                    "WM wait "
+                } else {
+                    "        "
+                };
+                wait_lines.push(format!("{prefix}{reason}"));
+            }
+        }
+    }
+    lines.extend(wait_lines);
+    if m.world_model_action_model_capacity > 0 {
+        // Saturation is the difference between "still maturing" and "reborn
+        // every time a new key shows up", so it gets stated rather than implied.
         lines.push(format!(
-            "{}{}",
-            if index == 0 { "WM wait " } else { "        " },
-            reasons.join(" ")
+            "WM-C   {}/{}{} ev{} b{}",
+            format_number(m.world_model_action_model_len),
+            format_number(m.world_model_action_model_capacity),
+            if m.world_model_action_model_len >= m.world_model_action_model_capacity {
+                " full"
+            } else {
+                ""
+            },
+            compact_counter(m.world_model_action_model_evictions_total),
+            compact_counter(m.world_model_action_model_births_total),
         ));
     }
+    // "Waiting" only means learning is in flight if evidence is still arriving.
+    lines.push(if m.world_model_last_evidence_cycle == 0 {
+        format!(
+            "WM-E   ev{} no evidence yet",
+            compact_counter(m.world_model_evidence_updates_total)
+        )
+    } else {
+        format!(
+            "WM-E   ev{} last c{} idle{}",
+            compact_counter(m.world_model_evidence_updates_total),
+            format_number(m.world_model_last_evidence_cycle),
+            compact_counter(m.cycles.saturating_sub(m.world_model_last_evidence_cycle)),
+        )
+    });
     if m.world_model_utility_vetoes_total > 0 || m.world_model_utility_promotions_total > 0 {
         lines.push(format!(
             "WM-S   V{} rank{}",
@@ -2183,6 +2230,64 @@ mod tests {
             .iter()
             .any(|line| line == "WM wait immature4 uncertain2"));
         assert!(think.iter().any(|line| line == "Mk-H 5s5 30s25 2m70 10m80"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_separates_models_still_maturing_from_models_gone_quiet() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_actuator_known_models = 247;
+        status.metrics.world_model_actuator_ready_models = 21;
+        status.metrics.world_model_context_authority_phase = "trusted".to_string();
+        status.metrics.world_model_readiness_immature = 20;
+        status.metrics.world_model_readiness_dormant = 180;
+        status.metrics.world_model_readiness_uncertain = 26;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "WM wait immature20 dormant180"));
+        assert!(think.iter().any(|line| line == "        uncertain26"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_shows_capacity_pressure_and_how_long_evidence_has_been_absent() {
+        let mut status = dashboard_status();
+        status.metrics.cycles = 11_065;
+        status.metrics.world_model_action_model_len = 256;
+        status.metrics.world_model_action_model_capacity = 256;
+        status.metrics.world_model_action_model_evictions_total = 12;
+        status.metrics.world_model_action_model_births_total = 17;
+        status.metrics.world_model_evidence_updates_total = 20;
+        status.metrics.world_model_last_evidence_cycle = 10_870;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "WM-C   256/256 full ev12 b17"),
+            "a saturated map must say so: {think:?}"
+        );
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "WM-E   ev20 last c10,870 idle195"),
+            "the age of the newest evidence must be visible: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_says_plainly_when_no_evidence_has_ever_arrived() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_last_evidence_cycle = 0;
+        status.metrics.world_model_evidence_updates_total = 0;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "WM-E   ev0 no evidence yet"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

@@ -380,6 +380,18 @@ impl ActionModelStats {
         (self.evidence_mass * decay).clamp(0.0, ACTION_MODEL_EVIDENCE_CAP)
     }
 
+    /// A model whose newest observation predates one full evidence half-life is
+    /// no longer accumulating: at least half its authority has already decayed
+    /// and nothing is refilling it. Reported apart from immaturity so a census
+    /// cannot present a dormant model as one that is patiently maturing.
+    pub fn is_dormant_at(&self, now_unix: i64) -> bool {
+        if self.last_observed_unix <= 0 {
+            return true;
+        }
+        (now_unix.saturating_sub(self.last_observed_unix)) as f64
+            > ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS
+    }
+
     pub fn effective_state_evidence_at(&self, now_unix: i64) -> f64 {
         if self.last_observed_unix <= 0 || now_unix < self.last_observed_unix {
             return 0.0;

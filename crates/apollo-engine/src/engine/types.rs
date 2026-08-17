@@ -2132,6 +2132,10 @@ pub struct RuntimeMetrics {
     pub world_model_readiness_no_gold: u64,
     #[serde(default)]
     pub world_model_readiness_immature: u64,
+    /// Immature *and* no longer accumulating. Split out of `immature` so an
+    /// inactive model is never presented as learning in progress.
+    #[serde(default)]
+    pub world_model_readiness_dormant: u64,
     #[serde(default)]
     pub world_model_readiness_low_quality: u64,
     #[serde(default)]
@@ -2142,6 +2146,23 @@ pub struct RuntimeMetrics {
     pub world_model_readiness_hardware: u64,
     #[serde(default)]
     pub world_model_readiness_uncertain: u64,
+    /// Action-model capacity. When `len` sits on `capacity`, every newly
+    /// observed key destroys a learned one, so a key can be reborn instead of
+    /// maturing. Evictions and births make that pressure countable.
+    #[serde(default)]
+    pub world_model_action_model_len: u64,
+    #[serde(default)]
+    pub world_model_action_model_capacity: u64,
+    #[serde(default)]
+    pub world_model_action_model_evictions_total: u64,
+    #[serde(default)]
+    pub world_model_action_model_births_total: u64,
+    /// Evidence actually reaching action models, and the cycle of the newest
+    /// one. Distinguishes "nothing is arriving" from "arriving but blocked".
+    #[serde(default)]
+    pub world_model_evidence_updates_total: u64,
+    #[serde(default)]
+    pub world_model_last_evidence_cycle: u64,
     #[serde(default)]
     pub world_model_family_known_models: u64,
     #[serde(default)]
@@ -2365,6 +2386,8 @@ pub struct RuntimeMetrics {
     pub world_model_abstention_unknown_total: u64,
     #[serde(default)]
     pub world_model_abstention_immature_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_dormant_total: u64,
     #[serde(default)]
     pub world_model_abstention_quality_total: u64,
     #[serde(default)]
