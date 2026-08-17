@@ -45,7 +45,15 @@ User explicitly opted into supervision over autopilot. Rules:
 
 ## Project Overview
 
-**apollo-silicon-reactor** (formerly `apollo-optimizer`) is a macOS system optimization daemon written in Rust (edition 2021) for Apple Silicon M1 8GB baseline. See `README.md` for full description, qualities, and academic foundation.
+**apollo-silicon-reactor** (formerly `apollo-optimizer`) is a macOS system optimization daemon written in Rust (edition 2021) for Apple Silicon. See `README.md` for full description, qualities, and academic foundation.
+
+### Hardware
+
+Topology and memory are detected by **capability**, never by chip name: `HardwareRegime` is `{p_core_count, e_core_count, ram_gib}`, so new Apple Silicon generations work without code changes.
+
+The M1 8GB figure that appears in the history is **retained evidence, not the target machine** — see `README.md`. The current development host is an **Apple M4, 4P+6E, 16 GB, macOS 26**.
+
+That difference matters when reading metrics. On a host with headroom, pressure sits near 0.35 against a 0.65 survival bypass, `ais_optimization_opportunity` is well under 1%, and `boosts/throttles/freezes` stay at 0 over tens of thousands of cycles. **That is the correct outcome, not a stalled daemon.** `no-candidates`, an empty `action_keys`, and a Lab without opportunities all follow from having nothing worth rescuing. Read those as an idle machine before reading them as a defect.
 
 ### Three Binaries
 
