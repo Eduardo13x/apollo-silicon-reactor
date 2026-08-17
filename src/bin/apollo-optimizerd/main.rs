@@ -2809,6 +2809,20 @@ fn main() -> anyhow::Result<()> {
                         value_metrics.invalid_features_total;
                     metrics.metrics.value_scheduler_invalid_publication_total =
                         value_metrics.invalid_publication_total;
+                    metrics.metrics.value_scheduler_unhealthy_pressure_total =
+                        value_metrics.unhealthy_pressure_total;
+                    metrics.metrics.value_scheduler_unhealthy_thermal_total =
+                        value_metrics.unhealthy_thermal_total;
+                    metrics.metrics.value_scheduler_unhealthy_profile_total =
+                        value_metrics.unhealthy_profile_total;
+                    metrics.metrics.value_scheduler_unhealthy_p95_total =
+                        value_metrics.unhealthy_p95_total;
+                    metrics.metrics.value_scheduler_unhealthy_latency_total =
+                        value_metrics.unhealthy_latency_total;
+                    metrics.metrics.value_scheduler_unhealthy_kill_switch_total =
+                        value_metrics.unhealthy_kill_switch_total;
+                    metrics.metrics.value_scheduler_unhealthy_sleeping_total =
+                        value_metrics.unhealthy_sleeping_total;
                     if let Some(fabric) = fabric_metrics.as_ref() {
                         metrics.metrics.fabric_phase = fabric.phase.clone();
                         metrics.metrics.fabric_blocker = fabric.blocker.clone();

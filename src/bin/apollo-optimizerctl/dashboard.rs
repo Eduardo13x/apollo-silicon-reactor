@@ -501,15 +501,53 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.value_scheduler_predicted_us / 1_000,
             m.value_scheduler_budget_us / 1_000,
         ));
+        // `J` is this cycle; `sel` is lifetime. They used to sit on one line
+        // with the cumulative counters, reading as if they shared a window.
+        lines.push(format!(
+            "       now J{}/{} elig{} · sel{}",
+            m.value_scheduler_selected_jobs,
+            m.value_scheduler_registered_jobs,
+            m.value_scheduler_eligible_jobs,
+            compact_counter(m.value_scheduler_selected_total),
+        ));
         if m.value_scheduler_invalid_samples_total > 0 {
             lines.push(format!(
-                "       inv{} unhealthy{} seq{} feat{} pub{}",
+                "       inv{} seq{} feat{} pub{}",
                 compact_counter(m.value_scheduler_invalid_samples_total),
-                compact_counter(m.value_scheduler_invalid_unhealthy_total),
                 compact_counter(m.value_scheduler_invalid_sequence_total),
                 compact_counter(m.value_scheduler_invalid_features_total),
                 compact_counter(m.value_scheduler_invalid_publication_total),
             ));
+            let refusals = [
+                ("sleep", m.value_scheduler_unhealthy_sleeping_total),
+                ("kill", m.value_scheduler_unhealthy_kill_switch_total),
+                ("prof", m.value_scheduler_unhealthy_profile_total),
+                ("pres", m.value_scheduler_unhealthy_pressure_total),
+                ("therm", m.value_scheduler_unhealthy_thermal_total),
+                ("p95", m.value_scheduler_unhealthy_p95_total),
+                ("lat", m.value_scheduler_unhealthy_latency_total),
+            ];
+            let named: u64 = refusals.iter().map(|(_, total)| *total).sum();
+            let mut shown = refusals
+                .iter()
+                .filter(|(_, total)| *total > 0)
+                .map(|(label, total)| format!("{label}{}", compact_counter(*total)))
+                .collect::<Vec<_>>();
+            // Pre-breakdown history has no reason. Say so rather than let the
+            // named buckets look like they explain every refusal.
+            let unattributed = m
+                .value_scheduler_invalid_unhealthy_total
+                .saturating_sub(named);
+            if unattributed > 0 {
+                shown.push(format!("pre{}", compact_counter(unattributed)));
+            }
+            for (index, chunk) in shown.chunks(3).enumerate() {
+                lines.push(format!(
+                    "       {}{}",
+                    if index == 0 { "why " } else { "    " },
+                    chunk.join(" ")
+                ));
+            }
         }
         if !m.value_scheduler_blocker.is_empty() && m.value_scheduler_blocker != "shadow-ready" {
             lines.push(format!(
@@ -2230,6 +2268,45 @@ mod tests {
             .iter()
             .any(|line| line == "WM wait immature4 uncertain2"));
         assert!(think.iter().any(|line| line == "Mk-H 5s5 30s25 2m70 10m80"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn value_refusals_name_the_gate_and_flag_pre_breakdown_history() {
+        let mut status = dashboard_status();
+        status.metrics.value_scheduler_phase = "active".to_string();
+        status.metrics.value_scheduler_valid_cycles = 17_149;
+        status.metrics.value_scheduler_invalid_samples_total = 3_880;
+        status.metrics.value_scheduler_invalid_unhealthy_total = 3_880;
+        status.metrics.value_scheduler_unhealthy_sleeping_total = 12;
+        status.metrics.value_scheduler_unhealthy_thermal_total = 4;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       why sleep12 therm4 pre4k"),
+            "refusals must name their gate and admit the unattributed remainder: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn value_separates_this_cycle_from_lifetime_selection() {
+        let mut status = dashboard_status();
+        status.metrics.value_scheduler_phase = "active".to_string();
+        status.metrics.value_scheduler_selected_jobs = 0;
+        status.metrics.value_scheduler_registered_jobs = 10;
+        status.metrics.value_scheduler_eligible_jobs = 0;
+        status.metrics.value_scheduler_selected_total = 1_752;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       now J0/10 elig0 · sel2k"),
+            "an idle cycle must not read as a scheduler that never selects: {think:?}"
+        );
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

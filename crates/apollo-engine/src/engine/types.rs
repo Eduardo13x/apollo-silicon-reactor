@@ -681,6 +681,22 @@ pub struct RuntimeMetrics {
     pub value_scheduler_invalid_features_total: u64,
     #[serde(default)]
     pub value_scheduler_invalid_publication_total: u64,
+    /// Which gate refused the control sample. Sums to
+    /// `value_scheduler_invalid_unhealthy_total` with no unclassified residue.
+    #[serde(default)]
+    pub value_scheduler_unhealthy_pressure_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_thermal_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_profile_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_p95_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_latency_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_kill_switch_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_sleeping_total: u64,
     /// Operational heterogeneous-compute telemetry. These fields are not AIS
     /// evidence and cannot authorize actions.
     #[serde(default)]
