@@ -3778,6 +3778,14 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
                         metrics.metrics.ioreport_gpu_pct = ir.gpu_pct;
                         metrics.metrics.ioreport_ane_busy = ir.ane_busy;
+                        metrics.metrics.ioreport_ane_observation = if !ir.ane_channel_present {
+                            "unavailable"
+                        } else if ir.ane_busy {
+                            "measured-active"
+                        } else {
+                            "measured-idle"
+                        }
+                        .to_string();
                         metrics.metrics.ioreport_cpu_mw = ir.cpu_mw;
                         metrics.metrics.ioreport_total_watts = ir.total_watts();
                     } else {

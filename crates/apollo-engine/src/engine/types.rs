@@ -1444,6 +1444,14 @@ pub struct RuntimeMetrics {
     pub ioreport_gpu_pct: f64,
     #[serde(default)]
     pub ioreport_ane_busy: bool,
+    /// IOReport's view of the Neural Engine as an explicit status:
+    /// `unavailable` (no ANE channel in this subscription), `measured-idle`,
+    /// or `measured-active`.
+    ///
+    /// `ioreport_ane_busy` alone keeps its `false` default when no channel is
+    /// published, so it reads identically to a genuinely idle accelerator.
+    #[serde(default)]
+    pub ioreport_ane_observation: String,
     #[serde(default)]
     pub ioreport_cpu_mw: f64,
     #[serde(default)]

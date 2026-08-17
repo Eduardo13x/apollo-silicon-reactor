@@ -103,7 +103,19 @@ pub struct IOReportSnapshot {
     /// GPU active fraction (0.0–1.0).
     pub gpu_pct: f64,
     /// ANE (Neural Engine) detected as active.
+    ///
+    /// Only meaningful together with `ane_channel_present`: this field is
+    /// raised when a channel reports activity and otherwise keeps its `false`
+    /// default, so on its own it cannot separate an idle Neural Engine from a
+    /// subscription that never carried an ANE channel to read.
     pub ane_busy: bool,
+    /// Whether this subscription actually carried an ANE channel.
+    ///
+    /// IOReport publishes channels per driver, and a host, OS version or
+    /// permission level that exposes none leaves `ane_busy` at `false`
+    /// forever. Recording the channel's presence is what turns that `false`
+    /// into a measurement instead of an absence.
+    pub ane_channel_present: bool,
     /// CPU package power (milliwatts).
     pub cpu_mw: f64,
     /// GPU power (milliwatts).
@@ -298,6 +310,9 @@ impl IOReportReader {
 
             // ── ANE (Neural Engine) ──────────────────────────────────────────
             if channel.contains("ANE") || driver.contains("ANE") {
+                // Seeing the channel at all is what makes a subsequent `false`
+                // a measurement rather than an absence.
+                acc.snap.ane_channel_present = true;
                 if ch.state_count > 0 {
                     let active = active_fraction(&ch.duty_cycles, &ch.state_names, ch.state_count);
                     if active > 0.01 {
@@ -420,6 +435,32 @@ fn c_chars_to_str(arr: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ane_busy: false` is the struct default, so a host whose IOReport
+    /// subscription carries no ANE channel reports exactly what an idle
+    /// Neural Engine reports. The two demand opposite responses — go find a
+    /// working channel, versus conclude the accelerator is unused — so the
+    /// snapshot has to say which one it is.
+    #[test]
+    fn an_absent_ane_channel_is_not_the_same_as_a_measured_idle_ane() {
+        let never_observed = IOReportSnapshot::default();
+        let measured_idle = IOReportSnapshot {
+            ane_channel_present: true,
+            ..IOReportSnapshot::default()
+        };
+        let measured_busy = IOReportSnapshot {
+            ane_channel_present: true,
+            ane_busy: true,
+            ..IOReportSnapshot::default()
+        };
+
+        // Indistinguishable on the raw flag...
+        assert_eq!(never_observed.ane_busy, measured_idle.ane_busy);
+        // ...and separable once the channel's presence is recorded.
+        assert!(!never_observed.ane_channel_present);
+        assert!(measured_idle.ane_channel_present);
+        assert!(measured_busy.ane_channel_present && measured_busy.ane_busy);
+    }
 
     #[test]
     fn reader_initializes_without_panic() {
