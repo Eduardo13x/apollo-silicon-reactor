@@ -1174,14 +1174,28 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 m.world_model_gpu_calibration_quality * 100.0,
                 m.world_model_gpu_calibration_mae * 100.0
             ));
+            // GPU-M is lifetime-cumulative (persisted in the medallion) while
+            // GPU-I above resets every boot, and a Bronze is one of the many
+            // ranked candidates a single job emits — not a job. Stacked in one
+            // column they invite a jobs-over-Bronze ratio whose two terms share
+            // neither span nor unit. Say the span out loud.
+            lines.push("       B/S/G lifetime".to_string());
             if m.world_model_gpu_rejected_total > 0 {
                 lines.push(format!(
-                    "       rej{} evict{} unused{} bronze{}",
+                    "       rej{} ev{} un{} br{}",
                     format_number(m.world_model_gpu_rejected_total),
                     format_number(m.world_model_gpu_evicted_total),
                     format_number(m.world_model_gpu_unused_total),
                     format_number(m.world_model_gpu_bronze_rejected_total),
                 ));
+                // Rejections older than the breakdown. Without this the three
+                // buckets look like they should sum to `rej` and do not.
+                if m.world_model_gpu_unclassified_rejections > 0 {
+                    lines.push(format!(
+                        "       pre-split{}",
+                        format_number(m.world_model_gpu_unclassified_rejections),
+                    ));
+                }
             }
         }
     }

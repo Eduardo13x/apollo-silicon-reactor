@@ -1167,6 +1167,20 @@ pub struct TelemetryMedallionMetrics {
     pub gpu_prediction_evicted_total: u64,
     pub gpu_prediction_unused_total: u64,
     pub gpu_prediction_bronze_rejected_total: u64,
+    /// Rejections the breakdown above cannot account for.
+    ///
+    /// `gpu_prediction_rejected_total` is persisted and has accumulated since
+    /// the lane existed. The three buckets were added later and, being
+    /// `#[serde(default)]`, started from zero on the first restore after that
+    /// change — they only classify rejections observed from then on. So the
+    /// buckets provably cannot sum to the aggregate, and reporting them as if
+    /// they did would misattribute the entire pre-breakdown history to
+    /// whichever bucket a reader assumed.
+    ///
+    /// Publishing the remainder keeps the funnel closed by construction and
+    /// makes the unclassifiable tail visible instead of silently absorbed. It
+    /// stays flat while the classified buckets grow.
+    pub gpu_prediction_unclassified_rejections: u64,
     pub gpu_prediction_pending_total: u64,
     pub gpu_prediction_calibrated_models: u64,
     pub gpu_prediction_mean_absolute_error: f64,
@@ -1587,6 +1601,20 @@ impl TelemetryMedallion {
             admitted = admitted.saturating_add(1);
         }
         admitted
+    }
+
+    /// Rejections that predate the per-reason breakdown, so the funnel is
+    /// closed by construction: evicted + unused + bronze_rejected +
+    /// unclassified == rejected_total, always.
+    ///
+    /// Saturating rather than asserting: the restore path clamps each bucket
+    /// to the aggregate independently, so a hostile or truncated checkpoint
+    /// must not be able to panic the daemon here.
+    fn gpu_prediction_unclassified_rejections(&self) -> u64 {
+        self.gpu_prediction_rejected_total
+            .saturating_sub(self.gpu_prediction_evicted_total)
+            .saturating_sub(self.gpu_prediction_unused_total)
+            .saturating_sub(self.gpu_prediction_bronze_rejected_total)
     }
 
     fn expire_unused_gpu_predictions(&mut self, cycle: u64) {
@@ -2997,6 +3025,7 @@ impl TelemetryMedallion {
             gpu_prediction_evicted_total: self.gpu_prediction_evicted_total,
             gpu_prediction_unused_total: self.gpu_prediction_unused_total,
             gpu_prediction_bronze_rejected_total: self.gpu_prediction_bronze_rejected_total,
+            gpu_prediction_unclassified_rejections: self.gpu_prediction_unclassified_rejections(),
             gpu_prediction_pending_total: self
                 .gpu_predictions
                 .iter()
@@ -4928,6 +4957,56 @@ mod tests {
     use chrono::Utc;
 
     const LOCAL_ID: InstallationId = InstallationId(0x1020_3040_5060_7080);
+
+    /// Every GPU rejection must land in exactly one bucket, including the ones
+    /// that predate the buckets existing.
+    ///
+    /// `gpu_prediction_rejected_total` is persisted and has counted since the
+    /// lane shipped. The three per-reason buckets were added later as
+    /// `#[serde(default)]` fields, so on the first restore after that change
+    /// they began at zero against an aggregate already in the hundreds of
+    /// thousands — production read 261,296 rejected against 16,253 classified.
+    /// A reader summing the buckets silently attributes the 245,043-event gap
+    /// to whichever bucket they assumed.
+    ///
+    /// The remainder is therefore published rather than derived by the reader,
+    /// and the funnel closes by construction.
+    #[test]
+    fn gpu_rejection_buckets_and_the_pre_breakdown_remainder_close_the_funnel() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        // A checkpoint written before the breakdown existed: the aggregate
+        // carries history the buckets never saw.
+        medallion.gpu_prediction_rejected_total = 261_296;
+        medallion.gpu_prediction_evicted_total = 0;
+        medallion.gpu_prediction_unused_total = 16_049;
+        medallion.gpu_prediction_bronze_rejected_total = 204;
+
+        let unclassified = medallion.gpu_prediction_unclassified_rejections();
+
+        assert_eq!(unclassified, 245_043);
+        assert_eq!(
+            medallion.gpu_prediction_evicted_total
+                + medallion.gpu_prediction_unused_total
+                + medallion.gpu_prediction_bronze_rejected_total
+                + unclassified,
+            medallion.gpu_prediction_rejected_total,
+            "the four buckets must partition the aggregate exactly"
+        );
+    }
+
+    /// The restore path clamps each bucket to the aggregate independently, so
+    /// a truncated or hostile checkpoint can present buckets that oversum.
+    /// That must saturate to zero, never underflow into a vast bogus count.
+    #[test]
+    fn oversummed_gpu_buckets_saturate_instead_of_wrapping() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.gpu_prediction_rejected_total = 10;
+        medallion.gpu_prediction_evicted_total = 8;
+        medallion.gpu_prediction_unused_total = 8;
+        medallion.gpu_prediction_bronze_rejected_total = 8;
+
+        assert_eq!(medallion.gpu_prediction_unclassified_rejections(), 0);
+    }
 
     fn snapshot() -> SystemSnapshot {
         SystemSnapshot {

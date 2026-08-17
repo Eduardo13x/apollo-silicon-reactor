@@ -2084,6 +2084,15 @@ pub struct RuntimeMetrics {
     pub world_model_gpu_unused_total: u64,
     #[serde(default)]
     pub world_model_gpu_bronze_rejected_total: u64,
+    /// Rejections older than the per-reason breakdown. Non-zero means the
+    /// three buckets above describe only part of `world_model_gpu_rejected_total`;
+    /// they and this field partition it exactly.
+    ///
+    /// Every `world_model_gpu_*` counter is lifetime-cumulative (persisted in
+    /// `telemetry_medallion_state`), unlike the per-boot `gpu_imagination_*`
+    /// family. Ratios across the two families are meaningless.
+    #[serde(default)]
+    pub world_model_gpu_unclassified_rejections: u64,
     #[serde(default)]
     pub world_model_gpu_pending_total: u64,
     #[serde(default)]
