@@ -6,6 +6,19 @@ use apollo_engine::engine::reflex::{
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+/// Bound on how long a test will wait for a spawned reasoning worker to publish
+/// its first result, so a genuinely stuck worker fails instead of hanging.
+///
+/// It is not a latency assertion. At one second it behaved like one: the whole
+/// suite runs many test binaries in parallel against the daemon, and a worker
+/// thread that simply does not get scheduled inside the budget failed the test
+/// with "reasoning result not published" roughly once every fourteen runs on an
+/// otherwise clean tree. These tests assert freshness *semantics* — age in
+/// cycles, identity mismatch, deadline_misses — none of which depend on how
+/// quickly the thread starts, so the bound is set where only a real hang can
+/// reach it.
+const WORKER_PUBLISH_TIMEOUT: Duration = Duration::from_secs(30);
+
 fn target(pid: u32) -> ReflexTarget {
     ReflexTarget {
         pid,
@@ -299,7 +312,7 @@ fn reasoning_mailbox_overwrites_pending_work_with_latest_snapshot() {
         *lock.lock().unwrap_or_else(|error| error.into_inner()) = true;
         condvar.notify_all();
     }
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + WORKER_PUBLISH_TIMEOUT;
     loop {
         if let ReasoningLookup::Fresh(result) = worker.latest_for(3, identity) {
             if result.cycle == 3 {
@@ -390,7 +403,7 @@ fn reasoning_worker_never_publishes_running_work_superseded_by_a_newer_identity(
         ReasoningLookup::Pending,
         "the completed result for the recycled identity must never be published"
     );
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + WORKER_PUBLISH_TIMEOUT;
     loop {
         if let ReasoningLookup::Fresh(result) = worker.latest_for(3, latest_identity) {
             assert_eq!(result.payload, 30);
@@ -407,7 +420,7 @@ fn reasoning_results_accept_age_two_and_reject_age_three_or_other_identity() {
         .expect("worker starts");
     let identity = reasoning_identity(42, 100);
     worker.submit(ReasoningSnapshot::new(8, identity, 9));
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + WORKER_PUBLISH_TIMEOUT;
     while !matches!(worker.latest_for(8, identity), ReasoningLookup::Fresh(_)) {
         assert!(Instant::now() < deadline, "reasoning result not published");
         std::thread::sleep(Duration::from_millis(2));
@@ -433,7 +446,7 @@ fn rejected_reasoning_results_are_discarded_after_one_observation() {
         .expect("worker starts");
     let identity = reasoning_identity(42, 100);
     stale_worker.submit(ReasoningSnapshot::new(1, identity, 9));
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + WORKER_PUBLISH_TIMEOUT;
     while !matches!(
         stale_worker.latest_for(1, identity),
         ReasoningLookup::Fresh(_)
@@ -455,7 +468,7 @@ fn rejected_reasoning_results_are_discarded_after_one_observation() {
         LatestReasoningWorker::spawn("reflex-identity-discard", |value: u64| value)
             .expect("worker starts");
     mismatch_worker.submit(ReasoningSnapshot::new(8, identity, 9));
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + WORKER_PUBLISH_TIMEOUT;
     while mismatch_worker.stats().completed == 0 {
         assert!(Instant::now() < deadline, "reasoning result not published");
         std::thread::sleep(Duration::from_millis(2));
@@ -478,7 +491,7 @@ fn reasoning_freshness_probe_never_reports_age_above_two_cycles() {
         .expect("worker starts");
     let identity = reasoning_identity(42, 100);
     worker.submit(ReasoningSnapshot::new(8, identity, 9));
-    let deadline = Instant::now() + Duration::from_secs(1);
+    let deadline = Instant::now() + WORKER_PUBLISH_TIMEOUT;
     while worker.stats().completed == 0 {
         assert!(Instant::now() < deadline, "reasoning result not published");
         std::thread::sleep(Duration::from_millis(2));
