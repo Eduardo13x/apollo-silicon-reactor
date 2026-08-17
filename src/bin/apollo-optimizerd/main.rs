@@ -2966,6 +2966,8 @@ fn main() -> anyhow::Result<()> {
                         micro_metrics.invalidated_total;
                     metrics.metrics.microexperiment_deadline_expired_total =
                         micro_metrics.deadline_expired_total;
+                    metrics.metrics.microexperiment_unbound_expiries_total =
+                        micro_metrics.unbound_expiries_total;
                     metrics.metrics.microexperiment_rollback_failed_total =
                         micro_metrics.rollback_failed_total;
 

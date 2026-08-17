@@ -708,9 +708,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         }
         if m.microexperiment_invalidated_total > 0 {
             lines.push(format!(
-                "       inv{} dl{} rbf{}",
+                "       inv{} dl{} unb{} rbf{}",
                 compact_counter(m.microexperiment_invalidated_total),
                 compact_counter(m.microexperiment_deadline_expired_total),
+                compact_counter(m.microexperiment_unbound_expiries_total),
                 compact_counter(m.microexperiment_rollback_failed_total),
             ));
         }

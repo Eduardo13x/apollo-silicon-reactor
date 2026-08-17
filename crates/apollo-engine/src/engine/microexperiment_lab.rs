@@ -413,6 +413,9 @@ pub struct LabMetrics {
     pub shadow_would_open_total: u64,
     pub invalidated_total: u64,
     pub deadline_expired_total: u64,
+    /// Arms that expired without ever reporting, outside Shadow. Counted apart
+    /// from `canary_failures`: no data is not adverse data.
+    pub unbound_expiries_total: u64,
     pub rollback_failed_total: u64,
     pub open_pairs: usize,
     pub completed_pairs: usize,
@@ -484,6 +487,8 @@ struct PersistedMetrics {
     shadow_would_open_total: u64,
     invalidated_total: u64,
     deadline_expired_total: u64,
+    #[serde(default)]
+    unbound_expiries_total: u64,
     rollback_failed_total: u64,
 }
 
@@ -1194,8 +1199,20 @@ impl MicroexperimentLab {
             }
             _ => {}
         }
+        // An arm that never reported produced no evidence about the rollout.
+        // Recording an endpoint clears `issued`, so the deadline path is only
+        // reachable for an arm nothing ever bound to: treating that as adverse
+        // evidence let one evaporated opportunity destroy every banked one.
+        // Pair-scoped invalidation retires its own pair; the global reasons
+        // (safety gate, clock regression) reset the rollout on their own paths.
+        let produced_evidence = record.first_endpoint.is_some() || record.second_endpoint.is_some();
         if self.rollout.phase != LabPhase::Shadow {
-            self.rollout.canary_failures = self.rollout.canary_failures.saturating_add(1);
+            if produced_evidence {
+                self.rollout.canary_failures = self.rollout.canary_failures.saturating_add(1);
+            } else {
+                self.metrics.unbound_expiries_total =
+                    self.metrics.unbound_expiries_total.saturating_add(1);
+            }
         }
         push_bounded(
             &mut self.completed,
@@ -1352,6 +1369,7 @@ impl MicroexperimentLab {
             shadow_would_open_total: self.metrics.shadow_would_open_total,
             invalidated_total: self.metrics.invalidated_total,
             deadline_expired_total: self.metrics.deadline_expired_total,
+            unbound_expiries_total: self.metrics.unbound_expiries_total,
             rollback_failed_total: self.metrics.rollback_failed_total,
             open_pairs: self.open.len(),
             completed_pairs: self.completed.len(),
@@ -1875,6 +1893,195 @@ mod rollout_tests {
         ));
         assert_eq!(lab.metrics().pair_gold_total, 0);
         assert_eq!(lab.metrics().open_pairs, 0);
+    }
+
+    /// Drives the lab to Canary with `earned` shadow opportunities banked, the
+    /// shape production reaches before it issues its first arm.
+    fn lab_in_canary_with_progress(earned: u64) -> MicroexperimentLab {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: earned,
+            shadow_min_duration_ms: 10,
+            canary_percent: 100,
+            canary_min_opportunities: 500,
+        };
+        for index in 0..earned {
+            let _ = lab.consider_candidate(
+                candidate(index + 1),
+                PairGates::healthy_enabled(),
+                index * 2,
+            );
+        }
+        assert_eq!(lab.phase(), LabPhase::Canary, "setup must reach canary");
+        lab
+    }
+
+    #[test]
+    fn an_arm_that_expires_without_ever_reporting_does_not_erase_banked_progress() {
+        // Reproduces production: progress stood at 460, one arm was issued,
+        // nothing ever bound to it, its deadline passed, and the whole rollout
+        // fell back to shadow with the progress destroyed.
+        let mut lab = lab_in_canary_with_progress(460);
+        // Banked shadow evidence. `rollout_progress` reports the counter of the
+        // current phase, so in Canary it does not surface this value.
+        let banked = 460;
+
+        let candidate = candidate(9_001);
+        let assignment = match lab
+            .consider_candidate(candidate.clone(), PairGates::healthy_enabled(), 1_000)
+            .unwrap()
+        {
+            CandidateDisposition::Opened(assignment) => assignment,
+            other => panic!("expected an opened canary pair, got {other:?}"),
+        };
+        let directive = lab
+            .issue_ready_arms(1_001, PairGates::healthy_enabled())
+            .pop()
+            .expect("canary must issue an arm");
+        // Deliberately record no endpoint: this is the unbound case.
+        let expiry = directive.expires_after_cycle;
+        lab.advance_cycle(expiry + 1, 2_000, PairGates::healthy_enabled());
+
+        let _ = assignment;
+        assert_eq!(
+            lab.metrics().open_pairs,
+            0,
+            "the expired pair itself must be retired"
+        );
+        assert_eq!(
+            lab.phase(),
+            LabPhase::Canary,
+            "one arm that never reported is not evidence that the rollout is unsafe"
+        );
+        let (_, resets, reason) = lab.rollout_provenance();
+        assert_eq!(
+            resets, 0,
+            "no global reset is warranted; got reason {reason}"
+        );
+        // `rollout_progress` reports the counter of the *current* phase, so the
+        // banked shadow evidence is read back through a restart.
+        let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        assert_eq!(
+            restored.rollout_progress().0,
+            banked,
+            "independent banked progress must survive an unbound expiry"
+        );
+    }
+
+    #[test]
+    fn an_arm_that_reported_can_no_longer_reach_the_deadline_path() {
+        // Pins why the unbound case is the only one reachable: recording an
+        // endpoint clears `issued`, and the expiry sweep only looks at issued
+        // arms. Any future change that lets a reported pair expire would make
+        // the reclassification above unsafe, and this test would fail first.
+        let mut lab = lab_in_canary_with_progress(120);
+        let candidate = candidate(9_100);
+        match lab
+            .consider_candidate(candidate.clone(), PairGates::healthy_enabled(), 1_000)
+            .unwrap()
+        {
+            CandidateDisposition::Opened(_) => {}
+            other => panic!("expected opened, got {other:?}"),
+        }
+        let directive = lab
+            .issue_ready_arms(1_001, PairGates::healthy_enabled())
+            .pop()
+            .expect("canary must issue an arm");
+        lab.record_timed_endpoint(endpoint(&candidate, &directive, 1_000))
+            .expect("endpoint recorded");
+        lab.advance_cycle(
+            directive.expires_after_cycle + 1,
+            2_000,
+            PairGates::healthy_enabled(),
+        );
+
+        assert_eq!(
+            lab.metrics().deadline_expired_total,
+            0,
+            "a pair that reported must not be swept by the deadline path"
+        );
+        assert_eq!(lab.metrics().unbound_expiries_total, 0);
+        assert_eq!(
+            lab.metrics().open_pairs,
+            1,
+            "it stays open, awaiting closure"
+        );
+    }
+
+    #[test]
+    fn a_safety_gate_still_resets_the_whole_rollout() {
+        let mut lab = lab_in_canary_with_progress(200);
+        assert_eq!(lab.phase(), LabPhase::Canary);
+        let unsafe_gates = PairGates {
+            secure_input: true,
+            ..PairGates::healthy_enabled()
+        };
+        lab.advance_cycle(1_000, 3_000, unsafe_gates);
+        assert_eq!(
+            lab.phase(),
+            LabPhase::Shadow,
+            "an explicit global condition must still reset"
+        );
+        let (_, resets, reason) = lab.rollout_provenance();
+        assert_eq!(resets, 1);
+        assert_eq!(reason, "safety-gate");
+    }
+
+    #[test]
+    fn progress_is_monotonic_while_no_global_invalidation_occurs() {
+        let mut lab = lab_in_canary_with_progress(300);
+        let mut last = lab.rollout_progress().0;
+        for round in 0..3u64 {
+            let candidate = candidate(9_200 + round);
+            if let Ok(CandidateDisposition::Opened(_)) = lab.consider_candidate(
+                candidate,
+                PairGates::healthy_enabled(),
+                3_000 + round * 1_000,
+            ) {
+                if let Some(directive) = lab
+                    .issue_ready_arms(1_100 + round, PairGates::healthy_enabled())
+                    .pop()
+                {
+                    lab.advance_cycle(
+                        directive.expires_after_cycle + 1,
+                        3_500 + round * 1_000,
+                        PairGates::healthy_enabled(),
+                    );
+                }
+            }
+            let now = lab.rollout_progress().0;
+            assert!(
+                now >= last,
+                "round {round}: progress went backwards {last} -> {now}"
+            );
+            last = now;
+        }
+        let (_, resets, reason) = lab.rollout_provenance();
+        assert_eq!(resets, 0, "unexpected reset, reason={reason}");
+    }
+
+    #[test]
+    fn an_unbound_expiry_survives_the_persistence_round_trip() {
+        let mut lab = lab_in_canary_with_progress(460);
+        let candidate = candidate(9_300);
+        let _ = lab.consider_candidate(candidate, PairGates::healthy_enabled(), 1_000);
+        if let Some(directive) = lab
+            .issue_ready_arms(1_001, PairGates::healthy_enabled())
+            .pop()
+        {
+            lab.advance_cycle(
+                directive.expires_after_cycle + 1,
+                2_000,
+                PairGates::healthy_enabled(),
+            );
+        }
+        let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        assert_eq!(
+            restored.rollout_progress().0,
+            460,
+            "banked shadow evidence must survive restart after an unbound expiry"
+        );
+        assert_eq!(restored.phase(), LabPhase::Shadow, "authority is re-earned");
     }
 
     #[test]

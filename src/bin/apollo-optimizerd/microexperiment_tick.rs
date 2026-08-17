@@ -72,6 +72,7 @@ pub struct MicroexperimentTickMetrics {
     pub synthetic_quarantined_total: u64,
     pub invalidated_total: u64,
     pub deadline_expired_total: u64,
+    pub unbound_expiries_total: u64,
     pub rollback_failed_total: u64,
     pub mean_effect: f64,
 }
@@ -393,6 +394,7 @@ impl MicroexperimentRuntime {
             synthetic_quarantined_total: metrics.synthetic_quarantined_total,
             invalidated_total: metrics.invalidated_total,
             deadline_expired_total: metrics.deadline_expired_total,
+            unbound_expiries_total: metrics.unbound_expiries_total,
             rollback_failed_total: metrics.rollback_failed_total,
             mean_effect: metrics.mean_effect,
         }

@@ -870,6 +870,10 @@ pub struct RuntimeMetrics {
     pub microexperiment_invalidated_total: u64,
     #[serde(default)]
     pub microexperiment_deadline_expired_total: u64,
+    /// Arms that expired without ever reporting. Counted apart from canary
+    /// failures: absence of data is not adverse data.
+    #[serde(default)]
+    pub microexperiment_unbound_expiries_total: u64,
     #[serde(default)]
     pub microexperiment_rollback_failed_total: u64,
     #[serde(default)]
