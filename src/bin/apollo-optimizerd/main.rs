@@ -723,6 +723,9 @@ fn main() -> anyhow::Result<()> {
                 freeze_cooldown: Arc::new(Mutex::new(
                     apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
                 )),
+                throttle_refusal: Arc::new(Mutex::new(
+                    apollo_engine::engine::throttle_refusal::ThrottleRefusalCooldown::new(),
+                )),
                 effect_decay: Arc::new(Mutex::new(
                     apollo_engine::engine::effect_decay::DecayWatchdog::new(),
                 )),
@@ -2012,6 +2015,16 @@ fn main() -> anyhow::Result<()> {
                 // Decrement freeze cooldown counters once per cycle.
                 // [Nygard 2018] §8.5 circuit-breaker hold-down decay.
                 state.freeze_cooldown.lock_recover().tick();
+                let throttle_refusal_active = {
+                    let mut c = state.throttle_refusal.lock_recover();
+                    c.tick();
+                    c.active_count() as u32
+                };
+                state
+                    .metrics
+                    .lock_recover()
+                    .metrics
+                    .throttle_refusal_cooldown_active = throttle_refusal_active;
 
                 // ── Feature 4: Post-Wake Suppression ─────────────────────────
                 // If more than 30s passed since the last cycle, the system was

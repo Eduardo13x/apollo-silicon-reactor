@@ -3184,6 +3184,16 @@ pub struct RuntimeMetrics {
     // pipeline carve-out) tries to take a Boost path. See LSE field doc.
     #[serde(default)]
     pub hard_protected_boost_skipped_total: u64,
+    /// Throttle proposals dropped for targeting a process too small to matter.
+    /// Rising with `throttles_applied` flat is the intended steady state.
+    #[serde(default)]
+    pub throttle_below_resource_floor_total: u64,
+    /// Throttle proposals skipped because execution already refused this PID.
+    #[serde(default)]
+    pub throttle_refusal_suppressed_total: u64,
+    /// PIDs currently held in the throttle-refusal cooldown.
+    #[serde(default)]
+    pub throttle_refusal_cooldown_active: u32,
 
     // ── Approach-3 wire (2026-06-07). ────────────────────────────────────────
     // Producer: `learned_state::poke_rollback_guard_via_decay`. Increments

@@ -308,6 +308,7 @@ pub fn run_heuristic_pass(
         current_actions,
         &heuristic_critical_pids,
         recently_applied,
+        &state.throttle_refusal.lock_recover(),
     );
     let additional_actions: Vec<RootAction> = heuristic_actions
         .into_iter()

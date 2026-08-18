@@ -409,6 +409,53 @@ pub fn run_learning_tick<'a>(
         }
     }
 
+    // ── Throttle refusals feed back to the proposal layer ───────────────────
+    // Without this the decision layer never learns that the executor refused,
+    // and re-proposes the same throttle every cycle. Observed 2026-08-18:
+    // 1537 throttle proposals over 18 days, zero applied, 1502 of them aimed
+    // at just two processes.
+    //
+    // The window depends on how the refusal decays. A coalition hold follows
+    // the user's focus and lifts on its own, so it is re-checked soon; a
+    // protection-list or platform refusal only changes with a redeploy.
+    // Nothing here is permanent — a refusal describes one moment, and a
+    // permanent memory would outlive the policy that justified it.
+    {
+        use apollo_engine::engine::audit_types::BlockReason;
+        use apollo_engine::engine::throttle_refusal::RefusalKind;
+        use apollo_engine::engine::types::RootAction;
+        let mut refused: Vec<(u32, RefusalKind)> = Vec::new();
+        for trace in &exec_outcomes.audit_traces {
+            if trace.applied {
+                continue;
+            }
+            let RootAction::ThrottleProcess { pid, .. } = &trace.intended_action else {
+                continue;
+            };
+            let kind = match trace.block_reason {
+                Some(BlockReason::ActiveCoalition) | Some(BlockReason::CpuSaturated) => {
+                    RefusalKind::Transient
+                }
+                Some(BlockReason::ProtectedProcess)
+                | Some(BlockReason::MlProtected)
+                | Some(BlockReason::ApplePlatform)
+                | Some(BlockReason::CriticalBackground) => RefusalKind::Structural,
+                // PidRecycled means the PID is gone or reused — remembering it
+                // would silence whatever process inherits the number. Every
+                // other reason is left out on purpose: an unrecognised refusal
+                // should keep being retried, not silently suppressed.
+                _ => continue,
+            };
+            refused.push((*pid, kind));
+        }
+        if !refused.is_empty() {
+            let mut cooldown = state.throttle_refusal.lock_recover();
+            for (pid, kind) in refused {
+                cooldown.mark_refused(pid, kind);
+            }
+        }
+    }
+
     // ── Causal graph: process co-occurrence at high pressure ─────────────────
     if snapshot.pressure.memory_pressure >= 0.60 {
         let active: Vec<String> = snapshot

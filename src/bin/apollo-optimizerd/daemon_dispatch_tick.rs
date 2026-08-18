@@ -1698,6 +1698,7 @@ mod tests {
             freeze_cooldown: Arc::new(Mutex::new(
                 apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
             )),
+            throttle_refusal: Default::default(),
             effect_decay: Arc::new(Mutex::new(
                 apollo_engine::engine::effect_decay::DecayWatchdog::new(),
             )),

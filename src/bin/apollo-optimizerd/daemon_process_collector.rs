@@ -249,6 +249,7 @@ mod tests {
             frozen_state: Arc::new(Mutex::new(HashMap::new())),
             mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
             freeze_cooldown: Arc::new(Mutex::new(FreezeCooldown::new())),
+            throttle_refusal: Default::default(),
             effect_decay: Arc::new(Mutex::new(
                 apollo_engine::engine::effect_decay::DecayWatchdog::new(),
             )),

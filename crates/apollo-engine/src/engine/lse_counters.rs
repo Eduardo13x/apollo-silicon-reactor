@@ -714,6 +714,13 @@ pub struct LockFreeMetrics {
     /// [Saltzer & Kaashoek 2009 §3.3] complete mediation invariant.
     pub hard_protected_boost_skipped_total: AtomicU64,
 
+    /// Throttle proposals dropped because the target consumes too little for a
+    /// throttle to pay off (see `adaptive_governor::THROTTLE_FLOOR_*`).
+    pub throttle_below_resource_floor_total: AtomicU64,
+    /// Throttle proposals suppressed because execution already refused this
+    /// PID and the refusal is still in its cooldown window.
+    pub throttle_refusal_suppressed_total: AtomicU64,
+
     /// Approach-3 wire (2026-06-07). Hellerstein settling-time observer
     /// → `PolicyRollbackGuard` link. Bumps once per successful
     /// `PolicyRollbackGuard::evaluate_from_decay` application
@@ -930,6 +937,8 @@ impl LockFreeMetrics {
             mediator_port_hub_probe_unavailable_total: AtomicU64::new(0),
             policy_scorer_ds_high_conflict_fallback_total: AtomicU64::new(0),
             hard_protected_boost_skipped_total: AtomicU64::new(0),
+            throttle_below_resource_floor_total: AtomicU64::new(0),
+            throttle_refusal_suppressed_total: AtomicU64::new(0),
             policy_rollback_triggered_by_decay_total: AtomicU64::new(0),
             effect_decay_phantom_enroll_skipped_total: AtomicU64::new(0),
         }
@@ -1486,6 +1495,12 @@ impl LockFreeMetrics {
             hard_protected_boost_skipped_total: self
                 .hard_protected_boost_skipped_total
                 .load(Ordering::Relaxed),
+            throttle_below_resource_floor_total: self
+                .throttle_below_resource_floor_total
+                .load(Ordering::Relaxed),
+            throttle_refusal_suppressed_total: self
+                .throttle_refusal_suppressed_total
+                .load(Ordering::Relaxed),
             policy_rollback_triggered_by_decay_total: self
                 .policy_rollback_triggered_by_decay_total
                 .load(Ordering::Relaxed),
@@ -1943,6 +1958,20 @@ impl LockFreeMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// A throttle proposal the target was too small to justify.
+    #[inline(always)]
+    pub fn inc_throttle_below_resource_floor(&self) {
+        self.throttle_below_resource_floor_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A throttle proposal skipped because execution already said no.
+    #[inline(always)]
+    pub fn inc_throttle_refusal_suppressed(&self) {
+        self.throttle_refusal_suppressed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Approach-3 wire (2026-06-07). One increment per successful
     /// `PolicyRollbackGuard::evaluate_from_decay` application — the
     /// decay-driven complement of `inc_policy_rollback_execution`.
@@ -2179,6 +2208,8 @@ pub struct MetricsSnapshot {
     pub policy_scorer_ds_high_conflict_fallback_total: u64,
     /// Sprint patch (2026-06-07). APPROACH 1 — BOOST-path hard-protected guard.
     pub hard_protected_boost_skipped_total: u64,
+    pub throttle_below_resource_floor_total: u64,
+    pub throttle_refusal_suppressed_total: u64,
     /// Approach-3 wire (2026-06-07). Cumulative count of
     /// `PolicyRollbackGuard` reverts triggered by the
     /// effect-decay watchdog rather than by

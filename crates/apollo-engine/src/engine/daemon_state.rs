@@ -346,6 +346,8 @@ impl MetricsState {
         // `4b13a39`): without it the LSE counter increments forever but
         // never surfaces in `runtime_metrics.json`.
         self.metrics.hard_protected_boost_skipped_total = lf.hard_protected_boost_skipped_total;
+        self.metrics.throttle_below_resource_floor_total = lf.throttle_below_resource_floor_total;
+        self.metrics.throttle_refusal_suppressed_total = lf.throttle_refusal_suppressed_total;
 
         // Approach-3 wire (2026-06-07). Producer =
         // `learned_state::poke_rollback_guard_via_decay`. Increments only
@@ -604,6 +606,10 @@ pub struct SharedState {
     /// Per-PID post-thaw cooldown set. Prevents gate_e from re-freezing a PID
     /// that was just thawed by the TTL path. See `freeze_cooldown` module.
     pub freeze_cooldown: Arc<Mutex<crate::engine::freeze_cooldown::FreezeCooldown>>,
+    /// Per-PID memory of throttles that execution refused. Keeps the decision
+    /// layer from re-proposing an action the executor will refuse again.
+    /// See `throttle_refusal` module.
+    pub throttle_refusal: Arc<Mutex<crate::engine::throttle_refusal::ThrottleRefusalCooldown>>,
 
     /// S10 cutover (2026-06-06): Hellerstein settling-time observer.
     /// Producers in `execute_actions.rs` record post-Receipt; consumer

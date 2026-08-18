@@ -70,6 +70,17 @@ pub enum GovernorDecision {
     Kill,
 }
 
+/// Throttle floor — a process below **all three** of these cannot yield a
+/// worthwhile saving from a lowered scheduling priority, whatever its waste
+/// ratio says. Deliberately conservative: any single signal above its floor
+/// lets the throttle through.
+pub const THROTTLE_FLOOR_CPU_PCT: f32 = 1.0;
+/// 32 MiB. Below this, reclaim under memory pressure is rounding error.
+pub const THROTTLE_FLOOR_RSS_BYTES: u64 = 32 * 1024 * 1024;
+/// A near-idle process waking the CPU this often costs real energy even at
+/// 0% CPU, so it stays throttleable.
+pub const THROTTLE_FLOOR_WAKEUPS_PER_SEC: f32 = 50.0;
+
 #[derive(Debug, Clone)]
 pub struct ProcessDecision {
     pub pid: u32,
@@ -394,15 +405,56 @@ impl AdaptiveGovernor {
         foreground_app: Option<&str>,
         hour_of_day: u8,
     ) -> ProcessDecision {
-        // Helper closure: avoids repeating pid/name/tier/waste_score on every early return.
-        let pd = |decision: GovernorDecision, utility_score: f32, reason: String| ProcessDecision {
-            pid: snap.pid,
-            name: snap.name.clone(),
-            decision,
-            tier,
-            utility_score,
-            waste_score: waste,
-            reason,
+        // Throttle floor. `waste` is a *ratio* of resources to delivered
+        // utility, so a process that consumes almost nothing and delivers
+        // nothing still scores as highly wasteful. Observed 2026-08-18:
+        // `apollo-web-bridge` was proposed for throttling 795 times at
+        // waste=0.70 while sitting at 0.0% CPU and 5.7 MB RSS — a throttle
+        // there could not have paid for itself even had it been permitted.
+        //
+        // Throttling lowers scheduling priority, so the gain scales with what
+        // the process would otherwise have consumed. Below this floor the
+        // gain is not small, it is nil. All three signals must be negligible:
+        // any one of them being significant means a throttle can still pay.
+        // Wakeups are included because a near-idle process that wakes the CPU
+        // hundreds of times a second is a real energy cost (`wakeup_vampires`
+        // tracks exactly that) even at 0% CPU.
+        let below_throttle_floor = snap.cpu_percent < THROTTLE_FLOOR_CPU_PCT
+            && snap.rss_bytes < THROTTLE_FLOOR_RSS_BYTES
+            && snap.wakeups_per_sec < THROTTLE_FLOOR_WAKEUPS_PER_SEC;
+
+        // Helper closure: avoids repeating pid/name/tier/waste_score on every
+        // early return. It is also a single chokepoint for the floor above,
+        // rather than a guard on each throttle branch: the
+        // four throttle rules (night mode, waste override, swarm, graduated
+        // idle) would otherwise each need their own copy, and a fifth added
+        // later would silently miss it.
+        let pd = |decision: GovernorDecision, utility_score: f32, reason: String| {
+            let (decision, reason) = if decision == GovernorDecision::Throttle
+                && below_throttle_floor
+            {
+                crate::engine::lse_counters::LSE_COUNTERS.inc_throttle_below_resource_floor();
+                (
+                    GovernorDecision::Allow,
+                    format!(
+                        "below throttle floor (cpu={:.1}% rss={} MB wakeups={:.0}/s) — {reason}",
+                        snap.cpu_percent,
+                        snap.rss_bytes / (1024 * 1024),
+                        snap.wakeups_per_sec
+                    ),
+                )
+            } else {
+                (decision, reason)
+            };
+            ProcessDecision {
+                pid: snap.pid,
+                name: snap.name.clone(),
+                decision,
+                tier,
+                utility_score,
+                waste_score: waste,
+                reason,
+            }
         };
 
         // Zombie/orphan handling: true zombies (is_zombie=true) need SIGKILL to
@@ -899,6 +951,7 @@ fn is_render_pipeline(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::engine::process_classifier::ProcessSnapshot;
     use crate::engine::zombie_hunter::HuntSnapshot;
@@ -1645,6 +1698,60 @@ mod tests {
         assert!(
             per_call_ms < 5.0,
             "decide_all too slow: {per_call_ms:.2}ms/call (expected < 5ms)"
+        );
+    }
+
+    #[test]
+    fn a_process_too_small_to_matter_is_not_throttled() {
+        // The exact shape seen in production: the waste ratio says 0.70, but
+        // the process holds 0% CPU and a few MB, so a throttle has nothing to
+        // reclaim. `apollo-web-bridge` was proposed 795 times on this basis.
+        let mut gov = governor();
+        let mut snap = base_proc(41, "tiny-idle-daemon");
+        snap.cpu_percent = 0.0;
+        snap.rss_bytes = 5_744 * 1024;
+        snap.wakeups_per_sec = 0.0;
+        let decisions = gov.decide_all(&[snap], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert_ne!(
+            decisions[0].decision,
+            GovernorDecision::Throttle,
+            "below the floor a throttle cannot pay for itself: {}",
+            decisions[0].reason
+        );
+    }
+
+    #[test]
+    fn a_quiet_process_that_wakes_the_cpu_constantly_is_still_reachable() {
+        // 0% CPU and small, but hundreds of wakeups a second is a real energy
+        // cost. The floor requires ALL three signals to be negligible, so this
+        // one must not be excused by it.
+        let mut gov = governor();
+        let mut quiet = base_proc(42, "wakeup-vampire");
+        quiet.cpu_percent = 0.0;
+        quiet.rss_bytes = 4 * 1024 * 1024;
+        quiet.wakeups_per_sec = 300.0;
+        let decisions = gov.decide_all(&[quiet], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            !decisions[0].reason.contains("below throttle floor"),
+            "wakeups are a cost the floor must not excuse: {}",
+            decisions[0].reason
+        );
+    }
+
+    #[test]
+    fn a_heavy_process_is_unaffected_by_the_floor() {
+        let mut gov = governor();
+        let mut heavy = base_proc(43, "background-worker");
+        heavy.cpu_percent = 40.0;
+        heavy.rss_bytes = 900 * 1024 * 1024;
+        let decisions = gov.decide_all(&[heavy], &no_hunts(), None, &[], 12);
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            !decisions[0].reason.contains("below throttle floor"),
+            "the floor must only ever silence negligible targets: {}",
+            decisions[0].reason
         );
     }
 }

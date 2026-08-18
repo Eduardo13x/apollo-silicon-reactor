@@ -612,6 +612,7 @@ pub fn convert_and_merge_heuristic_decisions(
     existing_actions: &[RootAction],
     critical_pids: &HashSet<u32>,
     recently_applied: &RecentlyApplied,
+    refusal_cooldown: &apollo_engine::engine::throttle_refusal::ThrottleRefusalCooldown,
 ) -> (Vec<RootAction>, HeuristicStats) {
     let mut stats = HeuristicStats {
         decisions_total: decisions.len() as u64,
@@ -681,6 +682,18 @@ pub fn convert_and_merge_heuristic_decisions(
         // catch-all; SwarmThrottling/GraduatedIdle differentiate two
         // well-known governor rule classes that account for ~20% of throttles.
         let dr = classify_governor_reason(&decision.reason);
+
+        // Execution already refused a throttle for this PID and the refusal is
+        // still warm. `recently_applied` above only remembers proposals that
+        // were *admitted*, so without this a permanently-refused target is
+        // re-proposed every cycle — 795 times for one process over 18 days,
+        // every one refused, every one journalled.
+        if decision.decision == GovernorDecision::Throttle
+            && refusal_cooldown.is_in_cooldown(decision.pid)
+        {
+            apollo_engine::engine::lse_counters::LSE_COUNTERS.inc_throttle_refusal_suppressed();
+            continue;
+        }
 
         match decision.decision {
             GovernorDecision::Throttle => {
@@ -825,8 +838,13 @@ mod tests {
         ];
         let critical = HashSet::from([405]);
 
-        let (actions, stats) =
-            convert_and_merge_heuristic_decisions(&decisions, &[], &critical, &cache);
+        let (actions, stats) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &critical,
+            &cache,
+            &Default::default(),
+        );
         assert!(actions.is_empty());
         assert_eq!(stats.zombies_detected, 0);
     }
@@ -840,8 +858,13 @@ mod tests {
             GovernorDecision::Throttle,
         )];
 
-        let (actions, stats) =
-            convert_and_merge_heuristic_decisions(&decisions, &[], &HashSet::new(), &cache);
+        let (actions, stats) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &HashSet::new(),
+            &cache,
+            &Default::default(),
+        );
 
         assert!(actions.is_empty());
         assert_eq!(stats.throttles, 0);
@@ -852,8 +875,13 @@ mod tests {
         let cache = RecentlyApplied::new();
         let decisions = vec![make_zombie_decision(12_345, "unprotected-orphan")];
 
-        let (actions, stats) =
-            convert_and_merge_heuristic_decisions(&decisions, &[], &HashSet::new(), &cache);
+        let (actions, stats) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &HashSet::new(),
+            &cache,
+            &Default::default(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(stats.zombies_detected, 1);
     }
@@ -863,8 +891,13 @@ mod tests {
         let cache = RecentlyApplied::new();
         let critical = HashSet::new();
         let decisions = vec![make_decision(1234, "testproc", GovernorDecision::Throttle)];
-        let (actions, stats) =
-            convert_and_merge_heuristic_decisions(&decisions, &[], &critical, &cache);
+        let (actions, stats) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &critical,
+            &cache,
+            &Default::default(),
+        );
         assert_eq!(actions.len(), 1);
         assert_eq!(stats.throttles, 1);
         assert!(
@@ -882,8 +915,13 @@ mod tests {
 
         // Simulate the final dispatch chokepoint recording cycle 1.
         cache.record(1234, CachedActionKind::Throttle);
-        let (actions2, stats2) =
-            convert_and_merge_heuristic_decisions(&decisions, &[], &critical, &cache);
+        let (actions2, stats2) = convert_and_merge_heuristic_decisions(
+            &decisions,
+            &[],
+            &critical,
+            &cache,
+            &Default::default(),
+        );
         assert_eq!(actions2.len(), 0, "duplicate within TTL must be suppressed");
         assert_eq!(stats2.throttles, 0);
     }
@@ -899,7 +937,13 @@ mod tests {
         cache.record(1234, CachedActionKind::Throttle);
 
         // Freeze for SAME pid is a different cache key — should pass through.
-        let (a2, _) = convert_and_merge_heuristic_decisions(&freeze, &[], &critical, &cache);
+        let (a2, _) = convert_and_merge_heuristic_decisions(
+            &freeze,
+            &[],
+            &critical,
+            &cache,
+            &Default::default(),
+        );
         assert_eq!(a2.len(), 1, "Freeze with prior Throttle must emit");
     }
 
@@ -912,7 +956,13 @@ mod tests {
         let critical = HashSet::new();
 
         let kill = vec![make_decision(1234, "testproc", GovernorDecision::Kill)];
-        let (a1, stats1) = convert_and_merge_heuristic_decisions(&kill, &[], &critical, &cache);
+        let (a1, stats1) = convert_and_merge_heuristic_decisions(
+            &kill,
+            &[],
+            &critical,
+            &cache,
+            &Default::default(),
+        );
         assert_eq!(a1.len(), 1);
         assert_eq!(stats1.kills_downgraded, 1);
         assert!(!cache.is_recent(1234, CachedActionKind::Freeze));
@@ -920,7 +970,13 @@ mod tests {
         // The final chokepoint records the effective Kill→Freeze action.
         cache.record(1234, CachedActionKind::Freeze);
         let freeze = vec![make_decision(1234, "testproc", GovernorDecision::Freeze)];
-        let (a2, _) = convert_and_merge_heuristic_decisions(&freeze, &[], &critical, &cache);
+        let (a2, _) = convert_and_merge_heuristic_decisions(
+            &freeze,
+            &[],
+            &critical,
+            &cache,
+            &Default::default(),
+        );
         assert_eq!(a2.len(), 0, "Freeze after Kill→Freeze must be suppressed");
     }
 

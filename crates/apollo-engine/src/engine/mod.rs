@@ -167,6 +167,7 @@ pub mod thermal_bailout;
 pub mod thermal_interrupt;
 pub mod thermal_iokit;
 pub mod thermal_manager;
+pub mod throttle_refusal;
 pub mod types;
 pub mod unfreeze_decay;
 pub mod unified_learning_health;
