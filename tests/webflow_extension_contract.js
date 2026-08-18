@@ -40,11 +40,15 @@ test('wire event contains only the closed privacy-safe schema', () => {
   for (const forbidden of FORBIDDEN) {
     assert.equal(encoded.includes(`"${forbidden}"`), false, forbidden);
   }
+  // The closed set grows only with producer identity — never with content.
   assert.deepEqual(Object.keys(event).sort(), [
     'browser_session_id',
+    'extension_version',
+    'feature_capabilities',
     'metrics',
     'navigation_id',
     'phase',
+    'producer_kind',
     'schema_version',
     'sequence',
     'site_bucket',
@@ -230,4 +234,22 @@ test('component totals sum across interactions', () => {
   assert.equal(totals.inputDelay, 15);
   assert.equal(totals.processing, 40);
   assert.equal(totals.presentation, 35);
+});
+
+test('every event declares its producer identity and capabilities', () => {
+  const event = buildEvent({ ...ids(), sequence: 1, phase: 'settled', source: 'extension-vitals', metrics: {} });
+  assert.equal(event.schema_version, 2);
+  assert.equal(event.producer_kind, 'chromium-extension');
+  assert.equal(event.extension_version, require('../extensions/apollo-webflow-chromium/protocol.js').EXTENSION_VERSION);
+  const caps = event.feature_capabilities;
+  assert.ok(caps & 0b001, 'interaction grouping');
+  assert.ok(caps & 0b010, 'component breakdown');
+  assert.ok(caps & 0b100, 'transport timing');
+});
+
+test('the declared extension version matches the manifest', () => {
+  const manifest = require('../extensions/apollo-webflow-chromium/manifest.json');
+  const P = require('../extensions/apollo-webflow-chromium/protocol.js');
+  assert.equal(manifest.version, P.EXTENSION_VERSION,
+    'a drifting version would make the daemon report a wrong producer');
 });

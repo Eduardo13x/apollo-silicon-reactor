@@ -2664,6 +2664,16 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.webflow_transport_samples = webflow_output.transport_samples;
                     metrics.metrics.webflow_transport_max_queue_depth =
                         webflow_output.transport_max_queue_depth;
+                    metrics.metrics.webflow_extension_status =
+                        webflow_output.extension_status.short().to_string();
+                    metrics.metrics.webflow_extension_version =
+                        webflow_output.extension_version.clone().unwrap_or_default();
+                    metrics.metrics.webflow_accepted_v1_total = webflow_output.accepted_v1_total;
+                    metrics.metrics.webflow_accepted_v2_total = webflow_output.accepted_v2_total;
+                    metrics.metrics.webflow_schema_rejected_total =
+                        webflow_output.schema_rejected_total;
+                    metrics.metrics.webflow_last_event_at_ms = webflow_output.last_event_at_ms;
+                    metrics.metrics.webflow_capabilities_bits = webflow_output.capabilities_bits;
                     metrics.metrics.browser_latency_samples = webflow_output.vitals_samples;
                     metrics.metrics.network_flow_active = networkflow_output.observation.active;
                     metrics.metrics.network_flow_traffic_bps =

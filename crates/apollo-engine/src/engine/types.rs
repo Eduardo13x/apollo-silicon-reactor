@@ -579,6 +579,23 @@ pub struct RuntimeMetrics {
     pub webflow_transport_samples: u64,
     #[serde(default)]
     pub webflow_transport_max_queue_depth: u32,
+    /// Producer negotiation. Exists so a zero interaction count always carries
+    /// its cause: a stale v1 extension, an uninterpretable schema and a silent
+    /// browser are otherwise indistinguishable.
+    #[serde(default)]
+    pub webflow_extension_status: String,
+    #[serde(default)]
+    pub webflow_extension_version: String,
+    #[serde(default)]
+    pub webflow_accepted_v1_total: u64,
+    #[serde(default)]
+    pub webflow_accepted_v2_total: u64,
+    #[serde(default)]
+    pub webflow_schema_rejected_total: u64,
+    #[serde(default)]
+    pub webflow_last_event_at_ms: u64,
+    #[serde(default)]
+    pub webflow_capabilities_bits: u32,
     /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
     /// p95 over a full window are very different claims, and reading one as
     /// the other already produced a bogus 120000ms LCP once.

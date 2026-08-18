@@ -234,6 +234,10 @@ mod tests {
                 site_bucket: None,
                 metrics: WebFlowMetrics::default(),
                 transport: Default::default(),
+                producer_kind: Default::default(),
+                extension_version: None,
+                bridge_version: None,
+                feature_capabilities: Default::default(),
             },
         };
         assert!(!request.is_privileged());

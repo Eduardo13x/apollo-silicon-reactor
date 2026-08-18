@@ -21,6 +21,16 @@
   /// v2 adds the per-interaction fields. Must match
   /// `WEBFLOW_SCHEMA_VERSION` in crates/apollo-engine/src/engine/webflow_types.rs.
   const SCHEMA_VERSION = 2;
+  /// Must match manifest.json. Sent so the daemon can say "EXT v1 STALE"
+  /// instead of showing unexplained zeros.
+  const EXTENSION_VERSION = '2.0.0';
+  /// Bit positions mirror FeatureCapabilities in webflow_types.rs.
+  const CAP_INTERACTION_GROUPING = 1 << 0;
+  const CAP_COMPONENT_BREAKDOWN = 1 << 1;
+  const CAP_TRANSPORT_TIMING = 1 << 2;
+  const CAP_FAST_PROBE = 1 << 3;
+  const FEATURE_CAPABILITIES =
+    CAP_INTERACTION_GROUPING | CAP_COMPONENT_BREAKDOWN | CAP_TRANSPORT_TIMING;
 
   function normalizeMetrics(input = {}) {
     const output = {};
@@ -94,6 +104,11 @@
       source: input.source,
       metrics: normalizeMetrics(input.metrics),
     };
+    event.producer_kind = 'chromium-extension';
+    event.extension_version = EXTENSION_VERSION;
+    event.feature_capabilities = input.featureCapabilities === undefined
+      ? FEATURE_CAPABILITIES
+      : (input.featureCapabilities | 0);
     const transport = normalizeTransport(input.transport);
     if (transport !== undefined) event.transport = transport;
     if (input.siteBucket !== undefined) {
@@ -207,7 +222,8 @@
     return { inputDelay, processing, presentation };
   }
 
-  const api = { MAX_MESSAGE_BYTES, SCHEMA_VERSION, normalizeTransport, foldInteractions, inpEstimateMs, componentTotals,
+  const api = { MAX_MESSAGE_BYTES, SCHEMA_VERSION, EXTENSION_VERSION,
+    FEATURE_CAPABILITIES, CAP_FAST_PROBE, normalizeTransport, foldInteractions, inpEstimateMs, componentTotals,
     MAX_TRACKED_INTERACTIONS, MIN_INTERACTIONS_FOR_PERCENTILE, NavigationTracker, buildEvent, encodeBounded, normalizeMetrics, randomOpaqueId };
   root.ApolloWebFlowProtocol = api;
   if (typeof module !== 'undefined') module.exports = api;

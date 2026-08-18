@@ -23,6 +23,10 @@ fn event(tab: u8, navigation: u8, sequence: u64, phase: WebFlowPhase) -> Receive
             site_bucket: None,
             metrics: WebFlowMetrics::default(),
             transport: Default::default(),
+            producer_kind: Default::default(),
+            extension_version: None,
+            bridge_version: None,
+            feature_capabilities: Default::default(),
         },
         received_at_ms: 1_000 + sequence * 10,
     }

@@ -906,6 +906,26 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
             lines.push(format!("       vitals LCP{lcp} evt{evt} n{n}"));
         }
+        // Producer negotiation first: every zero below must carry its cause.
+        if !m.webflow_extension_status.is_empty() {
+            let version = if m.webflow_extension_version.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", m.webflow_extension_version)
+            };
+            lines.push(format!(
+                "       ext {}{version}",
+                m.webflow_extension_status
+            ));
+            if m.webflow_accepted_v1_total > 0 || m.webflow_schema_rejected_total > 0 {
+                lines.push(format!(
+                    "       v1:{} v2:{} rej{}",
+                    compact_counter(m.webflow_accepted_v1_total),
+                    compact_counter(m.webflow_accepted_v2_total),
+                    compact_counter(m.webflow_schema_rejected_total),
+                ));
+            }
+        }
         // Transport cost, browser clock only. `cold` is the MV3 service-worker
         // wake count: the segment that decides whether a per-interaction fast
         // path is even conceivable. No cross-clock claim is made here.
@@ -2578,6 +2598,45 @@ mod tests {
             think.iter().any(|line| line.contains("evt440")),
             "the two series stay on separate rows: {think:?}"
         );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn a_stale_extension_explains_the_zeros_it_causes() {
+        // Without this row, a v1 extension and an idle browser render
+        // identically: every interaction counter at zero and no reason given.
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.webflow_extension_status = "v1-stale".to_string();
+        status.metrics.webflow_accepted_v1_total = 120;
+        status.metrics.webflow_accepted_v2_total = 0;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line == "       ext v1-stale"),
+            "the producer status must be stated: {think:?}"
+        );
+        assert!(
+            think.iter().any(|line| line == "       v1:120 v2:0 rej0"),
+            "with the counts behind it: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn an_active_v2_producer_reports_its_version() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.webflow_extension_status = "v2-active".to_string();
+        status.metrics.webflow_extension_version = "2.0.0".to_string();
+        status.metrics.webflow_accepted_v2_total = 40;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "       ext v2-active 2.0.0"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

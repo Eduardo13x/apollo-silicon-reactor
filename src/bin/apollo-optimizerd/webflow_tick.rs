@@ -5,8 +5,8 @@ use apollo_engine::engine::webflow_controller::{
     WebWorldObservation, MAX_WEBFLOW_EVENT_AGE_MS,
 };
 use apollo_engine::engine::webflow_types::{
-    OpaqueId, ReceivedWebFlowEvent, WebFlowEvent, WebFlowMetrics, WebFlowPhase, WebFlowSource,
-    WebFlowTransport, WEBFLOW_SCHEMA_VERSION,
+    ExtensionStatus, FeatureCapabilities, OpaqueId, ReceivedWebFlowEvent, WebFlowEvent,
+    WebFlowMetrics, WebFlowPhase, WebFlowSource, WebFlowTransport, WEBFLOW_SCHEMA_VERSION,
 };
 
 /// Bounded per-metric sample ring for browser Web Vitals. The extension is an
@@ -51,6 +51,13 @@ struct VitalsWindow {
     cold_starts: u64,
     transport_samples: u64,
     max_tab_queue_depth: u32,
+    /// Producer negotiation. A zero interaction count means something quite
+    /// different when v1 events are flowing than when nothing arrives at all.
+    accepted_v1: u64,
+    accepted_v2: u64,
+    last_extension_version: Option<String>,
+    last_capabilities: FeatureCapabilities,
+    last_event_at_ms: u64,
 }
 
 impl VitalsWindow {
@@ -99,6 +106,24 @@ impl VitalsWindow {
         self.cold_starts = 0;
         self.transport_samples = 0;
         self.max_tab_queue_depth = 0;
+    }
+
+    fn record_producer(&mut self, event: &WebFlowEvent, now_ms: u64) {
+        if event.source == WebFlowSource::DaemonInference {
+            return;
+        }
+        if event.schema_version >= 2 {
+            self.accepted_v2 = self.accepted_v2.saturating_add(1);
+        } else {
+            self.accepted_v1 = self.accepted_v1.saturating_add(1);
+        }
+        if let Some(version) = event.extension_version.as_deref() {
+            self.last_extension_version = Some(version.to_string());
+        }
+        if !event.feature_capabilities.is_empty() {
+            self.last_capabilities = event.feature_capabilities;
+        }
+        self.last_event_at_ms = now_ms;
     }
 
     fn record_transport(&mut self, transport: &WebFlowTransport) {
@@ -226,6 +251,13 @@ pub struct WebFlowCycleOutput {
     pub transport_cold_starts: u64,
     pub transport_samples: u64,
     pub transport_max_queue_depth: u32,
+    pub extension_status: ExtensionStatus,
+    pub extension_version: Option<String>,
+    pub accepted_v1_total: u64,
+    pub accepted_v2_total: u64,
+    pub schema_rejected_total: u64,
+    pub last_event_at_ms: u64,
+    pub capabilities_bits: u32,
     /// Samples behind those p95s.
     pub vitals_samples: u64,
 }
@@ -241,6 +273,9 @@ pub struct WebFlowRuntime {
     rollout_blocker: &'static str,
     vitals: VitalsWindow,
     vitals_session_revision: u64,
+    /// Payloads refused because their schema cannot be interpreted. Counted
+    /// apart from accepted events so a mismatch never presents as silence.
+    schema_rejected_total: u64,
 }
 
 impl WebFlowRuntime {
@@ -251,6 +286,7 @@ impl WebFlowRuntime {
             inference_active: false,
             last_exact_at_ms: None,
             rollout,
+            schema_rejected_total: 0,
             valid_health_cycles: 0,
             baseline_failures: None,
             rollout_blocker: if rollout == WebFlowRolloutPhase::Shadow {
@@ -307,6 +343,7 @@ impl WebFlowRuntime {
             }
             self.vitals.record(&received.event.metrics);
             self.vitals.record_transport(&received.event.transport);
+            self.vitals.record_producer(&received.event, input.now_ms);
         }
         if let Some(received_at_ms) = newest_exact_at_ms {
             self.last_exact_at_ms = Some(
@@ -344,6 +381,10 @@ impl WebFlowRuntime {
                     metrics: WebFlowMetrics::default(),
                     // Daemon-synthesised: no transport hops to record.
                     transport: WebFlowTransport::default(),
+                    producer_kind: Default::default(),
+                    extension_version: None,
+                    bridge_version: None,
+                    feature_capabilities: Default::default(),
                 },
                 received_at_ms: input.now_ms,
             });
@@ -390,6 +431,18 @@ impl WebFlowRuntime {
             transport_cold_starts: self.vitals.cold_starts,
             transport_samples: self.vitals.transport_samples,
             transport_max_queue_depth: self.vitals.max_tab_queue_depth,
+            extension_status: ExtensionStatus::classify(
+                self.vitals.accepted_v1,
+                self.vitals.accepted_v2,
+                self.schema_rejected_total,
+                self.vitals.last_capabilities,
+            ),
+            extension_version: self.vitals.last_extension_version.clone(),
+            accepted_v1_total: self.vitals.accepted_v1,
+            accepted_v2_total: self.vitals.accepted_v2,
+            schema_rejected_total: self.schema_rejected_total,
+            last_event_at_ms: self.vitals.last_event_at_ms,
+            capabilities_bits: self.vitals.last_capabilities.0,
             vitals_samples: self.vitals.samples(),
         }
     }
@@ -463,6 +516,10 @@ mod tests {
                 site_bucket: None,
                 metrics: WebFlowMetrics::default(),
                 transport: WebFlowTransport::default(),
+                producer_kind: Default::default(),
+                extension_version: None,
+                bridge_version: None,
+                feature_capabilities: Default::default(),
             },
             received_at_ms: 100,
         }
