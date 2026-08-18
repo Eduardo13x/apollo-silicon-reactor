@@ -78,7 +78,14 @@ function report() {
     domReadyMs: navigation ? navigation.domContentLoadedEventEnd : undefined,
     loadMs: navigation ? navigation.loadEventEnd : undefined,
   };
-  chrome.runtime.sendMessage({ type: 'apollo-webflow-vitals', metrics: payload }).catch(() => {});
+  // Browser clock. The gap to `service_worker_received_at_ms` contains the
+  // MV3 cold start, which is the unknown that decides whether any fast path
+  // could ever exist. Fire-and-forget: never block the interaction thread.
+  chrome.runtime.sendMessage({
+    type: 'apollo-webflow-vitals',
+    metrics: payload,
+    contentSendStartedAtMs: Math.round(performance.timeOrigin + performance.now()),
+  }).catch(() => {});
 }
 
 // A navigation or a closing tab ends the interaction population: carrying it

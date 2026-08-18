@@ -10,6 +10,9 @@ const tracker = new P.NavigationTracker(64);
 const tabQueues = new Map();
 let sequence = 0;
 let nativePort = null;
+// A fresh service worker global means MV3 tore the previous one down: the
+// first event after that pays the cold start we are trying to measure.
+let servedAnEvent = false;
 
 function nextSequence() {
   sequence += 1;
@@ -59,7 +62,7 @@ async function hmacSiteBucket(rawUrl) {
   return bucket.some((byte) => byte !== 0) ? bucket : undefined;
 }
 
-async function emit(record, phase, source, rawUrl, metrics = {}) {
+async function emit(record, phase, source, rawUrl, metrics = {}, transport = undefined) {
   if (!record) return;
   const siteBucket = rawUrl ? await hmacSiteBucket(rawUrl) : undefined;
   postNative(P.buildEvent({
@@ -71,6 +74,9 @@ async function emit(record, phase, source, rawUrl, metrics = {}) {
     source,
     siteBucket,
     metrics,
+    transport: transport
+      ? { ...transport, nativeMessageStartedAtMs: Date.now() }
+      : undefined,
   }));
 }
 
@@ -111,7 +117,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type !== 'apollo-webflow-vitals' || !sender.tab) return;
   const record = tracker.get(sender.tab.id);
-  enqueue(sender.tab.id, () => emit(record, 'settled', 'extension-vitals', undefined, message.metrics));
+  const transport = {
+    contentSendStartedAtMs: message.contentSendStartedAtMs,
+    serviceWorkerReceivedAtMs: Date.now(),
+    tabQueueDepth: tabQueues.size,
+    serviceWorkerColdStart: !servedAnEvent,
+  };
+  servedAnEvent = true;
+  enqueue(sender.tab.id, () =>
+    emit(record, 'settled', 'extension-vitals', undefined, message.metrics, transport));
 });
 
 function classifyError(error) {

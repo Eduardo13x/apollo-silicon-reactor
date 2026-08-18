@@ -21,6 +21,7 @@ fn event(sequence: u64) -> WebFlowEvent {
         source: WebFlowSource::ExtensionLifecycle,
         site_bucket: None,
         metrics: WebFlowMetrics::default(),
+        transport: Default::default(),
     }
 }
 

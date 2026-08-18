@@ -906,6 +906,21 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
             lines.push(format!("       vitals LCP{lcp} evt{evt} n{n}"));
         }
+        // Transport cost, browser clock only. `cold` is the MV3 service-worker
+        // wake count: the segment that decides whether a per-interaction fast
+        // path is even conceivable. No cross-clock claim is made here.
+        if m.webflow_transport_samples > 0 {
+            let seg = m
+                .webflow_transport_client_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            let wake = m
+                .webflow_transport_sw_wake_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            lines.push(format!(
+                "       hop{seg} sw{wake} cold{}",
+                compact_counter(m.webflow_transport_cold_starts)
+            ));
+        }
         if let Some(inp) = m.browser_inp_estimate_ms {
             lines.push(format!(
                 "       INP{inp:.0} i{}",
@@ -2564,6 +2579,33 @@ mod tests {
             "the two series stay on separate rows: {think:?}"
         );
         assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn the_transport_cost_is_reported_before_anyone_claims_a_fast_path() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.webflow_transport_samples = 40;
+        status.metrics.webflow_transport_client_p95_ms = Some(312.0);
+        status.metrics.webflow_transport_sw_wake_p95_ms = Some(280.0);
+        status.metrics.webflow_transport_cold_starts = 7;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line == "       hop312 sw280 cold7"),
+            "the transport segments must be visible: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_transport_row_without_transport_samples() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        let think = render_think_q(&status);
+        assert!(!think.iter().any(|line| line.contains("hop")));
     }
 
     #[test]

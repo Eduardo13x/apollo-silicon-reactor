@@ -233,6 +233,7 @@ mod tests {
                 source: WebFlowSource::ExtensionLifecycle,
                 site_bucket: None,
                 metrics: WebFlowMetrics::default(),
+                transport: Default::default(),
             },
         };
         assert!(!request.is_privileged());

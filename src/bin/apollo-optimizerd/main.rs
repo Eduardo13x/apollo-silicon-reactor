@@ -2655,6 +2655,15 @@ fn main() -> anyhow::Result<()> {
                         webflow_output.processing_total_ms;
                     metrics.metrics.browser_presentation_total_ms =
                         webflow_output.presentation_total_ms;
+                    metrics.metrics.webflow_transport_client_p95_ms =
+                        webflow_output.transport_client_segment_p95_ms;
+                    metrics.metrics.webflow_transport_sw_wake_p95_ms =
+                        webflow_output.transport_sw_wake_p95_ms;
+                    metrics.metrics.webflow_transport_cold_starts =
+                        webflow_output.transport_cold_starts;
+                    metrics.metrics.webflow_transport_samples = webflow_output.transport_samples;
+                    metrics.metrics.webflow_transport_max_queue_depth =
+                        webflow_output.transport_max_queue_depth;
                     metrics.metrics.browser_latency_samples = webflow_output.vitals_samples;
                     metrics.metrics.network_flow_active = networkflow_output.observation.active;
                     metrics.metrics.network_flow_traffic_bps =

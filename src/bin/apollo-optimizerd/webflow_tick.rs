@@ -6,7 +6,7 @@ use apollo_engine::engine::webflow_controller::{
 };
 use apollo_engine::engine::webflow_types::{
     OpaqueId, ReceivedWebFlowEvent, WebFlowEvent, WebFlowMetrics, WebFlowPhase, WebFlowSource,
-    WEBFLOW_SCHEMA_VERSION,
+    WebFlowTransport, WEBFLOW_SCHEMA_VERSION,
 };
 
 /// Bounded per-metric sample ring for browser Web Vitals. The extension is an
@@ -45,6 +45,12 @@ struct VitalsWindow {
     input_delay_total_ms: u64,
     processing_total_ms: u64,
     presentation_total_ms: u64,
+    /// Browser-clock transport segments. Same-clock differences only.
+    client_segment_ms: VecDeque<u32>,
+    service_worker_wake_ms: VecDeque<u32>,
+    cold_starts: u64,
+    transport_samples: u64,
+    max_tab_queue_depth: u32,
 }
 
 impl VitalsWindow {
@@ -88,6 +94,52 @@ impl VitalsWindow {
         self.input_delay_total_ms = 0;
         self.processing_total_ms = 0;
         self.presentation_total_ms = 0;
+        self.client_segment_ms.clear();
+        self.service_worker_wake_ms.clear();
+        self.cold_starts = 0;
+        self.transport_samples = 0;
+        self.max_tab_queue_depth = 0;
+    }
+
+    fn record_transport(&mut self, transport: &WebFlowTransport) {
+        let mut observed = false;
+        for (value, ring) in [
+            (transport.client_segment_ms(), &mut self.client_segment_ms),
+            (
+                transport.service_worker_wake_ms(),
+                &mut self.service_worker_wake_ms,
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            observed = true;
+            if ring.len() >= MAX_VITALS_SAMPLES {
+                ring.pop_front();
+            }
+            ring.push_back(value.min(u64::from(u32::MAX)) as u32);
+        }
+        if transport.service_worker_cold_start == Some(true) {
+            self.cold_starts = self.cold_starts.saturating_add(1);
+        }
+        self.max_tab_queue_depth = self
+            .max_tab_queue_depth
+            .max(transport.tab_queue_depth.unwrap_or(0));
+        if observed {
+            self.transport_samples = self.transport_samples.saturating_add(1);
+        }
+    }
+
+    fn client_segment_p95_ms(&self) -> Option<f64> {
+        vitals_p95(&self.client_segment_ms.iter().copied().collect::<Vec<_>>())
+    }
+
+    fn service_worker_wake_p95_ms(&self) -> Option<f64> {
+        vitals_p95(
+            &self
+                .service_worker_wake_ms
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+        )
     }
 
     fn inp_estimate_p95_ms(&self) -> Option<f64> {
@@ -169,6 +221,11 @@ pub struct WebFlowCycleOutput {
     pub input_delay_total_ms: u64,
     pub processing_total_ms: u64,
     pub presentation_total_ms: u64,
+    pub transport_client_segment_p95_ms: Option<f64>,
+    pub transport_sw_wake_p95_ms: Option<f64>,
+    pub transport_cold_starts: u64,
+    pub transport_samples: u64,
+    pub transport_max_queue_depth: u32,
     /// Samples behind those p95s.
     pub vitals_samples: u64,
 }
@@ -249,6 +306,7 @@ impl WebFlowRuntime {
                 continue;
             }
             self.vitals.record(&received.event.metrics);
+            self.vitals.record_transport(&received.event.transport);
         }
         if let Some(received_at_ms) = newest_exact_at_ms {
             self.last_exact_at_ms = Some(
@@ -284,6 +342,8 @@ impl WebFlowRuntime {
                     source: WebFlowSource::DaemonInference,
                     site_bucket: None,
                     metrics: WebFlowMetrics::default(),
+                    // Daemon-synthesised: no transport hops to record.
+                    transport: WebFlowTransport::default(),
                 },
                 received_at_ms: input.now_ms,
             });
@@ -325,6 +385,11 @@ impl WebFlowRuntime {
             input_delay_total_ms: self.vitals.input_delay_total_ms,
             processing_total_ms: self.vitals.processing_total_ms,
             presentation_total_ms: self.vitals.presentation_total_ms,
+            transport_client_segment_p95_ms: self.vitals.client_segment_p95_ms(),
+            transport_sw_wake_p95_ms: self.vitals.service_worker_wake_p95_ms(),
+            transport_cold_starts: self.vitals.cold_starts,
+            transport_samples: self.vitals.transport_samples,
+            transport_max_queue_depth: self.vitals.max_tab_queue_depth,
             vitals_samples: self.vitals.samples(),
         }
     }
@@ -397,6 +462,7 @@ mod tests {
                 source: WebFlowSource::ExtensionLifecycle,
                 site_bucket: None,
                 metrics: WebFlowMetrics::default(),
+                transport: WebFlowTransport::default(),
             },
             received_at_ms: 100,
         }

@@ -52,6 +52,25 @@
     return output;
   }
 
+  function normalizeTransport(input) {
+    if (!input || typeof input !== 'object') return undefined;
+    const output = {};
+    for (const [source, target] of [
+      ['contentSendStartedAtMs', 'content_send_started_at_ms'],
+      ['serviceWorkerReceivedAtMs', 'service_worker_received_at_ms'],
+      ['nativeMessageStartedAtMs', 'native_message_started_at_ms'],
+    ]) {
+      const value = boundedInteger(input[source], Number.MAX_SAFE_INTEGER);
+      if (value !== undefined) output[target] = value;
+    }
+    const depth = boundedInteger(input.tabQueueDepth, 100_000);
+    if (depth !== undefined) output.tab_queue_depth = depth;
+    if (typeof input.serviceWorkerColdStart === 'boolean') {
+      output.service_worker_cold_start = input.serviceWorkerColdStart;
+    }
+    return Object.keys(output).length > 0 ? output : undefined;
+  }
+
   function validId(value) {
     return Array.isArray(value)
       && value.length === 16
@@ -75,6 +94,8 @@
       source: input.source,
       metrics: normalizeMetrics(input.metrics),
     };
+    const transport = normalizeTransport(input.transport);
+    if (transport !== undefined) event.transport = transport;
     if (input.siteBucket !== undefined) {
       if (!validId(input.siteBucket)) throw new Error('invalid site bucket');
       event.site_bucket = input.siteBucket;
@@ -186,7 +207,7 @@
     return { inputDelay, processing, presentation };
   }
 
-  const api = { MAX_MESSAGE_BYTES, SCHEMA_VERSION, foldInteractions, inpEstimateMs, componentTotals,
+  const api = { MAX_MESSAGE_BYTES, SCHEMA_VERSION, normalizeTransport, foldInteractions, inpEstimateMs, componentTotals,
     MAX_TRACKED_INTERACTIONS, MIN_INTERACTIONS_FOR_PERCENTILE, NavigationTracker, buildEvent, encodeBounded, normalizeMetrics, randomOpaqueId };
   root.ApolloWebFlowProtocol = api;
   if (typeof module !== 'undefined') module.exports = api;

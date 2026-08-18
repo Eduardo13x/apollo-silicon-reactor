@@ -22,6 +22,7 @@ fn event(tab: u8, navigation: u8, sequence: u64, phase: WebFlowPhase) -> Receive
             source: WebFlowSource::ExtensionLifecycle,
             site_bucket: None,
             metrics: WebFlowMetrics::default(),
+            transport: Default::default(),
         },
         received_at_ms: 1_000 + sequence * 10,
     }

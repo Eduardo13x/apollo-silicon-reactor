@@ -566,6 +566,19 @@ pub struct RuntimeMetrics {
     pub browser_processing_total_ms: u64,
     #[serde(default)]
     pub browser_presentation_total_ms: u64,
+    /// Transport cost, browser clock, content script → native post. Contains
+    /// the MV3 service-worker cold start. This is the measurement that decides
+    /// whether any per-interaction fast path could ever exist.
+    #[serde(default)]
+    pub webflow_transport_client_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub webflow_transport_sw_wake_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub webflow_transport_cold_starts: u64,
+    #[serde(default)]
+    pub webflow_transport_samples: u64,
+    #[serde(default)]
+    pub webflow_transport_max_queue_depth: u32,
     /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
     /// p95 over a full window are very different claims, and reading one as
     /// the other already produced a bogus 120000ms LCP once.

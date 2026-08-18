@@ -15,6 +15,8 @@ pub const WEBFLOW_SCHEMA_VERSION: u16 = 2;
 pub const MIN_SUPPORTED_WEBFLOW_SCHEMA_VERSION: u16 = 1;
 /// An untrusted page must not be able to claim an unbounded interaction count.
 pub const MAX_WEBFLOW_INTERACTIONS: u32 = 4_096;
+/// A transport segment longer than this is a clock anomaly, not a measurement.
+pub const MAX_WEBFLOW_TRANSPORT_MS: u64 = 60_000;
 pub const MAX_WEBFLOW_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_WEBFLOW_INGRESS_EVENTS: usize = 256;
 pub const MAX_WEBFLOW_EVENTS_PER_CYCLE: usize = 128;
@@ -205,6 +207,56 @@ impl WebFlowMetrics {
     }
 }
 
+/// Per-hop transport timing. Every field is stamped by exactly one component
+/// **in that component's own clock**, and only same-clock differences are ever
+/// computed. Nothing here establishes a shared timeline: proving that an action
+/// landed before a paint would need an offset protocol with an error bound,
+/// which 0A-obs deliberately does not claim to have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebFlowTransport {
+    /// Browser clock. Content script hands the message to the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_send_started_at_ms: Option<u64>,
+    /// Browser clock. Service worker receives it — the gap over the field above
+    /// contains the MV3 cold start, the one unknown that decides feasibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_received_at_ms: Option<u64>,
+    /// Browser clock. Service worker posts to the native host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_message_started_at_ms: Option<u64>,
+    /// Depth of the per-tab promise queue when this event was enqueued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_queue_depth: Option<u32>,
+    /// Whether the service worker had to be woken for this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_cold_start: Option<bool>,
+}
+
+impl WebFlowTransport {
+    /// Browser-clock only: content script hand-off to native post. Includes the
+    /// service-worker cold start and the per-tab queue.
+    pub fn client_segment_ms(&self) -> Option<u64> {
+        let start = self.content_send_started_at_ms?;
+        let end = self.native_message_started_at_ms?;
+        end.checked_sub(start)
+    }
+
+    /// Browser-clock only: how long the message waited for the service worker.
+    pub fn service_worker_wake_ms(&self) -> Option<u64> {
+        let start = self.content_send_started_at_ms?;
+        let end = self.service_worker_received_at_ms?;
+        end.checked_sub(start)
+    }
+
+    pub fn is_plausible(&self) -> bool {
+        [self.client_segment_ms(), self.service_worker_wake_ms()]
+            .into_iter()
+            .flatten()
+            .all(|value| value <= MAX_WEBFLOW_TRANSPORT_MS)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebFlowEvent {
@@ -219,6 +271,14 @@ pub struct WebFlowEvent {
     pub site_bucket: Option<OpaqueBucket>,
     #[serde(default)]
     pub metrics: WebFlowMetrics,
+    #[serde(default, skip_serializing_if = "WebFlowTransport::is_default")]
+    pub transport: WebFlowTransport,
+}
+
+impl WebFlowTransport {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl WebFlowEvent {
@@ -239,6 +299,9 @@ impl WebFlowEvent {
                 .is_some_and(|bucket| bucket.bytes() == [0; 16])
         {
             return Err(WebFlowValidationError::ZeroIdentity);
+        }
+        if !self.transport.is_plausible() {
+            return Err(WebFlowValidationError::MetricOutOfRange);
         }
         self.metrics.validate()
     }
@@ -430,6 +493,7 @@ mod schema_v2_tests {
             source: WebFlowSource::ExtensionVitals,
             site_bucket: None,
             metrics,
+            transport: WebFlowTransport::default(),
         }
     }
 
@@ -521,5 +585,70 @@ mod schema_v2_tests {
         assert_eq!(round_trip.metrics.event_duration_ms, Some(440));
         assert_eq!(round_trip.metrics.inp_estimate_ms, Some(184));
         assert_eq!(round_trip.metrics.interaction_count, Some(312));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn only_same_clock_differences_are_computed() {
+        let transport = WebFlowTransport {
+            content_send_started_at_ms: Some(1_000),
+            service_worker_received_at_ms: Some(1_280),
+            native_message_started_at_ms: Some(1_312),
+            tab_queue_depth: Some(2),
+            service_worker_cold_start: Some(true),
+        };
+        // Both segments live entirely in the browser clock.
+        assert_eq!(transport.service_worker_wake_ms(), Some(280));
+        assert_eq!(transport.client_segment_ms(), Some(312));
+        assert!(transport.is_plausible());
+    }
+
+    #[test]
+    fn a_partial_transport_yields_no_segment_rather_than_a_guess() {
+        let partial = WebFlowTransport {
+            service_worker_received_at_ms: Some(1_280),
+            ..WebFlowTransport::default()
+        };
+        assert_eq!(partial.client_segment_ms(), None);
+        assert_eq!(partial.service_worker_wake_ms(), None);
+        assert!(partial.is_plausible(), "absence is not implausibility");
+    }
+
+    #[test]
+    fn a_backwards_clock_yields_no_segment_instead_of_underflowing() {
+        let regressed = WebFlowTransport {
+            content_send_started_at_ms: Some(2_000),
+            native_message_started_at_ms: Some(1_000),
+            ..WebFlowTransport::default()
+        };
+        assert_eq!(regressed.client_segment_ms(), None);
+    }
+
+    #[test]
+    fn an_implausible_segment_is_refused_at_validation() {
+        let event = WebFlowEvent {
+            schema_version: WEBFLOW_SCHEMA_VERSION,
+            browser_session_id: OpaqueId::new([1; 16]).expect("id"),
+            tab_session_id: OpaqueId::new([2; 16]).expect("id"),
+            navigation_id: OpaqueId::new([3; 16]).expect("id"),
+            sequence: 1,
+            phase: WebFlowPhase::Settled,
+            source: WebFlowSource::ExtensionVitals,
+            site_bucket: None,
+            metrics: WebFlowMetrics::default(),
+            transport: WebFlowTransport {
+                content_send_started_at_ms: Some(0),
+                native_message_started_at_ms: Some(MAX_WEBFLOW_TRANSPORT_MS + 1),
+                ..WebFlowTransport::default()
+            },
+        };
+        assert_eq!(
+            event.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
     }
 }
