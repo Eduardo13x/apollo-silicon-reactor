@@ -1030,6 +1030,48 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             ));
         }
     }
+    // Observational association. `CAUSAL UNTESTED` is printed unconditionally
+    // beside it: a with/without median shift is co-occurrence, and the Lab is
+    // the only thing that could turn it into a causal claim.
+    if !m.perceptual_assoc_verdict.is_empty() {
+        lines.push(format!(
+            "Assoc  {} {}",
+            m.perceptual_assoc_family
+                .chars()
+                .take(12)
+                .collect::<String>(),
+            m.perceptual_assoc_verdict
+                .chars()
+                .take(11)
+                .collect::<String>(),
+        ));
+        if m.perceptual_assoc_samples_with > 0 || m.perceptual_assoc_samples_without > 0 {
+            lines.push(format!(
+                "       {:+}ms w{} wo{}",
+                m.perceptual_assoc_delta_ms,
+                compact_counter(u64::from(m.perceptual_assoc_samples_with)),
+                compact_counter(u64::from(m.perceptual_assoc_samples_without)),
+            ));
+        }
+        if !m.perceptual_assoc_component.is_empty() {
+            lines.push(format!(
+                "       {} q{}",
+                m.perceptual_assoc_component
+                    .chars()
+                    .take(14)
+                    .collect::<String>(),
+                m.perceptual_assoc_confidence_q,
+            ));
+        }
+        lines.push(format!(
+            "       CAUSAL UNTESTED{}",
+            if m.perceptual_assoc_actionable {
+                " lever"
+            } else {
+                ""
+            }
+        ));
+    }
     // ── 0B observational state ───────────────────────────────────────────
     // Deliberately says what it does not know. A regime classification is what
     // the window supports saying, never a causal claim.
@@ -2684,6 +2726,38 @@ mod tests {
             "the two series stay on separate rows: {think:?}"
         );
         assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn an_association_is_always_printed_next_to_causal_untested() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_assoc_family = "compiler".to_string();
+        status.metrics.perceptual_assoc_verdict = "observed".to_string();
+        status.metrics.perceptual_assoc_delta_ms = 180;
+        status.metrics.perceptual_assoc_component = "input-delay".to_string();
+        status.metrics.perceptual_assoc_samples_with = 46;
+        status.metrics.perceptual_assoc_samples_without = 52;
+        status.metrics.perceptual_assoc_confidence_q = 740;
+        status.metrics.perceptual_assoc_actionable = true;
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line == "Assoc  compiler observed"));
+        assert!(think.iter().any(|line| line == "       +180ms w46 wo52"));
+        assert!(think.iter().any(|line| line == "       input-delay q740"));
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       CAUSAL UNTESTED lever"),
+            "a co-occurrence must never render without that caveat: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_association_row_before_any_comparison_exists() {
+        let think = render_think_q(&dashboard_status());
+        assert!(!think.iter().any(|line| line.starts_with("Assoc")));
+        assert!(!think.iter().any(|line| line.contains("CAUSAL")));
     }
 
     #[test]

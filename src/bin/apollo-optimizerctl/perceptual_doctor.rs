@@ -140,6 +140,37 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
             m.browser_interactions_dropped
         ),
     ));
+    checks.push(Check::new(
+        "store",
+        m.perceptual_observations_total > 0,
+        format!(
+            "stored={} invalid={} quality={} regimes={}",
+            m.perceptual_observations_total,
+            m.perceptual_invalid_total,
+            m.perceptual_quality_q,
+            m.perceptual_regimes_total
+        ),
+    ));
+    // Informational: having nothing to compare is a legitimate state. A
+    // machine with no varying contention produces no association, and calling
+    // that a failure would push someone to manufacture one.
+    checks.push(Check::new(
+        "association",
+        true,
+        if m.perceptual_assoc_verdict.is_empty() {
+            "no with/without comparison yet (needs varying contention)".to_string()
+        } else {
+            format!(
+                "{} {} {:+}ms w={} wo={} q={} causal=untested",
+                m.perceptual_assoc_family,
+                m.perceptual_assoc_verdict,
+                m.perceptual_assoc_delta_ms,
+                m.perceptual_assoc_samples_with,
+                m.perceptual_assoc_samples_without,
+                m.perceptual_assoc_confidence_q
+            )
+        },
+    ));
     let component_total = m
         .browser_input_delay_total_ms
         .saturating_add(m.browser_processing_total_ms)
@@ -368,6 +399,8 @@ mod tests {
                 "vitals",
                 "transport",
                 "interactions",
+                "store",
+                "association",
                 "components"
             ]
         );

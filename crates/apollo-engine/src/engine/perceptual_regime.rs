@@ -1067,7 +1067,7 @@ mod wiring_tests {
 // ── Source-agnostic evidence ────────────────────────────────────────────────
 
 use crate::engine::perceptual::types::{
-    MeasurementMode, PerceptualObservation, PerceptualSourceKind,
+    LatencyComponentKind, MeasurementMode, PerceptualObservation, PerceptualSourceKind,
 };
 
 /// One observation joined to the machine state around it.
@@ -1117,6 +1117,9 @@ pub struct EvidenceStratum {
     pub measurement_mode: MeasurementMode,
     pub contention_level: ContentionLevel,
     pub actionable: bool,
+    /// Hashed foreground application. An association that holds only under one
+    /// app is a different finding from one that holds everywhere.
+    pub foreground_hash: u64,
 }
 
 impl EvidenceStratum {
@@ -1126,6 +1129,7 @@ impl EvidenceStratum {
             measurement_mode: evidence.measurement_mode(),
             contention_level: evidence.contention.contention_level(),
             actionable: evidence.contention.actionable_count() > 0,
+            foreground_hash: evidence.contention.foreground_name_hash,
         }
     }
 }
@@ -1327,5 +1331,389 @@ mod agnostic_evidence_tests {
             MIN_REGIME_INTERACTIONS + 2 - 5,
             "ambiguous evidence is excluded from the aggregate"
         );
+    }
+}
+
+// ── Stratified observational association ────────────────────────────────────
+
+/// What a stratified comparison supports saying. Never more than that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AssociationVerdict {
+    /// Latency was consistently different when this family was contending.
+    Observed,
+    /// Contention varied and latency did not follow it.
+    NotFound,
+    /// Not enough of either side to compare.
+    InsufficientSamples,
+}
+
+impl AssociationVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Observed => "association-observed",
+            Self::NotFound => "association-not-found",
+            Self::InsufficientSamples => "insufficient-samples",
+        }
+    }
+
+    /// Association is not causation. Written as code so a later change that
+    /// tries to treat it as causal has to delete a test first.
+    pub const fn is_causal(self) -> bool {
+        false
+    }
+}
+
+/// Minimum on each side of a with/without comparison. Below this the
+/// difference between two medians is noise wearing a number's clothes.
+pub const MIN_ASSOCIATION_SAMPLES_PER_SIDE: u32 = 8;
+/// A median shift smaller than this is inside the browser's own 8 ms rounding
+/// and the sampling jitter around it.
+pub const MIN_ASSOCIATION_DELTA_MS: i32 = 10;
+
+/// One with/without comparison for a single contender family.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ObservationalAssociation {
+    pub contender_family: String,
+    pub actionable: bool,
+    pub samples_with: u32,
+    pub samples_without: u32,
+    pub median_with_ms: Option<u32>,
+    pub median_without_ms: Option<u32>,
+    pub delta_ms: i32,
+    /// Which stage moved most, when the source could break latency down.
+    pub worst_component: Option<LatencyComponentKind>,
+    pub component_delta_ms: i32,
+    pub confidence_q: u16,
+    pub verdict: AssociationVerdict,
+}
+
+impl ObservationalAssociation {
+    /// Whether the pattern disappears when the family is absent — the question
+    /// that separates "this always happens" from "this happens with them".
+    pub fn improves_without_contender(&self) -> bool {
+        self.verdict == AssociationVerdict::Observed && self.delta_ms > 0
+    }
+}
+
+fn median_of(values: &mut Vec<u32>) -> Option<u32> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
+}
+
+/// Compare latency with and without each contender family, within one stratum.
+///
+/// Only evidence of the same modality and measurement mode is compared, because
+/// the stratum key carries both. Nothing here establishes causation: a family
+/// that co-occurs with slow interactions may be a symptom of the same load, or
+/// may be irrelevant and merely busy at the same time.
+pub fn associate_by_contender(
+    evidence: &[PerceptualRegimeEvidence],
+) -> Vec<ObservationalAssociation> {
+    let usable: Vec<&PerceptualRegimeEvidence> = evidence
+        .iter()
+        .filter(|e| e.admits_to_aggregate() && e.total_duration_ms().is_some())
+        .collect();
+    if usable.is_empty() {
+        return Vec::new();
+    }
+    let mut families: Vec<String> = Vec::new();
+    for item in &usable {
+        for contender in &item.contention.contenders {
+            if !families.contains(&contender.family) {
+                families.push(contender.family.clone());
+            }
+        }
+    }
+
+    families
+        .into_iter()
+        .map(|family| {
+            let present = |e: &PerceptualRegimeEvidence| {
+                e.contention.contenders.iter().any(|c| c.family == family)
+            };
+            let mut with: Vec<u32> = usable
+                .iter()
+                .filter(|e| present(e))
+                .filter_map(|e| e.total_duration_ms())
+                .collect();
+            let mut without: Vec<u32> = usable
+                .iter()
+                .filter(|e| !present(e))
+                .filter_map(|e| e.total_duration_ms())
+                .collect();
+            let samples_with = with.len() as u32;
+            let samples_without = without.len() as u32;
+            let actionable = usable
+                .iter()
+                .filter(|e| present(e))
+                .flat_map(|e| e.contention.contenders.iter())
+                .any(|c| c.family == family && c.is_actionable());
+
+            let median_with = median_of(&mut with);
+            let median_without = median_of(&mut without);
+            let delta = match (median_with, median_without) {
+                (Some(a), Some(b)) => i64::from(a) - i64::from(b),
+                _ => 0,
+            } as i32;
+
+            // Which stage moved most, when both sides could break latency down.
+            let component_shift = |kind: LatencyComponentKind| -> Option<i32> {
+                let mut a: Vec<u32> = usable
+                    .iter()
+                    .filter(|e| present(e))
+                    .filter_map(|e| e.observation.measurement().component(kind))
+                    .collect();
+                let mut b: Vec<u32> = usable
+                    .iter()
+                    .filter(|e| !present(e))
+                    .filter_map(|e| e.observation.measurement().component(kind))
+                    .collect();
+                match (median_of(&mut a), median_of(&mut b)) {
+                    (Some(x), Some(y)) => Some((i64::from(x) - i64::from(y)) as i32),
+                    _ => None,
+                }
+            };
+            let mut worst_component = None;
+            let mut component_delta: i32 = 0;
+            for kind in [
+                LatencyComponentKind::InputDelay,
+                LatencyComponentKind::Processing,
+                LatencyComponentKind::Presentation,
+            ] {
+                if let Some(shift) = component_shift(kind) {
+                    if shift.abs() > component_delta.abs() {
+                        component_delta = shift;
+                        worst_component = Some(kind);
+                    }
+                }
+            }
+
+            let verdict = if samples_with < MIN_ASSOCIATION_SAMPLES_PER_SIDE
+                || samples_without < MIN_ASSOCIATION_SAMPLES_PER_SIDE
+            {
+                AssociationVerdict::InsufficientSamples
+            } else if delta.abs() >= MIN_ASSOCIATION_DELTA_MS {
+                AssociationVerdict::Observed
+            } else {
+                AssociationVerdict::NotFound
+            };
+
+            // Confidence grows with the thinner side, never with the total: a
+            // thousand samples on one side and three on the other is still a
+            // three-sample comparison.
+            let thinner = samples_with.min(samples_without);
+            let confidence_q = if verdict == AssociationVerdict::Observed {
+                (u32::from(QUALITY_SCALE_U16).min(thinner * 20)) as u16
+            } else {
+                0
+            };
+
+            ObservationalAssociation {
+                contender_family: family,
+                actionable,
+                samples_with,
+                samples_without,
+                median_with_ms: median_with,
+                median_without_ms: median_without,
+                delta_ms: delta,
+                worst_component,
+                component_delta_ms: component_delta,
+                confidence_q,
+                verdict,
+            }
+        })
+        .collect()
+}
+
+const QUALITY_SCALE_U16: u16 = 1_000;
+
+/// Families that co-occur with the slowest observations, ranked. Answers "what
+/// keeps showing up when things feel bad" without asserting they cause it.
+pub fn families_co_occurring_with_slowness(
+    evidence: &[PerceptualRegimeEvidence],
+    slow_threshold_ms: u32,
+) -> Vec<(String, u32, bool)> {
+    let mut counts: Vec<(String, u32, bool)> = Vec::new();
+    for item in evidence
+        .iter()
+        .filter(|e| e.admits_to_aggregate())
+        .filter(|e| {
+            e.total_duration_ms()
+                .is_some_and(|d| d >= slow_threshold_ms)
+        })
+    {
+        for contender in &item.contention.contenders {
+            match counts.iter_mut().find(|(f, _, _)| *f == contender.family) {
+                Some(entry) => {
+                    entry.1 = entry.1.saturating_add(1);
+                    entry.2 |= contender.is_actionable();
+                }
+                None => counts.push((contender.family.clone(), 1, contender.is_actionable())),
+            }
+        }
+    }
+    counts.sort_by(|a, b| b.1.cmp(&a.1));
+    counts
+}
+
+#[cfg(test)]
+mod association_tests {
+    use super::*;
+    use crate::engine::perceptual::types::{
+        InteractionScope, MeasurementMode, ObservationHeader, PerceptualId, PerceptualMeasurement,
+        PerceptualQuality, PerceptualTransportTrace, ProducerKind,
+    };
+
+    fn evidence(total_ms: u32, family: Option<&str>, actionable: bool) -> PerceptualRegimeEvidence {
+        let contenders = family
+            .map(|f| {
+                vec![Contender {
+                    name_hash: 1,
+                    family: f.to_string(),
+                    pid: 900,
+                    cpu_percent: 70.0,
+                    thread_count: 8,
+                    ineligible: (!actionable).then_some(IneligibilityReason::BrowserFamily),
+                }]
+            })
+            .unwrap_or_default();
+        PerceptualRegimeEvidence {
+            observation:
+                crate::engine::perceptual::types::PerceptualObservation::InferredInteraction(
+                    crate::engine::perceptual::types::InferredInteractionEpisode {
+                        header: ObservationHeader {
+                            observed_at_ms: 1,
+                            source_kind: PerceptualSourceKind::Synthetic,
+                            producer_kind: ProducerKind::SyntheticTest,
+                            scope: InteractionScope {
+                                producer_session_id: PerceptualId::new([1; 16]).expect("id"),
+                                ..InteractionScope::default()
+                            },
+                            quality: PerceptualQuality::default(),
+                            correlation:
+                                crate::engine::perceptual::types::CorrelationState::CompletedOnly,
+                            transport: PerceptualTransportTrace::default(),
+                            legacy_contract: false,
+                        },
+                        measurement: PerceptualMeasurement {
+                            total_duration_ms: Some(total_ms),
+                            components: Vec::new(),
+                            measurement_mode: MeasurementMode::Inferred,
+                        },
+                        inference_basis:
+                            crate::engine::perceptual::types::InferenceBasis::ProcessActivity,
+                    },
+                ),
+            contention: ContentionSnapshot {
+                foreground_name_hash: 42,
+                contenders,
+                ..ContentionSnapshot::default()
+            },
+        }
+    }
+
+    fn dataset(
+        with_ms: u32,
+        without_ms: u32,
+        per_side: u32,
+        actionable: bool,
+    ) -> Vec<PerceptualRegimeEvidence> {
+        let mut out = Vec::new();
+        for _ in 0..per_side {
+            out.push(evidence(with_ms, Some("compiler"), actionable));
+            out.push(evidence(without_ms, None, actionable));
+        }
+        out
+    }
+
+    #[test]
+    fn a_repeated_shift_with_a_contender_is_observed_but_never_causal() {
+        let associations = associate_by_contender(&dataset(300, 120, 12, true));
+        let compiler = associations
+            .iter()
+            .find(|a| a.contender_family == "compiler")
+            .expect("family present");
+        assert_eq!(compiler.verdict, AssociationVerdict::Observed);
+        assert_eq!(compiler.delta_ms, 180);
+        assert!(compiler.improves_without_contender());
+        assert!(
+            !compiler.verdict.is_causal(),
+            "association is not causation"
+        );
+    }
+
+    #[test]
+    fn varying_contention_without_a_latency_shift_is_not_found() {
+        let associations = associate_by_contender(&dataset(122, 120, 12, true));
+        let compiler = associations
+            .iter()
+            .find(|a| a.contender_family == "compiler")
+            .expect("family present");
+        assert_eq!(compiler.verdict, AssociationVerdict::NotFound);
+        assert_eq!(compiler.confidence_q, 0);
+    }
+
+    #[test]
+    fn a_one_sided_comparison_reports_insufficiency_instead_of_a_delta() {
+        // Nine hundred samples on one side and three on the other is still a
+        // three-sample comparison.
+        let mut lopsided: Vec<_> = (0..40)
+            .map(|_| evidence(300, Some("compiler"), true))
+            .collect();
+        lopsided.extend((0..3).map(|_| evidence(120, None, true)));
+        let associations = associate_by_contender(&lopsided);
+        let compiler = &associations[0];
+        assert_eq!(compiler.verdict, AssociationVerdict::InsufficientSamples);
+        assert_eq!(compiler.confidence_q, 0);
+    }
+
+    #[test]
+    fn confidence_follows_the_thinner_side_not_the_total() {
+        let balanced = associate_by_contender(&dataset(300, 120, 10, true));
+        let mut lopsided: Vec<_> = (0..100)
+            .map(|_| evidence(300, Some("compiler"), true))
+            .collect();
+        lopsided.extend((0..10).map(|_| evidence(120, None, true)));
+        let skewed = associate_by_contender(&lopsided);
+        assert_eq!(balanced[0].confidence_q, skewed[0].confidence_q);
+    }
+
+    #[test]
+    fn legal_actionability_travels_with_the_association() {
+        let vetoed = associate_by_contender(&dataset(300, 120, 12, false));
+        assert!(!vetoed[0].actionable, "a vetoed contender offers no lever");
+        let legal = associate_by_contender(&dataset(300, 120, 12, true));
+        assert!(legal[0].actionable);
+    }
+
+    #[test]
+    fn families_that_keep_appearing_when_things_feel_slow_are_ranked() {
+        let mut mixed = dataset(300, 120, 10, true);
+        for _ in 0..4 {
+            mixed.push(evidence(400, Some("indexer"), true));
+        }
+        let ranked = families_co_occurring_with_slowness(&mixed, 250);
+        assert_eq!(ranked[0].0, "compiler", "the most frequent leads");
+        assert!(ranked.iter().any(|(f, _, _)| f == "indexer"));
+    }
+
+    #[test]
+    fn an_empty_or_unusable_dataset_yields_no_association_rather_than_a_zero() {
+        assert!(associate_by_contender(&[]).is_empty());
+        let mut ambiguous = dataset(300, 120, 12, true);
+        for item in &mut ambiguous {
+            if let crate::engine::perceptual::types::PerceptualObservation::InferredInteraction(
+                ref mut e,
+            ) = item.observation
+            {
+                e.header.correlation =
+                    crate::engine::perceptual::types::CorrelationState::Ambiguous;
+            }
+        }
+        assert!(associate_by_contender(&ambiguous).is_empty());
     }
 }

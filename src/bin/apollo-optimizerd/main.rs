@@ -1700,6 +1700,11 @@ fn main() -> anyhow::Result<()> {
                             .expect("static observer id"),
                     );
             let mut perceptual_last_interactions: u64 = 0;
+            let mut perceptual_associations: Vec<
+                apollo_engine::engine::perceptual_regime::ObservationalAssociation,
+            > = Vec::new();
+            let mut perceptual_last_contention =
+                apollo_engine::engine::perceptual_regime::ContentionSnapshot::default();
             let mut webflow_runtime = webflow_tick::WebFlowRuntime::new(
                 apollo_engine::engine::webflow_controller::WebFlowRolloutPhase::Shadow,
             );
@@ -2629,6 +2634,7 @@ fn main() -> anyhow::Result<()> {
                 {
                     use apollo_engine::engine::perceptual::adapters::PerceptualAdapter as _;
                     use apollo_engine::engine::perceptual::types::MonotonicMillis;
+                    use apollo_engine::engine::perceptual_regime as perc;
 
                     // The browser adapter translates the vitals events the
                     // WebFlow contract already validated.
@@ -2642,6 +2648,17 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     perceptual_store.expire(webflow_now_ms);
+                    // Join every stored observation to the contention state and
+                    // recompute the with/without comparison. Observational: no
+                    // action, no credit, no Gold.
+                    let joined: Vec<perc::PerceptualRegimeEvidence> = perceptual_store
+                        .iter()
+                        .map(|observation| perc::PerceptualRegimeEvidence {
+                            observation: observation.clone(),
+                            contention: perceptual_last_contention.clone(),
+                        })
+                        .collect();
+                    perceptual_associations = perc::associate_by_contender(&joined);
                 }
                 // One window sample per vitals report that carried new
                 // interactions. The extension reports per-page aggregates, so a
@@ -2776,6 +2793,27 @@ fn main() -> anyhow::Result<()> {
                             .refused_correlation
                             .saturating_add(store_metrics.refused_capacity);
                         metrics.metrics.perceptual_quality_q = perceptual_store.mean_quality_q();
+                        // Strongest observed association, if any. Co-occurrence
+                        // only: the dashboard prints CAUSAL UNTESTED beside it.
+                        if let Some(strongest) = perceptual_associations
+                            .iter()
+                            .max_by_key(|a| (a.confidence_q, a.delta_ms.abs()))
+                        {
+                            metrics.metrics.perceptual_assoc_family =
+                                strongest.contender_family.clone();
+                            metrics.metrics.perceptual_assoc_verdict =
+                                strongest.verdict.as_str().to_string();
+                            metrics.metrics.perceptual_assoc_delta_ms = strongest.delta_ms;
+                            metrics.metrics.perceptual_assoc_component = strongest
+                                .worst_component
+                                .map(|k| k.as_str().to_string())
+                                .unwrap_or_default();
+                            metrics.metrics.perceptual_assoc_samples_with = strongest.samples_with;
+                            metrics.metrics.perceptual_assoc_samples_without =
+                                strongest.samples_without;
+                            metrics.metrics.perceptual_assoc_confidence_q = strongest.confidence_q;
+                            metrics.metrics.perceptual_assoc_actionable = strongest.actionable;
+                        }
                         let counts = perceptual_observatory.correlation_counts();
                         metrics.metrics.perceptual_episodes_stored =
                             perceptual_observatory.episode_count() as u64;

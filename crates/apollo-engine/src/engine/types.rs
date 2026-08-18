@@ -643,6 +643,24 @@ pub struct RuntimeMetrics {
     /// Mean overall quality on a 0..=1000 scale, weakest-link per observation.
     #[serde(default)]
     pub perceptual_quality_q: u16,
+    /// Stratified observational association. Correlation, never causation: the
+    /// dashboard prints CAUSAL UNTESTED beside it for exactly that reason.
+    #[serde(default)]
+    pub perceptual_assoc_family: String,
+    #[serde(default)]
+    pub perceptual_assoc_verdict: String,
+    #[serde(default)]
+    pub perceptual_assoc_delta_ms: i32,
+    #[serde(default)]
+    pub perceptual_assoc_component: String,
+    #[serde(default)]
+    pub perceptual_assoc_samples_with: u32,
+    #[serde(default)]
+    pub perceptual_assoc_samples_without: u32,
+    #[serde(default)]
+    pub perceptual_assoc_confidence_q: u16,
+    #[serde(default)]
+    pub perceptual_assoc_actionable: bool,
     /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
     /// p95 over a full window are very different claims, and reading one as
     /// the other already produced a bogus 120000ms LCP once.
