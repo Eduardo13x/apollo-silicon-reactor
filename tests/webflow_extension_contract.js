@@ -253,3 +253,34 @@ test('the declared extension version matches the manifest', () => {
   assert.equal(manifest.version, P.EXTENSION_VERSION,
     'a drifting version would make the daemon report a wrong producer');
 });
+
+test('the content script gets the protocol helpers it depends on', () => {
+  // content.js reads folding/percentile helpers from globalThis. An isolated
+  // world does not inherit the service worker's importScripts, so protocol.js
+  // must be injected alongside it — and before it.
+  const fs = require('node:fs');
+  const background = fs.readFileSync('extensions/apollo-webflow-chromium/background.js', 'utf8');
+  const match = background.match(/js:\s*\[([^\]]+)\]/);
+  assert.ok(match, 'registerContentScripts must declare a js list');
+  const files = match[1].split(',').map((s) => s.trim().replace(/['"]/g, ''));
+  assert.ok(files.includes('protocol.js'), 'protocol.js must be injected');
+  assert.ok(
+    files.indexOf('protocol.js') < files.indexOf('content.js'),
+    'protocol.js must load before content.js',
+  );
+
+  const content = fs.readFileSync('extensions/apollo-webflow-chromium/content.js', 'utf8');
+  assert.ok(
+    content.includes('collectorReady'),
+    'content.js must degrade quietly when the helpers are absent',
+  );
+});
+
+test('the content script survives an orphaned extension context', () => {
+  // Reloading the extension leaves content scripts running in open tabs;
+  // sendMessage then throws synchronously and .catch() never sees it.
+  const content = require('node:fs')
+    .readFileSync('extensions/apollo-webflow-chromium/content.js', 'utf8');
+  assert.ok(content.includes('chrome.runtime?.id'), 'must check the context is alive');
+  assert.match(content, /try\s*\{[\s\S]*sendMessage[\s\S]*catch/, 'and guard the throw');
+});

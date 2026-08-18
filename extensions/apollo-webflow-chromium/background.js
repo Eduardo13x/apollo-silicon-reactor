@@ -147,7 +147,9 @@ async function registerVitals() {
   await chrome.scripting.registerContentScripts([{
     id: 'apollo-webflow-vitals',
     matches: ['<all_urls>'],
-    js: ['content.js'],
+    // protocol.js first: content.js reads the folding helpers from it, and an
+    // isolated world does not inherit the service worker's importScripts.
+    js: ['protocol.js', 'content.js'],
     runAt: 'document_start',
     persistAcrossSessions: true,
   }]);

@@ -38,15 +38,20 @@ observe('largest-contentful-paint', (entries) => {
 // called it INP: that conflates the several entries of one interaction, counts
 // interactionId === 0 (scroll, not an interaction), and hides every fast one.
 const P = globalThis.ApolloWebFlowProtocol;
+// Without the protocol helpers there is nothing to collect. Staying silent
+// beats throwing on every observer callback for the life of the page.
+const collectorReady = Boolean(P && P.foldInteractions);
 let folded = { interactions: new Map(), dropped: 0 };
 
-observe('event', (entries) => {
-  folded = P.foldInteractions(entries, folded);
-  resetQuietTimer();
-}, { durationThreshold: 0 });
-observe('first-input', (entries) => {
-  folded = P.foldInteractions(entries, folded);
-});
+if (collectorReady) {
+  observe('event', (entries) => {
+    folded = P.foldInteractions(entries, folded);
+    resetQuietTimer();
+  }, { durationThreshold: 0 });
+  observe('first-input', (entries) => {
+    folded = P.foldInteractions(entries, folded);
+  });
+}
 
 function eventDurationTailMs() {
   // Same quantity the old collector published, under its true name: the worst
@@ -63,6 +68,7 @@ function eventDurationTailMs() {
 }
 
 function report() {
+  if (!collectorReady) return;
   const navigation = performance.getEntriesByType('navigation')[0];
   const components = P.componentTotals(folded.interactions);
   const payload = {
@@ -81,11 +87,19 @@ function report() {
   // Browser clock. The gap to `service_worker_received_at_ms` contains the
   // MV3 cold start, which is the unknown that decides whether any fast path
   // could ever exist. Fire-and-forget: never block the interaction thread.
-  chrome.runtime.sendMessage({
-    type: 'apollo-webflow-vitals',
-    metrics: payload,
-    contentSendStartedAtMs: Math.round(performance.timeOrigin + performance.now()),
-  }).catch(() => {});
+  try {
+    // `chrome.runtime.id` is undefined once the extension context is torn
+    // down — reloading the extension orphans the content scripts already
+    // running in open tabs, and sendMessage then throws synchronously.
+    if (!chrome.runtime?.id) return;
+    chrome.runtime.sendMessage({
+      type: 'apollo-webflow-vitals',
+      metrics: payload,
+      contentSendStartedAtMs: Math.round(performance.timeOrigin + performance.now()),
+    }).catch(() => {});
+  } catch (_) {
+    // Orphaned context: nothing to report to, and nothing to recover.
+  }
 }
 
 // A navigation or a closing tab ends the interaction population: carrying it

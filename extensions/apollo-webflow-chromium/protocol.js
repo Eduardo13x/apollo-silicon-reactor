@@ -23,7 +23,7 @@
   const SCHEMA_VERSION = 2;
   /// Must match manifest.json. Sent so the daemon can say "EXT v1 STALE"
   /// instead of showing unexplained zeros.
-  const EXTENSION_VERSION = '2.0.0';
+  const EXTENSION_VERSION = '2.0.1';
   /// Bit positions mirror FeatureCapabilities in webflow_types.rs.
   const CAP_INTERACTION_GROUPING = 1 << 0;
   const CAP_COMPONENT_BREAKDOWN = 1 << 1;
