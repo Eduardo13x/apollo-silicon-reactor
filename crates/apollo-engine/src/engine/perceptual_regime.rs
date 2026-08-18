@@ -851,3 +851,215 @@ mod export_tests {
         assert_eq!(export.schema_version, PERCEPTUAL_EXPORT_SCHEMA_VERSION);
     }
 }
+
+/// Build a contention snapshot from a process list.
+///
+/// Eligibility mirrors the actuator's own filters exactly — the Chromium family
+/// veto, the interactive classification, hard protection and the CPU floor — so
+/// "actionable" here means the same thing it means to `decide_actions`. It is a
+/// question about which lever exists, never a decision to pull one.
+pub fn snapshot_from_processes<F>(
+    foreground_name_hash: u64,
+    processes: &[(u32, String, f64, u32)],
+    classify: F,
+    total_cpu_percent: f64,
+    memory_pressure: f64,
+    thermal_level: &str,
+) -> ContentionSnapshot
+where
+    F: Fn(&str) -> Option<IneligibilityReason>,
+{
+    let mut contenders: Vec<Contender> = processes
+        .iter()
+        .filter(|(_, _, cpu, _)| *cpu >= CONTENDER_MIN_CPU_PERCENT)
+        .map(|(pid, name, cpu, threads)| Contender {
+            name_hash: stable_name_hash(name),
+            family: contender_family(name),
+            pid: *pid,
+            cpu_percent: *cpu,
+            thread_count: *threads,
+            ineligible: classify(name).or({
+                if *threads < 2 {
+                    Some(IneligibilityReason::SingleThreaded)
+                } else {
+                    None
+                }
+            }),
+        })
+        .collect();
+    // Bounded: an unbounded contender list would grow persisted state with the
+    // machine's process count.
+    contenders.sort_by(|a, b| b.cpu_percent.total_cmp(&a.cpu_percent));
+    contenders.truncate(8);
+    ContentionSnapshot {
+        foreground_name_hash,
+        contenders,
+        total_cpu_percent,
+        runnable_threads: 0,
+        context_switches_per_sec: 0,
+        memory_pressure,
+        thermal_level: thermal_level.to_string(),
+        throttled: false,
+        energy_watts: 0.0,
+    }
+}
+
+/// FNV-1a over the process name. Names never leave as names: a process list is
+/// as identifying as a browsing history.
+pub fn stable_name_hash(name: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in name.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+/// Closed, low-cardinality category. Anything unrecognised is "other" rather
+/// than the process name, which would defeat the hashing above.
+pub fn contender_family(name: &str) -> String {
+    let lower = name.to_ascii_lowercase();
+    for (needle, family) in [
+        ("rustc", "compiler"),
+        ("cargo", "compiler"),
+        ("clang", "compiler"),
+        ("swift", "compiler"),
+        ("node", "runtime"),
+        ("python", "runtime"),
+        ("java", "runtime"),
+        ("docker", "container"),
+        ("com.docker", "container"),
+        ("mdworker", "indexer"),
+        ("mds", "indexer"),
+        ("spotlight", "indexer"),
+        ("backupd", "backup"),
+        ("photoanalysisd", "media"),
+        ("windowserver", "compositor"),
+        ("helper", "browser-helper"),
+    ] {
+        if lower.contains(needle) {
+            return family.to_string();
+        }
+    }
+    "other".to_string()
+}
+
+impl PerceptualInteractionEpisode {
+    /// Summarise one vitals report as a single sample.
+    ///
+    /// The extension reports per-page aggregates, not individual interactions,
+    /// so the components are sums over `interactions` and `total_duration_ms`
+    /// is their sum by construction. That makes the reconciliation check
+    /// trivially true here — it still guards the per-interaction path, which is
+    /// where a mismatch would mean the components describe another interaction.
+    pub fn from_window(
+        observed_at_ms: u64,
+        context_hash: u64,
+        input_delay_ms: u32,
+        processing_ms: u32,
+        presentation_ms: u32,
+        transport_ms: Option<u32>,
+        contention: ContentionSnapshot,
+    ) -> Self {
+        Self {
+            observed_at_ms,
+            context_hash,
+            total_duration_ms: input_delay_ms
+                .saturating_add(processing_ms)
+                .saturating_add(presentation_ms),
+            input_delay_ms,
+            processing_ms,
+            presentation_ms,
+            correlation: CorrelationState::Unique,
+            transport_ms,
+            contention,
+        }
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    use super::*;
+
+    fn classify_none(_: &str) -> Option<IneligibilityReason> {
+        None
+    }
+
+    #[test]
+    fn processes_below_the_cpu_floor_are_not_competition() {
+        let procs = vec![
+            (1, "rustc".to_string(), 80.0, 8),
+            (2, "idle-thing".to_string(), 2.0, 4),
+        ];
+        let snap = snapshot_from_processes(1, &procs, classify_none, 50.0, 0.3, "nominal");
+        assert_eq!(snap.contenders.len(), 1);
+        assert_eq!(snap.contenders[0].family, "compiler");
+    }
+
+    #[test]
+    fn a_single_threaded_contender_is_ineligible_by_the_same_rule_the_actuator_uses() {
+        let procs = vec![(1, "rustc".to_string(), 80.0, 1)];
+        let snap = snapshot_from_processes(1, &procs, classify_none, 50.0, 0.3, "nominal");
+        assert_eq!(
+            snap.contenders[0].ineligible,
+            Some(IneligibilityReason::SingleThreaded)
+        );
+        assert_eq!(snap.actionable_count(), 0);
+    }
+
+    #[test]
+    fn the_caller_veto_wins_over_the_thread_rule() {
+        let procs = vec![(1, "Brave Browser Helper".to_string(), 80.0, 12)];
+        let snap = snapshot_from_processes(
+            1,
+            &procs,
+            |_| Some(IneligibilityReason::BrowserFamily),
+            50.0,
+            0.3,
+            "nominal",
+        );
+        assert_eq!(
+            snap.contenders[0].ineligible,
+            Some(IneligibilityReason::BrowserFamily)
+        );
+    }
+
+    #[test]
+    fn the_contender_list_is_bounded_against_a_busy_machine() {
+        let procs: Vec<_> = (0..40)
+            .map(|i| (i, format!("proc{i}"), 90.0 - f64::from(i), 8))
+            .collect();
+        let snap = snapshot_from_processes(1, &procs, classify_none, 90.0, 0.3, "nominal");
+        assert!(snap.contenders.len() <= 8);
+        assert!(
+            snap.contenders[0].cpu_percent >= snap.contenders[1].cpu_percent,
+            "the busiest survive truncation"
+        );
+    }
+
+    #[test]
+    fn a_process_name_never_leaves_as_a_name() {
+        let procs = vec![(1, "SuperSecretApp".to_string(), 80.0, 8)];
+        let snap = snapshot_from_processes(1, &procs, classify_none, 50.0, 0.3, "nominal");
+        let json = serde_json::to_string(&snap).expect("encodes");
+        assert!(!json.contains("SuperSecretApp"));
+        assert!(json.contains("other"), "only the closed family survives");
+        assert_ne!(snap.contenders[0].name_hash, 0);
+    }
+
+    #[test]
+    fn a_window_sample_reconciles_by_construction() {
+        let episode = PerceptualInteractionEpisode::from_window(
+            1_000,
+            42,
+            173,
+            45,
+            1_997,
+            Some(4),
+            ContentionSnapshot::default(),
+        );
+        assert_eq!(episode.total_duration_ms, 173 + 45 + 1_997);
+        assert!(episode.components_reconcile());
+        assert!(episode.is_usable());
+    }
+}

@@ -1677,6 +1677,11 @@ fn main() -> anyhow::Result<()> {
             value_scheduler_runtime.connect_handoff_jobs(&[
                 apollo_engine::engine::value_scheduler::JobId::HardwarePrediction,
             ]);
+            // Phase 0B observatory. Observes only: it never emits an action,
+            // grants credit or promotes to Gold.
+            let mut perceptual_observatory =
+                apollo_engine::engine::perceptual_regime::PerceptualObservatory::new();
+            let mut perceptual_last_interactions: u64 = 0;
             let mut webflow_runtime = webflow_tick::WebFlowRuntime::new(
                 apollo_engine::engine::webflow_controller::WebFlowRolloutPhase::Shadow,
             );
@@ -2603,6 +2608,53 @@ fn main() -> anyhow::Result<()> {
                     rollback_failures_total: webflow_rollback_failures,
                     protected_actions_total: 0,
                 });
+                // One window sample per vitals report that carried new
+                // interactions. The extension reports per-page aggregates, so a
+                // sample summarises a window rather than a single interaction.
+                if webflow_output.interaction_count > perceptual_last_interactions {
+                    use apollo_engine::engine::perceptual_regime as perc;
+                    perceptual_last_interactions = webflow_output.interaction_count;
+                    let processes: Vec<(u32, String, f64, u32)> = snapshot
+                        .top_processes
+                        .iter()
+                        .map(|p| (p.pid, p.name.clone(), f64::from(p.cpu_usage), 2))
+                        .collect();
+                    let contention = perc::snapshot_from_processes(
+                        perc::stable_name_hash(foreground_app.as_deref().unwrap_or_default()),
+                        &processes,
+                        |name| {
+                            // Exactly the vetoes the actuator itself applies, so
+                            // "actionable" means the same thing on both sides.
+                            if apollo_engine::engine::safety::is_boost_forbidden(name) {
+                                Some(perc::IneligibilityReason::BrowserFamily)
+                            } else if apollo_engine::engine::decide_actions::is_interactive_app_name(
+                                name,
+                            ) {
+                                Some(perc::IneligibilityReason::Interactive)
+                            } else {
+                                None
+                            }
+                        },
+                        f64::from(snapshot.cpu.global_usage),
+                        snapshot.pressure.memory_pressure,
+                        &snapshot.pressure.thermal_level,
+                    );
+                    perceptual_observatory.record(perc::PerceptualInteractionEpisode::from_window(
+                        webflow_now_ms,
+                        u64::from(webflow_output.interaction_count as u32),
+                        webflow_output.input_delay_total_ms.min(u64::from(u32::MAX)) as u32,
+                        webflow_output.processing_total_ms.min(u64::from(u32::MAX)) as u32,
+                        webflow_output
+                            .presentation_total_ms
+                            .min(u64::from(u32::MAX)) as u32,
+                        webflow_output
+                            .transport_client_segment_p95_ms
+                            .map(|v| v as u32),
+                        contention,
+                    ));
+                    perceptual_observatory.expire(webflow_now_ms);
+                    perceptual_observatory.segment();
+                }
                 let networkflow_output =
                     networkflow_runtime.tick(networkflow_tick::NetworkFlowCycleInput {
                         now_ms: webflow_now_ms,
@@ -2674,6 +2726,33 @@ fn main() -> anyhow::Result<()> {
                         webflow_output.schema_rejected_total;
                     metrics.metrics.webflow_last_event_at_ms = webflow_output.last_event_at_ms;
                     metrics.metrics.webflow_capabilities_bits = webflow_output.capabilities_bits;
+                    {
+                        let counts = perceptual_observatory.correlation_counts();
+                        metrics.metrics.perceptual_episodes_stored =
+                            perceptual_observatory.episode_count() as u64;
+                        metrics.metrics.perceptual_episodes_rejected =
+                            perceptual_observatory.rejected_unusable;
+                        metrics.metrics.perceptual_correlation_unique = counts[0];
+                        metrics.metrics.perceptual_correlation_ambiguous = counts[1];
+                        metrics.metrics.perceptual_correlation_unmatched = counts[2];
+                        let regimes: Vec<_> = perceptual_observatory.regimes().collect();
+                        metrics.metrics.perceptual_regimes_total = regimes.len() as u64;
+                        // The newest regime describes current conditions; older
+                        // ones are history and would misread as "now".
+                        if let Some(current) = regimes.last() {
+                            metrics.metrics.perceptual_regime_class =
+                                current.classification.as_str().to_string();
+                            metrics.metrics.perceptual_regime_level =
+                                current.level.as_str().to_string();
+                            metrics.metrics.perceptual_regime_interactions = current.interactions;
+                            metrics.metrics.perceptual_regime_actionable =
+                                current.actionable_contenders;
+                            metrics.metrics.perceptual_regime_dominant_family =
+                                current.dominant_family.clone().unwrap_or_default();
+                            metrics.metrics.perceptual_regime_median_total_ms =
+                                current.median_total_ms;
+                        }
+                    }
                     metrics.metrics.browser_latency_samples = webflow_output.vitals_samples;
                     metrics.metrics.network_flow_active = networkflow_output.observation.active;
                     metrics.metrics.network_flow_traffic_bps =
