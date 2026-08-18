@@ -271,9 +271,12 @@ test('the content script gets the protocol helpers it depends on', () => {
 
   const content = fs.readFileSync('extensions/apollo-webflow-chromium/content.js', 'utf8');
   assert.ok(
-    content.includes('collectorReady'),
-    'content.js must degrade quietly when the helpers are absent',
+    !content.includes('const P = globalThis'),
+    'the helpers must not be captured at load time: a stale registration can '
+    + 'inject content.js without protocol.js, and a cached value would then '
+    + 'stay undefined while the guard that read it still said "ready"',
   );
+  assert.ok(content.includes('function helpers()'), 'resolve them per call');
 });
 
 test('the content script survives an orphaned extension context', () => {
@@ -283,4 +286,21 @@ test('the content script survives an orphaned extension context', () => {
     .readFileSync('extensions/apollo-webflow-chromium/content.js', 'utf8');
   assert.ok(content.includes('chrome.runtime?.id'), 'must check the context is alive');
   assert.match(content, /try\s*\{[\s\S]*sendMessage[\s\S]*catch/, 'and guard the throw');
+});
+
+test('content script registration is idempotent across reloads', () => {
+  // registerContentScripts persists across sessions; re-registering the same id
+  // throws and silently leaves the previous js list active. That is exactly how
+  // a stale registration injected content.js without protocol.js.
+  const background = require('node:fs')
+    .readFileSync('extensions/apollo-webflow-chromium/background.js', 'utf8');
+  assert.ok(
+    background.includes('updateContentScripts'),
+    'an existing registration must be updated, not blindly re-registered',
+  );
+  assert.match(
+    background,
+    /registerContentScripts\(\[script\]\);\s*\}\s*catch/,
+    'and a failed register must not end with no registration at all',
+  );
 });

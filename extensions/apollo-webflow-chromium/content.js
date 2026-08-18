@@ -37,21 +37,28 @@ observe('largest-contentful-paint', (entries) => {
 // The previous collector took max(entry.duration) above a 40 ms threshold and
 // called it INP: that conflates the several entries of one interaction, counts
 // interactionId === 0 (scroll, not an interaction), and hides every fast one.
-const P = globalThis.ApolloWebFlowProtocol;
-// Without the protocol helpers there is nothing to collect. Staying silent
-// beats throwing on every observer callback for the life of the page.
-const collectorReady = Boolean(P && P.foldInteractions);
+// Resolved at CALL time, never cached at load time. A stale content-script
+// registration can inject this file without protocol.js — `registerContentScripts`
+// persists across sessions and a failed re-register leaves the old js list in
+// place — and a value captured at load would then be permanently undefined
+// while the guard that read it still said "ready".
+function helpers() {
+  const p = globalThis.ApolloWebFlowProtocol;
+  return p && typeof p.foldInteractions === 'function' ? p : undefined;
+}
 let folded = { interactions: new Map(), dropped: 0 };
 
-if (collectorReady) {
-  observe('event', (entries) => {
-    folded = P.foldInteractions(entries, folded);
-    resetQuietTimer();
-  }, { durationThreshold: 0 });
-  observe('first-input', (entries) => {
-    folded = P.foldInteractions(entries, folded);
-  });
-}
+observe('event', (entries) => {
+  const p = helpers();
+  if (!p) return;
+  folded = p.foldInteractions(entries, folded);
+  resetQuietTimer();
+}, { durationThreshold: 0 });
+observe('first-input', (entries) => {
+  const p = helpers();
+  if (!p) return;
+  folded = p.foldInteractions(entries, folded);
+});
 
 function eventDurationTailMs() {
   // Same quantity the old collector published, under its true name: the worst
@@ -68,13 +75,14 @@ function eventDurationTailMs() {
 }
 
 function report() {
-  if (!collectorReady) return;
+  const p = helpers();
+  if (!p) return;
   const navigation = performance.getEntriesByType('navigation')[0];
-  const components = P.componentTotals(folded.interactions);
+  const components = p.componentTotals(folded.interactions);
   const payload = {
     ...metrics,
     eventDurationMs: eventDurationTailMs(),
-    inpEstimateMs: P.inpEstimateMs(folded.interactions),
+    inpEstimateMs: p.inpEstimateMs(folded.interactions),
     interactionCount: folded.interactions.size,
     interactionsDropped: folded.dropped,
     inputDelayTotalMs: components.inputDelay,

@@ -141,10 +141,10 @@ function classifyError(error) {
 async function registerVitals() {
   const allowed = await chrome.permissions.contains({ origins: ['<all_urls>'] });
   if (!allowed) return;
-  try {
-    await chrome.scripting.unregisterContentScripts({ ids: ['apollo-webflow-vitals'] });
-  } catch (_) {}
-  await chrome.scripting.registerContentScripts([{
+  // A persisted registration survives reloads, so re-registering throws on the
+  // duplicate id and leaves the OLD js list active — which is how a stale
+  // registration injected content.js without protocol.js.
+  const script = {
     id: 'apollo-webflow-vitals',
     matches: ['<all_urls>'],
     // protocol.js first: content.js reads the folding helpers from it, and an
@@ -152,7 +152,21 @@ async function registerVitals() {
     js: ['protocol.js', 'content.js'],
     runAt: 'document_start',
     persistAcrossSessions: true,
-  }]);
+  };
+  try {
+    await chrome.scripting.updateContentScripts([script]);
+    return;
+  } catch (_) {
+    // Not registered yet: fall through and register it.
+  }
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [script.id] });
+  } catch (_) {}
+  try {
+    await chrome.scripting.registerContentScripts([script]);
+  } catch (_) {
+    // Leave the previous registration rather than ending with none.
+  }
 }
 
 chrome.action.onClicked.addListener(async () => {

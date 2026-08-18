@@ -77,6 +77,30 @@ else
   say FAIL "bridge binary" "native host points at ${BRIDGE_PATH:-?} which is not executable"; fail=1
 fi
 
+# The four binaries must come from one build: WebFlowEvent is
+# deny_unknown_fields, so a stale component rejects every newer payload and the
+# daemon never learns the event existed.
+STALE=()
+for b in /usr/local/libexec/apollo-optimizerd /usr/local/libexec/apollo-web-bridge \
+         /usr/local/libexec/apollo-context-agent /usr/local/bin/apollo-optimizerctl; do
+  [ -x "$b" ] || { STALE+=("$b:missing"); continue; }
+done
+NEWEST=$(ls -t /usr/local/libexec/apollo-optimizerd /usr/local/libexec/apollo-web-bridge \
+  /usr/local/libexec/apollo-context-agent /usr/local/bin/apollo-optimizerctl 2>/dev/null | head -1)
+OLDEST=$(ls -t /usr/local/libexec/apollo-optimizerd /usr/local/libexec/apollo-web-bridge \
+  /usr/local/libexec/apollo-context-agent /usr/local/bin/apollo-optimizerctl 2>/dev/null | tail -1)
+SKEW=$(python3 -c "
+import os,sys
+try: print(int(abs(os.path.getmtime('$NEWEST')-os.path.getmtime('$OLDEST'))))
+except Exception: print(-1)" 2>/dev/null)
+if [ ${#STALE[@]} -ne 0 ]; then
+  say FAIL "binary set" "missing: ${STALE[*]}"; fail=1
+elif [ "$SKEW" -ge 0 ] && [ "$SKEW" -le 600 ]; then
+  say ok "binary set" "all four within ${SKEW}s of each other"
+else
+  say FAIL "binary set" "components differ by ${SKEW}s — oldest: $(basename $OLDEST)"; fail=1
+fi
+
 # ── 3. daemon circuit ──────────────────────────────────────────────────────
 if $CTL metrics >/dev/null 2>&1; then
   say ok "daemon socket" "reachable"
