@@ -998,6 +998,38 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.network_flow_suppressed_exact_total),
         ));
     }
+    // ── perceptual layer, source-agnostic summary ────────────────────────
+    // Deliberately above the browser section: these hold for every producer.
+    // A per-source figure like INP lives with its adapter, because printing a
+    // zero for a source that cannot measure it would be a false reading.
+    if m.perceptual_observations_total > 0 {
+        lines.push(format!(
+            "Perc-S src{} obs{} q{}",
+            m.perceptual_sources_active,
+            compact_counter(m.perceptual_observations_total),
+            m.perceptual_quality_q,
+        ));
+        let total = m
+            .perceptual_instrumented_total
+            .saturating_add(m.perceptual_inferred_total)
+            .saturating_add(m.perceptual_windows_total);
+        if total > 0 {
+            let pct = |part: u64| (part as f64 / total as f64 * 100.0).round() as u64;
+            lines.push(format!(
+                "       ins{}% inf{}% win{}%",
+                pct(m.perceptual_instrumented_total),
+                pct(m.perceptual_inferred_total),
+                pct(m.perceptual_windows_total),
+            ));
+        }
+        if m.perceptual_invalid_total > 0 {
+            lines.push(format!(
+                "       valid{} invalid{}",
+                compact_counter(m.perceptual_valid_total),
+                compact_counter(m.perceptual_invalid_total),
+            ));
+        }
+    }
     // ── 0B observational state ───────────────────────────────────────────
     // Deliberately says what it does not know. A regime classification is what
     // the window supports saying, never a causal claim.
@@ -2652,6 +2684,45 @@ mod tests {
             "the two series stay on separate rows: {think:?}"
         );
         assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn the_generic_summary_reports_sources_without_naming_any_of_them() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_sources_active = 2;
+        status.metrics.perceptual_observations_total = 1_284;
+        status.metrics.perceptual_instrumented_total = 950;
+        status.metrics.perceptual_inferred_total = 231;
+        status.metrics.perceptual_windows_total = 103;
+        status.metrics.perceptual_valid_total = 1_233;
+        status.metrics.perceptual_invalid_total = 51;
+        status.metrics.perceptual_quality_q = 880;
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line == "Perc-S src2 obs1k q880"));
+        assert!(think
+            .iter()
+            .any(|line| line == "       ins74% inf18% win8%"));
+        assert!(think.iter().any(|line| line == "       valid1k invalid51"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn a_source_that_cannot_measure_inp_never_gets_a_zero_printed_for_it() {
+        // Only the browser adapter can produce INP. A generic summary with no
+        // browser data must not render an INP row at all.
+        let mut status = dashboard_status();
+        status.metrics.perceptual_sources_active = 1;
+        status.metrics.perceptual_observations_total = 40;
+        status.metrics.perceptual_windows_total = 40;
+        status.metrics.browser_inp_estimate_ms = None;
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line.starts_with("Perc-S")));
+        assert!(
+            !think.iter().any(|line| line.contains("INP")),
+            "an absent capability must stay absent, not zero: {think:?}"
+        );
     }
 
     #[test]

@@ -623,6 +623,26 @@ pub struct RuntimeMetrics {
     pub perceptual_regime_dominant_family: String,
     #[serde(default)]
     pub perceptual_regime_median_total_ms: u32,
+    /// Source-agnostic perceptual layer. These describe observations from every
+    /// producer; per-source figures like INP stay in their own adapter section
+    /// because no other source can produce them.
+    #[serde(default)]
+    pub perceptual_sources_active: u32,
+    #[serde(default)]
+    pub perceptual_observations_total: u64,
+    #[serde(default)]
+    pub perceptual_instrumented_total: u64,
+    #[serde(default)]
+    pub perceptual_inferred_total: u64,
+    #[serde(default)]
+    pub perceptual_windows_total: u64,
+    #[serde(default)]
+    pub perceptual_valid_total: u64,
+    #[serde(default)]
+    pub perceptual_invalid_total: u64,
+    /// Mean overall quality on a 0..=1000 scale, weakest-link per observation.
+    #[serde(default)]
+    pub perceptual_quality_q: u16,
     /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
     /// p95 over a full window are very different claims, and reading one as
     /// the other already produced a bogus 120000ms LCP once.

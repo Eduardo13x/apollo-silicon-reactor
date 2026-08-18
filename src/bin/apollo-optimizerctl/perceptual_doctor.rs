@@ -10,6 +10,8 @@ use apollo_engine::engine::types::RuntimeMetrics;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PerceptualVerdict {
     ReadyFor0b,
+    /// The agnostic core is live and at least one adapter is reporting.
+    PerceptualCoreReady,
     ObservationPartial,
     /// Lifecycle events arrive but the content script has produced no vitals.
     CollectorSilent,
@@ -23,6 +25,7 @@ impl PerceptualVerdict {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadyFor0b => "READY_FOR_0B",
+            Self::PerceptualCoreReady => "PERCEPTUAL_CORE_READY",
             Self::ObservationPartial => "OBSERVATION_PARTIAL",
             Self::CollectorSilent => "COLLECTOR_SILENT",
             Self::NoData => "NO_DATA",
@@ -63,6 +66,20 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
     let status = m.webflow_extension_status.as_str();
     let any_event = m.webflow_accepted_v1_total > 0 || m.webflow_accepted_v2_total > 0;
 
+    // Adapter-agnostic first: the core can be healthy while one adapter is not.
+    checks.push(Check::new(
+        "perceptual-core",
+        m.perceptual_observations_total > 0,
+        format!(
+            "sources={} observations={} instrumented={} inferred={} windows={} quality={}",
+            m.perceptual_sources_active,
+            m.perceptual_observations_total,
+            m.perceptual_instrumented_total,
+            m.perceptual_inferred_total,
+            m.perceptual_windows_total,
+            m.perceptual_quality_q
+        ),
+    ));
     checks.push(Check::new(
         "extension",
         any_event,
@@ -154,6 +171,8 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
         PerceptualVerdict::TransportBroken
     } else if m.browser_interaction_samples == 0 || component_total == 0 {
         PerceptualVerdict::ObservationPartial
+    } else if m.perceptual_observations_total > 0 {
+        PerceptualVerdict::PerceptualCoreReady
     } else {
         PerceptualVerdict::ReadyFor0b
     };
@@ -173,6 +192,11 @@ pub fn render(report: &Report) -> String {
     out.push_str(&format!("\n  verdict: {}\n", report.verdict.as_str()));
     out.push_str(match report.verdict {
         PerceptualVerdict::ReadyFor0b => "  the observational circuit is complete end to end.\n",
+        PerceptualVerdict::PerceptualCoreReady => {
+            "  the agnostic core is receiving observations. Per-source figures\n  \
+             such as INP belong to the adapter that can measure them; a source\n  \
+             without that capability reports absence, not zero.\n"
+        }
         PerceptualVerdict::ObservationPartial => {
             "  events arrive but interaction evidence is incomplete; the browser\n  \
              may simply be idle. Interact with a page and re-run.\n"
@@ -278,9 +302,57 @@ mod tests {
         m.browser_input_delay_total_ms = 1_200;
         m.browser_processing_total_ms = 8_400;
         m.browser_presentation_total_ms = 2_400;
+        // A complete circuit now includes the agnostic core, not just the
+        // browser adapter that feeds it.
+        m.perceptual_observations_total = 312;
+        m.perceptual_sources_active = 1;
+        m.perceptual_instrumented_total = 312;
+        m.perceptual_quality_q = 820;
         let report = diagnose(&m);
-        assert_eq!(report.verdict, PerceptualVerdict::ReadyFor0b);
+        assert_eq!(report.verdict, PerceptualVerdict::PerceptualCoreReady);
         assert!(report.checks.iter().all(|c| c.ok), "{:?}", report.checks);
+    }
+
+    #[test]
+    fn the_core_is_diagnosed_apart_from_any_single_adapter() {
+        // A browser adapter can be stale while a non-browser source keeps the
+        // core healthy; one verdict for both would hide that.
+        let mut m = metrics();
+        m.perceptual_observations_total = 40;
+        m.perceptual_sources_active = 1;
+        m.perceptual_windows_total = 40;
+        m.perceptual_quality_q = 420;
+        m.webflow_accepted_v2_total = 40;
+        m.browser_latency_samples = 12;
+        m.webflow_transport_samples = 40;
+        m.browser_interaction_samples = 4;
+        m.browser_input_delay_total_ms = 10;
+        let report = diagnose(&m);
+        assert_eq!(report.verdict, PerceptualVerdict::PerceptualCoreReady);
+        let core = report
+            .checks
+            .iter()
+            .find(|c| c.hop == "perceptual-core")
+            .expect("core is diagnosed");
+        assert!(core.ok);
+        assert!(core.detail.contains("windows=40"));
+    }
+
+    #[test]
+    fn a_silent_core_is_reported_even_when_a_browser_adapter_is_healthy() {
+        let mut m = metrics();
+        m.webflow_accepted_v2_total = 40;
+        m.browser_latency_samples = 12;
+        m.webflow_transport_samples = 40;
+        m.browser_interaction_samples = 4;
+        m.browser_input_delay_total_ms = 10;
+        let report = diagnose(&m);
+        let core = report
+            .checks
+            .iter()
+            .find(|c| c.hop == "perceptual-core")
+            .expect("core is diagnosed");
+        assert!(!core.ok, "no observations reached the agnostic core");
     }
 
     #[test]
@@ -290,6 +362,7 @@ mod tests {
         assert_eq!(
             hops,
             vec![
+                "perceptual-core",
                 "extension",
                 "schema",
                 "vitals",

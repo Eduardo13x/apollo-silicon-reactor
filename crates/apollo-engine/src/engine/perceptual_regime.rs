@@ -1063,3 +1063,269 @@ mod wiring_tests {
         assert!(episode.is_usable());
     }
 }
+
+// ── Source-agnostic evidence ────────────────────────────────────────────────
+
+use crate::engine::perceptual::types::{
+    MeasurementMode, PerceptualObservation, PerceptualSourceKind,
+};
+
+/// One observation joined to the machine state around it.
+///
+/// The join needs nothing browser-specific: no interaction identifier, no
+/// surface identity, no latency breakdown. When a source *does* provide a
+/// breakdown it enriches the analysis; when it does not, the evidence is
+/// weaker and says so through its measurement mode rather than by faking parts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerceptualRegimeEvidence {
+    pub observation: PerceptualObservation,
+    pub contention: ContentionSnapshot,
+}
+
+impl PerceptualRegimeEvidence {
+    pub fn source_kind(&self) -> PerceptualSourceKind {
+        self.observation.header().source_kind
+    }
+
+    pub fn measurement_mode(&self) -> MeasurementMode {
+        self.observation.measurement().measurement_mode
+    }
+
+    /// Total latency when the source could measure one. `None` is a legitimate
+    /// answer, not a zero.
+    pub fn total_duration_ms(&self) -> Option<u32> {
+        self.observation.measurement().total_duration_ms
+    }
+
+    /// Evidence may only be pooled with evidence of the same modality and mode.
+    /// An instrumented browser episode and an inferred window answer different
+    /// questions, and averaging them would read precision nobody measured.
+    pub fn poolable_with(&self, other: &Self) -> bool {
+        self.observation.comparable_with(&other.observation)
+    }
+
+    pub fn admits_to_aggregate(&self) -> bool {
+        self.observation.admits_to_aggregate()
+    }
+}
+
+/// Stratum key for observational association. Measurement mode is part of the
+/// key by construction, so two modes can never land in the same cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EvidenceStratum {
+    pub source_kind: PerceptualSourceKind,
+    pub measurement_mode: MeasurementMode,
+    pub contention_level: ContentionLevel,
+    pub actionable: bool,
+}
+
+impl EvidenceStratum {
+    pub fn of(evidence: &PerceptualRegimeEvidence) -> Self {
+        Self {
+            source_kind: evidence.source_kind(),
+            measurement_mode: evidence.measurement_mode(),
+            contention_level: evidence.contention.contention_level(),
+            actionable: evidence.contention.actionable_count() > 0,
+        }
+    }
+}
+
+/// Summary of one stratum. Reports its own insufficiency rather than a number
+/// that looks like a finding.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StratumSummary {
+    pub stratum: EvidenceStratum,
+    pub samples: u32,
+    pub median_total_ms: Option<u32>,
+    pub spread_ms: Option<u32>,
+    pub classification: RegimeClassification,
+}
+
+/// Summarise evidence by stratum. Observational only: a stratum never becomes a
+/// causal claim, whatever its numbers look like.
+pub fn summarise_strata(evidence: &[PerceptualRegimeEvidence]) -> Vec<StratumSummary> {
+    let mut keys: Vec<EvidenceStratum> = Vec::new();
+    for item in evidence.iter().filter(|e| e.admits_to_aggregate()) {
+        let key = EvidenceStratum::of(item);
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys.into_iter()
+        .map(|key| {
+            let mut totals: Vec<u32> = evidence
+                .iter()
+                .filter(|e| e.admits_to_aggregate() && EvidenceStratum::of(e) == key)
+                .filter_map(PerceptualRegimeEvidence::total_duration_ms)
+                .collect();
+            let samples = evidence
+                .iter()
+                .filter(|e| e.admits_to_aggregate() && EvidenceStratum::of(e) == key)
+                .count() as u32;
+            let (median_total, spread) = if totals.is_empty() {
+                (None, None)
+            } else {
+                totals.sort_unstable();
+                (
+                    Some(totals[totals.len() / 2]),
+                    Some(totals[totals.len() - 1] - totals[0]),
+                )
+            };
+            let classification = if samples < MIN_REGIME_INTERACTIONS {
+                RegimeClassification::InsufficientSamples
+            } else if key.contention_level == ContentionLevel::None {
+                RegimeClassification::NoContention
+            } else if !key.actionable {
+                RegimeClassification::ContendedNonActuable
+            } else {
+                RegimeClassification::ContendedActuable
+            };
+            StratumSummary {
+                stratum: key,
+                samples,
+                median_total_ms: median_total,
+                spread_ms: spread,
+                classification,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod agnostic_evidence_tests {
+    use super::*;
+    use crate::engine::perceptual::adapters::synthetic::SyntheticPerceptualAdapter;
+    use crate::engine::perceptual::adapters::PerceptualAdapter;
+    use crate::engine::perceptual::types::MonotonicMillis;
+
+    fn contention(actionable: bool) -> ContentionSnapshot {
+        ContentionSnapshot {
+            foreground_name_hash: 42,
+            contenders: vec![Contender {
+                name_hash: 7,
+                family: "compiler".to_string(),
+                pid: 900,
+                cpu_percent: 80.0,
+                thread_count: 8,
+                ineligible: (!actionable).then_some(IneligibilityReason::BrowserFamily),
+            }],
+            ..ContentionSnapshot::default()
+        }
+    }
+
+    fn synthetic_evidence(count: usize, actionable: bool) -> Vec<PerceptualRegimeEvidence> {
+        let mut adapter = SyntheticPerceptualAdapter::new();
+        (0..count)
+            .filter_map(|index| {
+                let envelope =
+                    adapter.total_only_interaction(index as u64 * 100, 150 + index as u32);
+                adapter
+                    .normalize(envelope, MonotonicMillis(index as u64 * 100))
+                    .pop()
+                    .map(|observation| PerceptualRegimeEvidence {
+                        observation,
+                        contention: contention(actionable),
+                    })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_non_browser_observation_joins_the_machine_state_without_browser_fields() {
+        let evidence = synthetic_evidence(1, true).pop().expect("evidence");
+        // No interaction id, no surface identity, no breakdown — and it joins.
+        assert_eq!(evidence.observation.header().scope.surface_session_id, None);
+        assert!(evidence.observation.measurement().components.is_empty());
+        assert_eq!(evidence.source_kind(), PerceptualSourceKind::Synthetic);
+        assert_eq!(evidence.contention.dominant().map(|c| c.pid), Some(900));
+    }
+
+    #[test]
+    fn a_source_without_a_total_still_forms_evidence() {
+        let mut adapter = SyntheticPerceptualAdapter::new();
+        let envelope = adapter.bare_window(1_000, 8_000);
+        let observation = adapter
+            .normalize(envelope, MonotonicMillis(1_000))
+            .pop()
+            .expect("window");
+        let evidence = PerceptualRegimeEvidence {
+            observation,
+            contention: contention(true),
+        };
+        assert_eq!(evidence.total_duration_ms(), None, "absent, not zero");
+        assert!(evidence.admits_to_aggregate());
+    }
+
+    #[test]
+    fn measurement_mode_is_part_of_the_stratum_so_modes_never_pool() {
+        let mut mixed = synthetic_evidence(2, true);
+        let mut adapter = SyntheticPerceptualAdapter::new();
+        let envelope = adapter.bare_window(5_000, 8_000);
+        let window = adapter
+            .normalize(envelope, MonotonicMillis(5_000))
+            .pop()
+            .expect("window");
+        mixed.push(PerceptualRegimeEvidence {
+            observation: window,
+            contention: contention(true),
+        });
+
+        let strata = summarise_strata(&mixed);
+        assert_eq!(strata.len(), 2, "inferred and window are separate strata");
+        assert!(!mixed[0].poolable_with(mixed.last().expect("window")));
+    }
+
+    #[test]
+    fn a_thin_stratum_reports_insufficiency_instead_of_a_number_that_looks_like_a_finding() {
+        let strata = summarise_strata(&synthetic_evidence(3, true));
+        assert_eq!(strata.len(), 1);
+        assert_eq!(
+            strata[0].classification,
+            RegimeClassification::InsufficientSamples
+        );
+    }
+
+    #[test]
+    fn a_populated_stratum_with_a_legal_target_is_actuable_but_never_causal() {
+        let strata = summarise_strata(&synthetic_evidence(
+            MIN_REGIME_INTERACTIONS as usize + 2,
+            true,
+        ));
+        assert_eq!(strata.len(), 1);
+        assert_eq!(
+            strata[0].classification,
+            RegimeClassification::ContendedActuable
+        );
+        assert!(!strata[0].classification.grants_causal_credit());
+        assert!(strata[0].median_total_ms.is_some());
+    }
+
+    #[test]
+    fn vetoed_contention_is_nonactuable_for_any_source() {
+        let strata = summarise_strata(&synthetic_evidence(
+            MIN_REGIME_INTERACTIONS as usize + 2,
+            false,
+        ));
+        assert_eq!(
+            strata[0].classification,
+            RegimeClassification::ContendedNonActuable
+        );
+    }
+
+    #[test]
+    fn refused_observations_never_reach_a_stratum() {
+        let mut evidence = synthetic_evidence(MIN_REGIME_INTERACTIONS as usize + 2, true);
+        for item in evidence.iter_mut().take(5) {
+            if let PerceptualObservation::InferredInteraction(ref mut e) = item.observation {
+                e.header.correlation =
+                    crate::engine::perceptual::types::CorrelationState::Ambiguous;
+            }
+        }
+        let strata = summarise_strata(&evidence);
+        assert_eq!(
+            strata[0].samples,
+            MIN_REGIME_INTERACTIONS + 2 - 5,
+            "ambiguous evidence is excluded from the aggregate"
+        );
+    }
+}

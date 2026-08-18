@@ -1681,6 +1681,17 @@ fn main() -> anyhow::Result<()> {
             // grants credit or promotes to Gold.
             let mut perceptual_observatory =
                 apollo_engine::engine::perceptual_regime::PerceptualObservatory::new();
+            // Agnostic core plus its two live adapters. Observational only.
+            let mut perceptual_store =
+                apollo_engine::engine::perceptual::PerceptualObservationStore::new();
+            let mut chromium_adapter =
+                apollo_engine::engine::chromium_perceptual_adapter::ChromiumWebFlowAdapter::new();
+            let mut macos_adapter =
+                apollo_engine::engine::perceptual::adapters::macos_observer::
+                    MacOsGenericObservationAdapter::new(
+                        apollo_engine::engine::perceptual::PerceptualId::new([0xA1; 16])
+                            .expect("static observer id"),
+                    );
             let mut perceptual_last_interactions: u64 = 0;
             let mut webflow_runtime = webflow_tick::WebFlowRuntime::new(
                 apollo_engine::engine::webflow_controller::WebFlowRolloutPhase::Shadow,
@@ -2608,6 +2619,23 @@ fn main() -> anyhow::Result<()> {
                     rollback_failures_total: webflow_rollback_failures,
                     protected_actions_total: 0,
                 });
+                {
+                    use apollo_engine::engine::perceptual::adapters::PerceptualAdapter as _;
+                    use apollo_engine::engine::perceptual::types::MonotonicMillis;
+
+                    // The browser adapter translates the vitals events the
+                    // WebFlow contract already validated.
+                    for received in &webflow_events {
+                        if let Some(envelope) = chromium_adapter.to_envelope(&received.event) {
+                            for observation in chromium_adapter
+                                .normalize(envelope, MonotonicMillis(webflow_now_ms))
+                            {
+                                perceptual_store.record(observation);
+                            }
+                        }
+                    }
+                    perceptual_store.expire(webflow_now_ms);
+                }
                 // One window sample per vitals report that carried new
                 // interactions. The extension reports per-page aggregates, so a
                 // sample summarises a window rather than a single interaction.
@@ -2727,6 +2755,20 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.webflow_last_event_at_ms = webflow_output.last_event_at_ms;
                     metrics.metrics.webflow_capabilities_bits = webflow_output.capabilities_bits;
                     {
+                        // Agnostic core counters, published beside the 0B ones.
+                        let store_metrics = perceptual_store.metrics;
+                        metrics.metrics.perceptual_sources_active =
+                            perceptual_store.active_sources() as u32;
+                        metrics.metrics.perceptual_observations_total = store_metrics.stored_total;
+                        metrics.metrics.perceptual_instrumented_total =
+                            store_metrics.instrumented_total;
+                        metrics.metrics.perceptual_inferred_total = store_metrics.inferred_total;
+                        metrics.metrics.perceptual_windows_total = store_metrics.window_total;
+                        metrics.metrics.perceptual_valid_total = store_metrics.stored_total;
+                        metrics.metrics.perceptual_invalid_total = store_metrics
+                            .refused_correlation
+                            .saturating_add(store_metrics.refused_capacity);
+                        metrics.metrics.perceptual_quality_q = perceptual_store.mean_quality_q();
                         let counts = perceptual_observatory.correlation_counts();
                         metrics.metrics.perceptual_episodes_stored =
                             perceptual_observatory.episode_count() as u64;
@@ -4845,6 +4887,37 @@ fn main() -> anyhow::Result<()> {
                     {
                         let mut metrics = state.metrics.lock_recover();
                         metrics.metrics.perceptual_latency_score = latency.score;
+                        // Non-browser observer: window statistics only, from
+                        // signals Apollo already collects. No new permission,
+                        // no kernel access, and never a fabricated breakdown.
+                        {
+                            use apollo_engine::engine::perceptual::adapters::macos_observer::ForegroundResponseSample;
+                            use apollo_engine::engine::perceptual::adapters::PerceptualAdapter as _;
+                            use apollo_engine::engine::perceptual::types::MonotonicMillis;
+                            macos_adapter.observe(
+                                ForegroundResponseSample {
+                                    foreground_hash:
+                                        apollo_engine::engine::perceptual_regime::stable_name_hash(
+                                            metrics
+                                                .metrics
+                                                .foreground_app
+                                                .as_ref()
+                                                .map_or("", |app| app.name.as_str()),
+                                        ),
+                                    perceptual_latency_score: f64::from(latency.score),
+                                    fluidity_score: f64::from(metrics.metrics.fluidity_score),
+                                    human_active: latency.score > 0.0,
+                                },
+                                webflow_now_ms,
+                            );
+                            if let Some(envelope) = macos_adapter.close_window(webflow_now_ms) {
+                                for observation in macos_adapter
+                                    .normalize(envelope, MonotonicMillis(webflow_now_ms))
+                                {
+                                    perceptual_store.record(observation);
+                                }
+                            }
+                        }
                         metrics.metrics.perceptual_latency_category =
                             latency.category.as_str().to_string();
                         metrics.metrics.perceptual_latency_source =
