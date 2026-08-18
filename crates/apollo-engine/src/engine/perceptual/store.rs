@@ -142,7 +142,7 @@ impl PerceptualObservationStore {
         self.observations.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = &PerceptualObservation> {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = &PerceptualObservation> {
         self.observations.iter()
     }
 

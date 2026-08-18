@@ -2814,22 +2814,39 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.perceptual_quality_q = perceptual_store.mean_quality_q();
                         // Newest record of each modality, sanitized by the type
                         // itself: hashes and closed categories, never a name.
-                        for observation in perceptual_store.iter() {
-                            let encoded = serde_json::to_string(observation)
-                                .unwrap_or_default()
-                                .chars()
-                                .take(600)
-                                .collect::<String>();
-                            match observation {
-                                apollo_engine::engine::perceptual::PerceptualObservation::
-                                    InstrumentedInteraction(_) => {
-                                    metrics.metrics.perceptual_sample_instrumented = encoded;
+                        //
+                        // Walk backwards and stop once both are found. The
+                        // forward version serialised every observation in the
+                        // store to JSON on each publish and kept two of them,
+                        // which is hundreds of allocations per cycle.
+                        {
+                            use apollo_engine::engine::perceptual::PerceptualObservation as Obs;
+                            let mut want_instrumented =
+                                metrics.metrics.perceptual_sample_instrumented.is_empty();
+                            let mut want_window =
+                                metrics.metrics.perceptual_sample_window.is_empty();
+                            for observation in perceptual_store.iter().rev() {
+                                let slot = match observation {
+                                    Obs::InstrumentedInteraction(_) if want_instrumented => {
+                                        want_instrumented = false;
+                                        Some(&mut metrics.metrics.perceptual_sample_instrumented)
+                                    }
+                                    Obs::PerceptualWindow(_) if want_window => {
+                                        want_window = false;
+                                        Some(&mut metrics.metrics.perceptual_sample_window)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(slot) = slot {
+                                    *slot = serde_json::to_string(observation)
+                                        .unwrap_or_default()
+                                        .chars()
+                                        .take(600)
+                                        .collect();
                                 }
-                                apollo_engine::engine::perceptual::PerceptualObservation::
-                                    PerceptualWindow(_) => {
-                                    metrics.metrics.perceptual_sample_window = encoded;
+                                if !want_instrumented && !want_window {
+                                    break;
                                 }
-                                _ => {}
                             }
                         }
                         // Strongest observed association, if any. Co-occurrence
