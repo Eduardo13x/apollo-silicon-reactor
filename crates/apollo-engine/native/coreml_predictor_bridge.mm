@@ -17,11 +17,26 @@ static NSString *const kApolloInputName = @"temporal_features";
 static NSString *const kApolloSchemaHashKey = @"apollo_schema_hash";
 static NSString *const kApolloModelHashKey = @"apollo_model_hash";
 
+/// How much is known about where an inference actually executed.
+/// `kApolloAneUnsupported` is the honest state on current macOS: Core ML
+/// accepts a compute-unit request at load and then routes each inference
+/// itself without publishing the unit it chose.
+enum : uint32_t {
+    kApolloAneUnsupported = 0,
+    kApolloAneUnavailable = 1,
+    kApolloAneMeasuredIdle = 2,
+    kApolloAneMeasuredActive = 3,
+};
+
 typedef struct {
     uint32_t requested_backend;
-    uint32_t effective_backend;
+    /// Compute units Core ML accepted at model load. A configuration, not an
+    /// observation of where work ran.
+    uint32_t configured_backend;
     uint32_t model_available;
-    uint32_t ane_execution_measured;
+    /// One of the kApolloAne* codes above. Never a bool: "not implemented"
+    /// must not share a value with "measured, and the ANE stayed idle".
+    uint32_t ane_observation;
     char reason[kApolloReasonCapacity];
 } ApolloCoreMlStatus;
 
@@ -30,7 +45,7 @@ typedef struct {
     std::mutex inference_mutex;
 }
 @property(nonatomic, strong) MLModel *model;
-@property(nonatomic, assign) uint32_t effective_backend;
+@property(nonatomic, assign) uint32_t configured_backend;
 @property(nonatomic, assign) uint32_t feature_count;
 @end
 
@@ -170,6 +185,69 @@ static MLModel *apollo_load_model(NSURL *url, MLComputeUnits units, NSError **er
     return [MLModel modelWithContentsOfURL:compiled_url configuration:configuration error:error];
 }
 
+/// Probe entry point: pins one compute-unit configuration instead of walking
+/// the fallback ladder, so a caller can compare configurations against each
+/// other rather than measuring whichever one happened to load first. Returns
+/// null when that exact configuration will not load, which is itself the
+/// answer for that configuration.
+///
+/// `pinned_backend` uses the kApolloCpuAndNeuralEngine/kApolloAll/
+/// kApolloCpuOnly values; anything else is rejected.
+extern "C" void *apollo_coreml_create_pinned(uint64_t expected_schema_hash,
+                                             uint64_t expected_model_hash,
+                                             uint32_t feature_count,
+                                             uint32_t pinned_backend,
+                                             ApolloCoreMlStatus *status) {
+    MLComputeUnits units;
+    switch (pinned_backend) {
+        case kApolloCpuAndNeuralEngine: units = MLComputeUnitsCPUAndNeuralEngine; break;
+        case kApolloAll:                units = MLComputeUnitsAll;                break;
+        case kApolloCpuOnly:            units = MLComputeUnitsCPUOnly;            break;
+        default:
+            apollo_copy_reason(status, @"unknown pinned Core ML backend");
+            return nullptr;
+    }
+    if (status != nullptr) {
+        memset(status, 0, sizeof(*status));
+        status->requested_backend = pinned_backend;
+    }
+    if (feature_count == 0 || feature_count > kApolloMaxFeatureCount) {
+        apollo_copy_reason(status, @"Core ML feature count exceeds the versioned 256-feature bound");
+        return nullptr;
+    }
+    @autoreleasepool {
+        NSString *failure = nil;
+        NSURL *url = apollo_model_url(&failure);
+        if (url == nil) {
+            apollo_copy_reason(status, failure);
+            return nullptr;
+        }
+        NSError *error = nil;
+        MLModel *model = apollo_load_model(url, units, &error);
+        NSString *validation_failure = nil;
+        if (model != nil && apollo_validate_model(model,
+                                                  expected_schema_hash,
+                                                  expected_model_hash,
+                                                  feature_count,
+                                                  &validation_failure)) {
+            ApolloCoreMlContext *context = [ApolloCoreMlContext new];
+            context.model = model;
+            context.configured_backend = pinned_backend;
+            context.feature_count = feature_count;
+            if (status != nullptr) {
+                status->configured_backend = pinned_backend;
+                status->model_available = 1;
+                status->ane_observation = kApolloAneUnsupported;
+            }
+            return (__bridge_retained void *)context;
+        }
+        apollo_copy_reason(status, validation_failure != nil
+            ? validation_failure
+            : apollo_error_message(error, @"Core ML model could not be loaded"));
+        return nullptr;
+    }
+}
+
 extern "C" void *apollo_coreml_create(uint64_t expected_schema_hash,
                                         uint64_t expected_model_hash,
                                         uint32_t feature_count,
@@ -213,13 +291,15 @@ extern "C" void *apollo_coreml_create(uint64_t expected_schema_hash,
                                                        &validation_failure)) {
                 ApolloCoreMlContext *context = [ApolloCoreMlContext new];
                 context.model = model;
-                context.effective_backend = backend_values[index];
+                context.configured_backend = backend_values[index];
                 context.feature_count = feature_count;
                 if (status != nullptr) {
-                    status->effective_backend = backend_values[index];
+                    // What Core ML accepted, not where inference will run.
+                    status->configured_backend = backend_values[index];
                     status->model_available = 1;
-                    // A compute-unit request is not measured proof of ANE use.
-                    status->ane_execution_measured = 0;
+                    // A compute-unit request is not measured proof of ANE use,
+                    // and Core ML exposes no per-inference dispatch target.
+                    status->ane_observation = kApolloAneUnsupported;
                 }
                 return (__bridge_retained void *)context;
             }

@@ -103,7 +103,19 @@ pub struct IOReportSnapshot {
     /// GPU active fraction (0.0–1.0).
     pub gpu_pct: f64,
     /// ANE (Neural Engine) detected as active.
+    ///
+    /// Only meaningful together with `ane_channel_present`: this field is
+    /// raised when a channel reports activity and otherwise keeps its `false`
+    /// default, so on its own it cannot separate an idle Neural Engine from a
+    /// subscription that never carried an ANE channel to read.
     pub ane_busy: bool,
+    /// Whether this subscription actually carried an ANE channel.
+    ///
+    /// IOReport publishes channels per driver, and a host, OS version or
+    /// permission level that exposes none leaves `ane_busy` at `false`
+    /// forever. Recording the channel's presence is what turns that `false`
+    /// into a measurement instead of an absence.
+    pub ane_channel_present: bool,
     /// CPU package power (milliwatts).
     pub cpu_mw: f64,
     /// GPU power (milliwatts).
@@ -116,6 +128,35 @@ pub struct IOReportSnapshot {
     /// Derived from AMC Stats performance state duty cycles.
     /// >0.8 indicates memory bandwidth saturation (M1 8GB bottleneck).
     pub amc_bandwidth_pct: f64,
+}
+
+/// Published when no snapshot exists at all — IOReport is deprecated on macOS
+/// 26+, where the subscription needs Apple-private entitlements a third-party
+/// binary cannot hold, so every utilization field is a placeholder zero rather
+/// than a measurement.
+pub const IOREPORT_UNAVAILABLE: &str = "unavailable";
+
+impl IOReportSnapshot {
+    /// This snapshot's Neural Engine evidence as an explicit status.
+    ///
+    /// Free-standing so the caller cannot publish the ANE fields without also
+    /// publishing what they mean: the previous shape left the status unset on
+    /// the no-snapshot path, which rendered as an empty string — precisely the
+    /// "unknown that looks like nothing" this replaces.
+    pub fn ane_observation(&self) -> &'static str {
+        if !self.ane_channel_present {
+            IOREPORT_UNAVAILABLE
+        } else if self.ane_busy {
+            "measured-active"
+        } else {
+            "measured-idle"
+        }
+    }
+}
+
+/// Status for an optional snapshot, so `None` is reported rather than dropped.
+pub fn ane_observation_of(snapshot: Option<&IOReportSnapshot>) -> &'static str {
+    snapshot.map_or(IOREPORT_UNAVAILABLE, IOReportSnapshot::ane_observation)
 }
 
 impl IOReportSnapshot {
@@ -298,6 +339,9 @@ impl IOReportReader {
 
             // ── ANE (Neural Engine) ──────────────────────────────────────────
             if channel.contains("ANE") || driver.contains("ANE") {
+                // Seeing the channel at all is what makes a subsequent `false`
+                // a measurement rather than an absence.
+                acc.snap.ane_channel_present = true;
                 if ch.state_count > 0 {
                     let active = active_fraction(&ch.duty_cycles, &ch.state_names, ch.state_count);
                     if active > 0.01 {
@@ -420,6 +464,58 @@ fn c_chars_to_str(arr: &[c_char]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `ane_busy: false` is the struct default, so a host whose IOReport
+    /// subscription carries no ANE channel reports exactly what an idle
+    /// Neural Engine reports. The two demand opposite responses — go find a
+    /// working channel, versus conclude the accelerator is unused — so the
+    /// snapshot has to say which one it is.
+    #[test]
+    fn an_absent_ane_channel_is_not_the_same_as_a_measured_idle_ane() {
+        let never_observed = IOReportSnapshot::default();
+        let measured_idle = IOReportSnapshot {
+            ane_channel_present: true,
+            ..IOReportSnapshot::default()
+        };
+        let measured_busy = IOReportSnapshot {
+            ane_channel_present: true,
+            ane_busy: true,
+            ..IOReportSnapshot::default()
+        };
+
+        // Indistinguishable on the raw flag...
+        assert_eq!(never_observed.ane_busy, measured_idle.ane_busy);
+        // ...and separable once the channel's presence is recorded.
+        assert!(!never_observed.ane_channel_present);
+        assert!(measured_idle.ane_channel_present);
+        assert!(measured_busy.ane_channel_present && measured_busy.ane_busy);
+    }
+
+    /// The no-snapshot path is the live one on macOS 26+, where IOReport needs
+    /// Apple-private entitlements. Publishing the status only from the
+    /// snapshot branch left it empty there, which reads as "no opinion" rather
+    /// than "the sensor is gone" — the same defect one level up.
+    #[test]
+    fn a_missing_snapshot_reports_unavailable_rather_than_nothing() {
+        assert_eq!(ane_observation_of(None), IOREPORT_UNAVAILABLE);
+        assert!(!ane_observation_of(None).is_empty());
+
+        let idle = IOReportSnapshot {
+            ane_channel_present: true,
+            ..IOReportSnapshot::default()
+        };
+        let busy = IOReportSnapshot {
+            ane_channel_present: true,
+            ane_busy: true,
+            ..IOReportSnapshot::default()
+        };
+        let no_channel = IOReportSnapshot::default();
+
+        assert_eq!(ane_observation_of(Some(&idle)), "measured-idle");
+        assert_eq!(ane_observation_of(Some(&busy)), "measured-active");
+        // A snapshot without an ANE channel is as blind as no snapshot.
+        assert_eq!(ane_observation_of(Some(&no_channel)), IOREPORT_UNAVAILABLE);
+    }
 
     #[test]
     fn reader_initializes_without_panic() {

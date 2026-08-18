@@ -74,25 +74,39 @@ pub mod mach_sys {
     // Task-level QoS flavors (for direct latency/throughput QoS)
     pub const TASK_POLICY_QOS: i32 = 9;
     pub const TASK_BASE_QOS_POLICY: i32 = 8;
-    pub const TASK_QOS_POLICY_COUNT: u32 = 1;
+    /// XNU derives this as `sizeof(task_qos_policy_data_t) / sizeof(integer_t)`
+    /// and `task_policy_set` returns KERN_INVALID_ARGUMENT when the caller
+    /// passes less. `task_qos_policy_data_t` holds two integers, so a
+    /// hardcoded 1 rejected every task QoS write. Derived here so it cannot
+    /// drift from the struct again.
+    pub const TASK_QOS_POLICY_COUNT: u32 =
+        (std::mem::size_of::<super::ffi::TaskQosPolicy>() / std::mem::size_of::<i32>()) as u32;
 
-    // Latency QoS tiers
+    // Latency / throughput QoS tiers.
+    //
+    // These are NOT plain descending bytes. `mach/task_policy.h` encodes them
+    // as `(class << 16) | (n + 1)`, with class 0xFF for latency and 0xFE for
+    // throughput. `task_qos_policy_validate` in XNU range-checks against
+    // TIER_0..TIER_5 and returns KERN_INVALID_ARGUMENT otherwise, so the old
+    // 0xFF..0xFA bytes were rejected on every call.
+    const LATENCY_QOS_CLASS: i32 = 0xFF << 16;
+    const THROUGHPUT_QOS_CLASS: i32 = 0xFE << 16;
+
     pub const LATENCY_QOS_TIER_UNSPECIFIED: i32 = 0;
-    pub const LATENCY_QOS_TIER_0: i32 = 0xFF; // Interactive
-    pub const LATENCY_QOS_TIER_1: i32 = 0xFE;
-    pub const LATENCY_QOS_TIER_2: i32 = 0xFD;
-    pub const LATENCY_QOS_TIER_3: i32 = 0xFC; // Background
-    pub const LATENCY_QOS_TIER_4: i32 = 0xFB;
-    pub const LATENCY_QOS_TIER_5: i32 = 0xFA;
+    pub const LATENCY_QOS_TIER_0: i32 = LATENCY_QOS_CLASS | 1; // Interactive
+    pub const LATENCY_QOS_TIER_1: i32 = LATENCY_QOS_CLASS | 2;
+    pub const LATENCY_QOS_TIER_2: i32 = LATENCY_QOS_CLASS | 3;
+    pub const LATENCY_QOS_TIER_3: i32 = LATENCY_QOS_CLASS | 4; // Background
+    pub const LATENCY_QOS_TIER_4: i32 = LATENCY_QOS_CLASS | 5;
+    pub const LATENCY_QOS_TIER_5: i32 = LATENCY_QOS_CLASS | 6;
 
-    // Throughput QoS tiers
     pub const THROUGHPUT_QOS_TIER_UNSPECIFIED: i32 = 0;
-    pub const THROUGHPUT_QOS_TIER_0: i32 = 0xFF; // High throughput
-    pub const THROUGHPUT_QOS_TIER_1: i32 = 0xFE;
-    pub const THROUGHPUT_QOS_TIER_2: i32 = 0xFD;
-    pub const THROUGHPUT_QOS_TIER_3: i32 = 0xFC;
-    pub const THROUGHPUT_QOS_TIER_4: i32 = 0xFB;
-    pub const THROUGHPUT_QOS_TIER_5: i32 = 0xFA;
+    pub const THROUGHPUT_QOS_TIER_0: i32 = THROUGHPUT_QOS_CLASS | 1; // High
+    pub const THROUGHPUT_QOS_TIER_1: i32 = THROUGHPUT_QOS_CLASS | 2;
+    pub const THROUGHPUT_QOS_TIER_2: i32 = THROUGHPUT_QOS_CLASS | 3;
+    pub const THROUGHPUT_QOS_TIER_3: i32 = THROUGHPUT_QOS_CLASS | 4;
+    pub const THROUGHPUT_QOS_TIER_4: i32 = THROUGHPUT_QOS_CLASS | 5;
+    pub const THROUGHPUT_QOS_TIER_5: i32 = THROUGHPUT_QOS_CLASS | 6;
 
     // Task suppression (App Nap)
     pub const TASK_SUPPRESSION_POLICY: i32 = 3;
@@ -2209,6 +2223,50 @@ mod tests {
         // "reset" that XNU rejects (thread stayed RT after focus loss).
         assert_eq!(super::mach_sys::THREAD_EXTENDED_POLICY, 1);
         assert_eq!(super::mach_sys::THREAD_EXTENDED_POLICY_COUNT, 1);
+    }
+
+    #[test]
+    fn task_qos_policy_count_matches_the_struct_xnu_expects() {
+        // A hardcoded 1 here made task_policy_set(QOS) return
+        // KERN_INVALID_ARGUMENT on every call: XNU rejects the flavor when
+        // count < sizeof(task_qos_policy_data_t) / sizeof(integer_t). The
+        // task port was acquired fine, so it surfaced as a silent 100%
+        // fallback to nice() rather than as an error.
+        assert_eq!(super::mach_sys::TASK_QOS_POLICY_COUNT, 2);
+        assert_eq!(
+            std::mem::size_of::<super::ffi::TaskQosPolicy>(),
+            2 * std::mem::size_of::<i32>(),
+            "TaskQosPolicy must stay two integers or the derived count is wrong"
+        );
+    }
+
+    #[test]
+    fn qos_tiers_match_the_literal_values_in_mach_task_policy_h() {
+        // Transcribed from
+        // MacOSX.sdk/usr/include/mach/task_policy.h `enum task_latency_qos`
+        // and `enum task_throughput_qos`. The tiers are (class << 16) | (n+1),
+        // not descending bytes; the earlier 0xFF..0xFA encoding failed XNU's
+        // task_qos_policy_validate range check on every call.
+        use super::mach_sys::*;
+        assert_eq!(LATENCY_QOS_TIER_UNSPECIFIED, 0x0);
+        assert_eq!(LATENCY_QOS_TIER_0, (0xFF << 16) | 1);
+        assert_eq!(LATENCY_QOS_TIER_1, (0xFF << 16) | 2);
+        assert_eq!(LATENCY_QOS_TIER_2, (0xFF << 16) | 3);
+        assert_eq!(LATENCY_QOS_TIER_3, (0xFF << 16) | 4);
+        assert_eq!(LATENCY_QOS_TIER_4, (0xFF << 16) | 5);
+        assert_eq!(LATENCY_QOS_TIER_5, (0xFF << 16) | 6);
+
+        assert_eq!(THROUGHPUT_QOS_TIER_UNSPECIFIED, 0x0);
+        assert_eq!(THROUGHPUT_QOS_TIER_0, (0xFE << 16) | 1);
+        assert_eq!(THROUGHPUT_QOS_TIER_1, (0xFE << 16) | 2);
+        assert_eq!(THROUGHPUT_QOS_TIER_2, (0xFE << 16) | 3);
+        assert_eq!(THROUGHPUT_QOS_TIER_3, (0xFE << 16) | 4);
+        assert_eq!(THROUGHPUT_QOS_TIER_4, (0xFE << 16) | 5);
+        assert_eq!(THROUGHPUT_QOS_TIER_5, (0xFE << 16) | 6);
+
+        // Latency and throughput live in different classes; using one where
+        // the other belongs is silently accepted by the type system.
+        assert_ne!(LATENCY_QOS_TIER_0, THROUGHPUT_QOS_TIER_0);
     }
 
     #[test]

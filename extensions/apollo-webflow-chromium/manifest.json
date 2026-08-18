@@ -1,11 +1,18 @@
 {
   "manifest_version": 3,
   "name": "Apollo WebFlow",
-  "version": "1.0.0",
+  "version": "2.0.2",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA8s8SMpVTTGmMdHSG0Gp7nWjy9kktK7QvXAkPmDjgtszd+dFk8B5spgKABPzUD7DI8t3RVGjw0Gtay9M4cqsnK6ft+LNuAJPlBuiLZgr4KobkyXxXqGZgUcg9E54khIY4bpr8bgzxQ4u4TQYXkadooEwHTfX1XHMexmwMEqjcJCJiWkXZnVcCqMyIlTN91IzjIsO7C42XEpN1yE27As0DGabgoWoj1h3oSAZtlKPz0Y88uY4COzjPVy56gzjkRmC/UwagmRKuyYrw1Ob57ZoiuC/9tyqlJ9ZApscaVQkOZkPeDJEMxjIHfhED+ckOuWlqQml44hLpymlbLuiRxhHo6QIDAQAB",
-  "description": "Private numeric navigation telemetry for local Apollo acceleration.",
-  "permissions": ["nativeMessaging", "storage", "webNavigation", "scripting"],
-  "optional_host_permissions": ["<all_urls>"],
+  "description": "Private numeric navigation and interaction telemetry for local Apollo acceleration.",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "webNavigation",
+    "scripting"
+  ],
+  "optional_host_permissions": [
+    "<all_urls>"
+  ],
   "background": {
     "service_worker": "background.js"
   },

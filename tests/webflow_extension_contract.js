@@ -40,11 +40,15 @@ test('wire event contains only the closed privacy-safe schema', () => {
   for (const forbidden of FORBIDDEN) {
     assert.equal(encoded.includes(`"${forbidden}"`), false, forbidden);
   }
+  // The closed set grows only with producer identity — never with content.
   assert.deepEqual(Object.keys(event).sort(), [
     'browser_session_id',
+    'extension_version',
+    'feature_capabilities',
     'metrics',
     'navigation_id',
     'phase',
+    'producer_kind',
     'schema_version',
     'sequence',
     'site_bucket',
@@ -107,4 +111,196 @@ test('manifest public key pins the expected native-host extension ID', () => {
   const digest = crypto.createHash('sha256').update(Buffer.from(manifest.key, 'base64')).digest('hex').slice(0, 32);
   const extensionId = digest.replace(/[0-9a-f]/g, (nibble) => String.fromCharCode(97 + Number.parseInt(nibble, 16)));
   assert.equal(extensionId, 'mhagiddoeecedoknmhdlhghdnglglbhp');
+});
+
+// ── 0A-obs: interaction folding ─────────────────────────────────────────────
+// The previous collector took max(entry.duration) over entries above a 40 ms
+// threshold and published it as INP. These pin the corrected semantics.
+
+const {
+  foldInteractions,
+  inpEstimateMs,
+  componentTotals,
+  MAX_TRACKED_INTERACTIONS,
+} = require('../extensions/apollo-webflow-chromium/protocol.js');
+
+function entry(overrides = {}) {
+  return {
+    interactionId: 1,
+    startTime: 1000,
+    processingStart: 1010,
+    processingEnd: 1030,
+    duration: 48,
+    cancelable: true,
+    ...overrides,
+  };
+}
+
+test('entries sharing an interactionId fold into one interaction', () => {
+  const { interactions } = foldInteractions([
+    entry({ duration: 16 }),
+    entry({ duration: 48 }),
+    entry({ duration: 32 }),
+  ]);
+  assert.equal(interactions.size, 1);
+  assert.equal(interactions.get(1).totalMs, 48, 'the longest entry defines the latency');
+  assert.equal(interactions.get(1).entryCount, 3);
+});
+
+test('interactionId 0 is not an interaction and is discarded', () => {
+  const { interactions } = foldInteractions([
+    entry({ interactionId: 0, duration: 900 }),
+    entry({ interactionId: undefined, duration: 900 }),
+  ]);
+  assert.equal(interactions.size, 0);
+  assert.equal(inpEstimateMs(interactions), undefined);
+});
+
+test('consecutive clicks are separate interactions, not one maximum', () => {
+  const { interactions } = foldInteractions([
+    entry({ interactionId: 1, duration: 20 }),
+    entry({ interactionId: 2, duration: 300 }),
+    entry({ interactionId: 3, duration: 24 }),
+  ]);
+  assert.equal(interactions.size, 3);
+  assert.equal(inpEstimateMs(interactions), 300, 'worst interaction below the percentile floor');
+});
+
+test('repeated keys each count as their own interaction', () => {
+  const entries = Array.from({ length: 12 }, (_, index) =>
+    entry({ interactionId: index + 1, duration: 8 + index }));
+  const { interactions } = foldInteractions(entries);
+  assert.equal(interactions.size, 12);
+});
+
+test('fast interactions are represented, not filtered away', () => {
+  const { interactions } = foldInteractions([entry({ duration: 8 })]);
+  assert.equal(interactions.size, 1, 'no 40 ms threshold hides them');
+  assert.equal(inpEstimateMs(interactions), 8);
+});
+
+test('components reconcile with the total for the winning entry', () => {
+  const { interactions } = foldInteractions([
+    entry({ startTime: 1000, processingStart: 1012, processingEnd: 1040, duration: 60 }),
+  ]);
+  const i = interactions.get(1);
+  assert.equal(i.inputDelayMs, 12);
+  assert.equal(i.processingMs, 28);
+  assert.equal(i.presentationMs, 20);
+  assert.equal(i.inputDelayMs + i.processingMs + i.presentationMs, i.totalMs);
+});
+
+test('a cancelled event keeps its flag so it can be excluded downstream', () => {
+  const { interactions } = foldInteractions([entry({ cancelable: false })]);
+  assert.equal(interactions.get(1).cancelable, false);
+});
+
+test('an entry with no paint still yields nonnegative components', () => {
+  const { interactions } = foldInteractions([
+    entry({ startTime: 1000, processingStart: 1010, processingEnd: 1200, duration: 100 }),
+  ]);
+  const i = interactions.get(1);
+  assert.ok(i.presentationMs >= 0, 'processingEnd past the paint must not go negative');
+});
+
+test('late entries update an existing interaction only when longer', () => {
+  const first = foldInteractions([entry({ duration: 200 })]);
+  const second = foldInteractions([entry({ duration: 40 })], first);
+  assert.equal(second.interactions.get(1).totalMs, 200);
+  const third = foldInteractions([entry({ duration: 260 })], second);
+  assert.equal(third.interactions.get(1).totalMs, 260);
+});
+
+test('duplicate identical entries do not inflate the interaction count', () => {
+  const duplicated = [entry(), entry(), entry()];
+  const { interactions } = foldInteractions(duplicated);
+  assert.equal(interactions.size, 1);
+});
+
+test('the tracked population is bounded against a hostile page', () => {
+  const entries = Array.from({ length: MAX_TRACKED_INTERACTIONS + 50 }, (_, index) =>
+    entry({ interactionId: index + 1, duration: 10 }));
+  const { interactions, dropped } = foldInteractions(entries);
+  assert.equal(interactions.size, MAX_TRACKED_INTERACTIONS);
+  assert.equal(dropped, 50, 'refusals are counted, not silent');
+});
+
+test('component totals sum across interactions', () => {
+  const { interactions } = foldInteractions([
+    entry({ interactionId: 1, startTime: 0, processingStart: 10, processingEnd: 30, duration: 50 }),
+    entry({ interactionId: 2, startTime: 0, processingStart: 5, processingEnd: 25, duration: 40 }),
+  ]);
+  const totals = componentTotals(interactions);
+  assert.equal(totals.inputDelay, 15);
+  assert.equal(totals.processing, 40);
+  assert.equal(totals.presentation, 35);
+});
+
+test('every event declares its producer identity and capabilities', () => {
+  const event = buildEvent({ ...ids(), sequence: 1, phase: 'settled', source: 'extension-vitals', metrics: {} });
+  assert.equal(event.schema_version, 2);
+  assert.equal(event.producer_kind, 'chromium-extension');
+  assert.equal(event.extension_version, require('../extensions/apollo-webflow-chromium/protocol.js').EXTENSION_VERSION);
+  const caps = event.feature_capabilities;
+  assert.ok(caps & 0b001, 'interaction grouping');
+  assert.ok(caps & 0b010, 'component breakdown');
+  assert.ok(caps & 0b100, 'transport timing');
+});
+
+test('the declared extension version matches the manifest', () => {
+  const manifest = require('../extensions/apollo-webflow-chromium/manifest.json');
+  const P = require('../extensions/apollo-webflow-chromium/protocol.js');
+  assert.equal(manifest.version, P.EXTENSION_VERSION,
+    'a drifting version would make the daemon report a wrong producer');
+});
+
+test('the content script gets the protocol helpers it depends on', () => {
+  // content.js reads folding/percentile helpers from globalThis. An isolated
+  // world does not inherit the service worker's importScripts, so protocol.js
+  // must be injected alongside it — and before it.
+  const fs = require('node:fs');
+  const background = fs.readFileSync('extensions/apollo-webflow-chromium/background.js', 'utf8');
+  const match = background.match(/js:\s*\[([^\]]+)\]/);
+  assert.ok(match, 'registerContentScripts must declare a js list');
+  const files = match[1].split(',').map((s) => s.trim().replace(/['"]/g, ''));
+  assert.ok(files.includes('protocol.js'), 'protocol.js must be injected');
+  assert.ok(
+    files.indexOf('protocol.js') < files.indexOf('content.js'),
+    'protocol.js must load before content.js',
+  );
+
+  const content = fs.readFileSync('extensions/apollo-webflow-chromium/content.js', 'utf8');
+  assert.ok(
+    !content.includes('const P = globalThis'),
+    'the helpers must not be captured at load time: a stale registration can '
+    + 'inject content.js without protocol.js, and a cached value would then '
+    + 'stay undefined while the guard that read it still said "ready"',
+  );
+  assert.ok(content.includes('function helpers()'), 'resolve them per call');
+});
+
+test('the content script survives an orphaned extension context', () => {
+  // Reloading the extension leaves content scripts running in open tabs;
+  // sendMessage then throws synchronously and .catch() never sees it.
+  const content = require('node:fs')
+    .readFileSync('extensions/apollo-webflow-chromium/content.js', 'utf8');
+  assert.ok(content.includes('chrome.runtime?.id'), 'must check the context is alive');
+  assert.match(content, /try\s*\{[\s\S]*sendMessage[\s\S]*catch/, 'and guard the throw');
+});
+
+test('content script registration is idempotent across reloads', () => {
+  // registerContentScripts persists across sessions; re-registering the same id
+  // throws and silently leaves the previous js list active. That is exactly how
+  // a stale registration injected content.js without protocol.js.
+  const background = require('node:fs')
+    .readFileSync('extensions/apollo-webflow-chromium/background.js', 'utf8');
+  assert.ok(
+    background.includes('updateContentScripts'),
+    'an existing registration must be updated, not blindly re-registered',
+  );
+  assert.match(
+    background,
+    /registerContentScripts\(\[script\]\);\s*\}\s*catch/,
+    'and a failed register must not end with no registration at all',
+  );
 });

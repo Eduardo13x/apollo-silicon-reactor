@@ -155,17 +155,10 @@ fn filter_actions_for_mode(
     let mut allowed = Vec::with_capacity(actions.len());
     let mut blocked = Vec::new();
     for action in actions {
-        let admitted = match op_mode {
-            OperationMode::Emergency => matches!(action, RootAction::UnfreezeProcess { .. }),
-            OperationMode::Observe => false,
-            OperationMode::Conservative => matches!(
-                action,
-                RootAction::UnfreezeProcess { .. }
-                    | RootAction::SetThreadQoS { .. }
-                    | RootAction::BoostProcess { .. }
-            ),
-            OperationMode::Full => true,
-        };
+        // Delegates to OperationMode so the tier policy lives in one place.
+        // This used to be a second, inline copy that had already drifted from
+        // the predicates in degradation.rs.
+        let admitted = op_mode.admits(&action);
         if admitted {
             allowed.push(action);
         } else {

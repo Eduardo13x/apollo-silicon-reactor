@@ -7,7 +7,74 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-pub const WEBFLOW_SCHEMA_VERSION: u16 = 1;
+/// v2 adds the per-interaction fields (`inp_estimate_ms`, `interaction_count`,
+/// component totals) and renames the entry-duration tail. v1 payloads remain
+/// readable: every new field is `Option`/`default`, and a v1 producer simply
+/// reports no interaction data.
+pub const WEBFLOW_SCHEMA_VERSION: u16 = 2;
+pub const MIN_SUPPORTED_WEBFLOW_SCHEMA_VERSION: u16 = 1;
+/// An untrusted page must not be able to claim an unbounded interaction count.
+pub const MAX_WEBFLOW_INTERACTIONS: u32 = 4_096;
+/// A transport segment longer than this is a clock anomaly, not a measurement.
+pub const MAX_WEBFLOW_TRANSPORT_MS: u64 = 60_000;
+pub const MAX_PRODUCER_VERSION_CHARS: usize = 16;
+
+/// What produced an event, so a stale extension explains its own zeros rather
+/// than presenting them as an absence of activity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProducerKind {
+    #[default]
+    Unknown,
+    ChromiumExtension,
+    DaemonInference,
+}
+
+/// Capabilities the producer claims, as a bit set. An absent bit means "this
+/// producer cannot report it", which is a different statement from "it reported
+/// nothing" — the distinction a stale extension needs to explain its own zeros.
+///
+/// ponytail: a plain u32 with named constants rather than a bitflags
+/// dependency. Upgrade path: swap for `bitflags` if this ever needs set
+/// algebra beyond contains/insert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct FeatureCapabilities(pub u32);
+
+impl FeatureCapabilities {
+    pub const INTERACTION_GROUPING: u32 = 1 << 0;
+    pub const COMPONENT_BREAKDOWN: u32 = 1 << 1;
+    pub const TRANSPORT_TIMING: u32 = 1 << 2;
+    pub const FAST_PROBE: u32 = 1 << 3;
+    pub const CLOCK_SYNC: u32 = 1 << 4;
+    /// Everything a v2 extension is expected to provide.
+    pub const V2_EXPECTED: u32 =
+        Self::INTERACTION_GROUPING | Self::COMPONENT_BREAKDOWN | Self::TRANSPORT_TIMING;
+
+    pub const fn contains(self, bit: u32) -> bool {
+        self.0 & bit == bit
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Bits the producer claims that this build does not know about. Non-zero
+    /// means the producer is newer than the daemon.
+    pub const fn unknown_bits(self) -> u32 {
+        self.0
+            & !(Self::INTERACTION_GROUPING
+                | Self::COMPONENT_BREAKDOWN
+                | Self::TRANSPORT_TIMING
+                | Self::FAST_PROBE
+                | Self::CLOCK_SYNC)
+    }
+
+    pub const fn missing_v2(self) -> u32 {
+        Self::V2_EXPECTED & !self.0
+    }
+}
+
 pub const MAX_WEBFLOW_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_WEBFLOW_INGRESS_EVENTS: usize = 256;
 pub const MAX_WEBFLOW_EVENTS_PER_CYCLE: usize = 128;
@@ -118,7 +185,25 @@ pub struct WebFlowMetrics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lcp_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inp_ms: Option<u32>,
+    /// Max single `PerformanceEventTiming.duration`, not INP. See
+    /// `RuntimeMetrics::browser_event_duration_tail_ms`.
+    pub event_duration_ms: Option<u32>,
+    /// Web Vitals INP: high percentile over interactions grouped by
+    /// `interactionId`. Distinct series from `event_duration_ms`; never join them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inp_estimate_ms: Option<u32>,
+    /// Interactions (not entries) behind `inp_estimate_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_count: Option<u32>,
+    /// Interactions the collector refused to track once bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactions_dropped: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_delay_total_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_total_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_total_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cls_milli: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,7 +225,11 @@ impl WebFlowMetrics {
             self.dom_ready_ms,
             self.load_ms,
             self.lcp_ms,
-            self.inp_ms,
+            self.event_duration_ms,
+            self.inp_estimate_ms,
+            self.input_delay_total_ms,
+            self.processing_total_ms,
+            self.presentation_total_ms,
             self.long_task_total_ms,
         ]
         .into_iter()
@@ -149,6 +238,15 @@ impl WebFlowMetrics {
             if value > MAX_WEBFLOW_TIMING_MS {
                 return Err(WebFlowValidationError::MetricOutOfRange);
             }
+        }
+        if self
+            .interaction_count
+            .is_some_and(|value| value > MAX_WEBFLOW_INTERACTIONS)
+            || self
+                .interactions_dropped
+                .is_some_and(|value| value > MAX_WEBFLOW_INTERACTIONS)
+        {
+            return Err(WebFlowValidationError::MetricOutOfRange);
         }
         if self.cls_milli.is_some_and(|value| value > 100_000)
             || self
@@ -167,6 +265,56 @@ impl WebFlowMetrics {
     }
 }
 
+/// Per-hop transport timing. Every field is stamped by exactly one component
+/// **in that component's own clock**, and only same-clock differences are ever
+/// computed. Nothing here establishes a shared timeline: proving that an action
+/// landed before a paint would need an offset protocol with an error bound,
+/// which 0A-obs deliberately does not claim to have.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebFlowTransport {
+    /// Browser clock. Content script hands the message to the runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_send_started_at_ms: Option<u64>,
+    /// Browser clock. Service worker receives it — the gap over the field above
+    /// contains the MV3 cold start, the one unknown that decides feasibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_received_at_ms: Option<u64>,
+    /// Browser clock. Service worker posts to the native host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_message_started_at_ms: Option<u64>,
+    /// Depth of the per-tab promise queue when this event was enqueued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_queue_depth: Option<u32>,
+    /// Whether the service worker had to be woken for this event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_worker_cold_start: Option<bool>,
+}
+
+impl WebFlowTransport {
+    /// Browser-clock only: content script hand-off to native post. Includes the
+    /// service-worker cold start and the per-tab queue.
+    pub fn client_segment_ms(&self) -> Option<u64> {
+        let start = self.content_send_started_at_ms?;
+        let end = self.native_message_started_at_ms?;
+        end.checked_sub(start)
+    }
+
+    /// Browser-clock only: how long the message waited for the service worker.
+    pub fn service_worker_wake_ms(&self) -> Option<u64> {
+        let start = self.content_send_started_at_ms?;
+        let end = self.service_worker_received_at_ms?;
+        end.checked_sub(start)
+    }
+
+    pub fn is_plausible(&self) -> bool {
+        [self.client_segment_ms(), self.service_worker_wake_ms()]
+            .into_iter()
+            .flatten()
+            .all(|value| value <= MAX_WEBFLOW_TRANSPORT_MS)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebFlowEvent {
@@ -181,11 +329,31 @@ pub struct WebFlowEvent {
     pub site_bucket: Option<OpaqueBucket>,
     #[serde(default)]
     pub metrics: WebFlowMetrics,
+    #[serde(default, skip_serializing_if = "WebFlowTransport::is_default")]
+    pub transport: WebFlowTransport,
+    /// Who produced this event and what it can report. Absent on v1 payloads,
+    /// which is itself the signal that a stale extension is running.
+    #[serde(default)]
+    pub producer_kind: ProducerKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge_version: Option<String>,
+    #[serde(default)]
+    pub feature_capabilities: FeatureCapabilities,
+}
+
+impl WebFlowTransport {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl WebFlowEvent {
     pub fn validate(&self) -> Result<(), WebFlowValidationError> {
-        if self.schema_version != WEBFLOW_SCHEMA_VERSION {
+        if self.schema_version > WEBFLOW_SCHEMA_VERSION
+            || self.schema_version < MIN_SUPPORTED_WEBFLOW_SCHEMA_VERSION
+        {
             return Err(WebFlowValidationError::UnsupportedSchema);
         }
         if self.sequence == 0 {
@@ -199,6 +367,20 @@ impl WebFlowEvent {
                 .is_some_and(|bucket| bucket.bytes() == [0; 16])
         {
             return Err(WebFlowValidationError::ZeroIdentity);
+        }
+        for version in [
+            self.extension_version.as_deref(),
+            self.bridge_version.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if version.is_empty() || version.chars().count() > MAX_PRODUCER_VERSION_CHARS {
+                return Err(WebFlowValidationError::MetricOutOfRange);
+            }
+        }
+        if !self.transport.is_plausible() {
+            return Err(WebFlowValidationError::MetricOutOfRange);
         }
         self.metrics.validate()
     }
@@ -370,3 +552,343 @@ impl fmt::Display for WebFlowValidationError {
 }
 
 impl std::error::Error for WebFlowValidationError {}
+
+#[cfg(test)]
+mod schema_v2_tests {
+    use super::*;
+
+    fn opaque(byte: u8) -> OpaqueId {
+        OpaqueId::new([byte.max(1); 16]).expect("nonzero opaque id")
+    }
+
+    fn event(metrics: WebFlowMetrics) -> WebFlowEvent {
+        WebFlowEvent {
+            schema_version: WEBFLOW_SCHEMA_VERSION,
+            browser_session_id: opaque(1),
+            tab_session_id: opaque(2),
+            navigation_id: opaque(3),
+            sequence: 1,
+            phase: WebFlowPhase::Settled,
+            source: WebFlowSource::ExtensionVitals,
+            site_bucket: None,
+            metrics,
+            transport: WebFlowTransport::default(),
+            producer_kind: ProducerKind::ChromiumExtension,
+            extension_version: None,
+            bridge_version: None,
+            feature_capabilities: FeatureCapabilities::default(),
+        }
+    }
+
+    #[test]
+    fn a_v1_producer_still_validates_and_simply_reports_no_interactions() {
+        // The deployed extension is v1. Refusing its payloads would blind the
+        // daemon during the rollout window.
+        let mut legacy = event(WebFlowMetrics {
+            event_duration_ms: Some(440),
+            ..WebFlowMetrics::default()
+        });
+        legacy.schema_version = MIN_SUPPORTED_WEBFLOW_SCHEMA_VERSION;
+        assert!(legacy.validate().is_ok());
+        assert_eq!(legacy.metrics.inp_estimate_ms, None);
+        assert_eq!(legacy.metrics.interaction_count, None);
+    }
+
+    #[test]
+    fn a_future_schema_is_still_refused() {
+        let mut future = event(WebFlowMetrics::default());
+        future.schema_version = WEBFLOW_SCHEMA_VERSION + 1;
+        assert_eq!(
+            future.validate(),
+            Err(WebFlowValidationError::UnsupportedSchema)
+        );
+    }
+
+    #[test]
+    fn an_untrusted_interaction_count_cannot_be_unbounded() {
+        let hostile = event(WebFlowMetrics {
+            interaction_count: Some(MAX_WEBFLOW_INTERACTIONS + 1),
+            ..WebFlowMetrics::default()
+        });
+        assert_eq!(
+            hostile.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
+        let dropped = event(WebFlowMetrics {
+            interactions_dropped: Some(MAX_WEBFLOW_INTERACTIONS + 1),
+            ..WebFlowMetrics::default()
+        });
+        assert_eq!(
+            dropped.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
+    }
+
+    #[test]
+    fn every_interaction_timing_is_range_checked_like_the_legacy_ones() {
+        for build in [
+            |value| WebFlowMetrics {
+                inp_estimate_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+            |value| WebFlowMetrics {
+                input_delay_total_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+            |value| WebFlowMetrics {
+                processing_total_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+            |value| WebFlowMetrics {
+                presentation_total_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+        ] {
+            let hostile = event(build(MAX_WEBFLOW_TIMING_MS + 1));
+            assert_eq!(
+                hostile.validate(),
+                Err(WebFlowValidationError::MetricOutOfRange)
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_latency_series_travel_as_independent_fields() {
+        // Schema discontinuity made structural: a payload can carry the entry
+        // tail, the interaction estimate, both, or neither.
+        let both = event(WebFlowMetrics {
+            event_duration_ms: Some(440),
+            inp_estimate_ms: Some(184),
+            interaction_count: Some(312),
+            ..WebFlowMetrics::default()
+        });
+        assert!(both.validate().is_ok());
+        let round_trip = WebFlowEvent::from_bounded_json(&both.bounded_json().expect("encodes"))
+            .expect("decodes");
+        assert_eq!(round_trip.metrics.event_duration_ms, Some(440));
+        assert_eq!(round_trip.metrics.inp_estimate_ms, Some(184));
+        assert_eq!(round_trip.metrics.interaction_count, Some(312));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+
+    #[test]
+    fn only_same_clock_differences_are_computed() {
+        let transport = WebFlowTransport {
+            content_send_started_at_ms: Some(1_000),
+            service_worker_received_at_ms: Some(1_280),
+            native_message_started_at_ms: Some(1_312),
+            tab_queue_depth: Some(2),
+            service_worker_cold_start: Some(true),
+        };
+        // Both segments live entirely in the browser clock.
+        assert_eq!(transport.service_worker_wake_ms(), Some(280));
+        assert_eq!(transport.client_segment_ms(), Some(312));
+        assert!(transport.is_plausible());
+    }
+
+    #[test]
+    fn a_partial_transport_yields_no_segment_rather_than_a_guess() {
+        let partial = WebFlowTransport {
+            service_worker_received_at_ms: Some(1_280),
+            ..WebFlowTransport::default()
+        };
+        assert_eq!(partial.client_segment_ms(), None);
+        assert_eq!(partial.service_worker_wake_ms(), None);
+        assert!(partial.is_plausible(), "absence is not implausibility");
+    }
+
+    #[test]
+    fn a_backwards_clock_yields_no_segment_instead_of_underflowing() {
+        let regressed = WebFlowTransport {
+            content_send_started_at_ms: Some(2_000),
+            native_message_started_at_ms: Some(1_000),
+            ..WebFlowTransport::default()
+        };
+        assert_eq!(regressed.client_segment_ms(), None);
+    }
+
+    #[test]
+    fn an_implausible_segment_is_refused_at_validation() {
+        let event = WebFlowEvent {
+            schema_version: WEBFLOW_SCHEMA_VERSION,
+            browser_session_id: OpaqueId::new([1; 16]).expect("id"),
+            tab_session_id: OpaqueId::new([2; 16]).expect("id"),
+            navigation_id: OpaqueId::new([3; 16]).expect("id"),
+            sequence: 1,
+            phase: WebFlowPhase::Settled,
+            source: WebFlowSource::ExtensionVitals,
+            site_bucket: None,
+            metrics: WebFlowMetrics::default(),
+            producer_kind: ProducerKind::ChromiumExtension,
+            extension_version: None,
+            bridge_version: None,
+            feature_capabilities: FeatureCapabilities::default(),
+            transport: WebFlowTransport {
+                content_send_started_at_ms: Some(0),
+                native_message_started_at_ms: Some(MAX_WEBFLOW_TRANSPORT_MS + 1),
+                ..WebFlowTransport::default()
+            },
+        };
+        assert_eq!(
+            event.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
+    }
+}
+
+/// What the daemon can say about the producer feeding it. Exists so a zero on
+/// the dashboard always carries its cause: a stale extension, a schema
+/// mismatch and an idle browser produce identical counters otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ExtensionStatus {
+    /// No event of any kind has arrived.
+    #[default]
+    NoExtensionData,
+    /// Events arrive, but from a producer older than the current schema.
+    StaleV1,
+    /// A v2 producer with every expected capability.
+    ActiveV2,
+    /// A v2 producer missing capabilities this build expects.
+    PartialCapabilities,
+    /// The producer claims a schema this build cannot interpret.
+    SchemaMismatch,
+}
+
+impl ExtensionStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NoExtensionData => "NO EXTENSION DATA",
+            Self::StaleV1 => "EXT v1 STALE",
+            Self::ActiveV2 => "EXT v2 ACTIVE",
+            Self::PartialCapabilities => "PARTIAL CAPABILITIES",
+            Self::SchemaMismatch => "SCHEMA MISMATCH",
+        }
+    }
+
+    /// Compact form for the 32-column quadrant.
+    pub fn short(self) -> &'static str {
+        match self {
+            Self::NoExtensionData => "no-data",
+            Self::StaleV1 => "v1-stale",
+            Self::ActiveV2 => "v2-active",
+            Self::PartialCapabilities => "v2-partial",
+            Self::SchemaMismatch => "mismatch",
+        }
+    }
+
+    /// Derive the status from what has actually been observed. `rejected_schema`
+    /// counts payloads refused for an uninterpretable schema — those never
+    /// reach the accepted counters, so they must be passed in separately.
+    pub fn classify(
+        accepted_v1: u64,
+        accepted_v2: u64,
+        rejected_schema: u64,
+        capabilities: FeatureCapabilities,
+    ) -> Self {
+        if accepted_v1 == 0 && accepted_v2 == 0 {
+            return if rejected_schema > 0 {
+                Self::SchemaMismatch
+            } else {
+                Self::NoExtensionData
+            };
+        }
+        if accepted_v2 == 0 {
+            return Self::StaleV1;
+        }
+        if capabilities.missing_v2() != 0 {
+            return Self::PartialCapabilities;
+        }
+        Self::ActiveV2
+    }
+}
+
+#[cfg(test)]
+mod producer_identity_tests {
+    use super::*;
+
+    #[test]
+    fn a_silent_browser_and_a_refused_schema_are_distinguishable() {
+        assert_eq!(
+            ExtensionStatus::classify(0, 0, 0, FeatureCapabilities::default()),
+            ExtensionStatus::NoExtensionData
+        );
+        assert_eq!(
+            ExtensionStatus::classify(0, 0, 3, FeatureCapabilities::default()),
+            ExtensionStatus::SchemaMismatch
+        );
+    }
+
+    #[test]
+    fn a_stale_extension_explains_its_own_zeros() {
+        // The exact case in production today: v1 events flow, so the browser is
+        // plainly alive, yet every interaction counter reads zero.
+        assert_eq!(
+            ExtensionStatus::classify(120, 0, 0, FeatureCapabilities::default()),
+            ExtensionStatus::StaleV1
+        );
+        assert_eq!(ExtensionStatus::StaleV1.as_str(), "EXT v1 STALE");
+    }
+
+    #[test]
+    fn a_v2_producer_missing_a_capability_is_not_reported_as_healthy() {
+        let partial = FeatureCapabilities(FeatureCapabilities::INTERACTION_GROUPING);
+        assert_eq!(
+            ExtensionStatus::classify(0, 40, 0, partial),
+            ExtensionStatus::PartialCapabilities
+        );
+        assert_ne!(partial.missing_v2(), 0);
+    }
+
+    #[test]
+    fn a_fully_capable_v2_producer_is_active() {
+        let full = FeatureCapabilities(FeatureCapabilities::V2_EXPECTED);
+        assert_eq!(
+            ExtensionStatus::classify(0, 40, 0, full),
+            ExtensionStatus::ActiveV2
+        );
+        assert_eq!(full.missing_v2(), 0);
+        assert_eq!(full.unknown_bits(), 0);
+    }
+
+    #[test]
+    fn a_newer_producer_is_detected_without_being_misread() {
+        let newer = FeatureCapabilities(FeatureCapabilities::V2_EXPECTED | 1 << 20);
+        assert_ne!(newer.unknown_bits(), 0, "unknown bits are surfaced");
+        assert_eq!(newer.missing_v2(), 0, "and do not mask the known ones");
+    }
+
+    #[test]
+    fn a_producer_version_string_is_bounded() {
+        let mut event = WebFlowEvent {
+            schema_version: WEBFLOW_SCHEMA_VERSION,
+            browser_session_id: OpaqueId::new([1; 16]).expect("id"),
+            tab_session_id: OpaqueId::new([2; 16]).expect("id"),
+            navigation_id: OpaqueId::new([3; 16]).expect("id"),
+            sequence: 1,
+            phase: WebFlowPhase::Settled,
+            source: WebFlowSource::ExtensionVitals,
+            site_bucket: None,
+            metrics: WebFlowMetrics::default(),
+            transport: WebFlowTransport::default(),
+            producer_kind: ProducerKind::ChromiumExtension,
+            extension_version: Some("2.0.0".to_string()),
+            bridge_version: None,
+            feature_capabilities: FeatureCapabilities(FeatureCapabilities::V2_EXPECTED),
+        };
+        assert!(event.validate().is_ok());
+        event.extension_version = Some("x".repeat(MAX_PRODUCER_VERSION_CHARS + 1));
+        assert_eq!(
+            event.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
+        event.extension_version = Some(String::new());
+        assert_eq!(
+            event.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
+    }
+}

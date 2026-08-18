@@ -286,23 +286,78 @@ pub enum PredictorBackend {
     CpuOracle,
 }
 
+/// Whether the Neural Engine actually executed an inference, and — when we do
+/// not know — why not.
+///
+/// Core ML takes a compute-unit request at model load and then routes each
+/// inference itself, without publishing the unit it chose. The bridge is
+/// already honest about that (`coreml_predictor_bridge.mm`: "a compute-unit
+/// request is not measured proof of ANE use"), but it had nowhere to say so: a
+/// `bool` forced "the observation is not implemented" to share a value with
+/// "measured, and the ANE stayed idle".
+///
+/// Those two demand opposite responses — build a probe, versus stop paying for
+/// the lane — so they get distinct variants and never collapse into `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AneObservation {
+    /// No platform API exposes the dispatch target for this inference. This is
+    /// the honest state on current macOS for Core ML routing.
+    Unsupported,
+    /// An observation channel exists but produced nothing for this sample —
+    /// closed, unreadable, or sampled outside the execution window.
+    Unavailable,
+    /// Directly measured by a named source: the ANE did (`true`) or did not
+    /// (`false`) execute.
+    Measured(bool),
+}
+
+impl AneObservation {
+    /// True only when a real measurement backs this value. `Unsupported` and
+    /// `Unavailable` are not measurements and must never be counted as one.
+    pub fn is_measurement(self) -> bool {
+        matches!(self, Self::Measured(_))
+    }
+
+    /// True only when the ANE was measured to have executed. Absence of
+    /// evidence never answers `true`.
+    pub fn ane_active(self) -> bool {
+        matches!(self, Self::Measured(true))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::Unavailable => "unavailable",
+            Self::Measured(true) => "measured-active",
+            Self::Measured(false) => "measured-idle",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PredictorStatus {
     pub backend: PredictorBackend,
+    /// The compute units asked for.
     pub requested_backend: CoreMlBackend,
-    pub effective_backend: Option<CoreMlBackend>,
+    /// The compute units Core ML accepted at model load. This is a
+    /// *configuration*, not a dispatch observation — it was previously named
+    /// `effective_backend`, which read like the latter.
+    pub configured_backend: Option<CoreMlBackend>,
     pub model_available: bool,
-    pub ane_execution_measured: bool,
+    pub ane_observation: AneObservation,
     pub schema_hash: u64,
     pub model_hash: u64,
     pub reason: Option<String>,
 }
 
 impl PredictorStatus {
+    /// Whether an accelerator *configuration* was accepted. Deliberately says
+    /// nothing about execution: see `ane_observation` for that, which on this
+    /// platform is `Unsupported`.
     pub fn accelerator_backend_available(&self) -> bool {
         self.backend == PredictorBackend::CoreMl
             && matches!(
-                self.effective_backend,
+                self.configured_backend,
                 Some(CoreMlBackend::CpuAndNeuralEngine | CoreMlBackend::All)
             )
     }
@@ -311,9 +366,10 @@ impl PredictorStatus {
         Self {
             backend: PredictorBackend::CpuOracle,
             requested_backend: CoreMlBackend::CpuAndNeuralEngine,
-            effective_backend: None,
+            configured_backend: None,
             model_available: false,
-            ane_execution_measured: false,
+            // No Core ML model ran at all, so there is nothing to observe.
+            ane_observation: AneObservation::Unsupported,
             schema_hash: TEMPORAL_SCHEMA_HASH,
             model_hash: MODEL_HASH,
             reason: Some(reason.into()),
@@ -405,6 +461,60 @@ impl CoreMlPredictor {
         }
     }
 
+    /// Builds a predictor pinned to one compute-unit configuration, for
+    /// measurement only.
+    ///
+    /// `new()` walks a fallback ladder, so it reports whichever configuration
+    /// loaded first and cannot be used to compare configurations against each
+    /// other. This pins one and falls back to the oracle when that exact
+    /// configuration will not load — which is the answer for it.
+    ///
+    /// Not for the normal path: production wants the ladder, so that a host
+    /// missing one configuration still gets a working predictor.
+    pub fn pinned_for_probe(backend: CoreMlBackend) -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            let mut native_status = NativeCoreMlStatus::default();
+            let context = unsafe {
+                apollo_coreml_create_pinned(
+                    TEMPORAL_SCHEMA_HASH,
+                    MODEL_HASH,
+                    TEMPORAL_FEATURE_COUNT as u32,
+                    backend as u32,
+                    &mut native_status,
+                )
+            };
+            let Some(context) = std::ptr::NonNull::new(context) else {
+                let reason = native_status_reason(&native_status)
+                    .unwrap_or_else(|| format!("{} did not load", backend.as_str()));
+                return Self::oracle_with_reason(&reason);
+            };
+            let status = PredictorStatus {
+                backend: PredictorBackend::CoreMl,
+                requested_backend: backend,
+                configured_backend: coreml_backend(native_status.configured_backend),
+                model_available: native_status.model_available != 0,
+                ane_observation: ane_observation(native_status.ane_observation),
+                schema_hash: TEMPORAL_SCHEMA_HASH,
+                model_hash: MODEL_HASH,
+                reason: native_status_reason(&native_status),
+            };
+            Self {
+                state: Mutex::new(PredictorState {
+                    implementation: PredictorImplementation::CoreMl(NativeCoreMlContext {
+                        context,
+                    }),
+                    status,
+                }),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = backend;
+            Self::oracle_with_reason("Core ML is macOS only")
+        }
+    }
+
     #[cfg(target_os = "macos")]
     fn try_coreml() -> Self {
         let mut native_status = NativeCoreMlStatus::default();
@@ -427,11 +537,9 @@ impl CoreMlPredictor {
             backend: PredictorBackend::CoreMl,
             requested_backend: coreml_backend(native_status.requested_backend)
                 .unwrap_or(CoreMlBackend::CpuAndNeuralEngine),
-            effective_backend: coreml_backend(native_status.effective_backend),
+            configured_backend: coreml_backend(native_status.configured_backend),
             model_available: native_status.model_available != 0,
-            // Core ML's computeUnits is a permission/configuration, not proof
-            // of execution. The bridge never sets this without measured data.
-            ane_execution_measured: native_status.ane_execution_measured != 0,
+            ane_observation: ane_observation(native_status.ane_observation),
             schema_hash: TEMPORAL_SCHEMA_HASH,
             model_hash: MODEL_HASH,
             reason: native_status_reason(&native_status),
@@ -479,9 +587,10 @@ const NATIVE_REASON_CAPACITY: usize = 512;
 #[derive(Clone, Copy)]
 struct NativeCoreMlStatus {
     requested_backend: u32,
-    effective_backend: u32,
+    configured_backend: u32,
     model_available: u32,
-    ane_execution_measured: u32,
+    /// Mirrors the `kApolloAne*` codes in `coreml_predictor_bridge.mm`.
+    ane_observation: u32,
     reason: [c_char; NATIVE_REASON_CAPACITY],
 }
 
@@ -490,11 +599,25 @@ impl Default for NativeCoreMlStatus {
     fn default() -> Self {
         Self {
             requested_backend: CoreMlBackend::CpuAndNeuralEngine as u32,
-            effective_backend: 0,
+            configured_backend: 0,
             model_available: 0,
-            ane_execution_measured: 0,
+            // 0 == kApolloAneUnsupported: nothing observed, not "observed idle".
+            ane_observation: 0,
             reason: [0; NATIVE_REASON_CAPACITY],
         }
+    }
+}
+
+/// Decodes the bridge's `kApolloAne*` status code. An unrecognised code is
+/// treated as `Unavailable` rather than as a measurement, so a version skew
+/// between the bridge and this crate can never manufacture evidence.
+#[cfg(target_os = "macos")]
+fn ane_observation(code: u32) -> AneObservation {
+    match code {
+        0 => AneObservation::Unsupported,
+        2 => AneObservation::Measured(false),
+        3 => AneObservation::Measured(true),
+        _ => AneObservation::Unavailable,
     }
 }
 
@@ -543,6 +666,13 @@ unsafe extern "C" {
         expected_schema_hash: u64,
         expected_model_hash: u64,
         feature_count: u32,
+        status: *mut NativeCoreMlStatus,
+    ) -> *mut c_void;
+    fn apollo_coreml_create_pinned(
+        expected_schema_hash: u64,
+        expected_model_hash: u64,
+        feature_count: u32,
+        pinned_backend: u32,
         status: *mut NativeCoreMlStatus,
     ) -> *mut c_void;
     fn apollo_coreml_destroy(context: *mut c_void);

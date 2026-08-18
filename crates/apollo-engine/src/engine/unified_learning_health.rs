@@ -56,6 +56,10 @@ pub struct TrustInventorySnapshot {
     pub worst_horizon: String,
     pub worst_normalized_mae: Option<f64>,
     pub worst_coverage: Option<f64>,
+    /// Observations behind both figures above. `normalized_mae` and `coverage`
+    /// are EMAs fed by the same observation in the same call, so this is their
+    /// shared sample count — not a denominator, since neither is a mean.
+    pub worst_sample_count: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -725,6 +729,7 @@ fn trust_inventory(
         inventory.worst_horizon = horizon_label(record.key.horizon).to_string();
         inventory.worst_normalized_mae = Some(error);
         inventory.worst_coverage = record.coverage.and_then(finite_unit_option);
+        inventory.worst_sample_count = record.authority_gold_count;
     }
     inventory
 }

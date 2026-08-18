@@ -19,6 +19,11 @@ fn valid_event(sequence: u64) -> WebFlowEvent {
         source: WebFlowSource::ExtensionLifecycle,
         site_bucket: Some(OpaqueBucket::new([4; 16]).expect("nonzero bucket")),
         metrics: WebFlowMetrics::default(),
+        transport: Default::default(),
+        producer_kind: Default::default(),
+        extension_version: None,
+        bridge_version: None,
+        feature_capabilities: Default::default(),
     }
 }
 

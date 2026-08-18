@@ -416,8 +416,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             compact_profile(&m.parallel_expected_profile),
             compact_profile(&m.parallel_compiled_profile),
         ));
+        // Intent and status are both unbounded words; together they outgrow the
+        // quadrant whenever either is longer than "seq"/"ok".
         lines.push(format!(
-            "       eff {} W{}/{} {} {}",
+            "       eff {} W{}/{} {}",
             compact_profile(&m.parallel_effective_profile),
             m.parallel_worker_threads,
             m.parallel_max_worker_threads,
@@ -426,8 +428,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             } else {
                 m.parallel_worker_qos_intent.as_str()
             },
+        ));
+        lines.push(format!(
+            "       qos {}",
             if !m.parallel_worker_qos_status.is_empty() {
-                m.parallel_worker_qos_status.clone()
+                m.parallel_worker_qos_status.chars().take(24).collect()
             } else if m.parallel_worker_qos_failures == 0 {
                 "unknown".to_string()
             } else {
@@ -493,14 +498,74 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     if !m.value_scheduler_phase.is_empty() {
         lines.push(format!(
-            "Value  {} obs{} J{}/{} {}/{}ms",
+            "Value  {} obs{} {}/{}ms",
             m.value_scheduler_phase,
             compact_counter(m.value_scheduler_valid_cycles),
-            m.value_scheduler_selected_jobs,
-            m.value_scheduler_registered_jobs,
             m.value_scheduler_predicted_us / 1_000,
             m.value_scheduler_budget_us / 1_000,
         ));
+        // `J` is this cycle; `sel` is lifetime. They used to sit on one line
+        // with the cumulative counters, reading as if they shared a window.
+        lines.push(format!(
+            "       now J{}/{} elig{} · sel{}",
+            m.value_scheduler_selected_jobs,
+            m.value_scheduler_registered_jobs,
+            m.value_scheduler_eligible_jobs,
+            compact_counter(m.value_scheduler_selected_total),
+        ));
+        if m.value_scheduler_invalid_samples_total > 0 {
+            lines.push(format!(
+                "       inv{} seq{} feat{} pub{}",
+                compact_counter(m.value_scheduler_invalid_samples_total),
+                compact_counter(m.value_scheduler_invalid_sequence_total),
+                compact_counter(m.value_scheduler_invalid_features_total),
+                compact_counter(m.value_scheduler_invalid_publication_total),
+            ));
+            let refusals = [
+                ("sleep", m.value_scheduler_unhealthy_sleeping_total),
+                ("kill", m.value_scheduler_unhealthy_kill_switch_total),
+                ("prof", m.value_scheduler_unhealthy_profile_total),
+                ("pres", m.value_scheduler_unhealthy_pressure_total),
+                ("therm", m.value_scheduler_unhealthy_thermal_total),
+                ("p95", m.value_scheduler_unhealthy_p95_total),
+                ("lat", m.value_scheduler_unhealthy_latency_total),
+            ];
+            let named: u64 = refusals.iter().map(|(_, total)| *total).sum();
+            let mut shown = refusals
+                .iter()
+                .filter(|(_, total)| *total > 0)
+                .map(|(label, total)| format!("{label}{}", compact_counter(*total)))
+                .collect::<Vec<_>>();
+            // Pre-breakdown history has no reason. Say so rather than let the
+            // named buckets look like they explain every refusal.
+            let unattributed = m
+                .value_scheduler_invalid_unhealthy_total
+                .saturating_sub(named);
+            if unattributed > 0 {
+                shown.push(format!("pre{}", compact_counter(unattributed)));
+            }
+            let mut why_lines: Vec<String> = Vec::new();
+            for reason in shown {
+                let fits = why_lines
+                    .last()
+                    .is_some_and(|line| display_width(line) + 1 + display_width(&reason) <= QW);
+                match why_lines.last_mut() {
+                    Some(line) if fits => {
+                        line.push(' ');
+                        line.push_str(&reason);
+                    }
+                    _ => {
+                        let prefix = if why_lines.is_empty() {
+                            "       why "
+                        } else {
+                            "           "
+                        };
+                        why_lines.push(format!("{prefix}{reason}"));
+                    }
+                }
+            }
+            lines.extend(why_lines);
+        }
         if !m.value_scheduler_blocker.is_empty() && m.value_scheduler_blocker != "shadow-ready" {
             lines.push(format!(
                 "       block {}",
@@ -531,12 +596,18 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.fabric_rss_delta_bytes / (1024 * 1024),
             m.fabric_control_p95_baseline_ms,
         ));
-        let ane = if m.coreml_ane_execution_measured {
-            "ok"
-        } else {
-            "?"
+        // `cfg` prefixes the backend so the row cannot be read as "inference
+        // ran here". Core ML publishes no dispatch target, so the ANE column
+        // reports the evidence status verbatim rather than a glyph that a
+        // reader would resolve to "fine" or "broken".
+        let ane = match m.coreml_ane_observation.as_str() {
+            "measured-active" => "run",
+            "measured-idle" => "idle",
+            "unavailable" => "n/a",
+            // Includes the empty string from a daemon predating this field.
+            _ => "unobservable",
         };
-        let ml_backend = match m.coreml_effective_backend.as_str() {
+        let ml_backend = match m.coreml_configured_backend.as_str() {
             "cpu-and-neural-engine" => "cpu+ane",
             "cpu-only" => "cpu",
             "all" => "all",
@@ -544,12 +615,12 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             other => other,
         };
         lines.push(format!(
-            "ML     {} E{}/{} ANE {}",
+            "ML     cfg:{} E{}/{}",
             ml_backend,
             compact_counter(m.fabric_evaluation_total),
             compact_counter(m.fabric_eligible_total),
-            ane,
         ));
+        lines.push(format!("       ANE {ane}"));
         if !m.temporal_prediction_backend.is_empty() {
             lines.push(format!(
                 "Pred   {} {} p95{:.0}%",
@@ -575,18 +646,92 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     if !m.microexperiment_phase.is_empty() {
         lines.push(format!(
-            "Lab    {} would{} open{} Gold{}",
+            "Lab    {} would{} open{} {}",
             m.microexperiment_phase,
             compact_counter(m.microexperiment_shadow_would_open_total),
             compact_counter(m.microexperiment_open_pairs),
-            compact_counter(m.microexperiment_pair_gold_total),
+            // Shadow issues no arms at all, so a pair can never close Gold in
+            // this phase. Printing 0 reads as a measured failure rather than a
+            // quantity that is not yet defined.
+            if m.microexperiment_phase == "shadow" && m.microexperiment_pair_gold_total == 0 {
+                "Gn/a".to_string()
+            } else {
+                format!("G{}", compact_counter(m.microexperiment_pair_gold_total))
+            },
         ));
+        if m.microexperiment_rollout_required > 0 {
+            lines.push(format!(
+                "       gate {}/{} boot{}",
+                compact_counter(m.microexperiment_rollout_progress),
+                compact_counter(m.microexperiment_rollout_required),
+                compact_counter(m.microexperiment_restored_progress_at_boot),
+            ));
+        }
+        if m.microexperiment_progress_resets_total > 0 {
+            lines.push(format!(
+                "       reset{} {}",
+                compact_counter(m.microexperiment_progress_resets_total),
+                m.microexperiment_last_progress_reset_reason,
+            ));
+        }
         lines.push(format!(
             "       eff{} harm{} q{}",
             compact_counter(m.microexperiment_effective_total),
             compact_counter(m.microexperiment_harmful_total),
             compact_counter(m.microexperiment_synthetic_quarantined_total),
         ));
+        // Endpoint wire. `wire` is the contract state; the rest separate the
+        // stages so a stalled circuit names its own cause.
+        lines.push(format!(
+            "       wire{} arm{} bind{} end{} wt{}",
+            if m.microexperiment_endpoint_contract_ready {
+                "+"
+            } else {
+                "-"
+            },
+            compact_counter(m.microexperiment_arms_registered_total),
+            compact_counter(m.microexperiment_decisions_bound_total),
+            compact_counter(m.microexperiment_endpoints_emitted_total),
+            compact_counter(m.microexperiment_endpoints_pending_utility),
+        ));
+        let endpoint_rejects = [
+            ("key", m.microexperiment_endpoint_action_mismatch_total),
+            ("uncat", m.microexperiment_uncatalogued_episodes_total),
+            ("arm", m.microexperiment_endpoint_unknown_arm_total),
+            ("dup", m.microexperiment_endpoint_duplicate_total),
+            ("exp", m.microexperiment_endpoint_expired_total),
+            ("epo", m.microexperiment_endpoint_epoch_rejected_total),
+            ("aut", m.microexperiment_endpoint_authority_rejected_total),
+            ("met", m.microexperiment_endpoint_incomplete_metadata_total),
+            ("cap", m.microexperiment_endpoint_capacity_drops_total),
+        ];
+        let rejects = endpoint_rejects
+            .iter()
+            .filter(|(_, total)| *total > 0)
+            .map(|(label, total)| format!("{label}{}", compact_counter(*total)))
+            .collect::<Vec<_>>();
+        if !rejects.is_empty() {
+            lines.push(format!("       rej {}", rejects.join(" ")));
+        }
+        if m.microexperiment_control_withholds_total > 0
+            || m.microexperiment_endpoint_rollback_failed_total > 0
+        {
+            lines.push(format!(
+                "       hold{} rbk{}/{}",
+                compact_counter(m.microexperiment_control_withholds_total),
+                compact_counter(m.microexperiment_endpoint_rollback_observed_total),
+                compact_counter(m.microexperiment_endpoint_rollback_failed_total),
+            ));
+        }
+        if m.microexperiment_invalidated_total > 0 {
+            lines.push(format!(
+                "       inv{} dl{} unb{} rbf{}",
+                compact_counter(m.microexperiment_invalidated_total),
+                compact_counter(m.microexperiment_deadline_expired_total),
+                compact_counter(m.microexperiment_unbound_expiries_total),
+                compact_counter(m.microexperiment_rollback_failed_total),
+            ));
+        }
         if !m.microexperiment_blocker.is_empty()
             && m.microexperiment_blocker != "shadow-observed"
             && m.microexperiment_blocker != "no-candidates"
@@ -697,9 +842,27 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.acceleration_lease_nice_fallbacks_total),
             format_number(m.acceleration_lease_capability_skips_total),
         ));
+        if m.acceleration_lease_task_port_denied_total > 0
+            || m.acceleration_lease_qos_write_rejected_total > 0
+        {
+            lines.push(format!(
+                "       skip port{} write{}",
+                format_number(m.acceleration_lease_task_port_denied_total),
+                format_number(m.acceleration_lease_qos_write_rejected_total),
+            ));
+            if !m.acceleration_lease_qos_write_error.is_empty() {
+                lines.push(format!(
+                    "       {}",
+                    m.acceleration_lease_qos_write_error
+                        .chars()
+                        .take(52)
+                        .collect::<String>()
+                ));
+            }
+        }
         if !m.interaction_qos_ttl_band.is_empty() {
             lines.push(format!(
-                "       ttl {} {}ms {} exp{}",
+                "       ttl {} {}ms {}{}",
                 m.interaction_qos_ttl_band,
                 m.interaction_qos_ttl_ms,
                 if m.interaction_qos_ttl_exploratory {
@@ -707,7 +870,14 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 } else {
                     "policy"
                 },
-                format_number(m.interaction_qos_parameter_explorations_total),
+                if m.interaction_qos_parameter_explorations_total > 0 {
+                    format!(
+                        " x{}",
+                        compact_counter(m.interaction_qos_parameter_explorations_total)
+                    )
+                } else {
+                    String::new()
+                },
             ));
         }
     }
@@ -723,6 +893,81 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.webflow_proposed_total),
             format_number(m.webflow_admitted_total),
         ));
+        // The sample count is part of the reading: a p95 over a handful of
+        // samples is a guess, and reading one as settled produced a bogus
+        // 120000ms LCP once.
+        let n = m.browser_latency_samples;
+        // `evt` is the tail of individual event durations, deliberately NOT
+        // labelled INP: it is a max over single entries above a 40 ms
+        // threshold, blind to fast interactions. `INP` appears only once the
+        // corrected per-interaction collector reports, and carries its own
+        // interaction count so the two can never be read as one series.
+        if m.browser_lcp_p95_ms.is_some() || m.browser_event_duration_tail_ms.is_some() {
+            let lcp = m
+                .browser_lcp_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            let evt = m
+                .browser_event_duration_tail_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            lines.push(format!("       vitals LCP{lcp} evt{evt} n{n}"));
+        }
+        // Producer negotiation first: every zero below must carry its cause.
+        if !m.webflow_extension_status.is_empty() {
+            let version = if m.webflow_extension_version.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", m.webflow_extension_version)
+            };
+            lines.push(format!(
+                "       ext {}{version}",
+                m.webflow_extension_status
+            ));
+            if m.webflow_accepted_v1_total > 0 || m.webflow_schema_rejected_total > 0 {
+                lines.push(format!(
+                    "       v1:{} v2:{} rej{}",
+                    compact_counter(m.webflow_accepted_v1_total),
+                    compact_counter(m.webflow_accepted_v2_total),
+                    compact_counter(m.webflow_schema_rejected_total),
+                ));
+            }
+        }
+        // Transport cost, browser clock only. `cold` is the MV3 service-worker
+        // wake count: the segment that decides whether a per-interaction fast
+        // path is even conceivable. No cross-clock claim is made here.
+        if m.webflow_transport_samples > 0 {
+            let seg = m
+                .webflow_transport_client_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            let wake = m
+                .webflow_transport_sw_wake_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            lines.push(format!(
+                "       hop{seg} sw{wake} cold{}",
+                compact_counter(m.webflow_transport_cold_starts)
+            ));
+        }
+        if let Some(inp) = m.browser_inp_estimate_ms {
+            lines.push(format!(
+                "       INP{inp:.0} i{}",
+                compact_counter(m.browser_interaction_samples)
+            ));
+            // Where the time goes decides whether any OS-level actuator has a
+            // lever at all: processing is the site's own JavaScript, which no
+            // scheduler action can shorten.
+            let total = m
+                .browser_input_delay_total_ms
+                .saturating_add(m.browser_processing_total_ms)
+                .saturating_add(m.browser_presentation_total_ms);
+            if total > 0 {
+                let pct = |part: u64| (part as f64 / total as f64 * 100.0).round() as u64;
+                lines.push(format!(
+                    "       in{}% proc{}% pres{}%",
+                    pct(m.browser_input_delay_total_ms),
+                    pct(m.browser_processing_total_ms),
+                    pct(m.browser_presentation_total_ms),
+                ));
+            }
+        }
         if !m.webflow_phase.is_empty() {
             lines.push(format!(
                 "       {} G{} {}",
@@ -738,17 +983,148 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if m.network_flow_proposed_total > 0 || m.network_flow_active {
         lines.push(format!(
-            "Net+   {} {:.1}MB/s P{} R{} X{}",
+            "Net+   {} {:.1}MB/s",
             if m.network_flow_active {
                 "active"
             } else {
                 "idle"
             },
             m.network_flow_traffic_bps as f64 / 1_000_000.0,
+        ));
+        lines.push(format!(
+            "       P{} R{} X{}",
             format_number(m.network_flow_proposed_total),
             format_number(m.network_flow_renewed_total),
             format_number(m.network_flow_suppressed_exact_total),
         ));
+    }
+    // ── perceptual layer, source-agnostic summary ────────────────────────
+    // Deliberately above the browser section: these hold for every producer.
+    // A per-source figure like INP lives with its adapter, because printing a
+    // zero for a source that cannot measure it would be a false reading.
+    if m.perceptual_observations_total > 0 {
+        // Quality per modality, not the blend: the aggregate slides whenever
+        // low-precision windows outnumber instrumented episodes, which reads
+        // as decay when nothing measured has actually got worse. A modality
+        // with no resident observations prints "-", never a zero.
+        let q_of = |q: Option<u16>| q.map_or_else(|| "-".to_string(), |v| v.to_string());
+        lines.push(format!(
+            "Perc-S src{} obs{} qi{} qw{}",
+            m.perceptual_sources_active,
+            compact_counter(m.perceptual_observations_total),
+            q_of(m.perceptual_quality_instrumented_q),
+            q_of(m.perceptual_quality_window_q),
+        ));
+        let total = m
+            .perceptual_instrumented_total
+            .saturating_add(m.perceptual_inferred_total)
+            .saturating_add(m.perceptual_windows_total);
+        if total > 0 {
+            let pct = |part: u64| (part as f64 / total as f64 * 100.0).round() as u64;
+            lines.push(format!(
+                "       ins{}% inf{}% win{}%",
+                pct(m.perceptual_instrumented_total),
+                pct(m.perceptual_inferred_total),
+                pct(m.perceptual_windows_total),
+            ));
+        }
+        if m.perceptual_invalid_total > 0 {
+            lines.push(format!(
+                "       valid{} invalid{}",
+                compact_counter(m.perceptual_valid_total),
+                compact_counter(m.perceptual_invalid_total),
+            ));
+        }
+    }
+    // Observational association. `CAUSAL UNTESTED` is printed unconditionally
+    // beside it: a with/without median shift is co-occurrence, and the Lab is
+    // the only thing that could turn it into a causal claim.
+    if !m.perceptual_assoc_verdict.is_empty() {
+        lines.push(format!(
+            "Assoc  {} {}",
+            m.perceptual_assoc_family
+                .chars()
+                .take(12)
+                .collect::<String>(),
+            m.perceptual_assoc_verdict
+                .chars()
+                .take(11)
+                .collect::<String>(),
+        ));
+        if m.perceptual_assoc_samples_with > 0 || m.perceptual_assoc_samples_without > 0 {
+            lines.push(format!(
+                "       {:+}ms w{} wo{}",
+                m.perceptual_assoc_delta_ms,
+                compact_counter(u64::from(m.perceptual_assoc_samples_with)),
+                compact_counter(u64::from(m.perceptual_assoc_samples_without)),
+            ));
+        }
+        if !m.perceptual_assoc_component.is_empty() {
+            lines.push(format!(
+                "       {} q{}",
+                m.perceptual_assoc_component
+                    .chars()
+                    .take(14)
+                    .collect::<String>(),
+                m.perceptual_assoc_confidence_q,
+            ));
+        }
+        lines.push(format!(
+            "       CAUSAL UNTESTED{}",
+            if m.perceptual_assoc_actionable {
+                " lever"
+            } else {
+                ""
+            }
+        ));
+    }
+    // ── 0B observational state ───────────────────────────────────────────
+    // Deliberately says what it does not know. A regime classification is what
+    // the window supports saying, never a causal claim.
+    if m.perceptual_episodes_stored > 0 || m.perceptual_episodes_rejected > 0 {
+        lines.push(format!(
+            "Perc   ep{} rej{} reg{}",
+            compact_counter(m.perceptual_episodes_stored),
+            compact_counter(m.perceptual_episodes_rejected),
+            compact_counter(m.perceptual_regimes_total),
+        ));
+        let correlated = m
+            .perceptual_correlation_unique
+            .saturating_add(m.perceptual_correlation_ambiguous)
+            .saturating_add(m.perceptual_correlation_unmatched);
+        if correlated > 0 {
+            lines.push(format!(
+                "       uniq{} amb{} unm{}",
+                compact_counter(m.perceptual_correlation_unique),
+                compact_counter(m.perceptual_correlation_ambiguous),
+                compact_counter(m.perceptual_correlation_unmatched),
+            ));
+        }
+        if !m.perceptual_regime_class.is_empty() {
+            lines.push(format!(
+                "       {} {}",
+                m.perceptual_regime_class
+                    .chars()
+                    .take(20)
+                    .collect::<String>(),
+                m.perceptual_regime_level
+            ));
+            lines.push(format!(
+                "       i{} act{} med{}ms",
+                compact_counter(u64::from(m.perceptual_regime_interactions)),
+                m.perceptual_regime_actionable,
+                m.perceptual_regime_median_total_ms,
+            ));
+            if !m.perceptual_regime_dominant_family.is_empty() {
+                lines.push(format!(
+                    "       vs {}",
+                    m.perceptual_regime_dominant_family
+                        .chars()
+                        .take(24)
+                        .collect::<String>()
+                ));
+            }
+        }
     }
     let authority_phase = match m.world_model_context_authority_phase.as_str() {
         "calibrating" => "calibrating",
@@ -757,10 +1133,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         _ => "protected",
     };
     if m.world_model_actuator_known_models == 0 {
-        lines.push("WM-U   protected · no evidence".to_string());
+        lines.push("WM-UTL protected · no evidence".to_string());
     } else {
         lines.push(format!(
-            "WM-U   {} {}/{}",
+            "WM-UTL {} {}/{}",
             authority_phase,
             format_number(m.world_model_actuator_ready_models),
             format_number(m.world_model_actuator_known_models)
@@ -769,6 +1145,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     let readiness_reasons = [
         ("no-gold", m.world_model_readiness_no_gold),
         ("immature", m.world_model_readiness_immature),
+        ("dormant", m.world_model_readiness_dormant),
         ("quality", m.world_model_readiness_low_quality),
         ("stale", m.world_model_readiness_stale),
         ("origin", m.world_model_readiness_foreign),
@@ -779,13 +1156,59 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     .filter(|(_, count)| *count > 0)
     .map(|(reason, count)| format!("{reason}{}", compact_counter(count)))
     .collect::<Vec<_>>();
-    for (index, reasons) in readiness_reasons.chunks(3).enumerate() {
+    // Greedy wrap rather than a fixed chunk size: the reason list grows, and a
+    // fixed chunk silently overflows the quadrant the first time it does.
+    let mut wait_lines: Vec<String> = Vec::new();
+    for reason in readiness_reasons {
+        let fits = wait_lines
+            .last()
+            .is_some_and(|line| display_width(line) + 1 + display_width(&reason) <= QW);
+        match wait_lines.last_mut() {
+            Some(line) if fits => {
+                line.push(' ');
+                line.push_str(&reason);
+            }
+            _ => {
+                let prefix = if wait_lines.is_empty() {
+                    "WM wait "
+                } else {
+                    "        "
+                };
+                wait_lines.push(format!("{prefix}{reason}"));
+            }
+        }
+    }
+    lines.extend(wait_lines);
+    if m.world_model_action_model_capacity > 0 {
+        // Saturation is the difference between "still maturing" and "reborn
+        // every time a new key shows up", so it gets stated rather than implied.
         lines.push(format!(
-            "{}{}",
-            if index == 0 { "WM wait " } else { "        " },
-            reasons.join(" ")
+            "WM-C   {}/{}{} ev{} b{}",
+            format_number(m.world_model_action_model_len),
+            format_number(m.world_model_action_model_capacity),
+            if m.world_model_action_model_len >= m.world_model_action_model_capacity {
+                " full"
+            } else {
+                ""
+            },
+            compact_counter(m.world_model_action_model_evictions_total),
+            compact_counter(m.world_model_action_model_births_total),
         ));
     }
+    // "Waiting" only means learning is in flight if evidence is still arriving.
+    lines.push(if m.world_model_last_evidence_cycle == 0 {
+        format!(
+            "WM-EV  ev{} no evidence yet",
+            compact_counter(m.world_model_evidence_updates_total)
+        )
+    } else {
+        format!(
+            "WM-EV  ev{} last c{} idle{}",
+            compact_counter(m.world_model_evidence_updates_total),
+            format_number(m.world_model_last_evidence_cycle),
+            compact_counter(m.cycles.saturating_sub(m.world_model_last_evidence_cycle)),
+        )
+    });
     if m.world_model_utility_vetoes_total > 0 || m.world_model_utility_promotions_total > 0 {
         lines.push(format!(
             "WM-S   V{} rank{}",
@@ -795,13 +1218,22 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     }
     if m.world_model_decision_credit_sources > 0 {
         lines.push(format!(
-            "AU {:+.1}% {} {:+.1}% n{}",
+            // `~` marks a leader below the engine's own prior weight of 8:
+            // `source_authority_score` shrinks it by n/(n+8), so at n=3 the
+            // printed score enters decisions at roughly a quarter of its face
+            // value. Without the mark the raw figure reads as settled.
+            "AU {:+.1}% {} {:+.1}%{} n{}",
             m.world_model_apollo_utility * 100.0,
             m.world_model_decision_credit_leader
                 .chars()
                 .take(9)
                 .collect::<String>(),
             m.world_model_decision_credit_leader_score * 100.0,
+            if m.world_model_decision_credit_leader_observations < 8 {
+                "~"
+            } else {
+                ""
+            },
             compact_counter(u64::from(m.world_model_decision_credit_leader_observations)),
         ));
     }
@@ -832,11 +1264,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     {
         lines.push(format!(
             "WM-X   K{} Q{} O{} P{} C{}",
-            format_number(m.world_model_contextual_markov_total),
-            format_number(m.world_model_contextual_interaction_total),
-            format_number(m.world_model_contextual_io_total),
-            format_number(m.world_model_contextual_predictive_total),
-            format_number(m.world_model_contextual_chromium_total),
+            compact_counter(m.world_model_contextual_markov_total),
+            compact_counter(m.world_model_contextual_interaction_total),
+            compact_counter(m.world_model_contextual_io_total),
+            compact_counter(m.world_model_contextual_predictive_total),
+            compact_counter(m.world_model_contextual_chromium_total),
         ));
         let family = m.world_model_contextual_last_action.split_once(':').map_or(
             m.world_model_contextual_last_action.as_str(),
@@ -956,11 +1388,14 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             _ => "protected",
         };
         lines.push(format!(
-            "WM-D   {} A{} R{}/{} V{} e{:.1}%",
+            "WM-DYN {} A{} R{}/{}",
             phase,
             format_number(m.world_model_dynamics_authoritative_models),
             format_number(m.world_model_dynamics_ranking_models),
             format_number(m.world_model_dynamics_ready_models),
+        ));
+        lines.push(format!(
+            "       V{} e{:.1}%",
             format_number(m.world_model_dynamics_validation_samples),
             m.world_model_dynamics_validation_mae * 100.0
         ));
@@ -997,7 +1432,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format!("{}/{}", m.gpu_imagination_backend, circuit)
         };
         lines.push(format!(
-            "GPU-I  {} J{} S{} t{:.2}ms",
+            "GPU-I  {} J{} S{} t{:.1}ms",
             backend_health,
             format_number(m.gpu_imagination_jobs_completed_total),
             format_number(m.gpu_imagination_samples_total),
@@ -1042,7 +1477,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format!(
                 "{}:{} {:+.2}%",
                 scope,
-                action.chars().take(5).collect::<String>(),
+                action.chars().take(3).collect::<String>(),
                 m.gpu_imagination_last_influence_support * 100.0
             )
         };
@@ -1054,15 +1489,41 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         ));
         if m.world_model_gpu_bronze_total > 0 {
             lines.push(format!(
-                "GPU-M  B{} S{} G{} P{} M{} q{:.0}% e{:.1}%",
+                "GPU-M  B{} S{} G{}",
                 format_number(m.world_model_gpu_bronze_total),
                 format_number(m.world_model_gpu_silver_total),
                 format_number(m.world_model_gpu_gold_total),
+            ));
+            lines.push(format!(
+                "       P{} M{} q{:.0}% e{:.1}%",
                 format_number(m.world_model_gpu_pending_total),
                 format_number(m.world_model_gpu_calibrated_models),
                 m.world_model_gpu_calibration_quality * 100.0,
                 m.world_model_gpu_calibration_mae * 100.0
             ));
+            // GPU-M is lifetime-cumulative (persisted in the medallion) while
+            // GPU-I above resets every boot, and a Bronze is one of the many
+            // ranked candidates a single job emits — not a job. Stacked in one
+            // column they invite a jobs-over-Bronze ratio whose two terms share
+            // neither span nor unit. Say the span out loud.
+            lines.push("       B/S/G lifetime".to_string());
+            if m.world_model_gpu_rejected_total > 0 {
+                lines.push(format!(
+                    "       rej{} ev{} un{} br{}",
+                    compact_counter(m.world_model_gpu_rejected_total),
+                    compact_counter(m.world_model_gpu_evicted_total),
+                    compact_counter(m.world_model_gpu_unused_total),
+                    compact_counter(m.world_model_gpu_bronze_rejected_total),
+                ));
+                // Rejections older than the breakdown. Without this the three
+                // buckets look like they should sum to `rej` and do not.
+                if m.world_model_gpu_unclassified_rejections > 0 {
+                    lines.push(format!(
+                        "       pre-split{}",
+                        format_number(m.world_model_gpu_unclassified_rejections),
+                    ));
+                }
+            }
         }
     }
     if !m.system_deliberation_mode.is_empty() {
@@ -1087,19 +1548,18 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.system_deliberation_local_families,
         ));
         lines.push(format!(
-            "S2>S1  G{} +{}/-{} n{} s{} c{:.0}%",
+            "S2>S1  G{} +{}/-{} n{} c{:.0}%",
             compact_counter(m.local_consolidations),
             compact_counter(m.local_consolidation_improvements),
             compact_counter(m.local_consolidation_regressions),
             compact_counter(m.local_consolidation_neutral),
-            compact_counter(m.local_consolidation_system1_updates),
             m.system_deliberation_local_confidence * 100.0,
         ));
     }
     lines.push(format!(
         // This is the pressure-causal imagination model, not the universal
         // actuator-learning stream shown above as `Act` / `Act+`.
-        "Causal {}/{} ready G{} q{:.0}%",
+        "Caus-I {}/{} ready G{} q{:.0}%",
         format_number(m.world_model_ready_actions),
         format_number(m.world_model_curated_actions),
         format_number(m.world_model_gold_evidence),
@@ -1126,7 +1586,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
 
     // Causal Graph
     lines.push(format!(
-        "Causal {} slow",
+        "Caus-G {} slow",
         format_number(m.causal_slow_horizon_count as u64)
     ));
     lines.push(format!(
@@ -1154,22 +1614,28 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         ));
     }
     if !m.markov_prediction_app.is_empty() {
-        let app: String = m.markov_prediction_app.chars().take(11).collect();
+        let app: String = m.markov_prediction_app.chars().take(7).collect();
         let timing = if m.markov_prediction_overdue_secs > 0.0 {
             format!("stale{:.0}s", m.markov_prediction_overdue_secs)
         } else {
             format!("eta{:.0}s", m.markov_prediction_eta_secs)
         };
         lines.push(format!(
-            "Mk-P   {} {:.0}% {} {}",
+            "Mk-P   {} {:.0}% {}",
             app,
             m.markov_prediction_confidence * 100.0,
             timing,
+        ));
+        lines.push(format!(
+            "       {}",
             if m.markov_prewarm_blocker.is_empty() {
                 m.markov_prewarm_admission.as_str()
             } else {
                 m.markov_prewarm_blocker.as_str()
             }
+            .chars()
+            .take(24)
+            .collect::<String>()
         ));
         lines.push(format!(
             "Mk-H 5s{:.0} 30s{:.0} 2m{:.0} 10m{:.0}",
@@ -1558,6 +2024,18 @@ fn learning_percent(value: Option<f64>) -> String {
         .unwrap_or_else(|| "--".to_string())
 }
 
+/// Coverage collapses to `0%` under `{:.0}` for anything below 0.5%, which
+/// cannot be told apart from a genuine zero. A rate that is small but real is
+/// reported as such.
+fn coverage_percent(value: Option<f64>) -> String {
+    match value.filter(|value| value.is_finite()) {
+        None => "--".to_string(),
+        Some(value) if value <= 0.0 => "0%".to_string(),
+        Some(value) if value < 0.005 => "<1%".to_string(),
+        Some(value) => format!("{:.0}%", (value * 100.0).clamp(0.0, 100.0)),
+    }
+}
+
 fn utility_percent(value: Option<f64>) -> String {
     value
         .filter(|value| value.is_finite())
@@ -1624,14 +2102,22 @@ fn render_learning_band(status: &DaemonStatus) -> Vec<String> {
     let worst = if trust.worst_producer.is_empty() || trust.worst_action.is_empty() {
         "Worst  none with local Gold calibration".to_string()
     } else {
-        format!(
-            "Worst  {}/{}@{} MAE {} cov {}",
-            trust.worst_producer,
-            trust.worst_action,
-            trust.worst_horizon,
+        // Build the numbers first and give the identity whatever room is left.
+        // Trimming the other way round truncates a value mid-digit — "cov <1"
+        // instead of "cov <1%" — which is worse than a shortened name.
+        let tail = format!(
+            " MAE {} n{} cov {}",
             learning_percent(trust.worst_normalized_mae),
-            learning_percent(trust.worst_coverage),
-        )
+            format_number(trust.worst_sample_count),
+            coverage_percent(trust.worst_coverage),
+        );
+        let identity = format!(
+            "{}/{}@{}",
+            trust.worst_producer, trust.worst_action, trust.worst_horizon
+        );
+        let room = CW.saturating_sub("Worst  ".len() + tail.chars().count());
+        let identity: String = identity.chars().take(room).collect();
+        format!("Worst  {identity}{tail}")
     };
     let latest = &metrics.latest_resolved_episode;
     let latest = if !latest.present {
@@ -1878,7 +2364,7 @@ mod tests {
         let lines = render_learning_band(&status);
         assert_eq!(
             lines[1],
-            "Worst  world-model/boost:action@5s MAE 12% cov 90%"
+            "Worst  world-model/boost:action@5s MAE 12% n0 cov 90%"
         );
         assert_eq!(
             lines[2],
@@ -2026,7 +2512,7 @@ mod tests {
 
         assert!(render_think_q(&status)
             .iter()
-            .any(|line| line == "Mk-P   Alacritty 53% stale333s confidence"));
+            .any(|line| line == "Mk-P   Alacrit 53% stale333s"));
     }
 
     #[test]
@@ -2044,11 +2530,614 @@ mod tests {
         status.metrics.markov_prediction_10m = 0.80;
 
         let think = render_think_q(&status);
-        assert!(think.iter().any(|line| line == "WM-U   trusted 1/7"));
+        assert!(think.iter().any(|line| line == "WM-UTL trusted 1/7"));
         assert!(think
             .iter()
             .any(|line| line == "WM wait immature4 uncertain2"));
         assert!(think.iter().any(|line| line == "Mk-H 5s5 30s25 2m70 10m80"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn a_modality_never_seen_renders_as_absent_rather_than_zero() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_sources_active = 1;
+        status.metrics.perceptual_observations_total = 40;
+        status.metrics.perceptual_windows_total = 40;
+        status.metrics.perceptual_quality_q = 350;
+        status.metrics.perceptual_quality_window_q = Some(350);
+        status.metrics.perceptual_quality_window_n = 40;
+        // No instrumented source has ever reported here.
+        status.metrics.perceptual_quality_instrumented_q = None;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "Perc-S src1 obs40 qi- qw350"),
+            "an unmeasured modality must not print a zero: {think:?}"
+        );
+    }
+
+    #[test]
+    fn every_think_row_fits_the_quadrant_at_production_magnitudes() {
+        // Values taken from a live daemon. Rows only render when their
+        // subsystem has data, which is why the older width assertions never
+        // reached them and eight of them displaced the box border.
+        let mut status = dashboard_status();
+        let m = &mut status.metrics;
+        m.world_model_contextual_markov_total = 10_108;
+        m.world_model_contextual_interaction_total = 800;
+        m.world_model_contextual_io_total = 1;
+        m.world_model_contextual_predictive_total = 1_896;
+        m.world_model_contextual_chromium_total = 106;
+        m.value_scheduler_phase = "active".to_string();
+        m.value_scheduler_valid_cycles = 10_000;
+        m.value_scheduler_registered_jobs = 10;
+        m.value_scheduler_budget_us = 100_000;
+        m.value_scheduler_invalid_samples_total = 618;
+        m.value_scheduler_invalid_unhealthy_total = 618;
+        m.value_scheduler_unhealthy_sleeping_total = 375;
+        m.value_scheduler_unhealthy_thermal_total = 25;
+        m.value_scheduler_unhealthy_p95_total = 218;
+        m.interaction_qos_ttl_band = "standard".to_string();
+        m.interaction_qos_ttl_ms = 1_200;
+        m.interaction_qos_ttl_exploratory = false;
+        m.interaction_qos_parameter_explorations_total = 0;
+        m.browser_latency_samples = 64;
+        m.browser_lcp_p95_ms = Some(2_168.0);
+        m.browser_event_duration_tail_ms = Some(464.0);
+        m.network_flow_active = false;
+        m.network_flow_traffic_bps = 0;
+        m.network_flow_proposed_total = 320;
+        m.network_flow_renewed_total = 200;
+        m.network_flow_suppressed_exact_total = 149;
+        m.gpu_imagination_root_rank_uses_total = 5;
+        m.gpu_imagination_contextual_uses_total = 769;
+        m.world_model_gpu_bronze_total = 294_952;
+        m.world_model_gpu_silver_total = 5_393;
+        m.world_model_gpu_gold_total = 2_275;
+        m.world_model_gpu_pending_total = 10;
+        m.world_model_gpu_calibrated_models = 8;
+        m.world_model_gpu_calibration_quality = 0.54;
+        m.world_model_gpu_calibration_mae = 0.082;
+        m.world_model_gpu_rejected_total = 290_313;
+        m.world_model_gpu_evicted_total = 0;
+        m.world_model_gpu_unused_total = 44_635;
+        m.world_model_gpu_bronze_rejected_total = 456;
+        m.world_model_gpu_unclassified_rejections = 245_222;
+        m.local_consolidations = 233;
+        m.local_consolidation_improvements = 82;
+        m.local_consolidation_regressions = 130;
+        m.local_consolidation_neutral = 20;
+        m.local_consolidation_system1_updates = 848;
+        m.system_deliberation_local_confidence = 0.94;
+        m.markov_prediction_app = "Brave Browser".to_string();
+        m.markov_prediction_confidence = 0.53;
+        m.markov_prediction_eta_secs = 204.0;
+
+        let think = render_think_q(&status);
+        let over: Vec<String> = think
+            .iter()
+            .filter(|line| display_width(line) > QW)
+            .map(|line| format!("{} ({})", line, display_width(line)))
+            .collect();
+        assert!(
+            over.is_empty(),
+            "rows overflow the {QW}-column quadrant: {over:#?}\nall rows: {think:#?}"
+        );
+    }
+
+    #[test]
+    fn the_lab_and_dynamics_rows_fit_the_quadrant_with_real_values() {
+        // Both rows render only when their subsystem has data, so the existing
+        // width assertions never reached them and they overflowed the box in
+        // production. These are the shapes actually observed on the daemon.
+        let mut status = dashboard_status();
+        status.metrics.microexperiment_phase = "shadow".to_string();
+        status.metrics.microexperiment_shadow_would_open_total = 2_000;
+        status.metrics.microexperiment_open_pairs = 0;
+        status.metrics.microexperiment_pair_gold_total = 0;
+        status.metrics.world_model_dynamics_action_models = 255;
+        status.metrics.world_model_dynamics_phase = "trusted".to_string();
+        status.metrics.world_model_dynamics_authoritative_models = 21;
+        status.metrics.world_model_dynamics_ranking_models = 48;
+        status.metrics.world_model_dynamics_ready_models = 67;
+        status.metrics.world_model_dynamics_validation_samples = 22_287;
+        status.metrics.world_model_dynamics_validation_mae = 0.05;
+
+        let think = render_think_q(&status);
+        let over: Vec<_> = think
+            .iter()
+            .filter(|line| display_width(line) > QW)
+            .collect();
+        assert!(over.is_empty(), "rows overflow the quadrant: {over:?}");
+    }
+
+    #[test]
+    fn no_two_think_quadrant_rows_share_a_label() {
+        // Two rows under one label are indistinguishable to a reader. This
+        // caught `WM-E` (evidence flow vs episodic) and `Causal` (imagination
+        // model vs causal graph); it exists so the next one fails here first.
+        // A broadly populated status so most rows render at once.
+        let mut status = dashboard_status();
+        status.metrics.value_scheduler_phase = "active".to_string();
+        status.metrics.value_scheduler_invalid_samples_total = 10;
+        status.metrics.world_model_actuator_known_models = 247;
+        status.metrics.world_model_actuator_ready_models = 21;
+        status.metrics.world_model_readiness_immature = 200;
+        status.metrics.world_model_action_model_capacity = 256;
+        status.metrics.world_model_action_model_len = 256;
+        status.metrics.world_model_last_evidence_cycle = 100;
+        status.metrics.world_model_curated_actions = 3;
+        status.metrics.world_model_ready_actions = 2;
+        status.metrics.world_model_causal_actuator_gold_total = 42;
+        status.metrics.causal_slow_horizon_count = 4;
+        status.metrics.causal_mechanism_count = 1;
+        status.metrics.world_model_dynamics_action_models = 255;
+        status.metrics.world_model_decision_credit_sources = 16;
+        status.metrics.world_model_decision_credit_leader = "predictive".to_string();
+        status.metrics.microexperiment_phase = "shadow".to_string();
+        status.metrics.rl_total_ticks = 5;
+        let think = render_think_q(&status);
+        let mut seen: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for line in &think {
+            let plain: String = line.replace("\u{1b}[1m", "").replace("\u{1b}[0m", "");
+            // Continuation rows are indented and deliberately share the owner.
+            if plain.starts_with(' ') || plain.starts_with('─') || plain.trim().is_empty() {
+                continue;
+            }
+            let label = plain
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            *seen.entry(label).or_default() += 1;
+        }
+        let collisions: Vec<_> = seen
+            .iter()
+            .filter(|(_, count)| **count > 1)
+            .map(|(label, count)| format!("{label} x{count}"))
+            .collect();
+        assert!(
+            collisions.is_empty(),
+            "duplicate row labels: {collisions:?}\nrendered: {think:?}"
+        );
+    }
+
+    #[test]
+    fn the_event_duration_tail_is_never_labelled_inp() {
+        // Schema discontinuity: the old series was a max over single
+        // PerformanceEventTiming durations above a 40 ms threshold. Labelling
+        // it INP invited a comparison against Web Vitals thresholds it does
+        // not answer to.
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_latency_samples = 64;
+        status.metrics.browser_lcp_p95_ms = Some(1_568.0);
+        status.metrics.browser_event_duration_tail_ms = Some(440.0);
+        status.metrics.browser_inp_estimate_ms = None;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       vitals LCP1568 evt440 n64"),
+            "the tail must render under its own name: {think:?}"
+        );
+        assert!(
+            !think.iter().any(|line| line.contains("INP")),
+            "no INP row until the corrected collector reports: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn the_inp_estimate_renders_apart_and_counts_interactions_not_entries() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_latency_samples = 64;
+        status.metrics.browser_event_duration_tail_ms = Some(440.0);
+        status.metrics.browser_inp_estimate_ms = Some(184.0);
+        status.metrics.browser_interaction_samples = 312;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line == "       INP184 i312"),
+            "INP carries its own interaction count: {think:?}"
+        );
+        assert!(
+            think.iter().any(|line| line.contains("evt440")),
+            "the two series stay on separate rows: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn an_association_is_always_printed_next_to_causal_untested() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_assoc_family = "compiler".to_string();
+        status.metrics.perceptual_assoc_verdict = "observed".to_string();
+        status.metrics.perceptual_assoc_delta_ms = 180;
+        status.metrics.perceptual_assoc_component = "input-delay".to_string();
+        status.metrics.perceptual_assoc_samples_with = 46;
+        status.metrics.perceptual_assoc_samples_without = 52;
+        status.metrics.perceptual_assoc_confidence_q = 740;
+        status.metrics.perceptual_assoc_actionable = true;
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line == "Assoc  compiler observed"));
+        assert!(think.iter().any(|line| line == "       +180ms w46 wo52"));
+        assert!(think.iter().any(|line| line == "       input-delay q740"));
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       CAUSAL UNTESTED lever"),
+            "a co-occurrence must never render without that caveat: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_association_row_before_any_comparison_exists() {
+        let think = render_think_q(&dashboard_status());
+        assert!(!think.iter().any(|line| line.starts_with("Assoc")));
+        assert!(!think.iter().any(|line| line.contains("CAUSAL")));
+    }
+
+    #[test]
+    fn the_generic_summary_reports_sources_without_naming_any_of_them() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_sources_active = 2;
+        status.metrics.perceptual_observations_total = 1_284;
+        status.metrics.perceptual_instrumented_total = 950;
+        status.metrics.perceptual_inferred_total = 231;
+        status.metrics.perceptual_windows_total = 103;
+        status.metrics.perceptual_valid_total = 1_233;
+        status.metrics.perceptual_invalid_total = 51;
+        status.metrics.perceptual_quality_q = 880;
+        status.metrics.perceptual_quality_instrumented_q = Some(910);
+        status.metrics.perceptual_quality_instrumented_n = 950;
+        status.metrics.perceptual_quality_window_q = Some(350);
+        status.metrics.perceptual_quality_window_n = 103;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "Perc-S src2 obs1k qi910 qw350"));
+        assert!(think
+            .iter()
+            .any(|line| line == "       ins74% inf18% win8%"));
+        assert!(think.iter().any(|line| line == "       valid1k invalid51"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn a_source_that_cannot_measure_inp_never_gets_a_zero_printed_for_it() {
+        // Only the browser adapter can produce INP. A generic summary with no
+        // browser data must not render an INP row at all.
+        let mut status = dashboard_status();
+        status.metrics.perceptual_sources_active = 1;
+        status.metrics.perceptual_observations_total = 40;
+        status.metrics.perceptual_windows_total = 40;
+        status.metrics.browser_inp_estimate_ms = None;
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line.starts_with("Perc-S")));
+        assert!(
+            !think.iter().any(|line| line.contains("INP")),
+            "an absent capability must stay absent, not zero: {think:?}"
+        );
+    }
+
+    #[test]
+    fn the_0b_section_states_what_the_window_supports_saying() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_episodes_stored = 312;
+        status.metrics.perceptual_episodes_rejected = 18;
+        status.metrics.perceptual_regimes_total = 4;
+        status.metrics.perceptual_correlation_unique = 312;
+        status.metrics.perceptual_correlation_ambiguous = 11;
+        status.metrics.perceptual_correlation_unmatched = 7;
+        status.metrics.perceptual_regime_class = "contended-actuable".to_string();
+        status.metrics.perceptual_regime_level = "heavy".to_string();
+        status.metrics.perceptual_regime_interactions = 64;
+        status.metrics.perceptual_regime_actionable = 2;
+        status.metrics.perceptual_regime_median_total_ms = 184;
+        status.metrics.perceptual_regime_dominant_family = "compiler".to_string();
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line == "Perc   ep312 rej18 reg4"));
+        assert!(think.iter().any(|line| line == "       uniq312 amb11 unm7"));
+        assert!(think
+            .iter()
+            .any(|line| line == "       contended-actuable heavy"));
+        assert!(think.iter().any(|line| line == "       i64 act2 med184ms"));
+        assert!(think.iter().any(|line| line == "       vs compiler"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_0b_section_before_any_episode_exists() {
+        let think = render_think_q(&dashboard_status());
+        assert!(!think.iter().any(|line| line.starts_with("Perc")));
+    }
+
+    #[test]
+    fn a_stale_extension_explains_the_zeros_it_causes() {
+        // Without this row, a v1 extension and an idle browser render
+        // identically: every interaction counter at zero and no reason given.
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.webflow_extension_status = "v1-stale".to_string();
+        status.metrics.webflow_accepted_v1_total = 120;
+        status.metrics.webflow_accepted_v2_total = 0;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line == "       ext v1-stale"),
+            "the producer status must be stated: {think:?}"
+        );
+        assert!(
+            think.iter().any(|line| line == "       v1:120 v2:0 rej0"),
+            "with the counts behind it: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn an_active_v2_producer_reports_its_version() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.webflow_extension_status = "v2-active".to_string();
+        status.metrics.webflow_extension_version = "2.0.0".to_string();
+        status.metrics.webflow_accepted_v2_total = 40;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "       ext v2-active 2.0.0"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn the_transport_cost_is_reported_before_anyone_claims_a_fast_path() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.webflow_transport_samples = 40;
+        status.metrics.webflow_transport_client_p95_ms = Some(312.0);
+        status.metrics.webflow_transport_sw_wake_p95_ms = Some(280.0);
+        status.metrics.webflow_transport_cold_starts = 7;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line == "       hop312 sw280 cold7"),
+            "the transport segments must be visible: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_transport_row_without_transport_samples() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        let think = render_think_q(&status);
+        assert!(!think.iter().any(|line| line.contains("hop")));
+    }
+
+    #[test]
+    fn the_component_split_says_where_interaction_time_goes() {
+        // The split is the whole point of 0A-obs: if processing dominates, the
+        // bottleneck is the site's JavaScript and no scheduler actuator has a
+        // lever, which is a valid and valuable terminal result.
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_inp_estimate_ms = Some(184.0);
+        status.metrics.browser_interaction_samples = 312;
+        status.metrics.browser_input_delay_total_ms = 1_200;
+        status.metrics.browser_processing_total_ms = 8_400;
+        status.metrics.browser_presentation_total_ms = 2_400;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       in10% proc70% pres20%"),
+            "the three components must reconcile to 100%: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_component_split_is_rendered_without_component_evidence() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_inp_estimate_ms = Some(184.0);
+        status.metrics.browser_interaction_samples = 4;
+
+        let think = render_think_q(&status);
+        assert!(
+            !think.iter().any(|line| line.contains("proc")),
+            "a zero split must stay absent rather than print 0/0/0: {think:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_lcp_does_not_suppress_the_event_duration_tail() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_latency_samples = 12;
+        status.metrics.browser_lcp_p95_ms = None;
+        status.metrics.browser_event_duration_tail_ms = Some(96.0);
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "       vitals LCP- evt96 n12"));
+    }
+
+    #[test]
+    fn a_small_but_real_coverage_is_not_rounded_down_to_zero() {
+        assert_eq!(coverage_percent(None), "--");
+        assert_eq!(coverage_percent(Some(0.0)), "0%");
+        assert_eq!(
+            coverage_percent(Some(0.004)),
+            "<1%",
+            "a rate below half a percent must not be indistinguishable from zero"
+        );
+        assert_eq!(coverage_percent(Some(0.9)), "90%");
+    }
+
+    #[test]
+    fn the_worst_calibrated_model_reports_the_samples_behind_its_error() {
+        let mut status = dashboard_status();
+        status.metrics.trust_inventory.worst_producer = "world-model".to_string();
+        status.metrics.trust_inventory.worst_action = "interaction_qos:task_qos".to_string();
+        status.metrics.trust_inventory.worst_horizon = "30s".to_string();
+        status.metrics.trust_inventory.worst_normalized_mae = Some(0.10);
+        status.metrics.trust_inventory.worst_coverage = Some(0.004);
+        status.metrics.trust_inventory.worst_sample_count = 37;
+
+        let rendered = render_learning_band(&status);
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line
+                    == "Worst  world-model/interaction_qos:task_qos@30 MAE 10% n37 cov <1%"),
+            "MAE must carry its sample count and coverage its real magnitude: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn a_credit_leader_below_the_prior_weight_is_marked_low_sample() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_decision_credit_sources = 16;
+        status.metrics.world_model_decision_credit_leader = "predictive_profile".to_string();
+        status.metrics.world_model_decision_credit_leader_score = 0.745;
+        status
+            .metrics
+            .world_model_decision_credit_leader_observations = 3;
+        status.metrics.world_model_apollo_utility = -0.016;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line.contains("+74.5%~ n3")),
+            "a leader shrunk to a quarter of face value must say so: {think:?}"
+        );
+
+        status
+            .metrics
+            .world_model_decision_credit_leader_observations = 40;
+        let settled = render_think_q(&status);
+        assert!(
+            settled.iter().any(|line| line.contains("+74.5% n40")),
+            "a mature leader carries no marker: {settled:?}"
+        );
+    }
+
+    #[test]
+    fn value_refusals_name_the_gate_and_flag_pre_breakdown_history() {
+        let mut status = dashboard_status();
+        status.metrics.value_scheduler_phase = "active".to_string();
+        status.metrics.value_scheduler_valid_cycles = 17_149;
+        status.metrics.value_scheduler_invalid_samples_total = 3_880;
+        status.metrics.value_scheduler_invalid_unhealthy_total = 3_880;
+        status.metrics.value_scheduler_unhealthy_sleeping_total = 12;
+        status.metrics.value_scheduler_unhealthy_thermal_total = 4;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       why sleep12 therm4 pre4k"),
+            "refusals must name their gate and admit the unattributed remainder: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn value_separates_this_cycle_from_lifetime_selection() {
+        let mut status = dashboard_status();
+        status.metrics.value_scheduler_phase = "active".to_string();
+        status.metrics.value_scheduler_selected_jobs = 0;
+        status.metrics.value_scheduler_registered_jobs = 10;
+        status.metrics.value_scheduler_eligible_jobs = 0;
+        status.metrics.value_scheduler_selected_total = 1_752;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       now J0/10 elig0 · sel2k"),
+            "an idle cycle must not read as a scheduler that never selects: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_separates_models_still_maturing_from_models_gone_quiet() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_actuator_known_models = 247;
+        status.metrics.world_model_actuator_ready_models = 21;
+        status.metrics.world_model_context_authority_phase = "trusted".to_string();
+        status.metrics.world_model_readiness_immature = 20;
+        status.metrics.world_model_readiness_dormant = 180;
+        status.metrics.world_model_readiness_uncertain = 26;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "WM wait immature20 dormant180"));
+        assert!(think.iter().any(|line| line == "        uncertain26"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_shows_capacity_pressure_and_how_long_evidence_has_been_absent() {
+        let mut status = dashboard_status();
+        status.metrics.cycles = 11_065;
+        status.metrics.world_model_action_model_len = 256;
+        status.metrics.world_model_action_model_capacity = 256;
+        status.metrics.world_model_action_model_evictions_total = 12;
+        status.metrics.world_model_action_model_births_total = 17;
+        status.metrics.world_model_evidence_updates_total = 20;
+        status.metrics.world_model_last_evidence_cycle = 10_870;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "WM-C   256/256 full ev12 b17"),
+            "a saturated map must say so: {think:?}"
+        );
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "WM-EV  ev20 last c10,870 idle195"),
+            "the age of the newest evidence must be visible: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn dashboard_says_plainly_when_no_evidence_has_ever_arrived() {
+        let mut status = dashboard_status();
+        status.metrics.world_model_last_evidence_cycle = 0;
+        status.metrics.world_model_evidence_updates_total = 0;
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "WM-EV  ev0 no evidence yet"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2060,10 +3149,10 @@ mod tests {
         status.metrics.fabric_completed_total = 12;
         status.metrics.fabric_submitted_total = 14;
         status.metrics.fabric_cancelled_total = 1;
-        status.metrics.coreml_effective_backend = "cpu-and-neural-engine".to_string();
+        status.metrics.coreml_configured_backend = "cpu-and-neural-engine".to_string();
         status.metrics.fabric_evaluation_total = 8;
         status.metrics.fabric_eligible_total = 10;
-        status.metrics.coreml_ane_execution_measured = false;
+        status.metrics.coreml_ane_observation = "unsupported".to_string();
         status.metrics.temporal_prediction_backend = "cpu-utility".to_string();
         status.metrics.temporal_prediction_p95 = 0.42;
 
@@ -2071,9 +3160,11 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Fabric shadow W3 C12/14 X1"));
-        assert!(think
-            .iter()
-            .any(|line| line == "ML     cpu+ane E8/10 ANE ?"));
+        // `cfg:` marks the backend as configuration, and the ANE column says
+        // the evidence is missing rather than showing a glyph the reader would
+        // resolve to "fine" or "broken".
+        assert!(think.iter().any(|line| line == "ML     cfg:cpu+ane E8/10"));
+        assert!(think.iter().any(|line| line == "       ANE unobservable"));
         assert!(think
             .iter()
             .any(|line| line == "Pred   cpu-utility shadow p9542%"));
@@ -2123,7 +3214,7 @@ mod tests {
             .any(|line| line == "CPU-P  exp multi build multi"));
         assert!(think
             .iter()
-            .any(|line| line == "       eff multi W4/4 utility ok"));
+            .any(|line| line == "       eff multi W4/4 utility"));
         assert!(think.iter().any(|line| line == "WM-S   V0 rank3"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
@@ -2300,13 +3391,13 @@ mod tests {
         assert!(think.iter().any(|line| line == "Data   G 198/200 q99%"));
         assert!(think
             .iter()
-            .any(|line| line == "Causal 2/3 ready G127 q100%"));
+            .any(|line| line == "Caus-I 2/3 ready G127 q100%"));
         assert!(think.iter().any(|line| line == "Caus+  U42 universal Gold"));
         assert!(think.iter().any(|line| line == "Ctx-L  G490 S7 R3 q98%"));
         assert!(think.iter().any(|line| line == "Act    G 8/10 P2 q94%"));
         assert!(think.iter().any(|line| line == "Act+   boost G5/6"));
         assert!(think.iter().any(|line| line == "       eff 4/6 u+3%"));
-        assert!(think.iter().any(|line| line == "WM-U   calibrating 2/7"));
+        assert!(think.iter().any(|line| line == "WM-UTL calibrating 2/7"));
         assert!(think.iter().any(|line| line == "WM-S   V0 rank3"));
         assert!(think.iter().any(|line| line == "CF     R3/4 H2 rank7"));
         assert!(think.iter().any(|line| line == "WM-E   M23 F6 rank9"));
@@ -2319,23 +3410,19 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Seq-E  boost>markov_prewarm"));
-        assert!(think
-            .iter()
-            .any(|line| line == "WM-D   shadow A0 R4/6 V42 e3.2%"));
+        assert!(think.iter().any(|line| line == "WM-DYN shadow A0 R4/6"));
         assert!(think.iter().any(|line| line == "MPC-D  P17 R9 A3 B8 u7.1%"));
         assert!(think
             .iter()
-            .any(|line| line == "GPU-I  metal J3 S196,608 t0.42ms"));
+            .any(|line| line == "GPU-I  metal J3 S196,608 t0.4ms"));
         assert!(think.iter().any(|line| line == "GPU+   boost p82% d+1.2%"));
         assert!(think
             .iter()
-            .any(|line| line == "GPU-U  R4 C9 markov:marko +1.20%"));
+            .any(|line| line == "GPU-U  R4 C9 markov:mar +1.20%"));
         assert!(think
             .iter()
             .any(|line| line == "Delib  cal S1 c78% G24 g3 F1"));
-        assert!(think
-            .iter()
-            .any(|line| line == "S2>S1  G12 +8/-2 n2 s20 c66%"));
+        assert!(think.iter().any(|line| line == "S2>S1  G12 +8/-2 n2 c66%"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2348,7 +3435,7 @@ mod tests {
 
         assert!(think
             .iter()
-            .any(|line| line == "WM-U   protected · no evidence"));
+            .any(|line| line == "WM-UTL protected · no evidence"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2360,9 +3447,7 @@ mod tests {
 
         let think = render_think_q(&status);
 
-        assert!(think
-            .iter()
-            .any(|line| line == "GPU-I  metal J0 S0 t0.00ms"));
+        assert!(think.iter().any(|line| line == "GPU-I  metal J0 S0 t0.0ms"));
         assert!(think.iter().any(|line| line == "GPU-G  no-candidates"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
@@ -2384,9 +3469,7 @@ mod tests {
         assert!(think
             .iter()
             .any(|line| line == "Web    lifecycle N1 P12/A4"));
-        assert!(think
-            .iter()
-            .any(|line| line == "Net+   active 2.4MB/s P8 R6 X3"));
+        assert!(think.iter().any(|line| line == "Net+   active 2.4MB/s"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2400,7 +3483,7 @@ mod tests {
 
         assert!(think
             .iter()
-            .any(|line| line == "GPU-I  metal/H J0 S0 t0.00ms"));
+            .any(|line| line == "GPU-I  metal/H J0 S0 t0.0ms"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
@@ -2408,16 +3491,16 @@ mod tests {
     fn think_quadrant_distinguishes_idle_temporal_model_from_cold_start() {
         let mut status = dashboard_status();
         status.metrics.world_model_temporal_memory_samples = 32;
-        status.metrics.world_model_sequence_abstention_reason = "idle_no_accelerator".to_string();
+        status.metrics.world_model_sequence_abstention_reason = "idle_no_latency_work".to_string();
 
         let think = render_think_q(&status);
 
         assert!(think
             .iter()
-            .any(|line| line == "Seq-E  idle_no_accelerator"));
+            .any(|line| line == "Seq-E  idle_no_latency_work"));
         assert!(think
             .iter()
-            .any(|line| line == "Seq-A  idle_no_accelerator"));
+            .any(|line| line == "Seq-A  idle_no_latency_work"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 

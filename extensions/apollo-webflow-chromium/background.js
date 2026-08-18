@@ -10,6 +10,9 @@ const tracker = new P.NavigationTracker(64);
 const tabQueues = new Map();
 let sequence = 0;
 let nativePort = null;
+// A fresh service worker global means MV3 tore the previous one down: the
+// first event after that pays the cold start we are trying to measure.
+let servedAnEvent = false;
 
 function nextSequence() {
   sequence += 1;
@@ -59,7 +62,7 @@ async function hmacSiteBucket(rawUrl) {
   return bucket.some((byte) => byte !== 0) ? bucket : undefined;
 }
 
-async function emit(record, phase, source, rawUrl, metrics = {}) {
+async function emit(record, phase, source, rawUrl, metrics = {}, transport = undefined) {
   if (!record) return;
   const siteBucket = rawUrl ? await hmacSiteBucket(rawUrl) : undefined;
   postNative(P.buildEvent({
@@ -71,6 +74,9 @@ async function emit(record, phase, source, rawUrl, metrics = {}) {
     source,
     siteBucket,
     metrics,
+    transport: transport
+      ? { ...transport, nativeMessageStartedAtMs: Date.now() }
+      : undefined,
   }));
 }
 
@@ -111,7 +117,15 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type !== 'apollo-webflow-vitals' || !sender.tab) return;
   const record = tracker.get(sender.tab.id);
-  enqueue(sender.tab.id, () => emit(record, 'settled', 'extension-vitals', undefined, message.metrics));
+  const transport = {
+    contentSendStartedAtMs: message.contentSendStartedAtMs,
+    serviceWorkerReceivedAtMs: Date.now(),
+    tabQueueDepth: tabQueues.size,
+    serviceWorkerColdStart: !servedAnEvent,
+  };
+  servedAnEvent = true;
+  enqueue(sender.tab.id, () =>
+    emit(record, 'settled', 'extension-vitals', undefined, message.metrics, transport));
 });
 
 function classifyError(error) {
@@ -127,16 +141,32 @@ function classifyError(error) {
 async function registerVitals() {
   const allowed = await chrome.permissions.contains({ origins: ['<all_urls>'] });
   if (!allowed) return;
-  try {
-    await chrome.scripting.unregisterContentScripts({ ids: ['apollo-webflow-vitals'] });
-  } catch (_) {}
-  await chrome.scripting.registerContentScripts([{
+  // A persisted registration survives reloads, so re-registering throws on the
+  // duplicate id and leaves the OLD js list active — which is how a stale
+  // registration injected content.js without protocol.js.
+  const script = {
     id: 'apollo-webflow-vitals',
     matches: ['<all_urls>'],
-    js: ['content.js'],
+    // protocol.js first: content.js reads the folding helpers from it, and an
+    // isolated world does not inherit the service worker's importScripts.
+    js: ['protocol.js', 'content.js'],
     runAt: 'document_start',
     persistAcrossSessions: true,
-  }]);
+  };
+  try {
+    await chrome.scripting.updateContentScripts([script]);
+    return;
+  } catch (_) {
+    // Not registered yet: fall through and register it.
+  }
+  try {
+    await chrome.scripting.unregisterContentScripts({ ids: [script.id] });
+  } catch (_) {}
+  try {
+    await chrome.scripting.registerContentScripts([script]);
+  } catch (_) {
+    // Leave the previous registration rather than ending with none.
+  }
 }
 
 chrome.action.onClicked.addListener(async () => {

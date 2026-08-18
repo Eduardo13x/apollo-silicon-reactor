@@ -389,8 +389,12 @@ fn lse_metrics_32_threads_1m_increments() {
             thread::spawn(move || {
                 for _ in 0..n_increments {
                     m.inc_cycles();
-                    m.inc_freezes();
-                    m.add_actions(1);
+                    // Two more live counters. This test measures lock-free
+                    // throughput, so any counters do; it used to use
+                    // inc_freezes/add_actions, which were removed as legacy
+                    // no-producer counters.
+                    m.inc_pid_recycle_block();
+                    m.inc_mediator_block();
                 }
             })
         })
@@ -405,8 +409,8 @@ fn lse_metrics_32_threads_1m_increments() {
     let snap = m.snapshot();
     let expected = n_threads * n_increments;
     assert_eq!(snap.cycles, expected as u64);
-    assert_eq!(snap.freezes, expected as u64);
-    assert_eq!(snap.actions_applied, expected as u64);
+    assert_eq!(snap.pid_recycle_blocks_total, expected as u64);
+    assert_eq!(snap.mediator_blocks_total, expected as u64);
 
     let ops_total = expected * 3; // 3 ops per iteration
     let ops_per_sec = ops_total as f64 / elapsed.as_secs_f64();

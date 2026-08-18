@@ -413,6 +413,9 @@ pub struct LabMetrics {
     pub shadow_would_open_total: u64,
     pub invalidated_total: u64,
     pub deadline_expired_total: u64,
+    /// Arms that expired without ever reporting, outside Shadow. Counted apart
+    /// from `canary_failures`: no data is not adverse data.
+    pub unbound_expiries_total: u64,
     pub rollback_failed_total: u64,
     pub open_pairs: usize,
     pub completed_pairs: usize,
@@ -484,6 +487,8 @@ struct PersistedMetrics {
     shadow_would_open_total: u64,
     invalidated_total: u64,
     deadline_expired_total: u64,
+    #[serde(default)]
+    unbound_expiries_total: u64,
     rollback_failed_total: u64,
 }
 
@@ -502,7 +507,13 @@ struct PersistedRollout {
 }
 
 impl PersistedRollout {
-    fn reset_to_shadow(&mut self, now_millis: u64) {
+    /// Returns the shadow gate progress this reset discarded. Callers that are
+    /// not deliberately carrying the value forward must account for it: a
+    /// silent drop is indistinguishable on the dashboard from a host that
+    /// never produced opportunities in the first place.
+    #[must_use]
+    fn reset_to_shadow(&mut self, now_millis: u64) -> u64 {
+        let dropped = self.shadow_eligible;
         self.phase = LabPhase::Shadow;
         self.phase_started_millis = now_millis;
         self.last_monotonic_millis = now_millis;
@@ -512,6 +523,7 @@ impl PersistedRollout {
         self.canary_completed = 0;
         self.canary_gold = 0;
         self.canary_failures = 0;
+        dropped
     }
 }
 
@@ -585,6 +597,22 @@ pub struct MicroexperimentLab {
     rollout: PersistedRollout,
     rollout_config: LabRolloutConfig,
     last_work: LabWork,
+    /// Whether the phase clock has been armed against this boot's monotonic
+    /// clock. Deliberately not persisted: `phase_started_millis` alone cannot
+    /// express "unarmed", because 0 is also a legitimate `now_millis`.
+    phase_clock_armed: bool,
+    /// Shadow gate progress observed at the end of `restore`, before this boot
+    /// ran a single cycle. Not persisted: it describes this boot only.
+    ///
+    /// Without it a gate counter that fell backwards across a restart is
+    /// ambiguous from the dashboard — "the disk held a low value" and "the
+    /// runtime discarded a high one" render identically.
+    restored_progress: u64,
+    /// How many times a runtime reset discarded non-zero gate progress, and
+    /// why the last one fired. Not persisted, and deliberately separate from
+    /// the deliberate reset inside `restore`, which carries its value forward.
+    progress_resets: u64,
+    last_progress_reset_reason: &'static str,
 }
 
 impl MicroexperimentLab {
@@ -600,6 +628,10 @@ impl MicroexperimentLab {
             rollout: PersistedRollout::default(),
             rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
+            phase_clock_armed: false,
+            restored_progress: 0,
+            progress_resets: 0,
+            last_progress_reset_reason: "",
         }
     }
 
@@ -699,6 +731,43 @@ impl MicroexperimentLab {
         self.rollout.phase
     }
 
+    /// Opportunities counted toward the current phase gate, and the threshold
+    /// they must reach. Without this the remaining wait is invisible: the
+    /// published `*_total` counters are cumulative across restarts and do not
+    /// track the rollout gate.
+    fn note_progress_reset(&mut self, dropped: u64, reason: &'static str) {
+        if dropped == 0 {
+            return;
+        }
+        self.progress_resets = self.progress_resets.saturating_add(1);
+        self.last_progress_reset_reason = reason;
+    }
+
+    /// Boot-scoped provenance for the shadow gate counter: what `restore` left
+    /// in place before the first cycle, how many runtime resets have discarded
+    /// progress since, and the reason of the most recent one.
+    pub fn rollout_provenance(&self) -> (u64, u64, &'static str) {
+        (
+            self.restored_progress,
+            self.progress_resets,
+            self.last_progress_reset_reason,
+        )
+    }
+
+    pub fn rollout_progress(&self) -> (u64, u64) {
+        match self.rollout.phase {
+            LabPhase::Shadow => (
+                self.rollout.shadow_eligible,
+                self.rollout_config.shadow_min_opportunities,
+            ),
+            LabPhase::Canary => (
+                self.rollout.canary_eligible,
+                self.rollout_config.canary_min_opportunities,
+            ),
+            LabPhase::Active => (0, 0),
+        }
+    }
+
     pub fn readiness_blocker(&self) -> Option<&'static str> {
         if self.open.iter().any(|record| record.issued.is_some()) {
             return Some("awaiting-real-endpoint");
@@ -726,14 +795,17 @@ impl MicroexperimentLab {
         gates: PairGates,
         now_millis: u64,
     ) -> Result<CandidateDisposition, LabError> {
-        if self.rollout.shadow_eligible == 0
-            && self.rollout.canary_eligible == 0
-            && self.rollout.phase_started_millis == 0
-        {
+        // Arms the phase clock on the first candidate of this boot. A restore
+        // carries `shadow_eligible` forward, so the eligibility counters cannot
+        // serve as the "unarmed" signal any more, and `phase_started_millis`
+        // cannot either because 0 is a legitimate `now_millis`.
+        if !self.phase_clock_armed {
             self.rollout.phase_started_millis = now_millis;
+            self.phase_clock_armed = true;
         }
         if now_millis < self.rollout.last_monotonic_millis {
-            self.rollout.reset_to_shadow(now_millis);
+            let dropped = self.rollout.reset_to_shadow(now_millis);
+            self.note_progress_reset(dropped, "clock-regression-candidate");
         }
         self.rollout.last_monotonic_millis = now_millis;
 
@@ -779,14 +851,16 @@ impl MicroexperimentLab {
     ) -> Vec<PairInvalidation> {
         if now_millis < self.rollout.last_monotonic_millis {
             let invalidated = self.invalidate_all(PairInvalidationReason::ClockRegression);
-            self.rollout.reset_to_shadow(now_millis);
+            let dropped = self.rollout.reset_to_shadow(now_millis);
+            self.note_progress_reset(dropped, "clock-regression-cycle");
             return invalidated;
         }
         self.rollout.last_monotonic_millis = now_millis;
         if !gates.allows_pair() {
             let invalidated = self.invalidate_all(PairInvalidationReason::SafetyGate);
             if self.rollout.phase != LabPhase::Shadow || !invalidated.is_empty() {
-                self.rollout.reset_to_shadow(now_millis);
+                let dropped = self.rollout.reset_to_shadow(now_millis);
+                self.note_progress_reset(dropped, "safety-gate");
             }
             return invalidated;
         }
@@ -823,7 +897,8 @@ impl MicroexperimentLab {
         }
         if self.rollout.phase != LabPhase::Shadow && self.rollout.canary_failures > 0 {
             invalidated.extend(self.invalidate_all(PairInvalidationReason::Unauthoritative));
-            self.rollout.reset_to_shadow(now_millis);
+            let dropped = self.rollout.reset_to_shadow(now_millis);
+            self.note_progress_reset(dropped, "canary-failure");
         }
         self.advance_rollout(now_millis, true);
         invalidated
@@ -1124,8 +1199,20 @@ impl MicroexperimentLab {
             }
             _ => {}
         }
+        // An arm that never reported produced no evidence about the rollout.
+        // Recording an endpoint clears `issued`, so the deadline path is only
+        // reachable for an arm nothing ever bound to: treating that as adverse
+        // evidence let one evaporated opportunity destroy every banked one.
+        // Pair-scoped invalidation retires its own pair; the global reasons
+        // (safety gate, clock regression) reset the rollout on their own paths.
+        let produced_evidence = record.first_endpoint.is_some() || record.second_endpoint.is_some();
         if self.rollout.phase != LabPhase::Shadow {
-            self.rollout.canary_failures = self.rollout.canary_failures.saturating_add(1);
+            if produced_evidence {
+                self.rollout.canary_failures = self.rollout.canary_failures.saturating_add(1);
+            } else {
+                self.metrics.unbound_expiries_total =
+                    self.metrics.unbound_expiries_total.saturating_add(1);
+            }
         }
         push_bounded(
             &mut self.completed,
@@ -1194,6 +1281,10 @@ impl MicroexperimentLab {
             rollout: persisted.rollout,
             rollout_config: LabRolloutConfig::default(),
             last_work: LabWork::default(),
+            phase_clock_armed: false,
+            restored_progress: 0,
+            progress_resets: 0,
+            last_progress_reset_reason: "",
         };
         // Completed summaries do not retain both authoritative endpoint
         // receipts. On restart they remain useful history, but they cannot
@@ -1226,7 +1317,17 @@ impl MicroexperimentLab {
             .interrupted_total
             .saturating_add(interrupted as u64);
         lab.reconcile_authoritative_metrics();
-        lab.rollout.reset_to_shadow(0);
+        // A restart never resumes Canary or Active: mutation authority must be
+        // re-earned. The count of observed shadow opportunities is durable
+        // evidence about the host and is carried forward, but the duration gate
+        // re-arms from this boot because `now_millis` is monotonic-since-boot
+        // and would otherwise be satisfied instantly.
+        let shadow_eligible = lab.rollout.shadow_eligible;
+        let _deliberately_carried_forward = lab.rollout.reset_to_shadow(0);
+        lab.rollout.shadow_eligible = shadow_eligible;
+        // Boot-scoped provenance: this is the value the operator should see
+        // published before the new boot has run a cycle.
+        lab.restored_progress = shadow_eligible;
         let disposition = if interrupted == 0 {
             RestoreDisposition::Restored
         } else {
@@ -1268,6 +1369,7 @@ impl MicroexperimentLab {
             shadow_would_open_total: self.metrics.shadow_would_open_total,
             invalidated_total: self.metrics.invalidated_total,
             deadline_expired_total: self.metrics.deadline_expired_total,
+            unbound_expiries_total: self.metrics.unbound_expiries_total,
             rollback_failed_total: self.metrics.rollback_failed_total,
             open_pairs: self.open.len(),
             completed_pairs: self.completed.len(),
@@ -1793,6 +1895,195 @@ mod rollout_tests {
         assert_eq!(lab.metrics().open_pairs, 0);
     }
 
+    /// Drives the lab to Canary with `earned` shadow opportunities banked, the
+    /// shape production reaches before it issues its first arm.
+    fn lab_in_canary_with_progress(earned: u64) -> MicroexperimentLab {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: earned,
+            shadow_min_duration_ms: 10,
+            canary_percent: 100,
+            canary_min_opportunities: 500,
+        };
+        for index in 0..earned {
+            let _ = lab.consider_candidate(
+                candidate(index + 1),
+                PairGates::healthy_enabled(),
+                index * 2,
+            );
+        }
+        assert_eq!(lab.phase(), LabPhase::Canary, "setup must reach canary");
+        lab
+    }
+
+    #[test]
+    fn an_arm_that_expires_without_ever_reporting_does_not_erase_banked_progress() {
+        // Reproduces production: progress stood at 460, one arm was issued,
+        // nothing ever bound to it, its deadline passed, and the whole rollout
+        // fell back to shadow with the progress destroyed.
+        let mut lab = lab_in_canary_with_progress(460);
+        // Banked shadow evidence. `rollout_progress` reports the counter of the
+        // current phase, so in Canary it does not surface this value.
+        let banked = 460;
+
+        let candidate = candidate(9_001);
+        let assignment = match lab
+            .consider_candidate(candidate.clone(), PairGates::healthy_enabled(), 1_000)
+            .unwrap()
+        {
+            CandidateDisposition::Opened(assignment) => assignment,
+            other => panic!("expected an opened canary pair, got {other:?}"),
+        };
+        let directive = lab
+            .issue_ready_arms(1_001, PairGates::healthy_enabled())
+            .pop()
+            .expect("canary must issue an arm");
+        // Deliberately record no endpoint: this is the unbound case.
+        let expiry = directive.expires_after_cycle;
+        lab.advance_cycle(expiry + 1, 2_000, PairGates::healthy_enabled());
+
+        let _ = assignment;
+        assert_eq!(
+            lab.metrics().open_pairs,
+            0,
+            "the expired pair itself must be retired"
+        );
+        assert_eq!(
+            lab.phase(),
+            LabPhase::Canary,
+            "one arm that never reported is not evidence that the rollout is unsafe"
+        );
+        let (_, resets, reason) = lab.rollout_provenance();
+        assert_eq!(
+            resets, 0,
+            "no global reset is warranted; got reason {reason}"
+        );
+        // `rollout_progress` reports the counter of the *current* phase, so the
+        // banked shadow evidence is read back through a restart.
+        let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        assert_eq!(
+            restored.rollout_progress().0,
+            banked,
+            "independent banked progress must survive an unbound expiry"
+        );
+    }
+
+    #[test]
+    fn an_arm_that_reported_can_no_longer_reach_the_deadline_path() {
+        // Pins why the unbound case is the only one reachable: recording an
+        // endpoint clears `issued`, and the expiry sweep only looks at issued
+        // arms. Any future change that lets a reported pair expire would make
+        // the reclassification above unsafe, and this test would fail first.
+        let mut lab = lab_in_canary_with_progress(120);
+        let candidate = candidate(9_100);
+        match lab
+            .consider_candidate(candidate.clone(), PairGates::healthy_enabled(), 1_000)
+            .unwrap()
+        {
+            CandidateDisposition::Opened(_) => {}
+            other => panic!("expected opened, got {other:?}"),
+        }
+        let directive = lab
+            .issue_ready_arms(1_001, PairGates::healthy_enabled())
+            .pop()
+            .expect("canary must issue an arm");
+        lab.record_timed_endpoint(endpoint(&candidate, &directive, 1_000))
+            .expect("endpoint recorded");
+        lab.advance_cycle(
+            directive.expires_after_cycle + 1,
+            2_000,
+            PairGates::healthy_enabled(),
+        );
+
+        assert_eq!(
+            lab.metrics().deadline_expired_total,
+            0,
+            "a pair that reported must not be swept by the deadline path"
+        );
+        assert_eq!(lab.metrics().unbound_expiries_total, 0);
+        assert_eq!(
+            lab.metrics().open_pairs,
+            1,
+            "it stays open, awaiting closure"
+        );
+    }
+
+    #[test]
+    fn a_safety_gate_still_resets_the_whole_rollout() {
+        let mut lab = lab_in_canary_with_progress(200);
+        assert_eq!(lab.phase(), LabPhase::Canary);
+        let unsafe_gates = PairGates {
+            secure_input: true,
+            ..PairGates::healthy_enabled()
+        };
+        lab.advance_cycle(1_000, 3_000, unsafe_gates);
+        assert_eq!(
+            lab.phase(),
+            LabPhase::Shadow,
+            "an explicit global condition must still reset"
+        );
+        let (_, resets, reason) = lab.rollout_provenance();
+        assert_eq!(resets, 1);
+        assert_eq!(reason, "safety-gate");
+    }
+
+    #[test]
+    fn progress_is_monotonic_while_no_global_invalidation_occurs() {
+        let mut lab = lab_in_canary_with_progress(300);
+        let mut last = lab.rollout_progress().0;
+        for round in 0..3u64 {
+            let candidate = candidate(9_200 + round);
+            if let Ok(CandidateDisposition::Opened(_)) = lab.consider_candidate(
+                candidate,
+                PairGates::healthy_enabled(),
+                3_000 + round * 1_000,
+            ) {
+                if let Some(directive) = lab
+                    .issue_ready_arms(1_100 + round, PairGates::healthy_enabled())
+                    .pop()
+                {
+                    lab.advance_cycle(
+                        directive.expires_after_cycle + 1,
+                        3_500 + round * 1_000,
+                        PairGates::healthy_enabled(),
+                    );
+                }
+            }
+            let now = lab.rollout_progress().0;
+            assert!(
+                now >= last,
+                "round {round}: progress went backwards {last} -> {now}"
+            );
+            last = now;
+        }
+        let (_, resets, reason) = lab.rollout_provenance();
+        assert_eq!(resets, 0, "unexpected reset, reason={reason}");
+    }
+
+    #[test]
+    fn an_unbound_expiry_survives_the_persistence_round_trip() {
+        let mut lab = lab_in_canary_with_progress(460);
+        let candidate = candidate(9_300);
+        let _ = lab.consider_candidate(candidate, PairGates::healthy_enabled(), 1_000);
+        if let Some(directive) = lab
+            .issue_ready_arms(1_001, PairGates::healthy_enabled())
+            .pop()
+        {
+            lab.advance_cycle(
+                directive.expires_after_cycle + 1,
+                2_000,
+                PairGates::healthy_enabled(),
+            );
+        }
+        let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        assert_eq!(
+            restored.rollout_progress().0,
+            460,
+            "banked shadow evidence must survive restart after an unbound expiry"
+        );
+        assert_eq!(restored.phase(), LabPhase::Shadow, "authority is re-earned");
+    }
+
     #[test]
     fn rollout_reaches_active_only_after_a_real_canary_pair_closes_gold() {
         let mut lab = MicroexperimentLab::cold_start(origin());
@@ -1850,6 +2141,139 @@ mod rollout_tests {
 
         assert_eq!(lab.phase(), LabPhase::Active);
         assert_eq!(lab.metrics().pair_gold_total, 1);
+    }
+
+    #[test]
+    fn a_restart_keeps_shadow_progress_but_re_earns_the_duration_gate() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 2,
+            shadow_min_duration_ms: 10_000,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 2_000)
+            .unwrap();
+        assert_eq!(lab.phase(), LabPhase::Shadow);
+
+        let (mut restored, disposition) = MicroexperimentLab::restore(lab.persisted(), origin());
+        restored.rollout_config = lab.rollout_config;
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(restored.phase(), LabPhase::Shadow);
+        // The opportunity count survives; it is durable evidence about the host.
+        assert_eq!(restored.rollout.shadow_eligible, 2);
+
+        // The duration gate must NOT be instantly satisfiable after restore:
+        // the phase clock re-arms on the first candidate of the new boot.
+        restored
+            .consider_candidate(candidate(3), PairGates::healthy_enabled(), 500_000)
+            .unwrap();
+        assert_eq!(
+            restored.phase(),
+            LabPhase::Shadow,
+            "restore must not let a monotonic clock satisfy the duration gate instantly"
+        );
+
+        // Once the minimum duration genuinely elapses on this boot, it promotes.
+        restored
+            .consider_candidate(candidate(4), PairGates::healthy_enabled(), 511_000)
+            .unwrap();
+        assert_eq!(restored.phase(), LabPhase::Canary);
+    }
+
+    /// The in-memory restore path is covered above. Production does not use
+    /// it: the struct is written into `learned_state.json` and read back, and
+    /// the value the operator actually sees is `rollout_progress()`, published
+    /// after several cycles of the new boot have already run. This pins the
+    /// whole chain — persisted -> serialized -> restored -> published — at the
+    /// production gate size, because a defect anywhere in it looks identical
+    /// from the dashboard: a gate counter that fell backwards after a restart.
+    #[test]
+    fn shadow_progress_survives_the_json_round_trip_and_the_first_cycles() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        for sequence in 1..=413u64 {
+            lab.consider_candidate(
+                candidate(sequence),
+                PairGates::healthy_enabled(),
+                1_000 + sequence,
+            )
+            .unwrap();
+        }
+        assert_eq!(lab.rollout_progress(), (413, SHADOW_MIN_OPPORTUNITIES));
+
+        let encoded = serde_json::to_string(&lab.persisted()).expect("encode");
+        let decoded: MicroexperimentLabPersisted = serde_json::from_str(&encoded).expect("decode");
+        let (mut restored, disposition) = MicroexperimentLab::restore(decoded, origin());
+
+        assert_eq!(disposition, RestoreDisposition::Restored);
+        assert_eq!(
+            restored.rollout_progress(),
+            (413, SHADOW_MIN_OPPORTUNITIES),
+            "the gate counter must survive the disk round trip"
+        );
+
+        // The new boot's clock restarts near zero while the persisted rollout
+        // carries millisecond stamps from the previous boot. The early cycles
+        // are exactly where a monotonic-regression reset would fire.
+        for cycle in 1..=5u64 {
+            restored.advance_cycle(cycle, cycle * 300, PairGates::healthy_enabled());
+        }
+        assert_eq!(
+            restored.rollout_progress().0,
+            413,
+            "the first cycles of the new boot must not reset the gate counter"
+        );
+    }
+
+    #[test]
+    fn rollout_progress_reports_the_gate_counter_not_the_cumulative_total() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 4,
+            shadow_min_duration_ms: 10_000,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        assert_eq!(lab.rollout_progress(), (0, 4));
+
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 2_000)
+            .unwrap();
+
+        assert_eq!(lab.rollout_progress(), (2, 4));
+        // The cumulative metric counts the same events but is not the gate.
+        assert_eq!(lab.metrics().eligible_total, 2);
+
+        // After a restart the cumulative total keeps climbing from persisted
+        // state while the gate counter is what actually governs promotion.
+        let (mut restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        restored.rollout_config = lab.rollout_config;
+        assert_eq!(restored.rollout_progress(), (2, 4));
+        assert_eq!(restored.metrics().eligible_total, 2);
+    }
+
+    #[test]
+    fn a_restart_never_resumes_mutation_authority() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 1,
+            shadow_min_duration_ms: 0,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 10)
+            .unwrap();
+        assert_eq!(lab.phase(), LabPhase::Canary);
+
+        let (mut restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+
+        assert_eq!(restored.phase(), LabPhase::Shadow);
+        assert!(restored
+            .issue_ready_arms(1, PairGates::healthy_enabled())
+            .is_empty());
     }
 
     #[test]

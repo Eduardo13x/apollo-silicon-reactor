@@ -253,6 +253,10 @@ pub enum UtilityAbstentionReason {
     NoCurrentGold,
     UnknownAction,
     ImmatureEvidence,
+    /// Immature *and* not accumulating: the newest observation predates one
+    /// evidence half-life. Distinct from `ImmatureEvidence` so a census cannot
+    /// report an inactive model as learning in progress.
+    DormantEvidence,
     LowQuality,
     StaleEvidence,
     ForeignInstallation,
@@ -266,6 +270,7 @@ impl UtilityAbstentionReason {
             Self::NoCurrentGold => "no_current_gold",
             Self::UnknownAction => "unknown_action",
             Self::ImmatureEvidence => "immature_evidence",
+            Self::DormantEvidence => "dormant_evidence",
             Self::LowQuality => "low_quality",
             Self::StaleEvidence => "stale_evidence",
             Self::ForeignInstallation => "foreign_installation",
@@ -289,6 +294,7 @@ pub struct UtilityReadinessBreakdown {
     pub ready: u64,
     pub no_current_gold: u64,
     pub immature: u64,
+    pub dormant: u64,
     pub low_quality: u64,
     pub stale: u64,
     pub foreign_installation: u64,
@@ -1492,6 +1498,9 @@ impl WorldModel {
                 Err(UtilityAbstentionReason::ImmatureEvidence) => {
                     breakdown.immature = breakdown.immature.saturating_add(1)
                 }
+                Err(UtilityAbstentionReason::DormantEvidence) => {
+                    breakdown.dormant = breakdown.dormant.saturating_add(1)
+                }
                 Err(UtilityAbstentionReason::LowQuality) => {
                     breakdown.low_quality = breakdown.low_quality.saturating_add(1)
                 }
@@ -1730,6 +1739,33 @@ fn episode_similarity(left: ActuatorEpisodeContext, right: ActuatorEpisodeContex
     (1.0 - distance / weight.max(f64::EPSILON)).clamp(0.0, 1.0)
 }
 
+/// Convert the decision gate's confidence interval for the *mean* utility into
+/// a prediction interval for a *single* future observation.
+///
+/// `lower_bound`/`upper_bound` are `ema ± Z·σ/√n`: they answer "where is the
+/// true mean". Calibration coverage asks a different question — "will the next
+/// observation land inside" — which needs `ema ± Z·σ`. Publishing the former
+/// where the latter is scored makes the interval up to `√n` too narrow (a
+/// factor of 8 at the evidence cap), so coverage collapses toward zero however
+/// well the model predicts. Multiplying back by `√n` recovers `Z·σ` without
+/// touching the bounds the gate itself spends.
+pub fn predictive_half_width(confidence_half_width: f64, effective_evidence: f64) -> f64 {
+    if !confidence_half_width.is_finite() || confidence_half_width <= 0.0 {
+        return 0.0;
+    }
+    let samples = if effective_evidence.is_finite() {
+        effective_evidence.max(1.0)
+    } else {
+        1.0
+    };
+    // `PredictionRecord::uncertainty` is contractually within (0, 1], and
+    // `valid_predictions` rejects the *entire* prediction set if any member
+    // breaks it. Widening by sqrt(n) can exceed 1.0 for a high-variance model,
+    // so saturate at the contract ceiling: "maximally uncertain" is the honest
+    // reading, and it keeps the other predictions in the set alive.
+    (confidence_half_width * samples.sqrt()).min(1.0)
+}
+
 fn utility_model_status(
     stats: &ActionModelStats,
     now_unix: i64,
@@ -1741,7 +1777,14 @@ fn utility_model_status(
         return Err(UtilityAbstentionReason::NoCurrentGold);
     };
     if stats.effective_evidence_at(now_unix) < MIN_UTILITY_EVIDENCE {
-        return Err(UtilityAbstentionReason::ImmatureEvidence);
+        // Same verdict either way — the model is not usable. Only the reported
+        // reason differs, so "waiting for evidence" cannot absorb models that
+        // stopped receiving any.
+        return Err(if stats.is_dormant_at(now_unix) {
+            UtilityAbstentionReason::DormantEvidence
+        } else {
+            UtilityAbstentionReason::ImmatureEvidence
+        });
     }
     if stats.quality_ema < MIN_UTILITY_DATA_QUALITY {
         return Err(UtilityAbstentionReason::LowQuality);
@@ -1888,11 +1931,24 @@ mod tests {
         models: &BTreeMap<String, ActionModelStats>,
         local_gold_total: u64,
     ) {
+        attach_view_at_revision(model, context, models, local_gold_total, 1);
+    }
+
+    /// Same as `attach_view`, but lets a test re-attach changed models. The
+    /// model cache keys on `action_models_revision`, so reusing a revision is
+    /// a deliberate cache hit rather than a refresh.
+    fn attach_view_at_revision(
+        model: &mut WorldModel,
+        context: Option<&TelemetryContextSummary>,
+        models: &BTreeMap<String, ActionModelStats>,
+        local_gold_total: u64,
+        action_models_revision: u64,
+    ) {
         model.attach_context(TrustedTelemetryView {
             current: context,
             installation_id: LOCAL_ID,
             action_models: models,
-            action_models_revision: 1,
+            action_models_revision,
             controlled_models: &BTreeMap::new(),
             controlled_models_revision: 0,
             episodic_evidence: &VecDeque::new(),
@@ -2364,6 +2420,138 @@ mod tests {
     }
 
     #[test]
+    fn a_prediction_interval_covers_a_draw_the_mean_interval_would_miss() {
+        // Realistic shape from production: sigma 0.20 (MAE 10% of the +/-2
+        // clamp), evidence at the cap. The gate's interval is the standard
+        // error of the mean, eight times too narrow for a single draw.
+        let sigma = 0.20_f64;
+        let evidence = 64.0_f64;
+        let confidence_half = UTILITY_CONFIDENCE_Z * (sigma * sigma / evidence).sqrt();
+        let predictive_half = predictive_half_width(confidence_half, evidence);
+
+        let realized_error = 0.15_f64;
+        assert!(
+            realized_error > confidence_half,
+            "the mean interval ({confidence_half:.4}) misses a draw well inside one sigma"
+        );
+        assert!(
+            realized_error <= predictive_half,
+            "the prediction interval ({predictive_half:.4}) must contain it"
+        );
+        assert!(
+            (predictive_half / confidence_half - evidence.sqrt()).abs() < 1e-9,
+            "widening is exactly sqrt(n)"
+        );
+    }
+
+    #[test]
+    fn widening_never_breaks_the_prediction_record_contract() {
+        // `valid_predictions` requires uncertainty <= 1.0 and rejects the whole
+        // set on a single violation, so a high-variance model must saturate
+        // rather than silently drop every prediction beside it.
+        let sigma = 0.9_f64;
+        let evidence = 64.0_f64;
+        let confidence_half = UTILITY_CONFIDENCE_Z * (sigma * sigma / evidence).sqrt();
+        let widened = predictive_half_width(confidence_half, evidence);
+        assert!(
+            confidence_half * evidence.sqrt() > 1.0,
+            "setup must actually overflow the contract before clamping"
+        );
+        assert!(
+            widened > 0.0 && widened <= 1.0,
+            "uncertainty must stay inside (0, 1]: got {widened}"
+        );
+    }
+
+    #[test]
+    fn a_degenerate_interval_stays_degenerate_rather_than_inventing_width() {
+        assert_eq!(predictive_half_width(0.0, 64.0), 0.0);
+        assert_eq!(predictive_half_width(-1.0, 64.0), 0.0);
+        assert_eq!(predictive_half_width(f64::NAN, 64.0), 0.0);
+        // Fewer than one effective sample must not shrink the interval.
+        assert_eq!(predictive_half_width(0.05, 0.25), 0.05);
+        assert_eq!(predictive_half_width(0.05, f64::NAN), 0.05);
+    }
+
+    #[test]
+    fn a_model_with_no_recent_evidence_is_dormant_rather_than_immature() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let mut accumulating = mature_model(now, LOCAL_ID);
+        accumulating.evidence_mass = 2.0;
+        let mut dormant = mature_model(now, LOCAL_ID);
+        dormant.evidence_mass = 2.0;
+        // Eight days: past one evidence half-life, still inside the 14-day
+        // staleness limit, so the only thing that changes is the reason.
+        dormant.last_observed_unix = now - 8 * 24 * 60 * 60;
+        let models = BTreeMap::from([
+            ("boost:Accumulating".to_string(), accumulating),
+            ("boost:Dormant".to_string(), dormant),
+        ]);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &models, 1);
+
+        let breakdown = model.utility_readiness_breakdown();
+        assert_eq!(breakdown.known, 2);
+        assert_eq!(
+            breakdown.immature, 1,
+            "only the model still receiving evidence counts as maturing"
+        );
+        assert_eq!(
+            breakdown.dormant, 1,
+            "a model that stopped receiving evidence must not be reported as \
+             learning in progress"
+        );
+        assert_eq!(breakdown.stale, 0, "dormancy is not staleness");
+    }
+
+    #[test]
+    fn dormancy_renames_the_reason_without_changing_the_readiness_verdict() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        // Enough mass that eight days of decay still clears MIN_UTILITY_EVIDENCE.
+        let mut rested = mature_model(now, LOCAL_ID);
+        rested.evidence_mass = 64.0;
+        rested.utility_ema = 0.12;
+        rested.last_observed_unix = now - 8 * 24 * 60 * 60;
+        let models = BTreeMap::from([("boost:Rested".to_string(), rested)]);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &models, 1);
+
+        let breakdown = model.utility_readiness_breakdown();
+        assert_eq!(
+            breakdown.ready, 1,
+            "dormancy must never demote a model that still clears the evidence bar"
+        );
+        assert_eq!(breakdown.dormant, 0);
+        assert_eq!(model.utility_ready_actions(), 1);
+    }
+
+    #[test]
+    fn a_dormant_model_reactivates_when_fresh_evidence_arrives() {
+        let now = Utc::now().timestamp();
+        let context = m4_context(now);
+        let mut model_stats = mature_model(now, LOCAL_ID);
+        model_stats.evidence_mass = 2.0;
+        model_stats.last_observed_unix = now - 8 * 24 * 60 * 60;
+        let dormant_models = BTreeMap::from([("boost:Sleeper".to_string(), model_stats.clone())]);
+        let mut model = WorldModel::default();
+        attach_view(&mut model, Some(&context), &dormant_models, 1);
+        assert_eq!(model.utility_readiness_breakdown().dormant, 1);
+
+        // The scenario reappears: one fresh observation is enough to put the
+        // model back on the maturing path without any threshold moving.
+        model_stats.last_observed_unix = now;
+        model_stats.evidence_mass = 3.0;
+        let woken = BTreeMap::from([("boost:Sleeper".to_string(), model_stats)]);
+        attach_view_at_revision(&mut model, Some(&context), &woken, 2, 2);
+
+        let breakdown = model.utility_readiness_breakdown();
+        assert_eq!(breakdown.dormant, 0, "fresh evidence must reactivate it");
+        assert_eq!(breakdown.immature, 1);
+    }
+
+    #[test]
     fn readiness_inventory_accounts_for_every_known_utility_model() {
         let now = Utc::now().timestamp();
         let context = m4_context(now);
@@ -2412,6 +2600,7 @@ mod tests {
             breakdown.ready
                 + breakdown.no_current_gold
                 + breakdown.immature
+                + breakdown.dormant
                 + breakdown.low_quality
                 + breakdown.stale
                 + breakdown.foreign_installation

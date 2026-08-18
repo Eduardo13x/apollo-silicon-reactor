@@ -380,6 +380,18 @@ impl ActionModelStats {
         (self.evidence_mass * decay).clamp(0.0, ACTION_MODEL_EVIDENCE_CAP)
     }
 
+    /// A model whose newest observation predates one full evidence half-life is
+    /// no longer accumulating: at least half its authority has already decayed
+    /// and nothing is refilling it. Reported apart from immaturity so a census
+    /// cannot present a dormant model as one that is patiently maturing.
+    pub fn is_dormant_at(&self, now_unix: i64) -> bool {
+        if self.last_observed_unix <= 0 {
+            return true;
+        }
+        (now_unix.saturating_sub(self.last_observed_unix)) as f64
+            > ACTION_MODEL_EVIDENCE_HALF_LIFE_SECS
+    }
+
     pub fn effective_state_evidence_at(&self, now_unix: i64) -> f64 {
         if self.last_observed_unix <= 0 || now_unix < self.last_observed_unix {
             return 0.0;
@@ -834,6 +846,55 @@ struct StagedDecisionEpisode {
     cohort_size: u16,
 }
 
+/// Most arms a microexperiment can have measured at once. Two per open pair.
+pub const MAX_LAB_WINDOWS: usize = 64;
+pub const MAX_LAB_SAMPLES: usize = 64;
+/// Cycles past its horizon that an arm window waits for a closing context
+/// before it is abandoned without a sample.
+pub const LAB_WINDOW_GRACE_CYCLES: u64 = 12;
+
+/// One open measurement window for a microexperiment arm.
+///
+/// This is intentionally *not* a `PendingActuatorEvidence`. A lab arm must be
+/// measured without being admitted as evidence: it never touches
+/// `actuator_issued_total`, `family_stats`, `recent_evidence`, the action
+/// models, the calibration store or the causal dynamics model. It reads
+/// telemetry and nothing else.
+#[derive(Debug, Clone)]
+struct LabUtilityWindow {
+    decision_id: u64,
+    objective: ActuatorObjective,
+    opened_cycle: u64,
+    horizon_cycles: u64,
+    deadline_cycle: u64,
+    before: TelemetryContextSummary,
+}
+
+/// Raw local utility observed across one arm's window.
+///
+/// The value is deliberately **not** counterfactual-adjusted. In a paired
+/// design the complementary arm *is* the counterfactual, so subtracting a
+/// modelled baseline here would discount it twice.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LabUtilitySample {
+    pub decision_id: u64,
+    pub utility_micros: i64,
+    pub resolved_cycle: u64,
+    pub confounded: bool,
+    pub quality: f64,
+}
+
+/// Outcome objective for the two families the experiment catalog admits.
+/// Mirrors `decision_episode_spec` so an arm is scored the same way the
+/// corresponding production action would be.
+fn lab_objective(family: ActuatorFamily) -> Option<ActuatorObjective> {
+    match family {
+        ActuatorFamily::InteractionQos => Some(ActuatorObjective::Responsiveness),
+        ActuatorFamily::MarkovPrewarm => Some(ActuatorObjective::Prediction),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct ExternalActuatorCounters {
@@ -1096,6 +1157,15 @@ pub struct TelemetryMedallionMetrics {
     pub actuator_expired_total: u64,
     pub actuator_mean_quality: f64,
     pub actuator_mean_utility: f64,
+    /// Action-model capacity accounting. `capacity` is the hard ceiling, so a
+    /// `len` that sits on it means every newly observed key destroys a learned
+    /// one — the difference between "still maturing" and "repeatedly reborn".
+    pub action_model_len: u64,
+    pub action_model_capacity: u64,
+    pub action_model_evictions_total: u64,
+    pub action_model_births_total: u64,
+    pub action_model_evidence_updates_total: u64,
+    pub action_model_last_evidence_cycle: u64,
     pub apollo_utility_ema: f64,
     pub decision_credit_sources: u64,
     pub decision_credit_leader_score: f64,
@@ -1112,6 +1182,26 @@ pub struct TelemetryMedallionMetrics {
     pub gpu_prediction_silver_total: u64,
     pub gpu_prediction_gold_total: u64,
     pub gpu_prediction_rejected_total: u64,
+    /// Breakdown of `gpu_prediction_rejected_total`, which conflates a
+    /// capacity eviction, advice nobody consumed, and a Bronze-tier
+    /// calibration refusal. Only the last is a model-quality signal.
+    pub gpu_prediction_evicted_total: u64,
+    pub gpu_prediction_unused_total: u64,
+    pub gpu_prediction_bronze_rejected_total: u64,
+    /// Rejections the breakdown above cannot account for.
+    ///
+    /// `gpu_prediction_rejected_total` is persisted and has accumulated since
+    /// the lane existed. The three buckets were added later and, being
+    /// `#[serde(default)]`, started from zero on the first restore after that
+    /// change — they only classify rejections observed from then on. So the
+    /// buckets provably cannot sum to the aggregate, and reporting them as if
+    /// they did would misattribute the entire pre-breakdown history to
+    /// whichever bucket a reader assumed.
+    ///
+    /// Publishing the remainder keeps the funnel closed by construction and
+    /// makes the unclassifiable tail visible instead of silently absorbed. It
+    /// stays flat while the classified buckets grow.
+    pub gpu_prediction_unclassified_rejections: u64,
     pub gpu_prediction_pending_total: u64,
     pub gpu_prediction_calibrated_models: u64,
     pub gpu_prediction_mean_absolute_error: f64,
@@ -1153,6 +1243,14 @@ pub struct TelemetryMedallionPersisted {
     pub family_stats: BTreeMap<ActuatorFamily, ActuatorFamilyStats>,
     #[serde(default)]
     pub action_models: BTreeMap<String, ActionModelStats>,
+    #[serde(default)]
+    pub action_model_evictions_total: u64,
+    #[serde(default)]
+    pub action_model_births_total: u64,
+    #[serde(default)]
+    pub action_model_evidence_updates_total: u64,
+    #[serde(default)]
+    pub action_model_last_evidence_cycle: u64,
     #[serde(default, deserialize_with = "deserialize_recent_evidence")]
     pub recent_evidence: Vec<ResolvedActuatorEvidence>,
     #[serde(default, deserialize_with = "deserialize_episodic_evidence")]
@@ -1217,6 +1315,12 @@ pub struct TelemetryMedallionPersisted {
     pub gpu_prediction_gold_total: u64,
     #[serde(default)]
     pub gpu_prediction_rejected_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_evicted_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_unused_total: u64,
+    #[serde(default)]
+    pub gpu_prediction_bronze_rejected_total: u64,
 }
 
 struct BoundedEvidenceVisitor<const MAX: usize>(PhantomData<ResolvedActuatorEvidence>);
@@ -1286,9 +1390,21 @@ pub struct TelemetryMedallion {
     last_cycle: u64,
     latest: Option<TelemetryContextSummary>,
     pending_actions: VecDeque<PendingActuatorEvidence>,
+    /// Microexperiment arm windows. Deliberately separate from
+    /// `pending_actions`: a lab arm is measured, never admitted as evidence.
+    lab_windows: VecDeque<LabUtilityWindow>,
+    lab_samples: VecDeque<LabUtilitySample>,
+    lab_windows_expired_total: u64,
     family_stats: BTreeMap<ActuatorFamily, ActuatorFamilyStats>,
     action_models: BTreeMap<String, ActionModelStats>,
     action_models_revision: u64,
+    /// Capacity accounting for `action_models`. Eviction at `MAX_ACTION_MODELS`
+    /// destroys learned evidence, so it is counted rather than silent: a reborn
+    /// key is otherwise indistinguishable from one patiently maturing.
+    action_model_evictions_total: u64,
+    action_model_births_total: u64,
+    action_model_evidence_updates_total: u64,
+    action_model_last_evidence_cycle: u64,
     recent_evidence: VecDeque<ResolvedActuatorEvidence>,
     episodic_evidence: VecDeque<ResolvedActuatorEvidence>,
     new_gold_evidence: VecDeque<ResolvedActuatorEvidence>,
@@ -1327,6 +1443,9 @@ pub struct TelemetryMedallion {
     gpu_prediction_silver_total: u64,
     gpu_prediction_gold_total: u64,
     gpu_prediction_rejected_total: u64,
+    gpu_prediction_evicted_total: u64,
+    gpu_prediction_unused_total: u64,
+    gpu_prediction_bronze_rejected_total: u64,
 }
 
 impl Default for TelemetryMedallion {
@@ -1351,9 +1470,16 @@ impl Default for TelemetryMedallion {
             last_cycle: 0,
             latest: None,
             pending_actions: VecDeque::new(),
+            lab_windows: VecDeque::new(),
+            lab_samples: VecDeque::new(),
+            lab_windows_expired_total: 0,
             family_stats: BTreeMap::new(),
             action_models: BTreeMap::new(),
             action_models_revision: 0,
+            action_model_evictions_total: 0,
+            action_model_births_total: 0,
+            action_model_evidence_updates_total: 0,
+            action_model_last_evidence_cycle: 0,
             recent_evidence: VecDeque::new(),
             episodic_evidence: VecDeque::new(),
             new_gold_evidence: VecDeque::new(),
@@ -1392,6 +1518,9 @@ impl Default for TelemetryMedallion {
             gpu_prediction_silver_total: 0,
             gpu_prediction_gold_total: 0,
             gpu_prediction_rejected_total: 0,
+            gpu_prediction_evicted_total: 0,
+            gpu_prediction_unused_total: 0,
+            gpu_prediction_bronze_rejected_total: 0,
         }
     }
 }
@@ -1474,6 +1603,8 @@ impl TelemetryMedallion {
             {
                 self.gpu_prediction_rejected_total =
                     self.gpu_prediction_rejected_total.saturating_add(1);
+                self.gpu_prediction_evicted_total =
+                    self.gpu_prediction_evicted_total.saturating_add(1);
             }
             self.gpu_predictions.push_back(GpuPredictionEvidence {
                 generation: result.generation,
@@ -1512,6 +1643,20 @@ impl TelemetryMedallion {
         admitted
     }
 
+    /// Rejections that predate the per-reason breakdown, so the funnel is
+    /// closed by construction: evicted + unused + bronze_rejected +
+    /// unclassified == rejected_total, always.
+    ///
+    /// Saturating rather than asserting: the restore path clamps each bucket
+    /// to the aggregate independently, so a hostile or truncated checkpoint
+    /// must not be able to panic the daemon here.
+    fn gpu_prediction_unclassified_rejections(&self) -> u64 {
+        self.gpu_prediction_rejected_total
+            .saturating_sub(self.gpu_prediction_evicted_total)
+            .saturating_sub(self.gpu_prediction_unused_total)
+            .saturating_sub(self.gpu_prediction_bronze_rejected_total)
+    }
+
     fn expire_unused_gpu_predictions(&mut self, cycle: u64) {
         self.gpu_same_cycle_consumed
             .retain(|(authorized_cycle, _, _)| *authorized_cycle >= cycle);
@@ -1524,6 +1669,7 @@ impl TelemetryMedallion {
             prediction.resolved_cycle = Some(cycle);
             self.gpu_prediction_rejected_total =
                 self.gpu_prediction_rejected_total.saturating_add(1);
+            self.gpu_prediction_unused_total = self.gpu_prediction_unused_total.saturating_add(1);
         }
     }
 
@@ -1682,6 +1828,8 @@ impl TelemetryMedallion {
         if calibration_tier == EvidenceTier::Bronze {
             self.gpu_prediction_rejected_total =
                 self.gpu_prediction_rejected_total.saturating_add(1);
+            self.gpu_prediction_bronze_rejected_total =
+                self.gpu_prediction_bronze_rejected_total.saturating_add(1);
             return;
         }
         let signed_error = evidence.net_utility_delta - prediction.mean_gain;
@@ -1795,6 +1943,9 @@ impl TelemetryMedallion {
             external_deltas.markov_misses,
             external_deltas.interaction_reverts,
         );
+        // Measured against the same admitted context as production evidence,
+        // but kept out of every learning aggregate.
+        self.resolve_lab_windows(&summary, cycle);
 
         let root_cohort_size = applied_root_actions.len();
         let mut issued_this_cycle = (root_cohort_size as u64).saturating_add(staged_issued);
@@ -2689,18 +2840,32 @@ impl TelemetryMedallion {
             keys.push(format!("{}|{}", evidence.workload, parent));
         }
         keys.push(format!("{}:*", evidence.family.as_str()));
+        let now_unix = evidence.resolved_timestamp_unix;
         for key in keys {
-            if !self.action_models.contains_key(&key)
-                && self.action_models.len() >= MAX_ACTION_MODELS
-            {
+            let unseen = !self.action_models.contains_key(&key);
+            if unseen && self.action_models.len() >= MAX_ACTION_MODELS {
+                // Rank eviction by decayed evidence — the same currency the
+                // readiness gate spends. Raw `observations` never decay, so
+                // ranking by them keeps long-dead models resident forever while
+                // destroying the young ones that are actually accumulating.
                 if let Some(evict) = self
                     .action_models
                     .iter()
-                    .min_by_key(|(_, stats)| (stats.observations, stats.last_cycle))
+                    .min_by(|left, right| {
+                        left.1
+                            .effective_evidence_at(now_unix)
+                            .total_cmp(&right.1.effective_evidence_at(now_unix))
+                            .then(left.1.last_cycle.cmp(&right.1.last_cycle))
+                    })
                     .map(|(key, _)| key.clone())
                 {
                     self.action_models.remove(&evict);
+                    self.action_model_evictions_total =
+                        self.action_model_evictions_total.saturating_add(1);
                 }
+            }
+            if unseen {
+                self.action_model_births_total = self.action_model_births_total.saturating_add(1);
             }
             let model = self.action_models.entry(key).or_default();
             let previous_mean = model.utility_ema;
@@ -2760,6 +2925,9 @@ impl TelemetryMedallion {
             model.hardware_regime = evidence.hardware_regime;
             model.installation_id = evidence.installation_id;
         }
+        self.action_model_evidence_updates_total =
+            self.action_model_evidence_updates_total.saturating_add(1);
+        self.action_model_last_evidence_cycle = evidence.resolved_cycle;
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
     }
 
@@ -2871,6 +3039,12 @@ impl TelemetryMedallion {
             } else {
                 (self.actuator_utility_sum / self.actuator_resolved_total as f64).clamp(-1.0, 1.0)
             },
+            action_model_len: self.action_models.len() as u64,
+            action_model_capacity: MAX_ACTION_MODELS as u64,
+            action_model_evictions_total: self.action_model_evictions_total,
+            action_model_births_total: self.action_model_births_total,
+            action_model_evidence_updates_total: self.action_model_evidence_updates_total,
+            action_model_last_evidence_cycle: self.action_model_last_evidence_cycle,
             apollo_utility_ema: self.apollo_utility_ema.clamp(-1.0, 1.0),
             decision_credit_sources: self.decision_source_stats.len() as u64,
             decision_credit_leader_score: decision_credit_leader
@@ -2911,6 +3085,10 @@ impl TelemetryMedallion {
             gpu_prediction_silver_total: self.gpu_prediction_silver_total,
             gpu_prediction_gold_total: self.gpu_prediction_gold_total,
             gpu_prediction_rejected_total: self.gpu_prediction_rejected_total,
+            gpu_prediction_evicted_total: self.gpu_prediction_evicted_total,
+            gpu_prediction_unused_total: self.gpu_prediction_unused_total,
+            gpu_prediction_bronze_rejected_total: self.gpu_prediction_bronze_rejected_total,
+            gpu_prediction_unclassified_rejections: self.gpu_prediction_unclassified_rejections(),
             gpu_prediction_pending_total: self
                 .gpu_predictions
                 .iter()
@@ -3212,6 +3390,104 @@ impl TelemetryMedallion {
         self.new_gold_evidence.drain(..).collect()
     }
 
+    /// Start measuring one microexperiment arm over its horizon.
+    ///
+    /// Returns `false` — and records nothing — when there is no admitted
+    /// context to measure against, the family is outside the experiment
+    /// catalog, the decision is already being measured, or the bounded window
+    /// set is full. Opening a window grants no authority and performs no
+    /// action; it only remembers a telemetry snapshot.
+    pub fn open_lab_utility_window(
+        &mut self,
+        decision_id: u64,
+        family: ActuatorFamily,
+        horizon_cycles: u64,
+        cycle: u64,
+    ) -> bool {
+        if decision_id == 0 || horizon_cycles == 0 || self.lab_windows.len() >= MAX_LAB_WINDOWS {
+            return false;
+        }
+        let Some(objective) = lab_objective(family) else {
+            return false;
+        };
+        let Some(before) = self.latest.clone() else {
+            return false;
+        };
+        if self
+            .lab_windows
+            .iter()
+            .any(|window| window.decision_id == decision_id)
+        {
+            return false;
+        }
+        let deadline_cycle = cycle
+            .saturating_add(horizon_cycles)
+            .saturating_add(LAB_WINDOW_GRACE_CYCLES);
+        self.lab_windows.push_back(LabUtilityWindow {
+            decision_id,
+            objective,
+            opened_cycle: cycle,
+            horizon_cycles,
+            deadline_cycle,
+            before,
+        });
+        true
+    }
+
+    /// Hand over arm measurements closed since the previous call. Like the Gold
+    /// queue this is never persisted, so a restart cannot replay a stale
+    /// measurement as fresh experimental evidence.
+    pub fn drain_lab_utility(&mut self) -> Vec<LabUtilitySample> {
+        self.lab_samples.drain(..).collect()
+    }
+
+    pub fn lab_windows_open(&self) -> usize {
+        self.lab_windows.len()
+    }
+
+    pub fn lab_windows_expired_total(&self) -> u64 {
+        self.lab_windows_expired_total
+    }
+
+    /// Close every arm window that reached its horizon, and drop the ones that
+    /// ran past their grace deadline without a closing context.
+    fn resolve_lab_windows(&mut self, after: &TelemetryContextSummary, cycle: u64) {
+        if self.lab_windows.is_empty() {
+            return;
+        }
+        let mut retained = VecDeque::with_capacity(self.lab_windows.len());
+        while let Some(window) = self.lab_windows.pop_front() {
+            if cycle > window.deadline_cycle {
+                self.lab_windows_expired_total = self.lab_windows_expired_total.saturating_add(1);
+                continue;
+            }
+            if cycle < window.opened_cycle.saturating_add(window.horizon_cycles) {
+                retained.push_back(window);
+                continue;
+            }
+            let before_utility = utility_score(window.objective, &window.before);
+            let after_utility = utility_score(window.objective, after);
+            let raw_delta = (after_utility - before_utility).clamp(-1.0, 1.0);
+            let quality = context_quality(&window.before).min(context_quality(after));
+            let confounded = !raw_delta.is_finite()
+                || quality < 0.85
+                || window.before.workload != after.workload
+                || (window.before.thermal_score - after.thermal_score).abs() > 0.34
+                || after.operation_failures_total > window.before.operation_failures_total;
+            if self.lab_samples.len() >= MAX_LAB_SAMPLES {
+                self.lab_samples.pop_front();
+            }
+            self.lab_samples.push_back(LabUtilitySample {
+                decision_id: window.decision_id,
+                utility_micros: (finite_or_zero(raw_delta) * 1_000_000.0) as i64,
+                resolved_cycle: cycle,
+                confounded,
+                quality,
+            });
+        }
+        self.lab_windows = retained;
+    }
+
     pub fn snapshot(&self) -> TelemetryMedallionPersisted {
         if let Some(quarantined) = &self.quarantined_future_state {
             return quarantined.as_ref().clone();
@@ -3232,6 +3508,10 @@ impl TelemetryMedallion {
             pending_actions: self.pending_actions.iter().cloned().collect(),
             family_stats: self.family_stats.clone(),
             action_models: self.action_models.clone(),
+            action_model_evictions_total: self.action_model_evictions_total,
+            action_model_births_total: self.action_model_births_total,
+            action_model_evidence_updates_total: self.action_model_evidence_updates_total,
+            action_model_last_evidence_cycle: self.action_model_last_evidence_cycle,
             recent_evidence: self.recent_evidence.iter().cloned().collect(),
             episodic_evidence: self.episodic_evidence.iter().cloned().collect(),
             external_counters: self.external_counters.clone(),
@@ -3264,6 +3544,9 @@ impl TelemetryMedallion {
             gpu_prediction_silver_total: self.gpu_prediction_silver_total,
             gpu_prediction_gold_total: self.gpu_prediction_gold_total,
             gpu_prediction_rejected_total: self.gpu_prediction_rejected_total,
+            gpu_prediction_evicted_total: self.gpu_prediction_evicted_total,
+            gpu_prediction_unused_total: self.gpu_prediction_unused_total,
+            gpu_prediction_bronze_rejected_total: self.gpu_prediction_bronze_rejected_total,
         }
     }
 
@@ -3382,6 +3665,10 @@ impl TelemetryMedallion {
             })
             .take(MAX_ACTION_MODELS)
             .collect();
+        self.action_model_evictions_total = state.action_model_evictions_total;
+        self.action_model_births_total = state.action_model_births_total;
+        self.action_model_evidence_updates_total = state.action_model_evidence_updates_total;
+        self.action_model_last_evidence_cycle = state.action_model_last_evidence_cycle;
         self.recent_evidence = state
             .recent_evidence
             .into_iter()
@@ -3621,11 +3908,26 @@ impl TelemetryMedallion {
                 .gpu_prediction_rejected_total
                 .saturating_add(abandoned)
                 .min(self.gpu_prediction_bronze_total);
+            // Predictions abandoned by the restart were never consumed, so
+            // they belong to the unused bucket.
+            self.gpu_prediction_evicted_total = state
+                .gpu_prediction_evicted_total
+                .min(self.gpu_prediction_rejected_total);
+            self.gpu_prediction_unused_total = state
+                .gpu_prediction_unused_total
+                .saturating_add(abandoned)
+                .min(self.gpu_prediction_rejected_total);
+            self.gpu_prediction_bronze_rejected_total = state
+                .gpu_prediction_bronze_rejected_total
+                .min(self.gpu_prediction_rejected_total);
         } else {
             self.gpu_prediction_bronze_total = 0;
             self.gpu_prediction_silver_total = 0;
             self.gpu_prediction_gold_total = 0;
             self.gpu_prediction_rejected_total = 0;
+            self.gpu_prediction_evicted_total = 0;
+            self.gpu_prediction_unused_total = 0;
+            self.gpu_prediction_bronze_rejected_total = 0;
         }
         if !same_origin {
             for evidence in &mut self.recent_evidence {
@@ -3671,6 +3973,9 @@ impl TelemetryMedallion {
             self.gpu_prediction_silver_total = 0;
             self.gpu_prediction_gold_total = 0;
             self.gpu_prediction_rejected_total = 0;
+            self.gpu_prediction_evicted_total = 0;
+            self.gpu_prediction_unused_total = 0;
+            self.gpu_prediction_bronze_rejected_total = 0;
         }
         self.action_models_revision = self.action_models_revision.wrapping_add(1);
         self.controlled_models_revision = self.controlled_models_revision.wrapping_add(1);
@@ -4724,6 +5029,56 @@ mod tests {
 
     const LOCAL_ID: InstallationId = InstallationId(0x1020_3040_5060_7080);
 
+    /// Every GPU rejection must land in exactly one bucket, including the ones
+    /// that predate the buckets existing.
+    ///
+    /// `gpu_prediction_rejected_total` is persisted and has counted since the
+    /// lane shipped. The three per-reason buckets were added later as
+    /// `#[serde(default)]` fields, so on the first restore after that change
+    /// they began at zero against an aggregate already in the hundreds of
+    /// thousands — production read 261,296 rejected against 16,253 classified.
+    /// A reader summing the buckets silently attributes the 245,043-event gap
+    /// to whichever bucket they assumed.
+    ///
+    /// The remainder is therefore published rather than derived by the reader,
+    /// and the funnel closes by construction.
+    #[test]
+    fn gpu_rejection_buckets_and_the_pre_breakdown_remainder_close_the_funnel() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        // A checkpoint written before the breakdown existed: the aggregate
+        // carries history the buckets never saw.
+        medallion.gpu_prediction_rejected_total = 261_296;
+        medallion.gpu_prediction_evicted_total = 0;
+        medallion.gpu_prediction_unused_total = 16_049;
+        medallion.gpu_prediction_bronze_rejected_total = 204;
+
+        let unclassified = medallion.gpu_prediction_unclassified_rejections();
+
+        assert_eq!(unclassified, 245_043);
+        assert_eq!(
+            medallion.gpu_prediction_evicted_total
+                + medallion.gpu_prediction_unused_total
+                + medallion.gpu_prediction_bronze_rejected_total
+                + unclassified,
+            medallion.gpu_prediction_rejected_total,
+            "the four buckets must partition the aggregate exactly"
+        );
+    }
+
+    /// The restore path clamps each bucket to the aggregate independently, so
+    /// a truncated or hostile checkpoint can present buckets that oversum.
+    /// That must saturate to zero, never underflow into a vast bogus count.
+    #[test]
+    fn oversummed_gpu_buckets_saturate_instead_of_wrapping() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.gpu_prediction_rejected_total = 10;
+        medallion.gpu_prediction_evicted_total = 8;
+        medallion.gpu_prediction_unused_total = 8;
+        medallion.gpu_prediction_bronze_rejected_total = 8;
+
+        assert_eq!(medallion.gpu_prediction_unclassified_rejections(), 0);
+    }
+
     fn snapshot() -> SystemSnapshot {
         SystemSnapshot {
             timestamp: Utc::now(),
@@ -4866,6 +5221,111 @@ mod tests {
             natural_drift: 0.0,
             arousal_level: 0.5,
         })
+    }
+
+    #[test]
+    fn a_lab_arm_window_is_measured_without_touching_any_learning_aggregate() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        // A window can only be opened against an admitted Gold context.
+        observe(&mut medallion, 1, &outcomes, &runtime);
+
+        let before = medallion.metrics();
+        let before_resolved = medallion.actuator_resolved_total;
+        let before_issued = medallion.actuator_issued_total;
+        let before_rejected = medallion.actuator_rejected_total;
+        let before_recent = medallion.recent_evidence.len();
+        let before_family = medallion
+            .family_stats
+            .get(&ActuatorFamily::InteractionQos)
+            .cloned()
+            .unwrap_or_default();
+
+        assert!(medallion.open_lab_utility_window(991, ActuatorFamily::InteractionQos, 3, 1));
+        assert_eq!(medallion.lab_windows_open(), 1);
+
+        // Before the horizon there is nothing to hand back.
+        observe(&mut medallion, 2, &outcomes, &runtime);
+        assert!(medallion.drain_lab_utility().is_empty());
+
+        observe(&mut medallion, 4, &outcomes, &runtime);
+        let samples = medallion.drain_lab_utility();
+        assert_eq!(samples.len(), 1);
+        assert_eq!(samples[0].decision_id, 991);
+        assert_eq!(samples[0].resolved_cycle, 4);
+        assert!(medallion.drain_lab_utility().is_empty(), "drains once");
+        assert_eq!(medallion.lab_windows_open(), 0);
+
+        // Nothing about the learning pipeline moved because of the arm.
+        assert_eq!(medallion.actuator_issued_total, before_issued);
+        assert_eq!(medallion.actuator_resolved_total, before_resolved);
+        assert_eq!(medallion.actuator_rejected_total, before_rejected);
+        assert_eq!(medallion.recent_evidence.len(), before_recent);
+        assert_eq!(
+            medallion
+                .family_stats
+                .get(&ActuatorFamily::InteractionQos)
+                .cloned()
+                .unwrap_or_default(),
+            before_family
+        );
+        let after = medallion.metrics();
+        assert_eq!(after.actuator_gold_total, before.actuator_gold_total);
+        assert_eq!(after.actuator_silver_total, before.actuator_silver_total);
+        assert!(medallion.drain_new_gold_evidence().is_empty());
+        assert_eq!(medallion.authoritative_gold_decision_count(), 0);
+    }
+
+    #[test]
+    fn lab_windows_are_bounded_deduplicated_and_catalogue_only() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        observe(
+            &mut medallion,
+            1,
+            &ExecuteOutcomes::default(),
+            &healthy_runtime(),
+        );
+
+        // Uncatalogued family, zero identity and zero horizon are refused.
+        assert!(!medallion.open_lab_utility_window(1, ActuatorFamily::Boost, 3, 1));
+        assert!(!medallion.open_lab_utility_window(0, ActuatorFamily::InteractionQos, 3, 1));
+        assert!(!medallion.open_lab_utility_window(2, ActuatorFamily::InteractionQos, 0, 1));
+
+        assert!(medallion.open_lab_utility_window(3, ActuatorFamily::MarkovPrewarm, 5, 1));
+        assert!(
+            !medallion.open_lab_utility_window(3, ActuatorFamily::MarkovPrewarm, 5, 1),
+            "one window per decision identity"
+        );
+
+        for id in 100..(100 + MAX_LAB_WINDOWS as u64 + 8) {
+            medallion.open_lab_utility_window(id, ActuatorFamily::InteractionQos, 5, 1);
+        }
+        assert!(medallion.lab_windows_open() <= MAX_LAB_WINDOWS);
+    }
+
+    #[test]
+    fn a_lab_window_past_its_grace_deadline_expires_without_a_sample() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        assert!(medallion.open_lab_utility_window(77, ActuatorFamily::InteractionQos, 3, 1));
+
+        let past_deadline = 1 + 3 + LAB_WINDOW_GRACE_CYCLES + 1;
+        observe(&mut medallion, past_deadline, &outcomes, &runtime);
+        assert!(medallion.drain_lab_utility().is_empty());
+        assert_eq!(medallion.lab_windows_open(), 0);
+        assert_eq!(medallion.lab_windows_expired_total(), 1);
+    }
+
+    #[test]
+    fn a_lab_window_without_an_admitted_context_is_refused() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        assert!(
+            !medallion.open_lab_utility_window(5, ActuatorFamily::InteractionQos, 3, 1),
+            "no admitted telemetry context yet"
+        );
     }
 
     fn local_episode(
@@ -5679,6 +6139,219 @@ mod tests {
             confounder_count: 0,
             target_present_after: None,
         }
+    }
+
+    /// Fills `action_models` to the hard ceiling with recently useful models so
+    /// the next unseen key is forced to evict something.
+    fn saturate_action_models(
+        medallion: &mut TelemetryMedallion,
+        now_unix: i64,
+        hardware: HardwareRegime,
+    ) {
+        while medallion.action_models.len() < MAX_ACTION_MODELS {
+            let key = format!("filler:{}", medallion.action_models.len());
+            medallion.action_models.insert(
+                key,
+                ActionModelStats {
+                    observations: 40,
+                    evidence_mass: 40.0,
+                    quality_ema: 0.95,
+                    last_cycle: 500,
+                    last_observed_unix: now_unix,
+                    hardware_regime: hardware,
+                    installation_id: LOCAL_ID,
+                    ..ActionModelStats::default()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn a_saturated_map_evicts_the_decayed_model_not_the_young_active_one() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        // A model that was busy long ago and has since decayed to nothing. Its
+        // raw `observations` stay high forever because they never decay.
+        medallion.action_models.insert(
+            "zombie:Ancient".to_string(),
+            ActionModelStats {
+                observations: 5_000,
+                evidence_mass: ACTION_MODEL_EVIDENCE_CAP,
+                quality_ema: 0.95,
+                last_cycle: 1,
+                last_observed_unix: now_unix - 60 * 24 * 60 * 60,
+                hardware_regime: hardware,
+                installation_id: LOCAL_ID,
+                ..ActionModelStats::default()
+            },
+        );
+        // A model observed moments ago that is genuinely accumulating evidence.
+        medallion.action_models.insert(
+            "young:Active".to_string(),
+            ActionModelStats {
+                observations: 3,
+                evidence_mass: 3.0,
+                quality_ema: 0.95,
+                last_cycle: 999,
+                last_observed_unix: now_unix,
+                hardware_regime: hardware,
+                installation_id: LOCAL_ID,
+                ..ActionModelStats::default()
+            },
+        );
+        saturate_action_models(&mut medallion, now_unix, hardware);
+        assert_eq!(medallion.action_models.len(), MAX_ACTION_MODELS);
+
+        let zombie_evidence = medallion
+            .action_models
+            .get("zombie:Ancient")
+            .unwrap()
+            .effective_evidence_at(now_unix);
+        let young_evidence = medallion
+            .action_models
+            .get("young:Active")
+            .unwrap()
+            .effective_evidence_at(now_unix);
+        assert!(
+            zombie_evidence < young_evidence,
+            "the decayed model must carry less usable evidence: {zombie_evidence} vs {young_evidence}"
+        );
+
+        let mut evidence = gold_evidence("boost:Fresh", 0.1, now_unix, hardware);
+        evidence.workload = "general".to_string();
+        medallion.update_action_model(&evidence);
+
+        assert!(
+            medallion.action_models.contains_key("young:Active"),
+            "a young model that is actively accumulating evidence must not be \
+             evicted in favour of one whose evidence has fully decayed"
+        );
+        assert!(
+            !medallion.action_models.contains_key("zombie:Ancient"),
+            "the decayed model is the correct eviction victim"
+        );
+    }
+
+    #[test]
+    fn evicting_a_learned_model_is_counted_rather_than_silent() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        saturate_action_models(&mut medallion, now_unix, hardware);
+        assert_eq!(medallion.metrics().action_model_evictions_total, 0);
+
+        let mut evidence = gold_evidence("boost:Fresh", 0.1, now_unix, hardware);
+        evidence.workload = "general".to_string();
+        medallion.update_action_model(&evidence);
+
+        let metrics = medallion.metrics();
+        assert_eq!(
+            metrics.action_model_len, metrics.action_model_capacity,
+            "the map stays pinned at its ceiling"
+        );
+        assert!(
+            metrics.action_model_evictions_total > 0,
+            "destroying learned evidence must be observable, not silent"
+        );
+        assert!(
+            metrics.action_model_births_total > 0,
+            "the replacement key must be counted as a birth"
+        );
+    }
+
+    #[test]
+    fn evidence_updates_record_when_the_world_model_last_made_progress() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        assert_eq!(medallion.metrics().action_model_evidence_updates_total, 0);
+        assert_eq!(medallion.metrics().action_model_last_evidence_cycle, 0);
+
+        let mut evidence = gold_evidence("boost:Editor", 0.1, now_unix, hardware);
+        evidence.resolved_cycle = 4_242;
+        medallion.update_action_model(&evidence);
+
+        let metrics = medallion.metrics();
+        assert_eq!(metrics.action_model_evidence_updates_total, 1);
+        assert_eq!(metrics.action_model_last_evidence_cycle, 4_242);
+    }
+
+    #[test]
+    fn state_written_before_capacity_accounting_existed_still_loads() {
+        // The deployed daemon persisted no capacity counters. Loading that file
+        // must succeed and start the counters cold rather than refusing state.
+        let legacy = serde_json::json!({
+            "actuator_evidence_schema_version": ACTUATOR_EVIDENCE_SCHEMA_VERSION,
+            "context_schema_version": TELEMETRY_CONTEXT_SCHEMA_VERSION,
+            "action_models": {
+                "boost:Editor": { "observations": 20, "evidence_mass": 20.0 }
+            }
+        });
+        let persisted: TelemetryMedallionPersisted =
+            serde_json::from_value(legacy).expect("legacy state must deserialize");
+        assert_eq!(persisted.action_model_evictions_total, 0);
+        assert_eq!(persisted.action_model_births_total, 0);
+        assert_eq!(persisted.action_model_evidence_updates_total, 0);
+        assert_eq!(persisted.action_model_last_evidence_cycle, 0);
+
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        medallion.restore(persisted);
+        assert!(medallion.action_models().contains_key("boost:Editor"));
+        assert_eq!(
+            medallion.metrics().action_model_capacity,
+            MAX_ACTION_MODELS as u64
+        );
+    }
+
+    #[test]
+    fn capacity_accounting_survives_the_persistence_round_trip() {
+        let now_unix = 1_900_000_000;
+        let hardware = HardwareRegime {
+            p_core_count: 4,
+            e_core_count: 6,
+            ram_gib: 16,
+        };
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        saturate_action_models(&mut medallion, now_unix, hardware);
+        let mut evidence = gold_evidence("boost:Fresh", 0.1, now_unix, hardware);
+        evidence.workload = "general".to_string();
+        medallion.update_action_model(&evidence);
+        let before = medallion.metrics();
+        assert!(before.action_model_evictions_total > 0);
+
+        let mut restored = TelemetryMedallion::new(LOCAL_ID);
+        restored.restore(medallion.snapshot());
+        let after = restored.metrics();
+
+        assert_eq!(
+            after.action_model_evictions_total, before.action_model_evictions_total,
+            "capacity pressure history must survive restart"
+        );
+        assert_eq!(
+            after.action_model_births_total,
+            before.action_model_births_total
+        );
+        assert_eq!(
+            after.action_model_evidence_updates_total,
+            before.action_model_evidence_updates_total
+        );
+        assert_eq!(
+            after.action_model_last_evidence_cycle,
+            before.action_model_last_evidence_cycle
+        );
     }
 
     #[test]

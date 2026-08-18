@@ -358,6 +358,68 @@ fn capture_acceleration_forecasts(
     forecasts
 }
 
+/// Decline one interaction QoS lease so the lab can observe a control window.
+///
+/// Returns `None` — and changes nothing — unless every one of these holds:
+/// the lab published an open control arm for this exact catalogued action, the
+/// exploration scheduler admits a `Control` candidate under the same gates the
+/// treatment path uses, and the commit succeeds. The result is a withhold: no
+/// syscall, no lease, no kernel state, and one `NoOp` decision event carrying
+/// the control metadata the endpoint adapter needs.
+fn withhold_interaction_lease_for_control(
+    exploration_scheduler: &mut apollo_engine::engine::exploration_scheduler::ExplorationScheduler,
+    gates: &apollo_engine::engine::exploration_scheduler::ExplorationGates,
+    now: apollo_engine::engine::exploration_scheduler::TimePoint,
+    root_pid: u32,
+    cycle: u64,
+) -> Option<CycleDecisionEvents> {
+    use apollo_engine::engine::microexperiment_actions::{parse_action_key, ActionVariant};
+    use apollo_engine::engine::microexperiment_endpoints::{
+        control_withhold_requested, record_control_withhold,
+    };
+
+    let arm = exploration_scheduler.interaction_arm();
+    let band = match arm {
+        ExplorationArm::InteractionQosShort => ActionVariant::Short,
+        ExplorationArm::InteractionQosStandard => ActionVariant::Standard,
+        ExplorationArm::InteractionQosLong => ActionVariant::Long,
+        _ => return None,
+    };
+    let action_key = format!("interaction_qos:foreground@{}", band.as_str());
+    let action = parse_action_key(&action_key).ok()?;
+    if !control_withhold_requested(action) {
+        return None;
+    }
+    let candidate = ExplorationCandidate::new(
+        ActuatorFamily::InteractionQos,
+        ExplorationMode::Control,
+        arm,
+        ActionClass::InteractionForeground,
+        ExplorationContext::Interactive,
+        exploration_scheduler.origin(),
+    )
+    .ok()?;
+    let approval = exploration_scheduler.request(&candidate, gates, now).ok()?;
+    let metadata = exploration_scheduler.commit_metadata(
+        approval.metadata.correlation,
+        now,
+        CommitEvidence::OmissionEndpointOpened,
+    )?;
+    record_control_withhold();
+    let mut events = CycleDecisionEvents::default();
+    events.push(
+        acceleration_event(
+            &action_key,
+            root_pid,
+            cycle,
+            ActuatorDecisionOutcome::NoOp,
+            "control arm: acceleration lease deliberately withheld",
+        )
+        .with_exploration(metadata),
+    );
+    Some(events)
+}
+
 fn acceleration_event(
     action_key: &str,
     pid: u32,
@@ -1324,6 +1386,12 @@ fn acquire_acceleration_lease(
     let ledger_ttl = ttl.saturating_add(LEDGER_GRACE);
     let mut identity_skips = 0u64;
     let mut capability_skips = 0u64;
+    // capability_skips stays the sum for compatibility; these two split it by
+    // cause. task_for_pid denial (SIP / hardened runtime) and a task port that
+    // accepts the call but does not mutate are different problems.
+    let mut task_port_denied = 0u64;
+    let mut qos_write_rejected = 0u64;
+    let mut qos_write_error: Option<String> = None;
     let mut nice_fallbacks = 0u64;
     let mut nice_failures = 0u64;
     let mut conflict_skips = 0u64;
@@ -1499,9 +1567,16 @@ fn acquire_acceleration_lease(
                     policy_lease = Some(lease);
                 } else {
                     capability_skips = capability_skips.saturating_add(1);
+                    qos_write_rejected = qos_write_rejected.saturating_add(1);
+                    // Keep the kern_return visible. Diagnosing this from the
+                    // counter alone cost two wrong root causes.
+                    if let Some(error) = outcome.error.as_deref() {
+                        qos_write_error = Some(error.to_string());
+                    }
                 }
             } else {
                 capability_skips = capability_skips.saturating_add(1);
+                task_port_denied = task_port_denied.saturating_add(1);
                 decision_events.push(acceleration_member_event(
                     candidate.pid,
                     &candidate.name,
@@ -1618,6 +1693,17 @@ fn acquire_acceleration_lease(
             .metrics
             .acceleration_lease_capability_skips_total
             .saturating_add(capability_skips);
+        metrics.metrics.acceleration_lease_task_port_denied_total = metrics
+            .metrics
+            .acceleration_lease_task_port_denied_total
+            .saturating_add(task_port_denied);
+        metrics.metrics.acceleration_lease_qos_write_rejected_total = metrics
+            .metrics
+            .acceleration_lease_qos_write_rejected_total
+            .saturating_add(qos_write_rejected);
+        if let Some(error) = qos_write_error {
+            metrics.metrics.acceleration_lease_qos_write_error = error;
+        }
         metrics.metrics.acceleration_lease_nice_fallbacks_total = metrics
             .metrics
             .acceleration_lease_nice_fallbacks_total
@@ -1863,6 +1949,21 @@ fn update_acceleration_lease_inner(
             let (request_gates, request_now) = exploration_environment();
             let gates =
                 acceleration_target_gates(request_gates, &selection, identity.as_ref(), snapshots);
+            // Control arm: when the Microexperiment Lab has an open control
+            // window for exactly this action, decline the lease this once so
+            // the withheld outcome becomes observable. This performs no effect,
+            // still passes every exploration gate, budget and cooldown, and is
+            // skipped entirely when the mask is empty.
+            if let Some(events) = withhold_interaction_lease_for_control(
+                exploration_scheduler,
+                &gates,
+                request_now,
+                selection_root_pid,
+                cycle,
+            ) {
+                decision_events.extend_buffer(&events);
+                return decision_events;
+            }
             let mut exploration_approval = ExplorationCandidate::new(
                 ActuatorFamily::InteractionQos,
                 ExplorationMode::Treatment,

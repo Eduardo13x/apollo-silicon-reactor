@@ -540,7 +540,166 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub browser_lcp_p95_ms: Option<f64>,
     #[serde(default)]
-    pub browser_inp_p95_ms: Option<f64>,
+    /// Tail of individual `PerformanceEventTiming.duration` values above the
+    /// collector's 40 ms threshold — **not** INP. INP is a high percentile over
+    /// interactions grouped by `interactionId`; this is a max over single
+    /// entries, blind to fast interactions and rounded to 8 ms by the browser.
+    /// Renamed from `browser_inp_p95_ms` (schema discontinuity: the two series
+    /// are not comparable and must not be joined).
+    pub browser_event_duration_tail_ms: Option<f64>,
+    /// True INP estimate. Populated only once the collector groups by
+    /// `interactionId`; `None` means the corrected path has not reported yet.
+    #[serde(default)]
+    pub browser_inp_estimate_ms: Option<f64>,
+    /// Interactions (not entries) behind `browser_inp_estimate_ms`.
+    #[serde(default)]
+    pub browser_interaction_samples: u64,
+    /// Interactions the bounded collector refused to track.
+    #[serde(default)]
+    pub browser_interactions_dropped: u64,
+    /// Where interaction time goes. Cumulative milliseconds across the observed
+    /// interactions — the split, not the magnitude, is the diagnostic: OS-level
+    /// actuators can only plausibly move input delay and presentation.
+    #[serde(default)]
+    pub browser_input_delay_total_ms: u64,
+    #[serde(default)]
+    pub browser_processing_total_ms: u64,
+    #[serde(default)]
+    pub browser_presentation_total_ms: u64,
+    /// Transport cost, browser clock, content script → native post. Contains
+    /// the MV3 service-worker cold start. This is the measurement that decides
+    /// whether any per-interaction fast path could ever exist.
+    #[serde(default)]
+    pub webflow_transport_client_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub webflow_transport_sw_wake_p95_ms: Option<f64>,
+    #[serde(default)]
+    pub webflow_transport_cold_starts: u64,
+    #[serde(default)]
+    pub webflow_transport_samples: u64,
+    #[serde(default)]
+    pub webflow_transport_max_queue_depth: u32,
+    /// Producer negotiation. Exists so a zero interaction count always carries
+    /// its cause: a stale v1 extension, an uninterpretable schema and a silent
+    /// browser are otherwise indistinguishable.
+    #[serde(default)]
+    pub webflow_extension_status: String,
+    #[serde(default)]
+    pub webflow_extension_version: String,
+    #[serde(default)]
+    pub webflow_accepted_v1_total: u64,
+    #[serde(default)]
+    pub webflow_accepted_v2_total: u64,
+    #[serde(default)]
+    pub webflow_schema_rejected_total: u64,
+    #[serde(default)]
+    pub webflow_last_event_at_ms: u64,
+    #[serde(default)]
+    pub webflow_capabilities_bits: u32,
+    /// Phase 0B observational state. None of it grants causal authority: these
+    /// are counts of what was seen, and the classification names what the
+    /// window supports saying rather than what caused it.
+    #[serde(default)]
+    pub perceptual_episodes_stored: u64,
+    #[serde(default)]
+    pub perceptual_episodes_rejected: u64,
+    #[serde(default)]
+    pub perceptual_correlation_unique: u64,
+    #[serde(default)]
+    pub perceptual_correlation_ambiguous: u64,
+    #[serde(default)]
+    pub perceptual_correlation_unmatched: u64,
+    #[serde(default)]
+    pub perceptual_regimes_total: u64,
+    #[serde(default)]
+    pub perceptual_regime_class: String,
+    #[serde(default)]
+    pub perceptual_regime_level: String,
+    #[serde(default)]
+    pub perceptual_regime_interactions: u32,
+    #[serde(default)]
+    pub perceptual_regime_actionable: u32,
+    #[serde(default)]
+    pub perceptual_regime_dominant_family: String,
+    #[serde(default)]
+    pub perceptual_regime_median_total_ms: u32,
+    /// Source-agnostic perceptual layer. These describe observations from every
+    /// producer; per-source figures like INP stay in their own adapter section
+    /// because no other source can produce them.
+    #[serde(default)]
+    pub perceptual_sources_active: u32,
+    /// Lifetime count, persisted across restarts. Distinct from
+    /// `perceptual_store_len`, which is how many are resident right now: a
+    /// bounded store means the two diverge, and reading the lifetime figure as
+    /// the store size makes a restart look like it gained observations.
+    #[serde(default)]
+    pub perceptual_observations_total: u64,
+    #[serde(default)]
+    pub perceptual_store_len: u32,
+    #[serde(default)]
+    pub perceptual_store_capacity: u32,
+    #[serde(default)]
+    pub perceptual_instrumented_total: u64,
+    #[serde(default)]
+    pub perceptual_inferred_total: u64,
+    #[serde(default)]
+    pub perceptual_windows_total: u64,
+    #[serde(default)]
+    pub perceptual_valid_total: u64,
+    #[serde(default)]
+    pub perceptual_invalid_total: u64,
+    /// Mean overall quality on a 0..=1000 scale, weakest-link per observation.
+    ///
+    /// Aggregate across every modality, so it moves with the evidence *mix*:
+    /// a burst of low-precision windows pulls it down while instrumented
+    /// episodes are unchanged. Prefer the per-modality figures below when
+    /// judging whether measurement actually got worse.
+    #[serde(default)]
+    pub perceptual_quality_q: u16,
+    /// Per-modality quality with the resident count behind each figure.
+    /// `None` means that modality has no resident observations — absence, not
+    /// a quality of zero. Counts are resident, so they pair with the means
+    /// above and never with the lifetime `*_total` counters.
+    #[serde(default)]
+    pub perceptual_quality_instrumented_q: Option<u16>,
+    #[serde(default)]
+    pub perceptual_quality_instrumented_n: u32,
+    #[serde(default)]
+    pub perceptual_quality_inferred_q: Option<u16>,
+    #[serde(default)]
+    pub perceptual_quality_inferred_n: u32,
+    #[serde(default)]
+    pub perceptual_quality_window_q: Option<u16>,
+    #[serde(default)]
+    pub perceptual_quality_window_n: u32,
+    /// Stratified observational association. Correlation, never causation: the
+    /// dashboard prints CAUSAL UNTESTED beside it for exactly that reason.
+    #[serde(default)]
+    pub perceptual_assoc_family: String,
+    #[serde(default)]
+    pub perceptual_assoc_verdict: String,
+    #[serde(default)]
+    pub perceptual_assoc_delta_ms: i32,
+    #[serde(default)]
+    pub perceptual_assoc_component: String,
+    #[serde(default)]
+    pub perceptual_assoc_samples_with: u32,
+    #[serde(default)]
+    pub perceptual_assoc_samples_without: u32,
+    #[serde(default)]
+    pub perceptual_assoc_confidence_q: u16,
+    #[serde(default)]
+    pub perceptual_assoc_actionable: bool,
+    /// One sanitized record per modality, as JSON. Bounded to two by
+    /// construction, carries hashes and closed categories only, and exists so
+    /// the shape reaching the store can be inspected without a new RPC.
+    #[serde(default)]
+    pub perceptual_sample_instrumented: String,
+    #[serde(default)]
+    pub perceptual_sample_window: String,
+    /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
+    /// p95 over a full window are very different claims, and reading one as
+    /// the other already produced a bogus 120000ms LCP once.
     #[serde(default)]
     pub browser_latency_samples: u64,
     /// Cycle-local decision events dropped by bounded producer/merge buffers.
@@ -670,6 +829,30 @@ pub struct RuntimeMetrics {
     pub value_scheduler_capacity_skips_total: u64,
     #[serde(default)]
     pub value_scheduler_invalid_samples_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_unhealthy_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_sequence_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_features_total: u64,
+    #[serde(default)]
+    pub value_scheduler_invalid_publication_total: u64,
+    /// Which gate refused the control sample. Sums to
+    /// `value_scheduler_invalid_unhealthy_total` with no unclassified residue.
+    #[serde(default)]
+    pub value_scheduler_unhealthy_pressure_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_thermal_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_profile_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_p95_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_latency_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_kill_switch_total: u64,
+    #[serde(default)]
+    pub value_scheduler_unhealthy_sleeping_total: u64,
     /// Operational heterogeneous-compute telemetry. These fields are not AIS
     /// evidence and cannot authorize actions.
     #[serde(default)]
@@ -710,10 +893,22 @@ pub struct RuntimeMetrics {
     pub coreml_model_available: bool,
     #[serde(default)]
     pub coreml_requested_backend: String,
+    /// Compute units Core ML accepted at model load — a *configuration*.
+    /// Named `effective` until it was found to read as "where inference ran",
+    /// which no macOS API reports. See `coreml_ane_observation` for what is
+    /// actually known about execution.
     #[serde(default)]
-    pub coreml_effective_backend: String,
+    pub coreml_configured_backend: String,
+    /// Execution-evidence status for the Neural Engine, one of
+    /// `unsupported` / `unavailable` / `measured-idle` / `measured-active`.
+    ///
+    /// Replaces a `bool` that could not tell "we never implemented the
+    /// observation" apart from "we measured it and the ANE stayed idle". Core
+    /// ML routes each inference itself without publishing the unit it chose,
+    /// so `unsupported` is the honest steady state on this platform, and a
+    /// consumer must never read it as evidence either way.
     #[serde(default)]
-    pub coreml_ane_execution_measured: bool,
+    pub coreml_ane_observation: String,
     #[serde(default)]
     pub coreml_circuit_state: String,
     #[serde(default)]
@@ -732,6 +927,20 @@ pub struct RuntimeMetrics {
     /// Pair Gold counts only fully closed local control/treatment pairs.
     #[serde(default)]
     pub microexperiment_phase: String,
+    #[serde(default)]
+    pub microexperiment_rollout_progress: u64,
+    #[serde(default)]
+    pub microexperiment_rollout_required: u64,
+    /// Boot-scoped provenance for `microexperiment_rollout_progress`. A gate
+    /// counter that fell backwards across a restart cannot be diagnosed from
+    /// the counter alone: these separate "the persisted value was low" from
+    /// "a runtime reset discarded it", and name the reset reason.
+    #[serde(default)]
+    pub microexperiment_restored_progress_at_boot: u64,
+    #[serde(default)]
+    pub microexperiment_progress_resets_total: u64,
+    #[serde(default)]
+    pub microexperiment_last_progress_reset_reason: String,
     #[serde(default)]
     pub microexperiment_blocker: String,
     #[serde(default)]
@@ -770,6 +979,59 @@ pub struct RuntimeMetrics {
     pub microexperiment_synthetic_quarantined_total: u64,
     #[serde(default)]
     pub microexperiment_mean_effect: f64,
+    /// Endpoint-wire observability. Every rejection reason has its own counter
+    /// so a stalled circuit names its own cause instead of collapsing into one
+    /// generic "blocked" total.
+    #[serde(default)]
+    pub microexperiment_endpoint_contract_ready: bool,
+    #[serde(default)]
+    pub microexperiment_arms_registered_total: u64,
+    #[serde(default)]
+    pub microexperiment_episodes_observed_total: u64,
+    #[serde(default)]
+    pub microexperiment_episodes_skipped_idle_total: u64,
+    #[serde(default)]
+    pub microexperiment_uncatalogued_episodes_total: u64,
+    #[serde(default)]
+    pub microexperiment_decisions_bound_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoints_emitted_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoints_pending_utility: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_action_mismatch_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_unknown_arm_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_duplicate_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_expired_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_epoch_rejected_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_authority_rejected_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_incomplete_metadata_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_capacity_drops_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_arms_expired_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_rollback_observed_total: u64,
+    #[serde(default)]
+    pub microexperiment_endpoint_rollback_failed_total: u64,
+    #[serde(default)]
+    pub microexperiment_control_withholds_total: u64,
+    #[serde(default)]
+    pub microexperiment_invalidated_total: u64,
+    #[serde(default)]
+    pub microexperiment_deadline_expired_total: u64,
+    /// Arms that expired without ever reporting. Counted apart from canary
+    /// failures: absence of data is not adverse data.
+    #[serde(default)]
+    pub microexperiment_unbound_expiries_total: u64,
+    #[serde(default)]
+    pub microexperiment_rollback_failed_total: u64,
     #[serde(default)]
     pub metrics_disk_writes_total: u64,
     #[serde(default)]
@@ -777,7 +1039,6 @@ pub struct RuntimeMetrics {
     pub refresh_duration_ms: f64,
     pub memory_budget_duration_ms: f64,
     pub reactor_duration_ms: f64,
-    pub lock_wait_duration_ms: f64,
     pub throttle_reverted: u64,
     pub reactor_pulses: u64,
     pub effective_profile: OptimizationProfile,
@@ -1010,6 +1271,14 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub acceleration_lease_capability_skips_total: u64,
     #[serde(default)]
+    pub acceleration_lease_task_port_denied_total: u64,
+    #[serde(default)]
+    pub acceleration_lease_qos_write_rejected_total: u64,
+    /// Last kern_return text from a rejected task QoS write, so the cause is
+    /// diagnosable without journal access.
+    #[serde(default)]
+    pub acceleration_lease_qos_write_error: String,
+    #[serde(default)]
     pub acceleration_lease_nice_fallbacks_total: u64,
     #[serde(default)]
     pub acceleration_lease_nice_failures_total: u64,
@@ -1194,8 +1463,6 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub parallel_worker_qos_failures: u64,
     #[serde(default)]
-    pub invalid_sysctl_value_denied: u64,
-    #[serde(default)]
     pub journal_rotations: u64,
     #[serde(default)]
     pub journal_rotation_failures: u64,
@@ -1353,6 +1620,23 @@ pub struct RuntimeMetrics {
     pub ioreport_gpu_pct: f64,
     #[serde(default)]
     pub ioreport_ane_busy: bool,
+    /// Whether IOReport produced a snapshot at all this cycle.
+    ///
+    /// IOReport is deprecated on macOS 26+, where the subscription requires
+    /// Apple-private entitlements a third-party binary cannot hold. Without a
+    /// snapshot the cluster and GPU percentages below are written as zeros —
+    /// this is what separates those placeholders from a genuinely idle
+    /// machine, and no consumer should read them without checking it.
+    #[serde(default)]
+    pub ioreport_available: bool,
+    /// IOReport's view of the Neural Engine as an explicit status:
+    /// `unavailable` (no ANE channel in this subscription), `measured-idle`,
+    /// or `measured-active`.
+    ///
+    /// `ioreport_ane_busy` alone keeps its `false` default when no channel is
+    /// published, so it reads identically to a genuinely idle accelerator.
+    #[serde(default)]
+    pub ioreport_ane_observation: String,
     #[serde(default)]
     pub ioreport_cpu_mw: f64,
     #[serde(default)]
@@ -1988,6 +2272,21 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub world_model_gpu_rejected_total: u64,
     #[serde(default)]
+    pub world_model_gpu_evicted_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_unused_total: u64,
+    #[serde(default)]
+    pub world_model_gpu_bronze_rejected_total: u64,
+    /// Rejections older than the per-reason breakdown. Non-zero means the
+    /// three buckets above describe only part of `world_model_gpu_rejected_total`;
+    /// they and this field partition it exactly.
+    ///
+    /// Every `world_model_gpu_*` counter is lifetime-cumulative (persisted in
+    /// `telemetry_medallion_state`), unlike the per-boot `gpu_imagination_*`
+    /// family. Ratios across the two families are meaningless.
+    #[serde(default)]
+    pub world_model_gpu_unclassified_rejections: u64,
+    #[serde(default)]
     pub world_model_gpu_pending_total: u64,
     #[serde(default)]
     pub world_model_gpu_calibrated_models: u64,
@@ -2009,6 +2308,10 @@ pub struct RuntimeMetrics {
     pub world_model_readiness_no_gold: u64,
     #[serde(default)]
     pub world_model_readiness_immature: u64,
+    /// Immature *and* no longer accumulating. Split out of `immature` so an
+    /// inactive model is never presented as learning in progress.
+    #[serde(default)]
+    pub world_model_readiness_dormant: u64,
     #[serde(default)]
     pub world_model_readiness_low_quality: u64,
     #[serde(default)]
@@ -2019,6 +2322,23 @@ pub struct RuntimeMetrics {
     pub world_model_readiness_hardware: u64,
     #[serde(default)]
     pub world_model_readiness_uncertain: u64,
+    /// Action-model capacity. When `len` sits on `capacity`, every newly
+    /// observed key destroys a learned one, so a key can be reborn instead of
+    /// maturing. Evictions and births make that pressure countable.
+    #[serde(default)]
+    pub world_model_action_model_len: u64,
+    #[serde(default)]
+    pub world_model_action_model_capacity: u64,
+    #[serde(default)]
+    pub world_model_action_model_evictions_total: u64,
+    #[serde(default)]
+    pub world_model_action_model_births_total: u64,
+    /// Evidence actually reaching action models, and the cycle of the newest
+    /// one. Distinguishes "nothing is arriving" from "arriving but blocked".
+    #[serde(default)]
+    pub world_model_evidence_updates_total: u64,
+    #[serde(default)]
+    pub world_model_last_evidence_cycle: u64,
     #[serde(default)]
     pub world_model_family_known_models: u64,
     #[serde(default)]
@@ -2242,6 +2562,8 @@ pub struct RuntimeMetrics {
     pub world_model_abstention_unknown_total: u64,
     #[serde(default)]
     pub world_model_abstention_immature_total: u64,
+    #[serde(default)]
+    pub world_model_abstention_dormant_total: u64,
     #[serde(default)]
     pub world_model_abstention_quality_total: u64,
     #[serde(default)]

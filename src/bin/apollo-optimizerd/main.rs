@@ -1324,12 +1324,14 @@ fn main() -> anyhow::Result<()> {
             > = None;
             let mut restored_local_consolidator: Option<LocalConsolidator> = None;
             let mut restored_microexperiment_lab = None;
+            let mut restored_perceptual_store = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
                 restored_local_consolidator = learned.local_consolidator.clone();
                 restored_microexperiment_lab = learned.microexperiment_lab.clone();
+                restored_perceptual_store = learned.perceptual_store.clone();
                 if let Some(persisted) = learned.exploration_scheduler.clone() {
                     let (restored, disposition) =
                         apollo_engine::engine::exploration_scheduler::ExplorationScheduler::restore(
@@ -1677,6 +1679,37 @@ fn main() -> anyhow::Result<()> {
             value_scheduler_runtime.connect_handoff_jobs(&[
                 apollo_engine::engine::value_scheduler::JobId::HardwarePrediction,
             ]);
+            // Phase 0B observatory. Observes only: it never emits an action,
+            // grants credit or promotes to Gold.
+            let mut perceptual_observatory =
+                apollo_engine::engine::perceptual_regime::PerceptualObservatory::new();
+            // Agnostic core plus its two live adapters. Observational only.
+            // Restored evidence keeps its provenance: nothing gains confidence
+            // by surviving a restart, and an unknown schema is discarded rather
+            // than reinterpreted.
+            let mut perceptual_store = restored_perceptual_store.map_or_else(
+                apollo_engine::engine::perceptual::PerceptualObservationStore::new,
+                apollo_engine::engine::perceptual::PerceptualObservationStore::restore,
+            );
+            let mut chromium_adapter =
+                apollo_engine::engine::chromium_perceptual_adapter::ChromiumWebFlowAdapter::new();
+            let mut macos_adapter =
+                apollo_engine::engine::perceptual::adapters::macos_observer::
+                    MacOsGenericObservationAdapter::new(
+                        apollo_engine::engine::perceptual::PerceptualId::new([0xA1; 16])
+                            .expect("static observer id"),
+                    );
+            let mut perceptual_last_interactions: u64 = 0;
+            // An association moves only over many samples; recomputing it more
+            // often buys nothing and costs the loop.
+            const PERCEPTUAL_ASSOC_CADENCE_EVENTS: u32 = 32;
+            const PERCEPTUAL_ASSOC_WINDOW: usize = 128;
+            let mut perceptual_assoc_countdown: u32 = 1;
+            let mut perceptual_associations: Vec<
+                apollo_engine::engine::perceptual_regime::ObservationalAssociation,
+            > = Vec::new();
+            let mut perceptual_last_contention =
+                apollo_engine::engine::perceptual_regime::ContentionSnapshot::default();
             let mut webflow_runtime = webflow_tick::WebFlowRuntime::new(
                 apollo_engine::engine::webflow_controller::WebFlowRolloutPhase::Shadow,
             );
@@ -2603,6 +2636,93 @@ fn main() -> anyhow::Result<()> {
                     rollback_failures_total: webflow_rollback_failures,
                     protected_actions_total: 0,
                 });
+                {
+                    use apollo_engine::engine::perceptual::adapters::PerceptualAdapter as _;
+                    use apollo_engine::engine::perceptual::types::MonotonicMillis;
+                    use apollo_engine::engine::perceptual_regime as perc;
+
+                    // The browser adapter translates the vitals events the
+                    // WebFlow contract already validated.
+                    for received in &webflow_events {
+                        if let Some(envelope) = chromium_adapter.to_envelope(&received.event) {
+                            for observation in chromium_adapter
+                                .normalize(envelope, MonotonicMillis(webflow_now_ms))
+                            {
+                                perceptual_store.record(observation);
+                            }
+                        }
+                    }
+                    perceptual_store.expire(webflow_now_ms);
+                    // Recompute the with/without comparison on a cadence over a
+                    // bounded tail. Doing it per event cloned the whole store —
+                    // observations and a contention snapshot each, both carrying
+                    // heap fields — which measured as roughly +5% cycle p95.
+                    // An association needs many samples to move at all, so it
+                    // gains nothing from running on every one of them.
+                    perceptual_assoc_countdown = perceptual_assoc_countdown.saturating_sub(1);
+                    if perceptual_assoc_countdown == 0 {
+                        perceptual_assoc_countdown = PERCEPTUAL_ASSOC_CADENCE_EVENTS;
+                        let tail = perceptual_store
+                            .len()
+                            .saturating_sub(PERCEPTUAL_ASSOC_WINDOW);
+                        let joined: Vec<perc::PerceptualRegimeEvidence> = perceptual_store
+                            .iter()
+                            .skip(tail)
+                            .map(|observation| perc::PerceptualRegimeEvidence {
+                                observation: observation.clone(),
+                                contention: perceptual_last_contention.clone(),
+                            })
+                            .collect();
+                        perceptual_associations = perc::associate_by_contender(&joined);
+                    }
+                }
+                // One window sample per vitals report that carried new
+                // interactions. The extension reports per-page aggregates, so a
+                // sample summarises a window rather than a single interaction.
+                if webflow_output.interaction_count > perceptual_last_interactions {
+                    use apollo_engine::engine::perceptual_regime as perc;
+                    perceptual_last_interactions = webflow_output.interaction_count;
+                    let processes: Vec<(u32, String, f64, u32)> = snapshot
+                        .top_processes
+                        .iter()
+                        .map(|p| (p.pid, p.name.clone(), f64::from(p.cpu_usage), 2))
+                        .collect();
+                    let contention = perc::snapshot_from_processes(
+                        perc::stable_name_hash(foreground_app.as_deref().unwrap_or_default()),
+                        &processes,
+                        |name| {
+                            // Exactly the vetoes the actuator itself applies, so
+                            // "actionable" means the same thing on both sides.
+                            if apollo_engine::engine::safety::is_boost_forbidden(name) {
+                                Some(perc::IneligibilityReason::BrowserFamily)
+                            } else if apollo_engine::engine::decide_actions::is_interactive_app_name(
+                                name,
+                            ) {
+                                Some(perc::IneligibilityReason::Interactive)
+                            } else {
+                                None
+                            }
+                        },
+                        f64::from(snapshot.cpu.global_usage),
+                        snapshot.pressure.memory_pressure,
+                        &snapshot.pressure.thermal_level,
+                    );
+                    perceptual_observatory.record(perc::PerceptualInteractionEpisode::from_window(
+                        webflow_now_ms,
+                        u64::from(webflow_output.interaction_count as u32),
+                        webflow_output.input_delay_total_ms.min(u64::from(u32::MAX)) as u32,
+                        webflow_output.processing_total_ms.min(u64::from(u32::MAX)) as u32,
+                        webflow_output
+                            .presentation_total_ms
+                            .min(u64::from(u32::MAX)) as u32,
+                        webflow_output
+                            .transport_client_segment_p95_ms
+                            .map(|v| v as u32),
+                        contention,
+                    ));
+                    perceptual_observatory.expire(webflow_now_ms);
+                    perceptual_observatory.segment();
+                }
                 let networkflow_output =
                     networkflow_runtime.tick(networkflow_tick::NetworkFlowCycleInput {
                         now_ms: webflow_now_ms,
@@ -2639,6 +2759,153 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.webflow_proposed_total = webflow_output.counters.proposed;
                     metrics.metrics.webflow_admitted_total = webflow_output.counters.admitted;
                     metrics.metrics.webflow_skipped_total = webflow_output.counters.skipped;
+                    // The extension already reports LCP/INP inside
+                    // WebFlowMetrics; before this these fields stayed None
+                    // forever because nothing copied them out.
+                    metrics.metrics.browser_lcp_p95_ms = webflow_output.lcp_p95_ms;
+                    metrics.metrics.browser_event_duration_tail_ms =
+                        webflow_output.event_duration_tail_ms;
+                    metrics.metrics.browser_inp_estimate_ms = webflow_output.inp_estimate_ms;
+                    metrics.metrics.browser_interaction_samples = webflow_output.interaction_count;
+                    metrics.metrics.browser_interactions_dropped =
+                        webflow_output.interactions_dropped;
+                    metrics.metrics.browser_input_delay_total_ms =
+                        webflow_output.input_delay_total_ms;
+                    metrics.metrics.browser_processing_total_ms =
+                        webflow_output.processing_total_ms;
+                    metrics.metrics.browser_presentation_total_ms =
+                        webflow_output.presentation_total_ms;
+                    metrics.metrics.webflow_transport_client_p95_ms =
+                        webflow_output.transport_client_segment_p95_ms;
+                    metrics.metrics.webflow_transport_sw_wake_p95_ms =
+                        webflow_output.transport_sw_wake_p95_ms;
+                    metrics.metrics.webflow_transport_cold_starts =
+                        webflow_output.transport_cold_starts;
+                    metrics.metrics.webflow_transport_samples = webflow_output.transport_samples;
+                    metrics.metrics.webflow_transport_max_queue_depth =
+                        webflow_output.transport_max_queue_depth;
+                    metrics.metrics.webflow_extension_status =
+                        webflow_output.extension_status.short().to_string();
+                    metrics.metrics.webflow_extension_version =
+                        webflow_output.extension_version.clone().unwrap_or_default();
+                    metrics.metrics.webflow_accepted_v1_total = webflow_output.accepted_v1_total;
+                    metrics.metrics.webflow_accepted_v2_total = webflow_output.accepted_v2_total;
+                    metrics.metrics.webflow_schema_rejected_total =
+                        webflow_output.schema_rejected_total;
+                    metrics.metrics.webflow_last_event_at_ms = webflow_output.last_event_at_ms;
+                    metrics.metrics.webflow_capabilities_bits = webflow_output.capabilities_bits;
+                    {
+                        // Agnostic core counters, published beside the 0B ones.
+                        let store_metrics = perceptual_store.metrics;
+                        metrics.metrics.perceptual_sources_active =
+                            perceptual_store.active_sources() as u32;
+                        metrics.metrics.perceptual_observations_total = store_metrics.stored_total;
+                        metrics.metrics.perceptual_store_len = perceptual_store.len() as u32;
+                        metrics.metrics.perceptual_store_capacity =
+                            apollo_engine::engine::perceptual::store::MAX_OBSERVATIONS as u32;
+                        metrics.metrics.perceptual_instrumented_total =
+                            store_metrics.instrumented_total;
+                        metrics.metrics.perceptual_inferred_total = store_metrics.inferred_total;
+                        metrics.metrics.perceptual_windows_total = store_metrics.window_total;
+                        metrics.metrics.perceptual_valid_total = store_metrics.stored_total;
+                        metrics.metrics.perceptual_invalid_total = store_metrics
+                            .refused_correlation
+                            .saturating_add(store_metrics.refused_capacity);
+                        let modality_q = perceptual_store.quality_by_modality();
+                        metrics.metrics.perceptual_quality_q = modality_q.overall_q.unwrap_or(0);
+                        metrics.metrics.perceptual_quality_instrumented_q =
+                            modality_q.instrumented_q;
+                        metrics.metrics.perceptual_quality_instrumented_n =
+                            modality_q.instrumented_n;
+                        metrics.metrics.perceptual_quality_inferred_q = modality_q.inferred_q;
+                        metrics.metrics.perceptual_quality_inferred_n = modality_q.inferred_n;
+                        metrics.metrics.perceptual_quality_window_q = modality_q.window_q;
+                        metrics.metrics.perceptual_quality_window_n = modality_q.window_n;
+                        // Newest record of each modality, sanitized by the type
+                        // itself: hashes and closed categories, never a name.
+                        //
+                        // Walk backwards and stop once both are found. The
+                        // forward version serialised every observation in the
+                        // store to JSON on each publish and kept two of them,
+                        // which is hundreds of allocations per cycle.
+                        {
+                            use apollo_engine::engine::perceptual::PerceptualObservation as Obs;
+                            let mut want_instrumented =
+                                metrics.metrics.perceptual_sample_instrumented.is_empty();
+                            let mut want_window =
+                                metrics.metrics.perceptual_sample_window.is_empty();
+                            for observation in perceptual_store.iter().rev() {
+                                let slot = match observation {
+                                    Obs::InstrumentedInteraction(_) if want_instrumented => {
+                                        want_instrumented = false;
+                                        Some(&mut metrics.metrics.perceptual_sample_instrumented)
+                                    }
+                                    Obs::PerceptualWindow(_) if want_window => {
+                                        want_window = false;
+                                        Some(&mut metrics.metrics.perceptual_sample_window)
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(slot) = slot {
+                                    *slot = serde_json::to_string(observation)
+                                        .unwrap_or_default()
+                                        .chars()
+                                        .take(600)
+                                        .collect();
+                                }
+                                if !want_instrumented && !want_window {
+                                    break;
+                                }
+                            }
+                        }
+                        // Strongest observed association, if any. Co-occurrence
+                        // only: the dashboard prints CAUSAL UNTESTED beside it.
+                        if let Some(strongest) = perceptual_associations
+                            .iter()
+                            .max_by_key(|a| (a.confidence_q, a.delta_ms.abs()))
+                        {
+                            metrics.metrics.perceptual_assoc_family =
+                                strongest.contender_family.clone();
+                            metrics.metrics.perceptual_assoc_verdict =
+                                strongest.verdict.as_str().to_string();
+                            metrics.metrics.perceptual_assoc_delta_ms = strongest.delta_ms;
+                            metrics.metrics.perceptual_assoc_component = strongest
+                                .worst_component
+                                .map(|k| k.as_str().to_string())
+                                .unwrap_or_default();
+                            metrics.metrics.perceptual_assoc_samples_with = strongest.samples_with;
+                            metrics.metrics.perceptual_assoc_samples_without =
+                                strongest.samples_without;
+                            metrics.metrics.perceptual_assoc_confidence_q = strongest.confidence_q;
+                            metrics.metrics.perceptual_assoc_actionable = strongest.actionable;
+                        }
+                        let counts = perceptual_observatory.correlation_counts();
+                        metrics.metrics.perceptual_episodes_stored =
+                            perceptual_observatory.episode_count() as u64;
+                        metrics.metrics.perceptual_episodes_rejected =
+                            perceptual_observatory.rejected_unusable;
+                        metrics.metrics.perceptual_correlation_unique = counts[0];
+                        metrics.metrics.perceptual_correlation_ambiguous = counts[1];
+                        metrics.metrics.perceptual_correlation_unmatched = counts[2];
+                        let regimes: Vec<_> = perceptual_observatory.regimes().collect();
+                        metrics.metrics.perceptual_regimes_total = regimes.len() as u64;
+                        // The newest regime describes current conditions; older
+                        // ones are history and would misread as "now".
+                        if let Some(current) = regimes.last() {
+                            metrics.metrics.perceptual_regime_class =
+                                current.classification.as_str().to_string();
+                            metrics.metrics.perceptual_regime_level =
+                                current.level.as_str().to_string();
+                            metrics.metrics.perceptual_regime_interactions = current.interactions;
+                            metrics.metrics.perceptual_regime_actionable =
+                                current.actionable_contenders;
+                            metrics.metrics.perceptual_regime_dominant_family =
+                                current.dominant_family.clone().unwrap_or_default();
+                            metrics.metrics.perceptual_regime_median_total_ms =
+                                current.median_total_ms;
+                        }
+                    }
+                    metrics.metrics.browser_latency_samples = webflow_output.vitals_samples;
                     metrics.metrics.network_flow_active = networkflow_output.observation.active;
                     metrics.metrics.network_flow_traffic_bps =
                         networkflow_output.observation.traffic_bps;
@@ -2730,11 +2997,21 @@ fn main() -> anyhow::Result<()> {
                                 .map_or(if interaction_active { 1.0 } else { 0.0 }, |summary| {
                                     summary.interaction_q
                                 }),
+                            // Same normalization the published world feature
+                            // vector already uses, so the model and the
+                            // snapshot agree on what "io pressure" means.
+                            io_pressure: world
+                                .network
+                                .filter(|flow| flow.sample_fresh)
+                                .map_or(0.0, |flow| {
+                                    flow.traffic_bps as f64 / (8.0 * 1024.0 * 1024.0)
+                                }),
                             optional_allowed: value_scheduler_tick::optional_job_allowed(
                                 value_scheduler_active,
                                 overhead_budget.allow_speculation,
                                 hardware_prediction_permit.is_some(),
                             ),
+                            budget_allows_speculation: overhead_budget.allow_speculation,
                             optional_recovery_healthy: !value_scheduler_active
                                 && overhead_input.p95_cycle_ms < 60.0
                                 && overhead_input.reason_avg_ms < 50.0
@@ -2785,6 +3062,28 @@ fn main() -> anyhow::Result<()> {
                         value_metrics.capacity_skips_total;
                     metrics.metrics.value_scheduler_invalid_samples_total =
                         value_metrics.invalid_samples_total;
+                    metrics.metrics.value_scheduler_invalid_unhealthy_total =
+                        value_metrics.invalid_unhealthy_total;
+                    metrics.metrics.value_scheduler_invalid_sequence_total =
+                        value_metrics.invalid_sequence_total;
+                    metrics.metrics.value_scheduler_invalid_features_total =
+                        value_metrics.invalid_features_total;
+                    metrics.metrics.value_scheduler_invalid_publication_total =
+                        value_metrics.invalid_publication_total;
+                    metrics.metrics.value_scheduler_unhealthy_pressure_total =
+                        value_metrics.unhealthy_pressure_total;
+                    metrics.metrics.value_scheduler_unhealthy_thermal_total =
+                        value_metrics.unhealthy_thermal_total;
+                    metrics.metrics.value_scheduler_unhealthy_profile_total =
+                        value_metrics.unhealthy_profile_total;
+                    metrics.metrics.value_scheduler_unhealthy_p95_total =
+                        value_metrics.unhealthy_p95_total;
+                    metrics.metrics.value_scheduler_unhealthy_latency_total =
+                        value_metrics.unhealthy_latency_total;
+                    metrics.metrics.value_scheduler_unhealthy_kill_switch_total =
+                        value_metrics.unhealthy_kill_switch_total;
+                    metrics.metrics.value_scheduler_unhealthy_sleeping_total =
+                        value_metrics.unhealthy_sleeping_total;
                     if let Some(fabric) = fabric_metrics.as_ref() {
                         metrics.metrics.fabric_phase = fabric.phase.clone();
                         metrics.metrics.fabric_blocker = fabric.blocker.clone();
@@ -2806,9 +3105,9 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.fabric_rss_delta_bytes = fabric.rss_delta_bytes;
                         metrics.metrics.coreml_model_available = fabric.coreml_model_available;
                         metrics.metrics.coreml_requested_backend = fabric.coreml_requested.clone();
-                        metrics.metrics.coreml_effective_backend = fabric.coreml_effective.clone();
-                        metrics.metrics.coreml_ane_execution_measured =
-                            fabric.ane_execution_measured;
+                        metrics.metrics.coreml_configured_backend =
+                            fabric.coreml_configured.clone();
+                        metrics.metrics.coreml_ane_observation = fabric.ane_observation.clone();
                         metrics.metrics.coreml_circuit_state = fabric.coreml_circuit.clone();
                         metrics.metrics.temporal_prediction_backend =
                             fabric.prediction_backend.clone();
@@ -2832,7 +3131,13 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.fluidity_degraded,
                     )
                 };
-                let micro_metrics =
+                // Presence of the opt-in file is the only way a pair ever
+                // mutates anything. Absent, the lab stays a Shadow diagnostic.
+                let experiments_opted_in =
+                    Path::new(apollo_engine::engine::daemon_helpers::experiments_opt_in_path())
+                        .exists();
+                let capture_active = screen_capture_cache.check();
+                let micro_output =
                     microexperiment_runtime.tick(microexperiment_tick::MicroexperimentTickInput {
                         cycle: cycle_count,
                         interaction_activations,
@@ -2855,12 +3160,43 @@ fn main() -> anyhow::Result<()> {
                             && !degraded
                             && parallel_runtime.build.expected_profile
                                 == parallel_runtime.build.effective_profile,
+                        experiments_enabled: experiments_opted_in,
+                        // Privacy posture counts as known only once the daemon
+                        // can actually read the sensitive-context signals it
+                        // gates on.
+                        privacy_known: experiments_opted_in,
+                        secure_input: false,
+                        screen_capture: capture_active,
+                        camera_active: user_audio,
+                        sensitive_context: user_call,
                     });
+                let micro_metrics = micro_output.metrics;
+                for gold in &micro_output.pair_gold {
+                    tracing::info!(
+                        action_key = %gold.action_key,
+                        control_decision_id = gold.control_decision_id,
+                        treatment_decision_id = gold.treatment_decision_id,
+                        effect_micros = gold.effect_micros,
+                        effective = gold.effective,
+                        harmful = gold.harmful,
+                        "microexperiment pair gold closed"
+                    );
+                }
                 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.microexperiment_phase = micro_metrics.phase;
+                    metrics.metrics.microexperiment_rollout_progress =
+                        micro_metrics.rollout_progress;
+                    metrics.metrics.microexperiment_rollout_required =
+                        micro_metrics.rollout_required;
                     metrics.metrics.microexperiment_blocker = micro_metrics.blocker;
                     metrics.metrics.microexperiment_restore = micro_metrics.restore;
+                    metrics.metrics.microexperiment_restored_progress_at_boot =
+                        micro_metrics.restored_progress_at_boot;
+                    metrics.metrics.microexperiment_progress_resets_total =
+                        micro_metrics.progress_resets_total;
+                    metrics.metrics.microexperiment_last_progress_reset_reason =
+                        micro_metrics.last_progress_reset_reason;
                     metrics.metrics.microexperiment_proposed_total = micro_metrics.proposed_total;
                     metrics.metrics.microexperiment_eligible_total = micro_metrics.eligible_total;
                     metrics.metrics.microexperiment_randomized_total =
@@ -2887,7 +3223,73 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.microexperiment_synthetic_quarantined_total =
                         micro_metrics.synthetic_quarantined_total;
                     metrics.metrics.microexperiment_mean_effect = micro_metrics.mean_effect;
+                    metrics.metrics.microexperiment_invalidated_total =
+                        micro_metrics.invalidated_total;
+                    metrics.metrics.microexperiment_deadline_expired_total =
+                        micro_metrics.deadline_expired_total;
+                    metrics.metrics.microexperiment_unbound_expiries_total =
+                        micro_metrics.unbound_expiries_total;
+                    metrics.metrics.microexperiment_rollback_failed_total =
+                        micro_metrics.rollback_failed_total;
+
+                    let endpoint = microexperiment_runtime.adapter_counters();
+                    metrics.metrics.microexperiment_endpoint_contract_ready =
+                        microexperiment_runtime.endpoint_contract_ready(cycle_count);
+                    metrics.metrics.microexperiment_arms_registered_total =
+                        endpoint.registered_arms;
+                    metrics.metrics.microexperiment_episodes_observed_total =
+                        endpoint.observed_episodes;
+                    metrics.metrics.microexperiment_episodes_skipped_idle_total =
+                        endpoint.episodes_skipped_idle;
+                    metrics.metrics.microexperiment_uncatalogued_episodes_total =
+                        endpoint.uncatalogued_episodes;
+                    metrics.metrics.microexperiment_decisions_bound_total =
+                        endpoint.bound_decisions;
+                    metrics.metrics.microexperiment_endpoints_emitted_total =
+                        endpoint.emitted_endpoints;
+                    metrics.metrics.microexperiment_endpoints_pending_utility =
+                        endpoint.pending_utility;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_action_mismatch_total =
+                        endpoint.rejected_action_mismatch;
+                    metrics.metrics.microexperiment_endpoint_unknown_arm_total =
+                        endpoint.rejected_unknown_arm;
+                    metrics.metrics.microexperiment_endpoint_duplicate_total =
+                        endpoint.rejected_duplicate;
+                    metrics.metrics.microexperiment_endpoint_expired_total =
+                        endpoint.rejected_expired;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_epoch_rejected_total = endpoint.rejected_epoch;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_authority_rejected_total =
+                        endpoint.rejected_authority;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_incomplete_metadata_total =
+                        endpoint.rejected_incomplete_metadata;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_capacity_drops_total = endpoint.dropped_capacity;
+                    metrics.metrics.microexperiment_endpoint_arms_expired_total =
+                        endpoint.expired_arms;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_rollback_observed_total =
+                        endpoint.rollback_observed;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_rollback_failed_total = endpoint.rollback_failed;
+                    metrics.metrics.microexperiment_control_withholds_total =
+                        apollo_engine::engine::microexperiment_endpoints::control_withholds_total();
                 }
+                // The lab's control requests are advisory only: an actuator may
+                // decline to take a lease, never take one it was not going to.
+                apollo_engine::engine::microexperiment_endpoints::publish_control_withholds(
+                    &microexperiment_runtime.control_withhold_requests(),
+                );
 
                 // FocusMarkov miss check, Markov observe+pre-warm, universal pre-thaw, temporal predictor.
                 // Extracted to daemon_markov_tick::run_markov_tick (Wave 29).
@@ -3648,6 +4050,18 @@ fn main() -> anyhow::Result<()> {
                     // expose cluster fields as unavailable zeros and preserve
                     // package power from the public powermetrics path. Do not
                     // relabel aggregate CPU as P-cluster activity.
+                    // Published unconditionally: derived from the Option, so
+                    // the no-snapshot path — the live one on macOS 26+ — can
+                    // no longer leave the status empty and have it read as
+                    // "no opinion" instead of "the sensor is gone".
+                    metrics.metrics.ioreport_ane_observation =
+                        apollo_engine::engine::ioreport::ane_observation_of(last_ioreport.as_ref())
+                            .to_string();
+                    // Whether the cluster/GPU percentages below are
+                    // measurements at all. The else branch writes zeros the
+                    // comment above already calls "unavailable zeros"; this is
+                    // what tells them apart from a genuinely idle machine.
+                    metrics.metrics.ioreport_available = last_ioreport.is_some();
                     if let Some(ref ir) = last_ioreport {
                         metrics.metrics.ioreport_p_cluster_pct = ir.p_cluster_pct;
                         metrics.metrics.ioreport_e_cluster_pct = ir.e_cluster_pct;
@@ -4583,6 +4997,37 @@ fn main() -> anyhow::Result<()> {
                     {
                         let mut metrics = state.metrics.lock_recover();
                         metrics.metrics.perceptual_latency_score = latency.score;
+                        // Non-browser observer: window statistics only, from
+                        // signals Apollo already collects. No new permission,
+                        // no kernel access, and never a fabricated breakdown.
+                        {
+                            use apollo_engine::engine::perceptual::adapters::macos_observer::ForegroundResponseSample;
+                            use apollo_engine::engine::perceptual::adapters::PerceptualAdapter as _;
+                            use apollo_engine::engine::perceptual::types::MonotonicMillis;
+                            macos_adapter.observe(
+                                ForegroundResponseSample {
+                                    foreground_hash:
+                                        apollo_engine::engine::perceptual_regime::stable_name_hash(
+                                            metrics
+                                                .metrics
+                                                .foreground_app
+                                                .as_ref()
+                                                .map_or("", |app| app.name.as_str()),
+                                        ),
+                                    perceptual_latency_score: f64::from(latency.score),
+                                    fluidity_score: f64::from(metrics.metrics.fluidity_score),
+                                    human_active: latency.score > 0.0,
+                                },
+                                webflow_now_ms,
+                            );
+                            if let Some(envelope) = macos_adapter.close_window(webflow_now_ms) {
+                                for observation in macos_adapter
+                                    .normalize(envelope, MonotonicMillis(webflow_now_ms))
+                                {
+                                    perceptual_store.record(observation);
+                                }
+                            }
+                        }
                         metrics.metrics.perceptual_latency_category =
                             latency.category.as_str().to_string();
                         metrics.metrics.perceptual_latency_source =
@@ -7666,6 +8111,36 @@ fn main() -> anyhow::Result<()> {
                     decision_ledger.ingest_cycle_events(&mut cycle_decision_events);
                 telemetry_medallion.stage_decision_episodes(&resolved_decisions);
 
+                // Endpoint wire, cycle tail. Decisions resolved now reach the
+                // lab on the next cycle; their measured utility arrives later
+                // still, when the medallion resolves that decision to Gold.
+                microexperiment_runtime.observe_decisions(&resolved_decisions, cycle_count);
+                // Each arm that just acquired a real decision identity opens a
+                // measurement window. The medallion measures that window without
+                // admitting it as evidence, so no learning aggregate moves and
+                // the Gold queue keeps belonging to the causal graph above.
+                for binding in microexperiment_runtime.drain_new_bindings() {
+                    telemetry_medallion.open_lab_utility_window(
+                        binding.decision_id,
+                        binding.family,
+                        u64::from(binding.horizon_cycles),
+                        cycle_count,
+                    );
+                }
+                let microexperiment_utilities: Vec<_> = telemetry_medallion
+                    .drain_lab_utility()
+                    .into_iter()
+                    .map(|sample| {
+                        apollo_engine::engine::microexperiment_endpoints::EndpointUtilitySample {
+                            decision_id: sample.decision_id,
+                            utility_micros: sample.utility_micros,
+                            resolved_cycle: sample.resolved_cycle,
+                            confounded: sample.confounded,
+                        }
+                    })
+                    .collect();
+                microexperiment_runtime.observe_utilities(&microexperiment_utilities, cycle_count);
+
                 // Push estado a suscriptores activos (menubar, etc.)
                 socket_handler::broadcast_current_status(&state);
 
@@ -8083,6 +8558,7 @@ fn main() -> anyhow::Result<()> {
                     telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
                     exploration_scheduler: Some(exploration_scheduler.persisted()),
                     microexperiment_lab: Some(microexperiment_runtime.persisted()),
+                    perceptual_store: Some(perceptual_store.persisted()),
                 },
             );
 

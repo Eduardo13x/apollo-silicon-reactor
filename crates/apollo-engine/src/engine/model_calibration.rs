@@ -354,6 +354,13 @@ pub struct CalibrationRecord {
     pub hardware_regime: HardwareRegime,
     pub lifetime_forecast_count: u64,
     pub authority_gold_count: u64,
+    /// Interval outcome tally. Sums to `authority_gold_count` by construction.
+    #[serde(default)]
+    pub interval_contains_total: u64,
+    #[serde(default)]
+    pub interval_misses_low_total: u64,
+    #[serde(default)]
+    pub interval_misses_high_total: u64,
     pub signed_error_ema: f64,
     pub normalized_mae_ema: f64,
     pub coverage_ema: f64,
@@ -1881,6 +1888,17 @@ fn update_record(
         observation.actual_utility >= prediction.expected_utility - prediction.uncertainty
             && observation.actual_utility <= prediction.expected_utility + prediction.uncertainty,
     );
+    // Which side the interval missed on. A narrow-but-centred interval misses
+    // roughly symmetrically; a persistent one-sided miss is bias or a sign
+    // error, and the two need different fixes. contains + low + high is
+    // exactly the number of scored observations.
+    if covered > 0.0 {
+        record.interval_contains_total = record.interval_contains_total.saturating_add(1);
+    } else if observation.actual_utility < prediction.expected_utility - prediction.uncertainty {
+        record.interval_misses_low_total = record.interval_misses_low_total.saturating_add(1);
+    } else {
+        record.interval_misses_high_total = record.interval_misses_high_total.saturating_add(1);
+    }
     let alpha = if record.authority_gold_count == 0 {
         1.0
     } else {
@@ -2358,6 +2376,37 @@ mod tests {
             effective: true,
             provenance,
         }
+    }
+
+    #[test]
+    fn interval_outcomes_reconcile_with_the_scored_observation_count() {
+        let provenance = CalibrationProvenance::default();
+        let mut record = CalibrationRecord::default();
+        let pred = |uncertainty: f64| PredictionRecord {
+            source: "world-model".to_string(),
+            expected_utility: 0.10,
+            uncertainty,
+            horizon_cycles: 30,
+            positive_probability: None,
+            binary_target: None,
+        };
+        // inside, below, above — one of each side of the interval.
+        for actual in [0.10_f64, -0.40, 0.60] {
+            let mut observation =
+                cohort_observation(1, ActuatorFamily::Boost, "boost:Editor", &provenance);
+            observation.actual_utility = actual;
+            update_record(&mut record, &observation, &pred(0.05), 1);
+        }
+        assert_eq!(record.interval_contains_total, 1);
+        assert_eq!(record.interval_misses_low_total, 1);
+        assert_eq!(record.interval_misses_high_total, 1);
+        assert_eq!(
+            record.interval_contains_total
+                + record.interval_misses_low_total
+                + record.interval_misses_high_total,
+            record.authority_gold_count,
+            "every scored observation lands in exactly one bucket"
+        );
     }
 
     #[test]

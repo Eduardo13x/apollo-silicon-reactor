@@ -19,6 +19,87 @@ use crate::adaptive_overhead::OverheadLevel;
 
 const SHADOW_CYCLES_REQUIRED: u64 = 500;
 
+/// Why one control sample was refused, as a single closed reason. The health
+/// gate and the operator-facing blocker used to be derived twice, with
+/// different precedence and different sets: the blocker could not express
+/// `kill_switch` or `sleeping` at all, so a sample refused for either reported
+/// an empty blocker and the reason was unobservable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleHealth {
+    Healthy,
+    PressureStale,
+    ThermalUnavailable,
+    ProfileMismatch,
+    CycleP95,
+    SelectionLatency,
+    KillSwitch,
+    Sleeping,
+}
+
+/// The one place the health gate is evaluated. Precedence is deliberate:
+/// operator-controlled states (kill switch, sleep) outrank sensor gaps, so a
+/// paused or sleeping daemon never reports a misleading sensor fault.
+#[allow(clippy::too_many_arguments)]
+fn classify_sample(
+    pressure_present: bool,
+    thermal_present: bool,
+    profile_matches: bool,
+    p95_cycle_ms: f64,
+    selection_latency_us: u64,
+    kill_switch: bool,
+    sleeping: bool,
+) -> SampleHealth {
+    if kill_switch {
+        SampleHealth::KillSwitch
+    } else if sleeping {
+        SampleHealth::Sleeping
+    } else if !profile_matches {
+        SampleHealth::ProfileMismatch
+    } else if !pressure_present {
+        SampleHealth::PressureStale
+    } else if !thermal_present {
+        SampleHealth::ThermalUnavailable
+    } else if !p95_cycle_ms.is_finite() || p95_cycle_ms >= 75.0 {
+        SampleHealth::CycleP95
+    } else if selection_latency_us > 1_000 {
+        SampleHealth::SelectionLatency
+    } else {
+        SampleHealth::Healthy
+    }
+}
+
+fn unhealthy_slot(health: SampleHealth) -> Option<usize> {
+    match health {
+        SampleHealth::Healthy => None,
+        SampleHealth::PressureStale => Some(0),
+        SampleHealth::ThermalUnavailable => Some(1),
+        SampleHealth::ProfileMismatch => Some(2),
+        SampleHealth::CycleP95 => Some(3),
+        SampleHealth::SelectionLatency => Some(4),
+        SampleHealth::KillSwitch => Some(5),
+        SampleHealth::Sleeping => Some(6),
+    }
+}
+
+impl SampleHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Healthy => "",
+            Self::PressureStale => "pressure-stale",
+            Self::ThermalUnavailable => "thermal-unavailable",
+            Self::ProfileMismatch => "profile-mismatch",
+            Self::CycleP95 => "cycle-p95",
+            Self::SelectionLatency => "selection-latency",
+            Self::KillSwitch => "kill-switch",
+            Self::Sleeping => "sleeping",
+        }
+    }
+
+    pub fn is_healthy(self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ValueSchedulerTickInput<'a> {
     pub cycle: u64,
@@ -67,6 +148,21 @@ pub struct ValueSchedulerTickMetrics {
     pub budget_skips_total: u64,
     pub capacity_skips_total: u64,
     pub invalid_samples_total: u64,
+    /// Breakdown of `invalid_samples_total`, which previously conflated an
+    /// unhealthy control sample with three distinct world-publication faults.
+    pub invalid_unhealthy_total: u64,
+    pub invalid_sequence_total: u64,
+    pub invalid_features_total: u64,
+    pub invalid_publication_total: u64,
+    /// Breakdown of `invalid_unhealthy_total` by the exact gate that refused
+    /// the sample. Sums to `invalid_unhealthy_total` by construction.
+    pub unhealthy_pressure_total: u64,
+    pub unhealthy_thermal_total: u64,
+    pub unhealthy_profile_total: u64,
+    pub unhealthy_p95_total: u64,
+    pub unhealthy_latency_total: u64,
+    pub unhealthy_kill_switch_total: u64,
+    pub unhealthy_sleeping_total: u64,
     pub world_snapshot: Option<Arc<WorldStateSnapshot>>,
 }
 
@@ -77,6 +173,11 @@ pub struct ValueSchedulerRuntime {
     started_at: Instant,
     valid_cycles: u64,
     invalid_samples_total: u64,
+    invalid_unhealthy_total: u64,
+    invalid_sequence_total: u64,
+    invalid_features_total: u64,
+    invalid_publication_total: u64,
+    unhealthy_reasons: [u64; 7],
     last_workload_id: u64,
     process_revision: u64,
     last_thermal_q: Option<u16>,
@@ -128,6 +229,11 @@ impl ValueSchedulerRuntime {
             started_at: Instant::now(),
             valid_cycles: 0,
             invalid_samples_total: 0,
+            invalid_unhealthy_total: 0,
+            invalid_sequence_total: 0,
+            invalid_features_total: 0,
+            invalid_publication_total: 0,
+            unhealthy_reasons: [0; 7],
             last_workload_id: 0,
             process_revision: 1,
             last_thermal_q: None,
@@ -281,6 +387,7 @@ impl ValueSchedulerRuntime {
         let current = self.world_publisher.latest();
         let Some(world_revision) = current.identity.revision.checked_add(1) else {
             self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+            self.invalid_sequence_total = self.invalid_sequence_total.saturating_add(1);
             return self.rejected_metrics("snapshot-sequence-exhausted");
         };
         let features = match FeatureStore::try_new(
@@ -302,6 +409,7 @@ impl ValueSchedulerRuntime {
             Ok(features) => features,
             Err(_) => {
                 self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+                self.invalid_features_total = self.invalid_features_total.saturating_add(1);
                 return self.rejected_metrics("invalid-feature-vector");
             }
         };
@@ -333,6 +441,7 @@ impl ValueSchedulerRuntime {
             Ok(world) => world,
             Err(_) => {
                 self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+                self.invalid_publication_total = self.invalid_publication_total.saturating_add(1);
                 return self.rejected_metrics("snapshot-publication-failed");
             }
         };
@@ -403,18 +512,24 @@ impl ValueSchedulerRuntime {
         scheduler_inputs.set_signal(JobId::WorldModelRefresh, input.pressure.clamp(0.0, 1.0));
 
         let plan = self.scheduler.plan(&snapshot, scheduler_inputs);
-        let sample_valid = snapshot.pressure_q().is_some()
-            && snapshot.thermal_q().is_some()
-            && input.profile_matches
-            && input.p95_cycle_ms.is_finite()
-            && input.p95_cycle_ms < 75.0
-            && plan.selection_latency_us <= 1_000
-            && !input.kill_switch
-            && !input.sleeping;
+        let health = classify_sample(
+            snapshot.pressure_q().is_some(),
+            snapshot.thermal_q().is_some(),
+            input.profile_matches,
+            input.p95_cycle_ms,
+            plan.selection_latency_us,
+            input.kill_switch,
+            input.sleeping,
+        );
+        let sample_valid = health.is_healthy();
         if sample_valid {
             self.valid_cycles = self.valid_cycles.saturating_add(1);
         } else {
             self.invalid_samples_total = self.invalid_samples_total.saturating_add(1);
+            self.invalid_unhealthy_total = self.invalid_unhealthy_total.saturating_add(1);
+            if let Some(slot) = unhealthy_slot(health) {
+                self.unhealthy_reasons[slot] = self.unhealthy_reasons[slot].saturating_add(1);
+            }
         }
 
         if plan.should_execute && sample_valid {
@@ -426,16 +541,10 @@ impl ValueSchedulerRuntime {
             self.scheduler.set_phase(SchedulerPhase::Shadow);
         }
 
-        let blocker = if !input.profile_matches {
-            "profile-mismatch"
-        } else if snapshot.pressure_q().is_none() {
-            "pressure-stale"
-        } else if snapshot.thermal_q().is_none() {
-            "thermal-unavailable"
-        } else if !input.p95_cycle_ms.is_finite() || input.p95_cycle_ms >= 75.0 {
-            "cycle-p95"
-        } else if plan.selection_latency_us > 1_000 {
-            "selection-latency"
+        // Single source of truth: the blocker now reports the same reason the
+        // health gate acted on, including the two it could never express.
+        let blocker = if !health.is_healthy() {
+            health.as_str()
         } else if self.valid_cycles < SHADOW_CYCLES_REQUIRED {
             "collecting-samples"
         } else if !self.handoff_connected {
@@ -469,6 +578,17 @@ impl ValueSchedulerRuntime {
             budget_skips_total: scheduler_metrics.budget_skipped_total,
             capacity_skips_total: scheduler_metrics.capacity_skipped_total,
             invalid_samples_total: self.invalid_samples_total,
+            invalid_unhealthy_total: self.invalid_unhealthy_total,
+            invalid_sequence_total: self.invalid_sequence_total,
+            invalid_features_total: self.invalid_features_total,
+            invalid_publication_total: self.invalid_publication_total,
+            unhealthy_pressure_total: self.unhealthy_reasons[0],
+            unhealthy_thermal_total: self.unhealthy_reasons[1],
+            unhealthy_profile_total: self.unhealthy_reasons[2],
+            unhealthy_p95_total: self.unhealthy_reasons[3],
+            unhealthy_latency_total: self.unhealthy_reasons[4],
+            unhealthy_kill_switch_total: self.unhealthy_reasons[5],
+            unhealthy_sleeping_total: self.unhealthy_reasons[6],
             world_snapshot: Some(Arc::clone(&world)),
         }
     }
@@ -479,6 +599,17 @@ impl ValueSchedulerRuntime {
             blocker: blocker.to_string(),
             shadow_cycles_required: SHADOW_CYCLES_REQUIRED,
             invalid_samples_total: self.invalid_samples_total,
+            invalid_unhealthy_total: self.invalid_unhealthy_total,
+            invalid_sequence_total: self.invalid_sequence_total,
+            invalid_features_total: self.invalid_features_total,
+            invalid_publication_total: self.invalid_publication_total,
+            unhealthy_pressure_total: self.unhealthy_reasons[0],
+            unhealthy_thermal_total: self.unhealthy_reasons[1],
+            unhealthy_profile_total: self.unhealthy_reasons[2],
+            unhealthy_p95_total: self.unhealthy_reasons[3],
+            unhealthy_latency_total: self.unhealthy_reasons[4],
+            unhealthy_kill_switch_total: self.unhealthy_reasons[5],
+            unhealthy_sleeping_total: self.unhealthy_reasons[6],
             ..ValueSchedulerTickMetrics::default()
         }
     }
@@ -707,6 +838,125 @@ fn stable_hash(value: &str) -> u64 {
 mod tests {
     use super::*;
     use apollo_engine::engine::webflow_types::{WebFlowPhase, WebFlowSource};
+
+    fn healthy_args() -> (bool, bool, bool, f64, u64, bool, bool) {
+        (true, true, true, 30.0, 10, false, false)
+    }
+
+    #[test]
+    fn a_sleeping_or_paused_daemon_names_its_own_reason() {
+        let (p, t, pr, p95, lat, _, _) = healthy_args();
+        assert_eq!(
+            classify_sample(p, t, pr, p95, lat, false, true),
+            SampleHealth::Sleeping,
+            "sleep was invisible: the old blocker had no way to express it"
+        );
+        assert_eq!(
+            classify_sample(p, t, pr, p95, lat, true, false),
+            SampleHealth::KillSwitch
+        );
+        assert_eq!(SampleHealth::Sleeping.as_str(), "sleeping");
+        assert_eq!(SampleHealth::KillSwitch.as_str(), "kill-switch");
+    }
+
+    #[test]
+    fn an_operator_state_outranks_a_sensor_gap() {
+        // A paused daemon must not be reported as a thermal fault.
+        assert_eq!(
+            classify_sample(false, false, false, f64::NAN, 9_999, true, true),
+            SampleHealth::KillSwitch
+        );
+        assert_eq!(
+            classify_sample(false, false, false, f64::NAN, 9_999, false, true),
+            SampleHealth::Sleeping
+        );
+    }
+
+    #[test]
+    fn every_gate_maps_to_exactly_one_reason_slot() {
+        let cases = [
+            (
+                classify_sample(true, true, true, 30.0, 10, false, false),
+                None,
+            ),
+            (
+                classify_sample(false, true, true, 30.0, 10, false, false),
+                Some(0),
+            ),
+            (
+                classify_sample(true, false, true, 30.0, 10, false, false),
+                Some(1),
+            ),
+            (
+                classify_sample(true, true, false, 30.0, 10, false, false),
+                Some(2),
+            ),
+            (
+                classify_sample(true, true, true, 80.0, 10, false, false),
+                Some(3),
+            ),
+            (
+                classify_sample(true, true, true, 30.0, 2_000, false, false),
+                Some(4),
+            ),
+            (
+                classify_sample(true, true, true, 30.0, 10, true, false),
+                Some(5),
+            ),
+            (
+                classify_sample(true, true, true, 30.0, 10, false, true),
+                Some(6),
+            ),
+        ];
+        let mut seen = Vec::new();
+        for (health, expected_slot) in cases {
+            assert_eq!(unhealthy_slot(health), expected_slot);
+            if let Some(slot) = expected_slot {
+                assert!(!seen.contains(&slot), "slot {slot} reused");
+                seen.push(slot);
+            }
+        }
+        assert_eq!(seen.len(), 7, "all seven refusal reasons are distinct");
+    }
+
+    #[test]
+    fn a_non_finite_cycle_p95_is_refused_as_p95_not_as_a_healthy_sample() {
+        assert_eq!(
+            classify_sample(true, true, true, f64::NAN, 10, false, false),
+            SampleHealth::CycleP95
+        );
+        assert_eq!(
+            classify_sample(true, true, true, f64::INFINITY, 10, false, false),
+            SampleHealth::CycleP95
+        );
+    }
+
+    #[test]
+    fn the_reason_breakdown_reconciles_with_the_unhealthy_total() {
+        let mut runtime = ValueSchedulerRuntime::with_epoch(7);
+        // Drive a mix of refusals through the counter path directly: the
+        // breakdown must account for every unhealthy sample, with no residue.
+        for health in [
+            SampleHealth::Sleeping,
+            SampleHealth::Sleeping,
+            SampleHealth::KillSwitch,
+            SampleHealth::ThermalUnavailable,
+            SampleHealth::CycleP95,
+        ] {
+            runtime.invalid_samples_total = runtime.invalid_samples_total.saturating_add(1);
+            runtime.invalid_unhealthy_total = runtime.invalid_unhealthy_total.saturating_add(1);
+            if let Some(slot) = unhealthy_slot(health) {
+                runtime.unhealthy_reasons[slot] = runtime.unhealthy_reasons[slot].saturating_add(1);
+            }
+        }
+        let summed: u64 = runtime.unhealthy_reasons.iter().sum();
+        assert_eq!(
+            summed, runtime.invalid_unhealthy_total,
+            "reasons must sum to the unhealthy total with no unclassified residue"
+        );
+        assert_eq!(runtime.unhealthy_reasons[6], 2, "sleeping counted twice");
+        assert_eq!(runtime.unhealthy_reasons[5], 1);
+    }
 
     fn input(cycle: u64) -> ValueSchedulerTickInput<'static> {
         ValueSchedulerTickInput {

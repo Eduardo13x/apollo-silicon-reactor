@@ -45,7 +45,15 @@ User explicitly opted into supervision over autopilot. Rules:
 
 ## Project Overview
 
-**apollo-silicon-reactor** (formerly `apollo-optimizer`) is a macOS system optimization daemon written in Rust (edition 2021) for Apple Silicon M1 8GB baseline. See `README.md` for full description, qualities, and academic foundation.
+**apollo-silicon-reactor** (formerly `apollo-optimizer`) is a macOS system optimization daemon written in Rust (edition 2021) for Apple Silicon. See `README.md` for full description, qualities, and academic foundation.
+
+### Hardware
+
+Topology and memory are detected by **capability**, never by chip name: `HardwareRegime` is `{p_core_count, e_core_count, ram_gib}`, so new Apple Silicon generations work without code changes.
+
+The M1 8GB figure that appears in the history is **retained evidence, not the target machine** — see `README.md`. The current development host is an **Apple M4, 4P+6E, 16 GB, macOS 26**.
+
+That difference matters when reading metrics. On a host with headroom, pressure sits near 0.35 against a 0.65 survival bypass, `ais_optimization_opportunity` is well under 1%, and `boosts/throttles/freezes` stay at 0 over tens of thousands of cycles. **That is the correct outcome, not a stalled daemon.** `no-candidates`, an empty `action_keys`, and a Lab without opportunities all follow from having nothing worth rescuing. Read those as an idle machine before reading them as a defect.
 
 ### Three Binaries
 
@@ -56,9 +64,28 @@ User explicitly opted into supervision over autopilot. Rules:
 ## Build & Development Commands
 
 ```bash
-# Build
-cargo build --release
+# Build — ALWAYS through the hardware profile, never bare `cargo build --release`
+source scripts/hardware-build-profile.sh
+cargo build --workspace --bins --release "${APOLLO_CARGO_FEATURE_ARGS[@]}"
+# binaries land in $APOLLO_RELEASE_DIR, not target/release
+```
 
+**Why this matters:** `Cargo.toml` has `default = []`, and
+`scripts/hardware-build-profile.sh` adds `--features adaptive-multicore` on
+every arm64 Darwin host plus its own `CARGO_TARGET_DIR`. A bare
+`cargo build --release` produces a **sequential** binary with no rayon and no
+worker QoS. Deploying it to a host that expects `adaptive-multicore` makes
+`parallel_expected_profile != parallel_compiled_profile`, which fails
+`profile_matches` and blocks the Value scheduler, Reflex and WebFlow with
+`expected-profile-mismatch` — Apollo observes but refuses to act. It also
+costs cycle p95, so a wrongly built binary silently invalidates any
+before/after performance comparison. Observed 2026-08-17: several manual
+deploys shipped `sequential` and the resulting p95 delta was mistaken for a
+regression in application code.
+
+Prefer `./scripts/apollo-deploy-gate.sh`, which sources the profile itself.
+
+```bash
 # Run from source
 cargo run -- snapshot --output system_snapshot.json
 cargo run --bin apollo-optimizerd -- daemon --profile balanced-root

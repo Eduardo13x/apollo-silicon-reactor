@@ -1,11 +1,190 @@
+use std::collections::VecDeque;
+
 use apollo_engine::engine::webflow_controller::{
     WebFlowController, WebFlowCounters, WebFlowIntent, WebFlowRolloutPhase, WebFlowTickInput,
     WebWorldObservation, MAX_WEBFLOW_EVENT_AGE_MS,
 };
 use apollo_engine::engine::webflow_types::{
-    OpaqueId, ReceivedWebFlowEvent, WebFlowEvent, WebFlowMetrics, WebFlowPhase, WebFlowSource,
-    WEBFLOW_SCHEMA_VERSION,
+    ExtensionStatus, FeatureCapabilities, OpaqueId, ReceivedWebFlowEvent, WebFlowEvent,
+    WebFlowMetrics, WebFlowPhase, WebFlowSource, WebFlowTransport, WEBFLOW_SCHEMA_VERSION,
 };
+
+/// Bounded per-metric sample ring for browser Web Vitals. The extension is an
+/// untrusted producer, so the window is fixed-size and never grows with input.
+///
+/// The `event_duration` ring holds individual `PerformanceEventTiming.duration`
+/// values, **not** interactions: it cannot yield INP, only the tail of single
+/// entries above the collector's threshold.
+const MAX_VITALS_SAMPLES: usize = 64;
+
+/// Nearest-rank p95 over a bounded sample window.
+///
+/// ponytail: nearest-rank on a 64-sample copy, not a streaming quantile
+/// sketch. Upgrade path: swap for a t-digest if the window ever needs to grow
+/// past a few hundred samples.
+fn vitals_p95(samples: &[u32]) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+    let rank = ((sorted.len() as f64) * 0.95).ceil() as usize;
+    let index = rank.clamp(1, sorted.len()) - 1;
+    Some(f64::from(sorted[index]))
+}
+
+#[derive(Debug, Default)]
+struct VitalsWindow {
+    lcp_ms: VecDeque<u32>,
+    event_duration_ms: VecDeque<u32>,
+    /// Corrected per-interaction series. Kept apart from the entry-duration
+    /// ring above so the two can never be folded into one reading.
+    inp_estimate_ms: VecDeque<u32>,
+    interaction_count: u64,
+    interactions_dropped: u64,
+    input_delay_total_ms: u64,
+    processing_total_ms: u64,
+    presentation_total_ms: u64,
+    /// Browser-clock transport segments. Same-clock differences only.
+    client_segment_ms: VecDeque<u32>,
+    service_worker_wake_ms: VecDeque<u32>,
+    cold_starts: u64,
+    transport_samples: u64,
+    max_tab_queue_depth: u32,
+    /// Producer negotiation. A zero interaction count means something quite
+    /// different when v1 events are flowing than when nothing arrives at all.
+    accepted_v1: u64,
+    accepted_v2: u64,
+    last_extension_version: Option<String>,
+    last_capabilities: FeatureCapabilities,
+    last_event_at_ms: u64,
+}
+
+impl VitalsWindow {
+    fn record(&mut self, metrics: &WebFlowMetrics) {
+        for (value, ring) in [
+            (metrics.lcp_ms, &mut self.lcp_ms),
+            (metrics.event_duration_ms, &mut self.event_duration_ms),
+            (metrics.inp_estimate_ms, &mut self.inp_estimate_ms),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            if ring.len() >= MAX_VITALS_SAMPLES {
+                ring.pop_front();
+            }
+            ring.push_back(value);
+        }
+        self.interaction_count = self
+            .interaction_count
+            .saturating_add(u64::from(metrics.interaction_count.unwrap_or(0)));
+        self.interactions_dropped = self
+            .interactions_dropped
+            .saturating_add(u64::from(metrics.interactions_dropped.unwrap_or(0)));
+        self.input_delay_total_ms = self
+            .input_delay_total_ms
+            .saturating_add(u64::from(metrics.input_delay_total_ms.unwrap_or(0)));
+        self.processing_total_ms = self
+            .processing_total_ms
+            .saturating_add(u64::from(metrics.processing_total_ms.unwrap_or(0)));
+        self.presentation_total_ms = self
+            .presentation_total_ms
+            .saturating_add(u64::from(metrics.presentation_total_ms.unwrap_or(0)));
+    }
+
+    fn clear(&mut self) {
+        self.lcp_ms.clear();
+        self.event_duration_ms.clear();
+        self.inp_estimate_ms.clear();
+        self.interaction_count = 0;
+        self.interactions_dropped = 0;
+        self.input_delay_total_ms = 0;
+        self.processing_total_ms = 0;
+        self.presentation_total_ms = 0;
+        self.client_segment_ms.clear();
+        self.service_worker_wake_ms.clear();
+        self.cold_starts = 0;
+        self.transport_samples = 0;
+        self.max_tab_queue_depth = 0;
+    }
+
+    fn record_producer(&mut self, event: &WebFlowEvent, now_ms: u64) {
+        if event.source == WebFlowSource::DaemonInference {
+            return;
+        }
+        if event.schema_version >= 2 {
+            self.accepted_v2 = self.accepted_v2.saturating_add(1);
+        } else {
+            self.accepted_v1 = self.accepted_v1.saturating_add(1);
+        }
+        if let Some(version) = event.extension_version.as_deref() {
+            self.last_extension_version = Some(version.to_string());
+        }
+        if !event.feature_capabilities.is_empty() {
+            self.last_capabilities = event.feature_capabilities;
+        }
+        self.last_event_at_ms = now_ms;
+    }
+
+    fn record_transport(&mut self, transport: &WebFlowTransport) {
+        let mut observed = false;
+        for (value, ring) in [
+            (transport.client_segment_ms(), &mut self.client_segment_ms),
+            (
+                transport.service_worker_wake_ms(),
+                &mut self.service_worker_wake_ms,
+            ),
+        ] {
+            let Some(value) = value else { continue };
+            observed = true;
+            if ring.len() >= MAX_VITALS_SAMPLES {
+                ring.pop_front();
+            }
+            ring.push_back(value.min(u64::from(u32::MAX)) as u32);
+        }
+        if transport.service_worker_cold_start == Some(true) {
+            self.cold_starts = self.cold_starts.saturating_add(1);
+        }
+        self.max_tab_queue_depth = self
+            .max_tab_queue_depth
+            .max(transport.tab_queue_depth.unwrap_or(0));
+        if observed {
+            self.transport_samples = self.transport_samples.saturating_add(1);
+        }
+    }
+
+    fn client_segment_p95_ms(&self) -> Option<f64> {
+        vitals_p95(&self.client_segment_ms.iter().copied().collect::<Vec<_>>())
+    }
+
+    fn service_worker_wake_p95_ms(&self) -> Option<f64> {
+        vitals_p95(
+            &self
+                .service_worker_wake_ms
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn inp_estimate_p95_ms(&self) -> Option<f64> {
+        vitals_p95(&self.inp_estimate_ms.iter().copied().collect::<Vec<_>>())
+    }
+
+    fn lcp_p95_ms(&self) -> Option<f64> {
+        vitals_p95(&self.lcp_ms.iter().copied().collect::<Vec<_>>())
+    }
+
+    fn event_duration_tail_ms(&self) -> Option<f64> {
+        vitals_p95(&self.event_duration_ms.iter().copied().collect::<Vec<_>>())
+    }
+
+    /// Widest sample count backing the published p95s, so a reader can tell a
+    /// three-sample guess from a settled measurement.
+    fn samples(&self) -> u64 {
+        self.lcp_ms.len().max(self.event_duration_ms.len()) as u64
+    }
+}
 
 pub fn is_supported_browser(name: &str) -> bool {
     const BROWSERS: &[&str] = &[
@@ -57,6 +236,30 @@ pub struct WebFlowCycleOutput {
     pub rollout: WebFlowRolloutPhase,
     pub valid_health_cycles: u64,
     pub rollout_blocker: &'static str,
+    /// p95 over the bounded Web Vitals window, `None` until the extension has
+    /// reported at least one sample of that metric.
+    pub lcp_p95_ms: Option<f64>,
+    pub event_duration_tail_ms: Option<f64>,
+    pub inp_estimate_ms: Option<f64>,
+    pub interaction_count: u64,
+    pub interactions_dropped: u64,
+    pub input_delay_total_ms: u64,
+    pub processing_total_ms: u64,
+    pub presentation_total_ms: u64,
+    pub transport_client_segment_p95_ms: Option<f64>,
+    pub transport_sw_wake_p95_ms: Option<f64>,
+    pub transport_cold_starts: u64,
+    pub transport_samples: u64,
+    pub transport_max_queue_depth: u32,
+    pub extension_status: ExtensionStatus,
+    pub extension_version: Option<String>,
+    pub accepted_v1_total: u64,
+    pub accepted_v2_total: u64,
+    pub schema_rejected_total: u64,
+    pub last_event_at_ms: u64,
+    pub capabilities_bits: u32,
+    /// Samples behind those p95s.
+    pub vitals_samples: u64,
 }
 
 pub struct WebFlowRuntime {
@@ -68,6 +271,11 @@ pub struct WebFlowRuntime {
     valid_health_cycles: u64,
     baseline_failures: Option<(u64, u64, u64)>,
     rollout_blocker: &'static str,
+    vitals: VitalsWindow,
+    vitals_session_revision: u64,
+    /// Payloads refused because their schema cannot be interpreted. Counted
+    /// apart from accepted events so a mismatch never presents as silence.
+    schema_rejected_total: u64,
 }
 
 impl WebFlowRuntime {
@@ -78,6 +286,7 @@ impl WebFlowRuntime {
             inference_active: false,
             last_exact_at_ms: None,
             rollout,
+            schema_rejected_total: 0,
             valid_health_cycles: 0,
             baseline_failures: None,
             rollout_blocker: if rollout == WebFlowRolloutPhase::Shadow {
@@ -85,6 +294,8 @@ impl WebFlowRuntime {
             } else {
                 "configured"
             },
+            vitals: VitalsWindow::default(),
+            vitals_session_revision: 0,
         }
     }
 
@@ -109,6 +320,31 @@ impl WebFlowRuntime {
             .map(|received| received.received_at_ms)
             .max();
         let exact_present = newest_exact_at_ms.is_some();
+        // Vitals are session- and liveness-scoped exactly like the observation:
+        // a sleep, a kill-switch flip, or a new login session drops the window
+        // rather than letting stale page timings age into the published p95.
+        if input.sleeping
+            || input.kill_switch
+            || input.session_revision != self.vitals_session_revision
+        {
+            self.vitals.clear();
+            self.vitals_session_revision = input.session_revision;
+        }
+        for received in &events {
+            // Only fresh, schema-valid, first-party measurements. Daemon
+            // inference carries no timings and must never fabricate a vital.
+            if received.event.source == WebFlowSource::DaemonInference
+                || received.received_at_ms == 0
+                || received.received_at_ms > input.now_ms
+                || input.now_ms.saturating_sub(received.received_at_ms) > MAX_WEBFLOW_EVENT_AGE_MS
+                || received.event.validate().is_err()
+            {
+                continue;
+            }
+            self.vitals.record(&received.event.metrics);
+            self.vitals.record_transport(&received.event.transport);
+            self.vitals.record_producer(&received.event, input.now_ms);
+        }
         if let Some(received_at_ms) = newest_exact_at_ms {
             self.last_exact_at_ms = Some(
                 self.last_exact_at_ms
@@ -143,6 +379,12 @@ impl WebFlowRuntime {
                     source: WebFlowSource::DaemonInference,
                     site_bucket: None,
                     metrics: WebFlowMetrics::default(),
+                    // Daemon-synthesised: no transport hops to record.
+                    transport: WebFlowTransport::default(),
+                    producer_kind: Default::default(),
+                    extension_version: None,
+                    bridge_version: None,
+                    feature_capabilities: Default::default(),
                 },
                 received_at_ms: input.now_ms,
             });
@@ -176,6 +418,32 @@ impl WebFlowRuntime {
             rollout: self.rollout,
             valid_health_cycles: self.valid_health_cycles,
             rollout_blocker: self.rollout_blocker,
+            lcp_p95_ms: self.vitals.lcp_p95_ms(),
+            event_duration_tail_ms: self.vitals.event_duration_tail_ms(),
+            inp_estimate_ms: self.vitals.inp_estimate_p95_ms(),
+            interaction_count: self.vitals.interaction_count,
+            interactions_dropped: self.vitals.interactions_dropped,
+            input_delay_total_ms: self.vitals.input_delay_total_ms,
+            processing_total_ms: self.vitals.processing_total_ms,
+            presentation_total_ms: self.vitals.presentation_total_ms,
+            transport_client_segment_p95_ms: self.vitals.client_segment_p95_ms(),
+            transport_sw_wake_p95_ms: self.vitals.service_worker_wake_p95_ms(),
+            transport_cold_starts: self.vitals.cold_starts,
+            transport_samples: self.vitals.transport_samples,
+            transport_max_queue_depth: self.vitals.max_tab_queue_depth,
+            extension_status: ExtensionStatus::classify(
+                self.vitals.accepted_v1,
+                self.vitals.accepted_v2,
+                self.schema_rejected_total,
+                self.vitals.last_capabilities,
+            ),
+            extension_version: self.vitals.last_extension_version.clone(),
+            accepted_v1_total: self.vitals.accepted_v1,
+            accepted_v2_total: self.vitals.accepted_v2,
+            schema_rejected_total: self.schema_rejected_total,
+            last_event_at_ms: self.vitals.last_event_at_ms,
+            capabilities_bits: self.vitals.last_capabilities.0,
+            vitals_samples: self.vitals.samples(),
         }
     }
 
@@ -247,6 +515,11 @@ mod tests {
                 source: WebFlowSource::ExtensionLifecycle,
                 site_bucket: None,
                 metrics: WebFlowMetrics::default(),
+                transport: WebFlowTransport::default(),
+                producer_kind: Default::default(),
+                extension_version: None,
+                bridge_version: None,
+                feature_capabilities: Default::default(),
             },
             received_at_ms: 100,
         }
@@ -361,6 +634,157 @@ mod tests {
             Some(WebFlowSource::DaemonInference)
         );
         assert!(output.admitted);
+    }
+
+    fn with_vitals(
+        sequence: u64,
+        lcp_ms: Option<u32>,
+        event_duration_ms: Option<u32>,
+    ) -> ReceivedWebFlowEvent {
+        let mut received = exact(sequence);
+        received.event.source = WebFlowSource::ExtensionVitals;
+        received.event.metrics = WebFlowMetrics {
+            lcp_ms,
+            event_duration_ms,
+            ..WebFlowMetrics::default()
+        };
+        received
+    }
+
+    #[test]
+    fn reported_vitals_reach_the_published_p95_instead_of_being_dropped() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        let events = [with_vitals(1, Some(1_200), Some(180))];
+
+        let output = runtime.tick(input(&events));
+
+        assert_eq!(output.lcp_p95_ms, Some(1_200.0));
+        assert_eq!(output.event_duration_tail_ms, Some(180.0));
+    }
+
+    #[test]
+    fn the_sample_count_travels_with_the_p95_so_a_guess_is_distinguishable() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        assert_eq!(runtime.tick(input(&[])).vitals_samples, 0);
+
+        let output = runtime.tick(input(&[with_vitals(1, Some(1_200), Some(180))]));
+        assert_eq!(output.vitals_samples, 1);
+        assert_eq!(output.lcp_p95_ms, Some(1_200.0));
+
+        for sequence in 2..=10 {
+            runtime.tick(input(&[with_vitals(sequence, Some(1_200), Some(180))]));
+        }
+        assert_eq!(runtime.vitals.samples(), 10);
+
+        // Never exceeds the window, and drops with it on invalidation.
+        for sequence in 11..=(MAX_VITALS_SAMPLES as u64 * 2) {
+            runtime.tick(input(&[with_vitals(sequence, Some(1_200), None)]));
+        }
+        assert_eq!(runtime.vitals.samples(), MAX_VITALS_SAMPLES as u64);
+
+        let mut sleeping = input(&[]);
+        sleeping.sleeping = true;
+        assert_eq!(runtime.tick(sleeping).vitals_samples, 0);
+    }
+
+    #[test]
+    fn a_metric_absent_from_the_report_stays_none_rather_than_becoming_zero() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        let events = [with_vitals(1, Some(900), None)];
+
+        let output = runtime.tick(input(&events));
+
+        assert_eq!(output.lcp_p95_ms, Some(900.0));
+        assert_eq!(output.event_duration_tail_ms, None);
+    }
+
+    #[test]
+    fn daemon_inference_never_fabricates_a_vital() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        let mut inferred = input(&[]);
+        inferred.browser_socket_active = true;
+
+        let output = runtime.tick(inferred);
+
+        assert_eq!(
+            output.observation.source,
+            Some(WebFlowSource::DaemonInference)
+        );
+        assert_eq!(output.lcp_p95_ms, None);
+        assert_eq!(output.event_duration_tail_ms, None);
+    }
+
+    #[test]
+    fn a_stale_report_is_excluded_from_the_vitals_window() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        let mut stale = with_vitals(1, Some(5_000), Some(900));
+        stale.received_at_ms = 100;
+        let events = [stale];
+        let mut cycle = input(&events);
+        cycle.now_ms = 2_101;
+
+        let output = runtime.tick(cycle);
+
+        assert_eq!(output.lcp_p95_ms, None);
+        assert_eq!(output.event_duration_tail_ms, None);
+    }
+
+    #[test]
+    fn the_vitals_window_is_bounded_and_evicts_oldest_first() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        // Feed far more samples than the window holds.
+        for sequence in 1..=(MAX_VITALS_SAMPLES as u64 * 3) {
+            let events = [with_vitals(sequence, Some(100), None)];
+            runtime.tick(input(&events));
+        }
+        assert_eq!(runtime.vitals.lcp_ms.len(), MAX_VITALS_SAMPLES);
+
+        // Refill the window entirely with slow samples: the fast ones must all
+        // have been evicted, so p95 follows the new regime.
+        for sequence in 1..=(MAX_VITALS_SAMPLES as u64) {
+            let events = [with_vitals(sequence, Some(4_000), None)];
+            runtime.tick(input(&events));
+        }
+        assert_eq!(runtime.vitals.lcp_ms.len(), MAX_VITALS_SAMPLES);
+        assert_eq!(runtime.vitals.lcp_p95_ms(), Some(4_000.0));
+    }
+
+    #[test]
+    fn p95_is_a_tail_statistic_that_one_slow_page_cannot_swing() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Shadow);
+        for sequence in 1..=(MAX_VITALS_SAMPLES as u64 - 1) {
+            runtime.tick(input(&[with_vitals(sequence, Some(100), None)]));
+        }
+
+        // A single outlier in a 64-sample window sits above the 95th
+        // percentile rank and must not move the reported value.
+        let output = runtime.tick(input(&[with_vitals(9_999, Some(4_000), None)]));
+        assert_eq!(output.lcp_p95_ms, Some(100.0));
+
+        // A sustained tail does move it.
+        for sequence in 10_000..10_008 {
+            runtime.tick(input(&[with_vitals(sequence, Some(4_000), None)]));
+        }
+        assert_eq!(runtime.vitals.lcp_p95_ms(), Some(4_000.0));
+    }
+
+    #[test]
+    fn sleep_and_session_change_drop_the_vitals_window() {
+        let mut runtime = WebFlowRuntime::new(WebFlowRolloutPhase::Active);
+        runtime.tick(input(&[with_vitals(1, Some(1_000), Some(120))]));
+        assert!(runtime.vitals.lcp_p95_ms().is_some());
+
+        let mut sleeping = input(&[]);
+        sleeping.sleeping = true;
+        let output = runtime.tick(sleeping);
+        assert_eq!(output.lcp_p95_ms, None);
+        assert_eq!(output.event_duration_tail_ms, None);
+
+        runtime.tick(input(&[with_vitals(2, Some(1_000), Some(120))]));
+        let mut relogin = input(&[]);
+        relogin.session_revision = 99;
+        let output = runtime.tick(relogin);
+        assert_eq!(output.lcp_p95_ms, None);
     }
 
     #[test]

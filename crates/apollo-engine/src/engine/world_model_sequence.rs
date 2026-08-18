@@ -209,7 +209,7 @@ pub fn plan_temporal_sequence_with_dynamics(
         return plan;
     }
     if action_keys.is_empty() {
-        plan.abstention_reason = Some("idle_no_accelerator");
+        plan.abstention_reason = Some("idle_no_latency_work");
         return plan;
     }
 
@@ -1070,8 +1070,35 @@ mod tests {
             &[],
             "coding",
         );
-        assert_eq!(plan.abstention_reason, Some("idle_no_accelerator"));
+        assert_eq!(plan.abstention_reason, Some("idle_no_latency_work"));
         assert_eq!(plan.candidates, 0);
         assert_eq!(plan.sequences_evaluated, 0);
+    }
+
+    #[test]
+    fn the_idle_reason_names_the_missing_candidates_not_a_missing_accelerator() {
+        // The planner never consults hardware. Its caller passes only
+        // BoostProcess and interactive-QoS keys, so an empty set means no
+        // latency-directed action was proposed — a claim about the workload,
+        // not about the ANE or the GPU being unavailable.
+        let (memory, latest) = warmed_memory();
+        let idle = plan_temporal_sequence(
+            &memory,
+            Some(&latest),
+            LOCAL_ID,
+            true,
+            &HashMap::new(),
+            &[],
+            "coding",
+        );
+        let reason = idle.abstention_reason.unwrap_or_default();
+        assert!(
+            !reason.contains("accelerator"),
+            "the reason must not claim a hardware accelerator verdict: {reason}"
+        );
+        assert!(
+            reason.contains("latency"),
+            "the reason names the missing work: {reason}"
+        );
     }
 }

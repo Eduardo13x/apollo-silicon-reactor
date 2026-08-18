@@ -377,6 +377,11 @@ fn publish_world_model_metrics(
     metrics.world_model_gpu_silver_total = context.gpu_prediction_silver_total;
     metrics.world_model_gpu_gold_total = context.gpu_prediction_gold_total;
     metrics.world_model_gpu_rejected_total = context.gpu_prediction_rejected_total;
+    metrics.world_model_gpu_evicted_total = context.gpu_prediction_evicted_total;
+    metrics.world_model_gpu_unused_total = context.gpu_prediction_unused_total;
+    metrics.world_model_gpu_bronze_rejected_total = context.gpu_prediction_bronze_rejected_total;
+    metrics.world_model_gpu_unclassified_rejections =
+        context.gpu_prediction_unclassified_rejections;
     metrics.world_model_gpu_pending_total = context.gpu_prediction_pending_total;
     metrics.world_model_gpu_calibrated_models = context.gpu_prediction_calibrated_models;
     metrics.world_model_gpu_calibration_mae = context.gpu_prediction_mean_absolute_error;
@@ -395,6 +400,13 @@ fn publish_world_model_metrics(
     let readiness = world_model.utility_readiness_breakdown();
     metrics.world_model_readiness_no_gold = readiness.no_current_gold;
     metrics.world_model_readiness_immature = readiness.immature;
+    metrics.world_model_readiness_dormant = readiness.dormant;
+    metrics.world_model_action_model_len = context.action_model_len;
+    metrics.world_model_action_model_capacity = context.action_model_capacity;
+    metrics.world_model_action_model_evictions_total = context.action_model_evictions_total;
+    metrics.world_model_action_model_births_total = context.action_model_births_total;
+    metrics.world_model_evidence_updates_total = context.action_model_evidence_updates_total;
+    metrics.world_model_last_evidence_cycle = context.action_model_last_evidence_cycle;
     metrics.world_model_readiness_low_quality = readiness.low_quality;
     metrics.world_model_readiness_stale = readiness.stale;
     metrics.world_model_readiness_foreign = readiness.foreign_installation;

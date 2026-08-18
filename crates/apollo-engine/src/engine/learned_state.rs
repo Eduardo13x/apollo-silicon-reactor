@@ -589,6 +589,11 @@ pub struct LearnedState {
     /// restart can terminalize them as interrupted; they are never resumed.
     #[serde(default)]
     pub microexperiment_lab: Option<MicroexperimentLabPersisted>,
+    /// Perceptual observations that should survive a restart. Bounded and
+    /// TTL-filtered at snapshot time: this carries recent evidence across a
+    /// restart, it is not an archive of a high-frequency stream.
+    #[serde(default)]
+    pub perceptual_store: Option<crate::engine::perceptual::store::PerceptualStorePersisted>,
 }
 
 /// Live snapshots that are owned outside the core learning context but belong
@@ -606,6 +611,7 @@ pub struct LearnedStateSupplement {
     pub telemetry_medallion_state: Option<TelemetryMedallionPersisted>,
     pub exploration_scheduler: Option<ExplorationSchedulerPersisted>,
     pub microexperiment_lab: Option<MicroexperimentLabPersisted>,
+    pub perceptual_store: Option<crate::engine::perceptual::store::PerceptualStorePersisted>,
 }
 
 /// Current schema version for [`LearnedState`].
@@ -754,6 +760,9 @@ impl LearnedState {
     ) -> Self {
         Self {
             version: CURRENT_SCHEMA_VERSION,
+            // Supplied by the caller after collect, like the other components
+            // the engine does not own.
+            perceptual_store: None,
             signal_intelligence: Some(signal_intel.to_persisted()),
             outcome_tracker: Some(outcome_tracker.to_persisted()),
             specialist_accuracy: Some(specialist_accuracy.clone()),
@@ -1167,6 +1176,7 @@ impl LearnedState {
         state.telemetry_medallion_state = supplement.telemetry_medallion_state;
         state.exploration_scheduler = supplement.exploration_scheduler;
         state.microexperiment_lab = supplement.microexperiment_lab;
+        state.perceptual_store = supplement.perceptual_store;
         // Components not owned by this checkpoint keep their last committed
         // snapshot. Load and parse once, then merge all such fields in memory.
         if let Some(previous) = Self::load(path) {
@@ -1946,6 +1956,7 @@ mod tests {
     #[test]
     fn self_improve_decays_co_occurrence() {
         let mut state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: None,
             outcome_tracker: Some(make_ot_persisted()),
@@ -1986,6 +1997,7 @@ mod tests {
     #[test]
     fn self_improve_prunes_noisy_weights() {
         let mut state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: None,
             outcome_tracker: Some(make_ot_persisted()),
@@ -2024,6 +2036,7 @@ mod tests {
     #[test]
     fn self_improve_caps_experience() {
         let mut state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: None,
             outcome_tracker: Some(make_ot_persisted()),
@@ -2081,6 +2094,7 @@ mod tests {
         // NOT increment it again — doing so would advance the counter by 2 per
         // cycle, making all decay / half-life calculations run at 2× intended rate.
         let mut state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: None,
             outcome_tracker: None,
@@ -2133,6 +2147,7 @@ mod tests {
             kf_mv: None,
         };
         let mut state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: Some(si),
             outcome_tracker: None,
@@ -2188,6 +2203,7 @@ mod tests {
             blocked_patterns: HashMap::new(),
         };
         let mut state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: None,
             outcome_tracker: Some(ot),
@@ -2569,6 +2585,7 @@ mod tests {
     fn local_consolidator_roundtrip() {
         let tmp = std::env::temp_dir().join(format!("apollo_local_s2_{}.json", std::process::id()));
         let seed = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: None,
             outcome_tracker: None,
@@ -2642,6 +2659,7 @@ mod tests {
     fn test_migrate_v0_to_current() {
         // v0 → v1 is a no-op baseline: no structural changes, just stamps version.
         let state = LearnedState {
+            perceptual_store: None,
             version: 0,
             signal_intelligence: None,
             outcome_tracker: None,
@@ -2687,6 +2705,7 @@ mod tests {
         let si_persisted = SignalIntelligence::new().to_persisted();
         assert!(si_persisted.kf_mv.is_some(), "precondition: kf_mv present");
         let state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: Some(si_persisted),
             outcome_tracker: None,
@@ -2860,6 +2879,7 @@ mod tests {
 
         // Seed an empty file so patch_companion_graph can load+update.
         let blank = LearnedState {
+            perceptual_store: None,
             version: CURRENT_SCHEMA_VERSION,
             signal_intelligence: None,
             outcome_tracker: None,
@@ -3017,6 +3037,7 @@ mod tests {
         // Construct a LearnedState with a learnable_params + an
         // already-populated guard with a recent ZoneAlpha shift.
         let mut state = LearnedState {
+            perceptual_store: None,
             version: 1,
             signal_intelligence: None,
             outcome_tracker: None,

@@ -374,13 +374,13 @@ impl ExplorationCandidate {
             ) => true,
             (
                 ActuatorFamily::MarkovPrewarm,
-                ExplorationMode::Treatment,
+                ExplorationMode::Treatment | ExplorationMode::Control,
                 ExplorationArm::MarkovCacheOnly,
                 ActionClass::MarkovPredictedApp,
             ) => true,
             (
                 ActuatorFamily::InteractionQos,
-                ExplorationMode::Treatment,
+                ExplorationMode::Treatment | ExplorationMode::Control,
                 ExplorationArm::InteractionQosShort
                 | ExplorationArm::InteractionQosStandard
                 | ExplorationArm::InteractionQosLong,
@@ -1317,12 +1317,14 @@ fn valid_key(key: &ExplorationKey) -> bool {
             ActionClass::BoostBackground,
         ) | (
             ActuatorFamily::MarkovPrewarm,
-            ExplorationMode::Treatment,
+            // Control is the withheld arm: the owner declines a pre-warm it
+            // was already free to decline. It grants no new effect.
+            ExplorationMode::Treatment | ExplorationMode::Control,
             ExplorationArm::MarkovCacheOnly,
             ActionClass::MarkovPredictedApp,
         ) | (
             ActuatorFamily::InteractionQos,
-            ExplorationMode::Treatment,
+            ExplorationMode::Treatment | ExplorationMode::Control,
             ExplorationArm::InteractionQosShort
                 | ExplorationArm::InteractionQosStandard
                 | ExplorationArm::InteractionQosLong,
