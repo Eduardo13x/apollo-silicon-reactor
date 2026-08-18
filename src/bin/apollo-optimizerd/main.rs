@@ -2784,6 +2784,9 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.perceptual_sources_active =
                             perceptual_store.active_sources() as u32;
                         metrics.metrics.perceptual_observations_total = store_metrics.stored_total;
+                        metrics.metrics.perceptual_store_len = perceptual_store.len() as u32;
+                        metrics.metrics.perceptual_store_capacity =
+                            apollo_engine::engine::perceptual::store::MAX_OBSERVATIONS as u32;
                         metrics.metrics.perceptual_instrumented_total =
                             store_metrics.instrumented_total;
                         metrics.metrics.perceptual_inferred_total = store_metrics.inferred_total;

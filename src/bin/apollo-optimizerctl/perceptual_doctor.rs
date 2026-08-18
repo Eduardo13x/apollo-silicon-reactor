@@ -144,7 +144,9 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
         "store",
         m.perceptual_observations_total > 0,
         format!(
-            "stored={} invalid={} quality={} regimes={}",
+            "resident={}/{} lifetime={} invalid={} quality={} regimes={}",
+            m.perceptual_store_len,
+            m.perceptual_store_capacity,
             m.perceptual_observations_total,
             m.perceptual_invalid_total,
             m.perceptual_quality_q,
@@ -349,6 +351,25 @@ mod tests {
         let report = diagnose(&m);
         assert_eq!(report.verdict, PerceptualVerdict::PerceptualCoreReady);
         assert!(report.checks.iter().all(|c| c.ok), "{:?}", report.checks);
+    }
+
+    #[test]
+    fn the_store_reports_resident_and_lifetime_as_separate_figures() {
+        // Observed across a real restart: the lifetime counter rose from 375 to
+        // 614 while the bounded store could hold at most a fraction of that.
+        // Printing one as the other made a restart look like it gained data.
+        let mut m = metrics();
+        m.perceptual_observations_total = 614;
+        m.perceptual_store_len = 128;
+        m.perceptual_store_capacity = 512;
+        let report = diagnose(&m);
+        let store = report
+            .checks
+            .iter()
+            .find(|c| c.hop == "store")
+            .expect("store hop");
+        assert!(store.detail.contains("resident=128/512"));
+        assert!(store.detail.contains("lifetime=614"));
     }
 
     #[test]

@@ -628,8 +628,16 @@ pub struct RuntimeMetrics {
     /// because no other source can produce them.
     #[serde(default)]
     pub perceptual_sources_active: u32,
+    /// Lifetime count, persisted across restarts. Distinct from
+    /// `perceptual_store_len`, which is how many are resident right now: a
+    /// bounded store means the two diverge, and reading the lifetime figure as
+    /// the store size makes a restart look like it gained observations.
     #[serde(default)]
     pub perceptual_observations_total: u64,
+    #[serde(default)]
+    pub perceptual_store_len: u32,
+    #[serde(default)]
+    pub perceptual_store_capacity: u32,
     #[serde(default)]
     pub perceptual_instrumented_total: u64,
     #[serde(default)]
