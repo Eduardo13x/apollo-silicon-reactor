@@ -1516,9 +1516,13 @@ impl MicroexperimentLab {
         let _deliberately_carried_forward = lab.rollout.reset_to_shadow(0);
         lab.rollout.shadow_eligible = shadow_eligible;
         lab.rollout.shadow_measurements_proven = shadow_measurements_proven;
-        // Boot-scoped provenance: this is the value the operator should see
-        // published before the new boot has run a cycle.
-        lab.restored_progress = shadow_eligible;
+        // Boot-scoped provenance: the value the operator should see published
+        // before the new boot has run a cycle. It must mirror what
+        // `rollout_progress` reports, which is evidence — publishing restored
+        // *exposure* beside an evidence gate reads as a counter that fell from
+        // 304 to 0 across the restart, the exact confusion this whole change
+        // set out to remove.
+        lab.restored_progress = shadow_measurements_proven;
         let disposition = if interrupted == 0 {
             RestoreDisposition::Restored
         } else {
@@ -2619,6 +2623,24 @@ mod rollout_tests {
             "evidence actually earned survives a restart"
         );
         assert_eq!(restored.phase(), LabPhase::Shadow);
+    }
+
+    #[test]
+    fn boot_provenance_reports_the_same_quantity_as_the_gate() {
+        // Publishing restored *exposure* beside an evidence gate renders as a
+        // counter that collapsed across the restart. The two must agree.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        for seq in 1..=20 {
+            let _ = lab.consider_candidate(candidate(seq), PairGates::healthy_enabled(), seq * 100);
+        }
+        prove_shadow_measurement(&mut lab, 900, 1, 3_000);
+        let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        assert_eq!(
+            restored.restored_progress,
+            restored.rollout_progress().0,
+            "boot provenance and the gate must publish the same quantity"
+        );
+        assert_eq!(restored.restored_progress, 1);
     }
 
     #[test]
