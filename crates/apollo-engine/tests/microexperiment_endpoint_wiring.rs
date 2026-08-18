@@ -142,8 +142,23 @@ fn episode(
 
 fn adapter_with_live_path(cycle: u64) -> MicroexperimentEndpointAdapter {
     let mut adapter = MicroexperimentEndpointAdapter::new(origin(), 7);
-    adapter.observe_episodes(&[], cycle);
+    // A delivered episode, not an empty poll: liveness now means the ledger
+    // handed something over.
+    adapter.observe_episodes(&[live_probe_episode(cycle)], cycle);
     adapter
+}
+
+/// A minimal settled episode used only to prove the observation route carries
+/// traffic. Its action key is deliberately outside the experiment catalog, so
+/// it can never bind to an arm or contribute evidence.
+fn live_probe_episode(cycle: u64) -> ResolvedDecisionEpisode {
+    episode(
+        900_000 + cycle,
+        "boost:unrelated-liveness-probe",
+        DecisionLifecycle::Applied,
+        cycle,
+        None,
+    )
 }
 
 fn open_pair(lab: &mut MicroexperimentLab, candidate: PairCandidate) {
@@ -325,8 +340,22 @@ fn contract_is_not_ready_until_the_observation_path_proves_itself_live() {
         !adapter.contract_ready(10, 8),
         "another daemon generation is never ready"
     );
+    // An empty batch is the ledger being polled, not the ledger delivering.
+    // It used to refresh liveness, which let `contract_ready` — and through it
+    // the lab's whole admission path — report a healthy observation route on a
+    // daemon that had never ingested a single episode.
     adapter.observe_episodes(&[], 40);
-    assert!(adapter.contract_ready(40, 7));
+    assert!(
+        !adapter.contract_ready(40, 7),
+        "an empty batch must not resurrect a stalled observation path"
+    );
+
+    // A batch that actually carries an episode does refresh it.
+    adapter.observe_episodes(&[live_probe_episode(41)], 41);
+    assert!(
+        adapter.contract_ready(41, 7),
+        "a delivered episode is what liveness means"
+    );
 }
 
 #[test]
@@ -1039,7 +1068,10 @@ fn routine_traffic_never_inflates_the_rejection_counters() {
     // No arm outstanding: the whole batch is skipped, not classified.
     adapter.observe_episodes(&batch, 2);
     let idle = adapter.counters();
-    assert_eq!(idle.episodes_skipped_idle, 6);
+    // 6 from this batch plus the one `adapter_with_live_path` delivers to prove
+    // the route carries traffic — it lands with no arm outstanding, so it is
+    // skipped exactly like the rest.
+    assert_eq!(idle.episodes_skipped_idle, 7);
     assert_eq!(idle.observed_episodes, 0);
     assert_eq!(idle.rejected_action_mismatch, 0);
     assert_eq!(idle.rejected_authority, 0);

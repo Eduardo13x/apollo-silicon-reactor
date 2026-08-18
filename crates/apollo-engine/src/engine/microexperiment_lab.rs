@@ -20,6 +20,16 @@ pub const MAX_GOLD_DEDUP: usize = 128;
 pub const MAX_SERIALIZED_BYTES: usize = 64 * 1024;
 pub const MAX_ACTION_KEY_BYTES: usize = 96;
 pub const SHADOW_MIN_OPPORTUNITIES: u64 = 500;
+/// Valid Shadow measurements required before Canary. This is *evidence*, not
+/// exposure: each unit is a control endpoint that was actually observed,
+/// bound, non-synthetic, and closed at a complete horizon. Seeing candidates
+/// or waiting out a duration cannot substitute for it.
+///
+/// Far smaller than `SHADOW_MIN_OPPORTUNITIES` on purpose. The question Shadow
+/// answers is binary — "can this daemon measure at all?" — and a handful of
+/// clean closures answers it. The old 500 was large precisely because seeing a
+/// candidate proved nothing, so the gate leaned on volume instead.
+pub const SHADOW_MIN_MEASUREMENTS: u64 = 8;
 pub const SHADOW_MIN_DURATION_MS: u64 = 15 * 60 * 1_000;
 pub const CANARY_MIN_OPPORTUNITIES: u64 = 500;
 pub const CANARY_PERCENT: u8 = 10;
@@ -48,6 +58,7 @@ impl LabPhase {
 #[derive(Debug, Clone, Copy)]
 struct LabRolloutConfig {
     shadow_min_opportunities: u64,
+    shadow_min_measurements: u64,
     shadow_min_duration_ms: u64,
     canary_percent: u8,
     canary_min_opportunities: u64,
@@ -57,6 +68,7 @@ impl Default for LabRolloutConfig {
     fn default() -> Self {
         Self {
             shadow_min_opportunities: SHADOW_MIN_OPPORTUNITIES,
+            shadow_min_measurements: SHADOW_MIN_MEASUREMENTS,
             shadow_min_duration_ms: SHADOW_MIN_DURATION_MS,
             canary_percent: CANARY_PERCENT,
             canary_min_opportunities: CANARY_MIN_OPPORTUNITIES,
@@ -254,6 +266,10 @@ pub struct PairDirective {
     pub complete_not_before_cycle: u64,
     pub expires_after_cycle: u64,
     pub rollback_required: bool,
+    /// Registered only so an episode can bind to it. A Shadow directive is
+    /// observe-only: it never reaches `outstanding_control_actions`, so it can
+    /// never withhold an action the machine was going to take.
+    pub observe_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -309,6 +325,9 @@ pub struct PairInvalidation {
 pub enum TimedEndpointDisposition {
     Progress(PairProgress),
     Invalidated(PairInvalidation),
+    /// A shadow pair consumed the endpoint. Carries no causal meaning: it only
+    /// records that the measurement pipeline delivered something bindable.
+    ShadowMeasured,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -345,6 +364,28 @@ struct IssuedArm {
     issued_cycle: u64,
     complete_not_before_cycle: u64,
     expires_after_cycle: u64,
+}
+
+/// A pair the lab tracks **without acting**.
+///
+/// Deliberately a different type in a different collection from `PairRecord`.
+/// `issue_ready_arms` iterates `self.open` only, so there is no code path from
+/// a shadow pair to a real directive — the guarantee is structural, not a flag
+/// someone can invert later. Its arms are issued separately and always carry
+/// `observe_only: true`, so they cannot reach `outstanding_control_actions`
+/// and cannot withhold anything either.
+///
+/// Only the control arm is ever tracked. A treatment arm would require the
+/// treatment to have been applied, and applying is exactly what Shadow must
+/// never do — which is also why a shadow pair can never yield `PairGold`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ShadowPairRecord {
+    candidate: PairCandidate,
+    assignment: PairAssignment,
+    #[serde(default)]
+    issued: Option<IssuedArm>,
+    #[serde(default)]
+    control_endpoint: Option<PairEndpoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +452,11 @@ pub struct LabMetrics {
     pub interrupted_total: u64,
     pub synthetic_quarantined_total: u64,
     pub shadow_would_open_total: u64,
+    /// EVIDENCE. Shadow pairs closed on a valid observed control endpoint.
+    pub shadow_measurements_proven_total: u64,
+    /// Shadow closures refused for an endpoint that was not a clean observed
+    /// non-synthetic control no-op.
+    pub shadow_measurements_refused_total: u64,
     pub invalidated_total: u64,
     pub deadline_expired_total: u64,
     /// Arms that expired without ever reporting, outside Shadow. Counted apart
@@ -461,6 +507,10 @@ pub struct MicroexperimentLabPersisted {
     origin: ExplorationOrigin,
     next_pair_sequence: u64,
     open: Vec<PairRecord>,
+    /// Shadow-phase bookkeeping. Never read by `issue_ready_arms`, so nothing
+    /// here can become a real directive. See `ShadowPairRecord`.
+    #[serde(default)]
+    shadow_open: Vec<ShadowPairRecord>,
     completed: VecDeque<CompletedPairSummary>,
     gold_dedup: VecDeque<PairId>,
     metrics: PersistedMetrics,
@@ -485,6 +535,15 @@ struct PersistedMetrics {
     interrupted_total: u64,
     synthetic_quarantined_total: u64,
     shadow_would_open_total: u64,
+    /// EVIDENCE. Lifetime count of shadow pairs closed on a valid control
+    /// endpoint. Distinct from `shadow_would_open_total`, which is exposure.
+    #[serde(default)]
+    shadow_measurements_proven_total: u64,
+    /// Shadow closures refused because the endpoint was not a clean, observed,
+    /// non-synthetic control no-op. Published so a host that never proves a
+    /// measurement can be told apart from one that never tried.
+    #[serde(default)]
+    shadow_measurements_refused_total: u64,
     invalidated_total: u64,
     deadline_expired_total: u64,
     #[serde(default)]
@@ -498,7 +557,15 @@ struct PersistedRollout {
     phase: LabPhase,
     phase_started_millis: u64,
     last_monotonic_millis: u64,
+    /// EXPOSURE. Candidates seen in Shadow. Kept because it describes the host,
+    /// but it no longer gates anything — seeing a candidate is not measuring.
     shadow_eligible: u64,
+    /// EVIDENCE. Shadow pairs closed with a valid, observed control endpoint.
+    ///
+    /// A new field on purpose: state persisted under the old semantics carries
+    /// no value for it and deserialises to 0, so the exposure a previous boot
+    /// accumulated cannot be laundered into evidence by the upgrade itself.
+    shadow_measurements_proven: u64,
     canary_eligible: u64,
     canary_opened: u64,
     canary_completed: u64,
@@ -518,6 +585,7 @@ impl PersistedRollout {
         self.phase_started_millis = now_millis;
         self.last_monotonic_millis = now_millis;
         self.shadow_eligible = 0;
+        self.shadow_measurements_proven = 0;
         self.canary_eligible = 0;
         self.canary_opened = 0;
         self.canary_completed = 0;
@@ -534,6 +602,7 @@ impl Default for MicroexperimentLabPersisted {
             origin: ExplorationOrigin::default(),
             next_pair_sequence: 0,
             open: Vec::new(),
+            shadow_open: Vec::new(),
             completed: VecDeque::new(),
             gold_dedup: VecDeque::new(),
             metrics: PersistedMetrics::default(),
@@ -590,6 +659,9 @@ pub struct MicroexperimentLab {
     origin: ExplorationOrigin,
     next_pair_sequence: u64,
     open: Vec<PairRecord>,
+    /// Shadow-phase bookkeeping. Never read by `issue_ready_arms`, so nothing
+    /// here can become a real directive. See `ShadowPairRecord`.
+    shadow_open: Vec<ShadowPairRecord>,
     completed: VecDeque<CompletedPairSummary>,
     gold_dedup: VecDeque<PairId>,
     pending_gold: VecDeque<PairGoldRecord>,
@@ -621,6 +693,7 @@ impl MicroexperimentLab {
             origin,
             next_pair_sequence: 0,
             open: Vec::with_capacity(MAX_OPEN_PAIRS),
+            shadow_open: Vec::new(),
             completed: VecDeque::with_capacity(MAX_COMPLETED_PAIRS),
             gold_dedup: VecDeque::with_capacity(MAX_GOLD_DEDUP),
             pending_gold: VecDeque::with_capacity(MAX_GOLD_DEDUP),
@@ -719,12 +792,111 @@ impl MicroexperimentLab {
         self.metrics.randomized_total = self.metrics.randomized_total.saturating_add(1);
         self.metrics.shadow_would_open_total =
             self.metrics.shadow_would_open_total.saturating_add(1);
-        Ok(PairAssignment {
+        let assignment = PairAssignment {
             id,
             order,
             first,
             second,
-        })
+        };
+        // Track it so an episode can bind and prove the measurement pipeline.
+        // Bounded by the same ceiling as real pairs: the point is to prove
+        // capability, and a handful of tracked pairs proves it as well as a
+        // thousand would.
+        if self.shadow_open.len() < MAX_OPEN_PAIRS {
+            self.shadow_open.push(ShadowPairRecord {
+                candidate,
+                assignment,
+                issued: None,
+                control_endpoint: None,
+            });
+        }
+        Ok(assignment)
+    }
+
+    /// Arms for shadow pairs. Always `observe_only`, so the adapter will bind
+    /// episodes to them but never surface them as control withholds.
+    ///
+    /// Separate from `issue_ready_arms` on purpose: that function reads
+    /// `self.open`, this one reads `self.shadow_open`, and neither can see the
+    /// other's collection. A shadow pair therefore has no reachable path to a
+    /// real directive.
+    pub fn issue_shadow_arms(&mut self, cycle: u64, gates: PairGates) -> Vec<PairDirective> {
+        if self.rollout.phase != LabPhase::Shadow || !gates.inherited_safe {
+            return Vec::new();
+        }
+        let mut directives = Vec::new();
+        for record in &mut self.shadow_open {
+            if record.issued.is_some() || record.control_endpoint.is_some() {
+                continue;
+            }
+            let horizon = u64::from(record.candidate.horizon_cycles);
+            let issued = IssuedArm {
+                arm: ArmKind::Control,
+                issued_cycle: cycle,
+                complete_not_before_cycle: cycle.saturating_add(horizon),
+                expires_after_cycle: cycle
+                    .saturating_add(horizon)
+                    .saturating_mul(2)
+                    .max(cycle + 1),
+            };
+            record.issued = Some(issued);
+            directives.push(PairDirective {
+                observe_only: true,
+                pair_id: record.assignment.id,
+                arm: ArmKind::Control,
+                treatment_arm: record.candidate.treatment_arm,
+                family: record.candidate.family,
+                action_class: record.candidate.action_class,
+                context: record.candidate.context,
+                action_key: record.candidate.action_key.clone(),
+                stratum_hash: record.candidate.stratum_hash,
+                issued_cycle: issued.issued_cycle,
+                complete_not_before_cycle: issued.complete_not_before_cycle,
+                expires_after_cycle: issued.expires_after_cycle,
+                rollback_required: false,
+            });
+        }
+        directives
+    }
+
+    /// Bind an observed endpoint to a shadow pair.
+    ///
+    /// Accepts only a control arm that genuinely ran as a no-op and completed
+    /// its horizon locally. Nothing here is inferred or filled in: an endpoint
+    /// that does not already say `NoOp`/`Complete`/observed/non-synthetic is
+    /// refused rather than coerced, because the whole value of this evidence is
+    /// that it was measured and not assumed.
+    fn record_shadow_endpoint(&mut self, observation: &TimedPairEndpoint) -> bool {
+        let Some(index) = self
+            .shadow_open
+            .iter()
+            .position(|record| record.assignment.id == observation.pair_id)
+        else {
+            return false;
+        };
+        let endpoint = &observation.endpoint;
+        let valid = endpoint.arm == ArmKind::Control
+            && endpoint.execution == ExecutionClosure::NoOp
+            && endpoint.horizon == HorizonClosure::Complete
+            && endpoint.observed_local
+            && !endpoint.synthetic
+            && endpoint_matches(&self.shadow_open[index].candidate, endpoint);
+        let record = self.shadow_open.swap_remove(index);
+        if valid {
+            self.rollout.shadow_measurements_proven =
+                self.rollout.shadow_measurements_proven.saturating_add(1);
+            self.metrics.shadow_measurements_proven_total = self
+                .metrics
+                .shadow_measurements_proven_total
+                .saturating_add(1);
+        } else {
+            self.metrics.shadow_measurements_refused_total = self
+                .metrics
+                .shadow_measurements_refused_total
+                .saturating_add(1);
+        }
+        let _ = record;
+        true
     }
 
     pub fn phase(&self) -> LabPhase {
@@ -757,8 +929,8 @@ impl MicroexperimentLab {
     pub fn rollout_progress(&self) -> (u64, u64) {
         match self.rollout.phase {
             LabPhase::Shadow => (
-                self.rollout.shadow_eligible,
-                self.rollout_config.shadow_min_opportunities,
+                self.rollout.shadow_measurements_proven,
+                self.rollout_config.shadow_min_measurements,
             ),
             LabPhase::Canary => (
                 self.rollout.canary_eligible,
@@ -935,6 +1107,9 @@ impl MicroexperimentLab {
                 expires_after_cycle,
             });
             directives.push(PairDirective {
+                // Real pair: this arm may legitimately request a control
+                // withhold. Shadow arms are issued elsewhere with `true`.
+                observe_only: false,
                 pair_id: record.assignment.id,
                 arm,
                 treatment_arm: record.candidate.treatment_arm,
@@ -957,9 +1132,18 @@ impl MicroexperimentLab {
         &mut self,
         observation: TimedPairEndpoint,
     ) -> Result<TimedEndpointDisposition, LabError> {
-        let index = self
-            .find_open(observation.pair_id)
-            .ok_or(LabError::UnknownPair)?;
+        let index = match self.find_open(observation.pair_id) {
+            Some(index) => index,
+            None => {
+                // Not a real pair. It may still be a shadow pair proving the
+                // measurement path; that route validates the endpoint itself
+                // and never produces causal evidence.
+                if self.record_shadow_endpoint(&observation) {
+                    return Ok(TimedEndpointDisposition::ShadowMeasured);
+                }
+                return Err(LabError::UnknownPair);
+            }
+        };
         let record = &self.open[index];
         let issued = record.issued.ok_or(LabError::EndpointNotIssued)?;
         if observation.issued_cycle != issued.issued_cycle || observation.endpoint.arm != issued.arm
@@ -1246,6 +1430,7 @@ impl MicroexperimentLab {
             origin: self.origin,
             next_pair_sequence: self.next_pair_sequence,
             open: self.open.clone(),
+            shadow_open: self.shadow_open.clone(),
             completed: self.completed.clone(),
             gold_dedup: self.gold_dedup.clone(),
             metrics: self.metrics,
@@ -1274,6 +1459,7 @@ impl MicroexperimentLab {
             origin: expected_origin,
             next_pair_sequence: persisted.next_pair_sequence,
             open: Vec::with_capacity(MAX_OPEN_PAIRS),
+            shadow_open: Vec::new(),
             completed: persisted.completed,
             gold_dedup: persisted.gold_dedup,
             pending_gold: VecDeque::with_capacity(MAX_GOLD_DEDUP),
@@ -1323,8 +1509,13 @@ impl MicroexperimentLab {
         // re-arms from this boot because `now_millis` is monotonic-since-boot
         // and would otherwise be satisfied instantly.
         let shadow_eligible = lab.rollout.shadow_eligible;
+        // Evidence earned is durable: a measurement the host actually produced
+        // stays produced across a restart. Exposure is carried too, but only
+        // because it describes the host — it no longer gates anything.
+        let shadow_measurements_proven = lab.rollout.shadow_measurements_proven;
         let _deliberately_carried_forward = lab.rollout.reset_to_shadow(0);
         lab.rollout.shadow_eligible = shadow_eligible;
+        lab.rollout.shadow_measurements_proven = shadow_measurements_proven;
         // Boot-scoped provenance: this is the value the operator should see
         // published before the new boot has run a cycle.
         lab.restored_progress = shadow_eligible;
@@ -1367,6 +1558,8 @@ impl MicroexperimentLab {
             interrupted_total: self.metrics.interrupted_total,
             synthetic_quarantined_total: self.metrics.synthetic_quarantined_total,
             shadow_would_open_total: self.metrics.shadow_would_open_total,
+            shadow_measurements_proven_total: self.metrics.shadow_measurements_proven_total,
+            shadow_measurements_refused_total: self.metrics.shadow_measurements_refused_total,
             invalidated_total: self.metrics.invalidated_total,
             deadline_expired_total: self.metrics.deadline_expired_total,
             unbound_expiries_total: self.metrics.unbound_expiries_total,
@@ -1423,10 +1616,15 @@ impl MicroexperimentLab {
 
     fn advance_rollout(&mut self, now_millis: u64, gates_enabled: bool) {
         match self.rollout.phase {
+            // Evidence, not exposure. `shadow_eligible` deliberately does not
+            // appear here: a host that shows a million candidates and never
+            // closes one measurement stays in Shadow forever, which is the
+            // correct outcome. The duration remains as a floor — it can only
+            // delay a graduation, never cause one.
             LabPhase::Shadow
                 if gates_enabled
-                    && self.rollout.shadow_eligible
-                        >= self.rollout_config.shadow_min_opportunities
+                    && self.rollout.shadow_measurements_proven
+                        >= self.rollout_config.shadow_min_measurements
                     && now_millis.saturating_sub(self.rollout.phase_started_millis)
                         >= self.rollout_config.shadow_min_duration_ms =>
             {
@@ -1761,6 +1959,36 @@ mod rollout_tests {
         }
     }
 
+    /// Drive one full Shadow measurement: candidate → tracked shadow pair →
+    /// observe-only arm → observed control endpoint → proven.
+    ///
+    /// Nothing is applied and nothing is forged. The endpoint says `NoOp`
+    /// because in Shadow the action genuinely did not run, which is exactly
+    /// what makes this evidence honest rather than a stand-in for PairGold.
+    fn prove_shadow_measurement(
+        lab: &mut MicroexperimentLab,
+        sequence: u64,
+        cycle: u64,
+        now_millis: u64,
+    ) {
+        let cand = candidate(sequence);
+        lab.consider_candidate(cand.clone(), PairGates::healthy_enabled(), now_millis)
+            .expect("shadow candidate accepted");
+        let directives = lab.issue_shadow_arms(cycle, PairGates::healthy_enabled());
+        // Candidates share an action_key; the stratum hash is what makes this
+        // one distinct, so bind by that or a later pair steals the endpoint.
+        let directive = directives
+            .iter()
+            .find(|d| d.stratum_hash == cand.stratum_hash)
+            .expect("shadow arm issued");
+        assert!(directive.observe_only, "a shadow arm must be observe-only");
+        let observation = endpoint(&cand, directive, 0);
+        let disposition = lab
+            .record_timed_endpoint(observation)
+            .expect("shadow endpoint accepted");
+        assert_eq!(disposition, TimedEndpointDisposition::ShadowMeasured);
+    }
+
     fn active_lab() -> MicroexperimentLab {
         let mut lab = MicroexperimentLab::cold_start(origin());
         lab.rollout.phase = LabPhase::Active;
@@ -1895,23 +2123,25 @@ mod rollout_tests {
         assert_eq!(lab.metrics().open_pairs, 0);
     }
 
-    /// Drives the lab to Canary with `earned` shadow opportunities banked, the
-    /// shape production reaches before it issues its first arm.
+    /// Drives the lab to Canary with `earned` **measurements** banked — the
+    /// shape production reaches before it issues its first real arm.
+    ///
+    /// Previously this walked candidates, because exposure was what the gate
+    /// read. It now has to actually measure, which is the whole point of the
+    /// change: a test cannot reach Canary by looking at candidates either.
     fn lab_in_canary_with_progress(earned: u64) -> MicroexperimentLab {
         let mut lab = MicroexperimentLab::cold_start(origin());
         lab.rollout_config = LabRolloutConfig {
             shadow_min_opportunities: earned,
+            shadow_min_measurements: earned,
             shadow_min_duration_ms: 10,
             canary_percent: 100,
             canary_min_opportunities: 500,
         };
         for index in 0..earned {
-            let _ = lab.consider_candidate(
-                candidate(index + 1),
-                PairGates::healthy_enabled(),
-                index * 2,
-            );
+            prove_shadow_measurement(&mut lab, index + 1, index + 1, index * 2);
         }
+        lab.advance_cycle(earned + 1, earned * 2, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Canary, "setup must reach canary");
         lab
     }
@@ -2089,18 +2319,14 @@ mod rollout_tests {
         let mut lab = MicroexperimentLab::cold_start(origin());
         lab.rollout_config = LabRolloutConfig {
             shadow_min_opportunities: 2,
+            shadow_min_measurements: 1,
             shadow_min_duration_ms: 10,
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        assert!(matches!(
-            lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 0),
-            Ok(CandidateDisposition::Shadow(_))
-        ));
-        assert!(matches!(
-            lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 10),
-            Ok(CandidateDisposition::Shadow(_))
-        ));
+        // Canary is now reached by measuring, not by being looked at.
+        prove_shadow_measurement(&mut lab, 1, 1, 0);
+        lab.advance_cycle(2, 11, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Canary);
 
         let candidate = candidate(3);
@@ -2148,22 +2374,20 @@ mod rollout_tests {
         let mut lab = MicroexperimentLab::cold_start(origin());
         lab.rollout_config = LabRolloutConfig {
             shadow_min_opportunities: 2,
+            shadow_min_measurements: 1,
             shadow_min_duration_ms: 10_000,
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
-            .unwrap();
-        lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 2_000)
-            .unwrap();
+        prove_shadow_measurement(&mut lab, 1, 1, 1_000);
         assert_eq!(lab.phase(), LabPhase::Shadow);
 
         let (mut restored, disposition) = MicroexperimentLab::restore(lab.persisted(), origin());
         restored.rollout_config = lab.rollout_config;
         assert_eq!(disposition, RestoreDisposition::Restored);
         assert_eq!(restored.phase(), LabPhase::Shadow);
-        // The opportunity count survives; it is durable evidence about the host.
-        assert_eq!(restored.rollout.shadow_eligible, 2);
+        // Evidence the host actually produced is durable across the restart.
+        assert_eq!(restored.rollout.shadow_measurements_proven, 1);
 
         // The duration gate must NOT be instantly satisfiable after restore:
         // the phase clock re-arms on the first candidate of the new boot.
@@ -2176,10 +2400,9 @@ mod rollout_tests {
             "restore must not let a monotonic clock satisfy the duration gate instantly"
         );
 
-        // Once the minimum duration genuinely elapses on this boot, it promotes.
-        restored
-            .consider_candidate(candidate(4), PairGates::healthy_enabled(), 511_000)
-            .unwrap();
+        // Once the minimum duration genuinely elapses on this boot, it promotes
+        // — the evidence requirement was already met before the restart.
+        restored.advance_cycle(9, 511_000, PairGates::healthy_enabled());
         assert_eq!(restored.phase(), LabPhase::Canary);
     }
 
@@ -2193,6 +2416,9 @@ mod rollout_tests {
     #[test]
     fn shadow_progress_survives_the_json_round_trip_and_the_first_cycles() {
         let mut lab = MicroexperimentLab::cold_start(origin());
+        // Earn the evidence first: `shadow_open` is bounded, so a pair created
+        // after the flood would never be tracked and could never be measured.
+        prove_shadow_measurement(&mut lab, 900, 1, 500);
         for sequence in 1..=413u64 {
             lab.consider_candidate(
                 candidate(sequence),
@@ -2201,7 +2427,12 @@ mod rollout_tests {
             )
             .unwrap();
         }
-        assert_eq!(lab.rollout_progress(), (413, SHADOW_MIN_OPPORTUNITIES));
+        // Exposure accumulated; the gate did not move, because none of those
+        // 413 candidates was ever measured.
+        // One measurement earned, 413 candidates merely seen: the gate reads
+        // the first number and ignores the second.
+        assert_eq!(lab.rollout_progress(), (1, SHADOW_MIN_MEASUREMENTS));
+        assert_eq!(lab.metrics().shadow_would_open_total, 414);
 
         let encoded = serde_json::to_string(&lab.persisted()).expect("encode");
         let decoded: MicroexperimentLabPersisted = serde_json::from_str(&encoded).expect("decode");
@@ -2210,8 +2441,8 @@ mod rollout_tests {
         assert_eq!(disposition, RestoreDisposition::Restored);
         assert_eq!(
             restored.rollout_progress(),
-            (413, SHADOW_MIN_OPPORTUNITIES),
-            "the gate counter must survive the disk round trip"
+            (1, SHADOW_MIN_MEASUREMENTS),
+            "earned evidence must survive the disk round trip"
         );
 
         // The new boot's clock restarts near zero while the persisted rollout
@@ -2222,8 +2453,8 @@ mod rollout_tests {
         }
         assert_eq!(
             restored.rollout_progress().0,
-            413,
-            "the first cycles of the new boot must not reset the gate counter"
+            1,
+            "the first cycles of the new boot must not reset earned evidence"
         );
     }
 
@@ -2232,27 +2463,187 @@ mod rollout_tests {
         let mut lab = MicroexperimentLab::cold_start(origin());
         lab.rollout_config = LabRolloutConfig {
             shadow_min_opportunities: 4,
+            shadow_min_measurements: 1,
             shadow_min_duration_ms: 10_000,
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        assert_eq!(lab.rollout_progress(), (0, 4));
+        assert_eq!(lab.rollout_progress(), (0, 1));
 
         lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
             .unwrap();
         lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 2_000)
             .unwrap();
 
-        assert_eq!(lab.rollout_progress(), (2, 4));
-        // The cumulative metric counts the same events but is not the gate.
+        // Two candidates seen, nothing measured. Exposure is recorded but the
+        // gate does not move: seeing a candidate is not measuring one.
+        assert_eq!(lab.rollout_progress(), (0, 1));
         assert_eq!(lab.metrics().eligible_total, 2);
+        assert_eq!(lab.metrics().shadow_would_open_total, 2);
 
-        // After a restart the cumulative total keeps climbing from persisted
-        // state while the gate counter is what actually governs promotion.
+        // A restart carries the same distinction: exposure survives, evidence
+        // is still zero because none was ever earned.
         let (mut restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
         restored.rollout_config = lab.rollout_config;
-        assert_eq!(restored.rollout_progress(), (2, 4));
+        assert_eq!(restored.rollout_progress(), (0, 1));
         assert_eq!(restored.metrics().eligible_total, 2);
+    }
+
+    // ── Shadow evidence invariants ──────────────────────────────────────────
+
+    #[test]
+    fn exposure_without_measurement_never_graduates() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        for seq in 0..600 {
+            let _ = lab.consider_candidate(
+                candidate(seq),
+                PairGates::healthy_enabled(),
+                (seq + 1) * 1_000,
+            );
+            lab.advance_cycle(seq, (seq + 1) * 1_000, PairGates::healthy_enabled());
+        }
+        assert_eq!(lab.phase(), LabPhase::Shadow);
+        assert_eq!(lab.rollout_progress().0, 0);
+        assert!(
+            lab.metrics().shadow_would_open_total >= 500,
+            "exposure did accumulate: {}",
+            lab.metrics().shadow_would_open_total
+        );
+    }
+
+    #[test]
+    fn a_shadow_arm_is_never_a_control_withhold() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        let directives = lab.issue_shadow_arms(1, PairGates::healthy_enabled());
+        assert!(!directives.is_empty(), "a shadow pair must issue its arm");
+        assert!(
+            directives.iter().all(|d| d.observe_only),
+            "an observe-only arm cannot withhold an action the machine would take"
+        );
+    }
+
+    #[test]
+    fn issue_ready_arms_cannot_see_a_shadow_pair() {
+        // The guarantee is structural: real directives come from `open`, shadow
+        // bookkeeping lives in `shadow_open`, and no code path bridges them.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        assert!(lab.open.is_empty(), "Shadow must never open a real pair");
+        assert_eq!(lab.shadow_open.len(), 1);
+        assert!(
+            lab.issue_ready_arms(1, PairGates::healthy_enabled())
+                .is_empty(),
+            "no real directive may originate in Shadow"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_that_was_applied_proves_nothing_in_shadow() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let cand = candidate(1);
+        lab.consider_candidate(cand.clone(), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        let directives = lab.issue_shadow_arms(1, PairGates::healthy_enabled());
+        let mut observation = endpoint(&cand, &directives[0], 0);
+        // Claiming the treatment ran is exactly the fabrication this design
+        // refuses: in Shadow nothing was applied.
+        observation.endpoint.execution = ExecutionClosure::Applied;
+        let _ = lab.record_timed_endpoint(observation);
+        assert_eq!(lab.rollout_progress().0, 0);
+        assert_eq!(lab.metrics().shadow_measurements_refused_total, 1);
+    }
+
+    #[test]
+    fn a_synthetic_endpoint_proves_nothing_in_shadow() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let cand = candidate(1);
+        lab.consider_candidate(cand.clone(), PairGates::healthy_enabled(), 1_000)
+            .unwrap();
+        let directives = lab.issue_shadow_arms(1, PairGates::healthy_enabled());
+        let mut observation = endpoint(&cand, &directives[0], 0);
+        observation.endpoint.synthetic = true;
+        let _ = lab.record_timed_endpoint(observation);
+        assert_eq!(lab.rollout_progress().0, 0);
+    }
+
+    #[test]
+    fn a_shadow_measurement_never_becomes_causal_evidence() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        prove_shadow_measurement(&mut lab, 1, 1, 1_000);
+        assert_eq!(lab.rollout_progress().0, 1);
+        assert_eq!(
+            lab.metrics().pair_gold_total,
+            0,
+            "measurement capability is not a causal claim"
+        );
+        assert_eq!(lab.metrics().effective_total, 0);
+    }
+
+    #[test]
+    fn the_shadow_gate_is_exact_at_its_boundary() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 1,
+            shadow_min_measurements: 3,
+            shadow_min_duration_ms: 0,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+        for seq in 1..=2 {
+            prove_shadow_measurement(&mut lab, seq, seq, seq * 1_000);
+        }
+        // Monotonic throughout: a clock that goes backwards is itself a reset
+        // trigger, and this test is about the threshold, not about regression.
+        lab.advance_cycle(3, 3_000, PairGates::healthy_enabled());
+        assert_eq!(lab.phase(), LabPhase::Shadow, "threshold - 1 stays Shadow");
+
+        prove_shadow_measurement(&mut lab, 3, 4, 4_000);
+        lab.advance_cycle(5, 5_000, PairGates::healthy_enabled());
+        assert_eq!(lab.phase(), LabPhase::Canary, "threshold promotes");
+    }
+
+    #[test]
+    fn a_restart_keeps_earned_evidence_and_invents_none() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        prove_shadow_measurement(&mut lab, 1, 1, 1_000);
+        prove_shadow_measurement(&mut lab, 2, 2, 2_000);
+        assert_eq!(lab.rollout_progress().0, 2);
+
+        let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        assert_eq!(
+            restored.rollout_progress().0,
+            2,
+            "evidence actually earned survives a restart"
+        );
+        assert_eq!(restored.phase(), LabPhase::Shadow);
+    }
+
+    #[test]
+    fn state_written_before_the_fix_carries_no_evidence_forward() {
+        // The old semantics banked exposure in `shadow_eligible`. Evidence
+        // lives in a field that state did not have, so it deserialises to 0
+        // and yesterday's 213 opportunities cannot be laundered into progress.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        for seq in 1..=40 {
+            let _ =
+                lab.consider_candidate(candidate(seq), PairGates::healthy_enabled(), seq * 1_000);
+        }
+        let mut json = serde_json::to_value(lab.persisted()).expect("serialise");
+        json.get_mut("rollout")
+            .and_then(|r| r.as_object_mut())
+            .map(|r| r.remove("shadow_measurements_proven"));
+        let legacy: MicroexperimentLabPersisted =
+            serde_json::from_value(json).expect("legacy state must still load");
+        let (restored, _) = MicroexperimentLab::restore(legacy, origin());
+        assert_eq!(
+            restored.rollout_progress().0,
+            0,
+            "exposure banked under the old rule is not evidence under the new one"
+        );
+        assert_eq!(restored.phase(), LabPhase::Shadow);
     }
 
     #[test]
@@ -2260,12 +2651,13 @@ mod rollout_tests {
         let mut lab = MicroexperimentLab::cold_start(origin());
         lab.rollout_config = LabRolloutConfig {
             shadow_min_opportunities: 1,
+            shadow_min_measurements: 1,
             shadow_min_duration_ms: 0,
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 10)
-            .unwrap();
+        prove_shadow_measurement(&mut lab, 1, 1, 10);
+        lab.advance_cycle(2, 20, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Canary);
 
         let (mut restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());

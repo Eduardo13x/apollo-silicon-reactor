@@ -430,22 +430,21 @@ impl AdaptiveGovernor {
         // idle) would otherwise each need their own copy, and a fifth added
         // later would silently miss it.
         let pd = |decision: GovernorDecision, utility_score: f32, reason: String| {
-            let (decision, reason) = if decision == GovernorDecision::Throttle
-                && below_throttle_floor
-            {
-                crate::engine::lse_counters::LSE_COUNTERS.inc_throttle_below_resource_floor();
-                (
-                    GovernorDecision::Allow,
-                    format!(
+            let (decision, reason) =
+                if decision == GovernorDecision::Throttle && below_throttle_floor {
+                    crate::engine::lse_counters::LSE_COUNTERS.inc_throttle_below_resource_floor();
+                    (
+                        GovernorDecision::Allow,
+                        format!(
                         "below throttle floor (cpu={:.1}% rss={} MB wakeups={:.0}/s) — {reason}",
                         snap.cpu_percent,
                         snap.rss_bytes / (1024 * 1024),
                         snap.wakeups_per_sec
                     ),
-                )
-            } else {
-                (decision, reason)
-            };
+                    )
+                } else {
+                    (decision, reason)
+                };
             ProcessDecision {
                 pid: snap.pid,
                 name: snap.name.clone(),

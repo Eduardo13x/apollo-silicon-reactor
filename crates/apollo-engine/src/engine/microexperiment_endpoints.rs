@@ -128,6 +128,11 @@ pub struct EndpointUtilitySample {
 struct OutstandingArm {
     pair_id: PairId,
     arm: ArmKind,
+    /// Shadow arms are registered purely so an episode can bind to them. They
+    /// must never surface through `outstanding_control_actions`, because a
+    /// withheld control window changes what the machine does — and Shadow's
+    /// whole contract is that it changes nothing.
+    observe_only: bool,
     canonical: CanonicalAction,
     action_key: String,
     family: ActuatorFamily,
@@ -252,6 +257,7 @@ impl MicroexperimentEndpointAdapter {
             self.outstanding.push_back(OutstandingArm {
                 pair_id: directive.pair_id,
                 arm: directive.arm,
+                observe_only: directive.observe_only,
                 canonical,
                 action_key: directive.action_key.clone(),
                 family: directive.family,
@@ -280,6 +286,9 @@ impl MicroexperimentEndpointAdapter {
     pub fn outstanding_control_actions(&self) -> Vec<CanonicalAction> {
         let mut actions = Vec::with_capacity(self.outstanding.len());
         for arm in &self.outstanding {
+            if arm.observe_only {
+                continue;
+            }
             if arm.arm == ArmKind::Control && !actions.contains(&arm.canonical) {
                 actions.push(arm.canonical);
             }
@@ -313,6 +322,14 @@ impl MicroexperimentEndpointAdapter {
     /// carries. It also keeps the hot path free of per-episode parsing when no
     /// experiment is open.
     pub fn observe_episodes(&mut self, episodes: &[ResolvedDecisionEpisode], cycle: u64) {
+        // Liveness means the ledger delivered something, not that this function
+        // was reached. The previous unconditional stamp made
+        // `observation_path_live` — and through it `endpoint_contract_ready` —
+        // report a healthy path on a daemon that had ingested nothing but empty
+        // batches, which is precisely the claim the doc comment above denies.
+        if episodes.is_empty() {
+            return;
+        }
         self.last_episode_cycle = Some(cycle);
         if self.outstanding.is_empty() {
             self.counters.episodes_skipped_idle = self

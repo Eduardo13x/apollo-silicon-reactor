@@ -301,6 +301,7 @@ impl MicroexperimentRuntime {
                             Err(error) => blocker = blocker_for_endpoint_error(error),
                         }
                     }
+                    Ok(TimedEndpointDisposition::ShadowMeasured) => blocker = "shadow-measured",
                     Ok(TimedEndpointDisposition::Progress(_)) => blocker = "washout",
                     Ok(TimedEndpointDisposition::Invalidated(record)) => {
                         invalidations.push(record);
@@ -333,11 +334,18 @@ impl MicroexperimentRuntime {
             }
         }
 
-        let directives = if input.endpoint_contract_ready && effective_gates.allows_pair() {
+        // Real arms only outside Shadow; shadow arms are observe-only and are
+        // issued from the separate collection. `issue_ready_arms` returns empty
+        // in Shadow and `issue_shadow_arms` returns empty outside it, so the two
+        // can never both produce a directive for the same pair.
+        let mut directives = if input.endpoint_contract_ready && effective_gates.allows_pair() {
             self.lab.issue_ready_arms(input.cycle, effective_gates)
         } else {
             Vec::new()
         };
+        if input.endpoint_contract_ready {
+            directives.extend(self.lab.issue_shadow_arms(input.cycle, effective_gates));
+        }
         if input.endpoint_contract_ready && effective_gates.allows_pair() {
             blocker = if let Some(readiness) = self.lab.readiness_blocker() {
                 readiness
@@ -589,6 +597,18 @@ mod tests {
         assert_eq!(markov.horizon_cycles, 120);
     }
 
+    /// A settled episode outside the experiment catalog. Enough to prove the
+    /// ledger delivers; never enough to bind an arm or earn evidence.
+    fn liveness_episode(cycle: u64) -> ResolvedDecisionEpisode {
+        ResolvedDecisionEpisode {
+            id: apollo_engine::engine::decision_ledger::DecisionId(900_000 + cycle),
+            lifecycle: apollo_engine::engine::decision_ledger::DecisionLifecycle::Settled,
+            settled_cycle: cycle,
+            authority_eligible: false,
+            envelope: Default::default(),
+        }
+    }
+
     #[test]
     fn contract_is_false_until_the_ledger_actually_delivers_episodes() {
         let mut runtime = MicroexperimentRuntime::new(origin(), None);
@@ -596,7 +616,13 @@ mod tests {
             !runtime.endpoint_contract_ready(1),
             "no ledger batch has been observed yet"
         );
+        // An empty poll is not delivery: liveness must not move.
         runtime.observe_decisions(&[], 2);
+        assert!(
+            !runtime.endpoint_contract_ready(2),
+            "an empty batch is the ledger being asked, not the ledger answering"
+        );
+        runtime.observe_decisions(&[liveness_episode(2)], 2);
         assert!(runtime.endpoint_contract_ready(2));
 
         let opted = runtime.tick(opted_in(3));
@@ -606,7 +632,7 @@ mod tests {
     #[test]
     fn an_opted_out_daemon_stays_in_shadow_even_with_a_live_ledger() {
         let mut runtime = MicroexperimentRuntime::new(origin(), None);
-        runtime.observe_decisions(&[], 1);
+        runtime.observe_decisions(&[liveness_episode(1)], 1);
         runtime.tick(input(1));
         let metrics = runtime
             .tick(MicroexperimentTickInput {
