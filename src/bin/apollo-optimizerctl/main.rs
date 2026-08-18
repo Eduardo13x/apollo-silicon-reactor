@@ -4,6 +4,7 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod dashboard;
+mod perceptual_doctor;
 mod whisper;
 
 use anyhow::Context;
@@ -89,6 +90,9 @@ enum Commands {
         #[arg(long)]
         always_on: bool,
     },
+    /// Diagnose the Perceptual Interaction Layer hop by hop. Reports which
+    /// component is responsible for missing data instead of a bare zero.
+    PerceptualDoctor,
 }
 
 #[derive(Subcommand)]
@@ -204,9 +208,20 @@ fn main() -> anyhow::Result<()> {
         return whisper::run(always_on);
     }
 
+    if matches!(cli.command, Commands::PerceptualDoctor) {
+        let response = send_request(DaemonRequest::GetMetrics)?;
+        let DaemonResponse::Metrics(metrics) = response else {
+            anyhow::bail!("daemon did not return metrics");
+        };
+        let report = perceptual_doctor::diagnose(&metrics);
+        print!("{}", perceptual_doctor::render(&report));
+        return Ok(());
+    }
+
     let response = match cli.command {
         Commands::Dashboard => unreachable!(),
         Commands::Whisper { .. } => unreachable!(),
+        Commands::PerceptualDoctor => unreachable!(),
         Commands::Status => send_request(DaemonRequest::GetStatus),
         Commands::Metrics => send_request(DaemonRequest::GetMetrics),
         Commands::TopBlockers => send_request(DaemonRequest::GetTopBlockers),
