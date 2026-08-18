@@ -11,6 +11,10 @@ use apollo_engine::engine::webflow_types::{
 
 /// Bounded per-metric sample ring for browser Web Vitals. The extension is an
 /// untrusted producer, so the window is fixed-size and never grows with input.
+///
+/// The `event_duration` ring holds individual `PerformanceEventTiming.duration`
+/// values, **not** interactions: it cannot yield INP, only the tail of single
+/// entries above the collector's threshold.
 const MAX_VITALS_SAMPLES: usize = 64;
 
 /// Nearest-rank p95 over a bounded sample window.
@@ -32,14 +36,23 @@ fn vitals_p95(samples: &[u32]) -> Option<f64> {
 #[derive(Debug, Default)]
 struct VitalsWindow {
     lcp_ms: VecDeque<u32>,
-    inp_ms: VecDeque<u32>,
+    event_duration_ms: VecDeque<u32>,
+    /// Corrected per-interaction series. Kept apart from the entry-duration
+    /// ring above so the two can never be folded into one reading.
+    inp_estimate_ms: VecDeque<u32>,
+    interaction_count: u64,
+    interactions_dropped: u64,
+    input_delay_total_ms: u64,
+    processing_total_ms: u64,
+    presentation_total_ms: u64,
 }
 
 impl VitalsWindow {
     fn record(&mut self, metrics: &WebFlowMetrics) {
         for (value, ring) in [
             (metrics.lcp_ms, &mut self.lcp_ms),
-            (metrics.inp_ms, &mut self.inp_ms),
+            (metrics.event_duration_ms, &mut self.event_duration_ms),
+            (metrics.inp_estimate_ms, &mut self.inp_estimate_ms),
         ] {
             let Some(value) = value else {
                 continue;
@@ -49,25 +62,50 @@ impl VitalsWindow {
             }
             ring.push_back(value);
         }
+        self.interaction_count = self
+            .interaction_count
+            .saturating_add(u64::from(metrics.interaction_count.unwrap_or(0)));
+        self.interactions_dropped = self
+            .interactions_dropped
+            .saturating_add(u64::from(metrics.interactions_dropped.unwrap_or(0)));
+        self.input_delay_total_ms = self
+            .input_delay_total_ms
+            .saturating_add(u64::from(metrics.input_delay_total_ms.unwrap_or(0)));
+        self.processing_total_ms = self
+            .processing_total_ms
+            .saturating_add(u64::from(metrics.processing_total_ms.unwrap_or(0)));
+        self.presentation_total_ms = self
+            .presentation_total_ms
+            .saturating_add(u64::from(metrics.presentation_total_ms.unwrap_or(0)));
     }
 
     fn clear(&mut self) {
         self.lcp_ms.clear();
-        self.inp_ms.clear();
+        self.event_duration_ms.clear();
+        self.inp_estimate_ms.clear();
+        self.interaction_count = 0;
+        self.interactions_dropped = 0;
+        self.input_delay_total_ms = 0;
+        self.processing_total_ms = 0;
+        self.presentation_total_ms = 0;
+    }
+
+    fn inp_estimate_p95_ms(&self) -> Option<f64> {
+        vitals_p95(&self.inp_estimate_ms.iter().copied().collect::<Vec<_>>())
     }
 
     fn lcp_p95_ms(&self) -> Option<f64> {
         vitals_p95(&self.lcp_ms.iter().copied().collect::<Vec<_>>())
     }
 
-    fn inp_p95_ms(&self) -> Option<f64> {
-        vitals_p95(&self.inp_ms.iter().copied().collect::<Vec<_>>())
+    fn event_duration_tail_ms(&self) -> Option<f64> {
+        vitals_p95(&self.event_duration_ms.iter().copied().collect::<Vec<_>>())
     }
 
     /// Widest sample count backing the published p95s, so a reader can tell a
     /// three-sample guess from a settled measurement.
     fn samples(&self) -> u64 {
-        self.lcp_ms.len().max(self.inp_ms.len()) as u64
+        self.lcp_ms.len().max(self.event_duration_ms.len()) as u64
     }
 }
 
@@ -124,7 +162,13 @@ pub struct WebFlowCycleOutput {
     /// p95 over the bounded Web Vitals window, `None` until the extension has
     /// reported at least one sample of that metric.
     pub lcp_p95_ms: Option<f64>,
-    pub inp_p95_ms: Option<f64>,
+    pub event_duration_tail_ms: Option<f64>,
+    pub inp_estimate_ms: Option<f64>,
+    pub interaction_count: u64,
+    pub interactions_dropped: u64,
+    pub input_delay_total_ms: u64,
+    pub processing_total_ms: u64,
+    pub presentation_total_ms: u64,
     /// Samples behind those p95s.
     pub vitals_samples: u64,
 }
@@ -274,7 +318,13 @@ impl WebFlowRuntime {
             valid_health_cycles: self.valid_health_cycles,
             rollout_blocker: self.rollout_blocker,
             lcp_p95_ms: self.vitals.lcp_p95_ms(),
-            inp_p95_ms: self.vitals.inp_p95_ms(),
+            event_duration_tail_ms: self.vitals.event_duration_tail_ms(),
+            inp_estimate_ms: self.vitals.inp_estimate_p95_ms(),
+            interaction_count: self.vitals.interaction_count,
+            interactions_dropped: self.vitals.interactions_dropped,
+            input_delay_total_ms: self.vitals.input_delay_total_ms,
+            processing_total_ms: self.vitals.processing_total_ms,
+            presentation_total_ms: self.vitals.presentation_total_ms,
             vitals_samples: self.vitals.samples(),
         }
     }
@@ -466,13 +516,13 @@ mod tests {
     fn with_vitals(
         sequence: u64,
         lcp_ms: Option<u32>,
-        inp_ms: Option<u32>,
+        event_duration_ms: Option<u32>,
     ) -> ReceivedWebFlowEvent {
         let mut received = exact(sequence);
         received.event.source = WebFlowSource::ExtensionVitals;
         received.event.metrics = WebFlowMetrics {
             lcp_ms,
-            inp_ms,
+            event_duration_ms,
             ..WebFlowMetrics::default()
         };
         received
@@ -486,7 +536,7 @@ mod tests {
         let output = runtime.tick(input(&events));
 
         assert_eq!(output.lcp_p95_ms, Some(1_200.0));
-        assert_eq!(output.inp_p95_ms, Some(180.0));
+        assert_eq!(output.event_duration_tail_ms, Some(180.0));
     }
 
     #[test]
@@ -522,7 +572,7 @@ mod tests {
         let output = runtime.tick(input(&events));
 
         assert_eq!(output.lcp_p95_ms, Some(900.0));
-        assert_eq!(output.inp_p95_ms, None);
+        assert_eq!(output.event_duration_tail_ms, None);
     }
 
     #[test]
@@ -538,7 +588,7 @@ mod tests {
             Some(WebFlowSource::DaemonInference)
         );
         assert_eq!(output.lcp_p95_ms, None);
-        assert_eq!(output.inp_p95_ms, None);
+        assert_eq!(output.event_duration_tail_ms, None);
     }
 
     #[test]
@@ -553,7 +603,7 @@ mod tests {
         let output = runtime.tick(cycle);
 
         assert_eq!(output.lcp_p95_ms, None);
-        assert_eq!(output.inp_p95_ms, None);
+        assert_eq!(output.event_duration_tail_ms, None);
     }
 
     #[test]
@@ -605,7 +655,7 @@ mod tests {
         sleeping.sleeping = true;
         let output = runtime.tick(sleeping);
         assert_eq!(output.lcp_p95_ms, None);
-        assert_eq!(output.inp_p95_ms, None);
+        assert_eq!(output.event_duration_tail_ms, None);
 
         runtime.tick(input(&[with_vitals(2, Some(1_000), Some(120))]));
         let mut relogin = input(&[]);

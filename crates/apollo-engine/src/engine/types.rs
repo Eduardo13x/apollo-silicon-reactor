@@ -540,7 +540,32 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub browser_lcp_p95_ms: Option<f64>,
     #[serde(default)]
-    pub browser_inp_p95_ms: Option<f64>,
+    /// Tail of individual `PerformanceEventTiming.duration` values above the
+    /// collector's 40 ms threshold — **not** INP. INP is a high percentile over
+    /// interactions grouped by `interactionId`; this is a max over single
+    /// entries, blind to fast interactions and rounded to 8 ms by the browser.
+    /// Renamed from `browser_inp_p95_ms` (schema discontinuity: the two series
+    /// are not comparable and must not be joined).
+    pub browser_event_duration_tail_ms: Option<f64>,
+    /// True INP estimate. Populated only once the collector groups by
+    /// `interactionId`; `None` means the corrected path has not reported yet.
+    #[serde(default)]
+    pub browser_inp_estimate_ms: Option<f64>,
+    /// Interactions (not entries) behind `browser_inp_estimate_ms`.
+    #[serde(default)]
+    pub browser_interaction_samples: u64,
+    /// Interactions the bounded collector refused to track.
+    #[serde(default)]
+    pub browser_interactions_dropped: u64,
+    /// Where interaction time goes. Cumulative milliseconds across the observed
+    /// interactions — the split, not the magnitude, is the diagnostic: OS-level
+    /// actuators can only plausibly move input delay and presentation.
+    #[serde(default)]
+    pub browser_input_delay_total_ms: u64,
+    #[serde(default)]
+    pub browser_processing_total_ms: u64,
+    #[serde(default)]
+    pub browser_presentation_total_ms: u64,
     /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
     /// p95 over a full window are very different claims, and reading one as
     /// the other already produced a bogus 120000ms LCP once.

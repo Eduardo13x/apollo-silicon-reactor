@@ -892,12 +892,41 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         // samples is a guess, and reading one as settled produced a bogus
         // 120000ms LCP once.
         let n = m.browser_latency_samples;
-        if let (Some(lcp), Some(inp)) = (m.browser_lcp_p95_ms, m.browser_inp_p95_ms) {
-            lines.push(format!("       vitals LCP{lcp:.0} INP{inp:.0} n{n}"));
-        } else if let Some(lcp) = m.browser_lcp_p95_ms {
-            lines.push(format!("       vitals LCP{lcp:.0} INP- n{n}"));
-        } else if let Some(inp) = m.browser_inp_p95_ms {
-            lines.push(format!("       vitals LCP- INP{inp:.0} n{n}"));
+        // `evt` is the tail of individual event durations, deliberately NOT
+        // labelled INP: it is a max over single entries above a 40 ms
+        // threshold, blind to fast interactions. `INP` appears only once the
+        // corrected per-interaction collector reports, and carries its own
+        // interaction count so the two can never be read as one series.
+        if m.browser_lcp_p95_ms.is_some() || m.browser_event_duration_tail_ms.is_some() {
+            let lcp = m
+                .browser_lcp_p95_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            let evt = m
+                .browser_event_duration_tail_ms
+                .map_or_else(|| "-".to_string(), |value| format!("{value:.0}"));
+            lines.push(format!("       vitals LCP{lcp} evt{evt} n{n}"));
+        }
+        if let Some(inp) = m.browser_inp_estimate_ms {
+            lines.push(format!(
+                "       INP{inp:.0} i{}",
+                compact_counter(m.browser_interaction_samples)
+            ));
+            // Where the time goes decides whether any OS-level actuator has a
+            // lever at all: processing is the site's own JavaScript, which no
+            // scheduler action can shorten.
+            let total = m
+                .browser_input_delay_total_ms
+                .saturating_add(m.browser_processing_total_ms)
+                .saturating_add(m.browser_presentation_total_ms);
+            if total > 0 {
+                let pct = |part: u64| (part as f64 / total as f64 * 100.0).round() as u64;
+                lines.push(format!(
+                    "       in{}% proc{}% pres{}%",
+                    pct(m.browser_input_delay_total_ms),
+                    pct(m.browser_processing_total_ms),
+                    pct(m.browser_presentation_total_ms),
+                ));
+            }
         }
         if !m.webflow_phase.is_empty() {
             lines.push(format!(
@@ -2368,7 +2397,7 @@ mod tests {
         m.interaction_qos_parameter_explorations_total = 0;
         m.browser_latency_samples = 64;
         m.browser_lcp_p95_ms = Some(2_168.0);
-        m.browser_inp_p95_ms = Some(464.0);
+        m.browser_event_duration_tail_ms = Some(464.0);
         m.network_flow_active = false;
         m.network_flow_traffic_bps = 0;
         m.network_flow_proposed_total = 320;
@@ -2485,6 +2514,110 @@ mod tests {
             collisions.is_empty(),
             "duplicate row labels: {collisions:?}\nrendered: {think:?}"
         );
+    }
+
+    #[test]
+    fn the_event_duration_tail_is_never_labelled_inp() {
+        // Schema discontinuity: the old series was a max over single
+        // PerformanceEventTiming durations above a 40 ms threshold. Labelling
+        // it INP invited a comparison against Web Vitals thresholds it does
+        // not answer to.
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_latency_samples = 64;
+        status.metrics.browser_lcp_p95_ms = Some(1_568.0);
+        status.metrics.browser_event_duration_tail_ms = Some(440.0);
+        status.metrics.browser_inp_estimate_ms = None;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       vitals LCP1568 evt440 n64"),
+            "the tail must render under its own name: {think:?}"
+        );
+        assert!(
+            !think.iter().any(|line| line.contains("INP")),
+            "no INP row until the corrected collector reports: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn the_inp_estimate_renders_apart_and_counts_interactions_not_entries() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_latency_samples = 64;
+        status.metrics.browser_event_duration_tail_ms = Some(440.0);
+        status.metrics.browser_inp_estimate_ms = Some(184.0);
+        status.metrics.browser_interaction_samples = 312;
+
+        let think = render_think_q(&status);
+        assert!(
+            think.iter().any(|line| line == "       INP184 i312"),
+            "INP carries its own interaction count: {think:?}"
+        );
+        assert!(
+            think.iter().any(|line| line.contains("evt440")),
+            "the two series stay on separate rows: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn the_component_split_says_where_interaction_time_goes() {
+        // The split is the whole point of 0A-obs: if processing dominates, the
+        // bottleneck is the site's JavaScript and no scheduler actuator has a
+        // lever, which is a valid and valuable terminal result.
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_inp_estimate_ms = Some(184.0);
+        status.metrics.browser_interaction_samples = 312;
+        status.metrics.browser_input_delay_total_ms = 1_200;
+        status.metrics.browser_processing_total_ms = 8_400;
+        status.metrics.browser_presentation_total_ms = 2_400;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "       in10% proc70% pres20%"),
+            "the three components must reconcile to 100%: {think:?}"
+        );
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_component_split_is_rendered_without_component_evidence() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_inp_estimate_ms = Some(184.0);
+        status.metrics.browser_interaction_samples = 4;
+
+        let think = render_think_q(&status);
+        assert!(
+            !think.iter().any(|line| line.contains("proc")),
+            "a zero split must stay absent rather than print 0/0/0: {think:?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_lcp_does_not_suppress_the_event_duration_tail() {
+        let mut status = dashboard_status();
+        status.metrics.webflow_mode = "active".to_string();
+        status.metrics.webflow_admitted_total = 1;
+        status.metrics.browser_latency_samples = 12;
+        status.metrics.browser_lcp_p95_ms = None;
+        status.metrics.browser_event_duration_tail_ms = Some(96.0);
+
+        let think = render_think_q(&status);
+        assert!(think
+            .iter()
+            .any(|line| line == "       vitals LCP- evt96 n12"));
     }
 
     #[test]

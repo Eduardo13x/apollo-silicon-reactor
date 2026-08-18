@@ -108,3 +108,126 @@ test('manifest public key pins the expected native-host extension ID', () => {
   const extensionId = digest.replace(/[0-9a-f]/g, (nibble) => String.fromCharCode(97 + Number.parseInt(nibble, 16)));
   assert.equal(extensionId, 'mhagiddoeecedoknmhdlhghdnglglbhp');
 });
+
+// ── 0A-obs: interaction folding ─────────────────────────────────────────────
+// The previous collector took max(entry.duration) over entries above a 40 ms
+// threshold and published it as INP. These pin the corrected semantics.
+
+const {
+  foldInteractions,
+  inpEstimateMs,
+  componentTotals,
+  MAX_TRACKED_INTERACTIONS,
+} = require('../extensions/apollo-webflow-chromium/protocol.js');
+
+function entry(overrides = {}) {
+  return {
+    interactionId: 1,
+    startTime: 1000,
+    processingStart: 1010,
+    processingEnd: 1030,
+    duration: 48,
+    cancelable: true,
+    ...overrides,
+  };
+}
+
+test('entries sharing an interactionId fold into one interaction', () => {
+  const { interactions } = foldInteractions([
+    entry({ duration: 16 }),
+    entry({ duration: 48 }),
+    entry({ duration: 32 }),
+  ]);
+  assert.equal(interactions.size, 1);
+  assert.equal(interactions.get(1).totalMs, 48, 'the longest entry defines the latency');
+  assert.equal(interactions.get(1).entryCount, 3);
+});
+
+test('interactionId 0 is not an interaction and is discarded', () => {
+  const { interactions } = foldInteractions([
+    entry({ interactionId: 0, duration: 900 }),
+    entry({ interactionId: undefined, duration: 900 }),
+  ]);
+  assert.equal(interactions.size, 0);
+  assert.equal(inpEstimateMs(interactions), undefined);
+});
+
+test('consecutive clicks are separate interactions, not one maximum', () => {
+  const { interactions } = foldInteractions([
+    entry({ interactionId: 1, duration: 20 }),
+    entry({ interactionId: 2, duration: 300 }),
+    entry({ interactionId: 3, duration: 24 }),
+  ]);
+  assert.equal(interactions.size, 3);
+  assert.equal(inpEstimateMs(interactions), 300, 'worst interaction below the percentile floor');
+});
+
+test('repeated keys each count as their own interaction', () => {
+  const entries = Array.from({ length: 12 }, (_, index) =>
+    entry({ interactionId: index + 1, duration: 8 + index }));
+  const { interactions } = foldInteractions(entries);
+  assert.equal(interactions.size, 12);
+});
+
+test('fast interactions are represented, not filtered away', () => {
+  const { interactions } = foldInteractions([entry({ duration: 8 })]);
+  assert.equal(interactions.size, 1, 'no 40 ms threshold hides them');
+  assert.equal(inpEstimateMs(interactions), 8);
+});
+
+test('components reconcile with the total for the winning entry', () => {
+  const { interactions } = foldInteractions([
+    entry({ startTime: 1000, processingStart: 1012, processingEnd: 1040, duration: 60 }),
+  ]);
+  const i = interactions.get(1);
+  assert.equal(i.inputDelayMs, 12);
+  assert.equal(i.processingMs, 28);
+  assert.equal(i.presentationMs, 20);
+  assert.equal(i.inputDelayMs + i.processingMs + i.presentationMs, i.totalMs);
+});
+
+test('a cancelled event keeps its flag so it can be excluded downstream', () => {
+  const { interactions } = foldInteractions([entry({ cancelable: false })]);
+  assert.equal(interactions.get(1).cancelable, false);
+});
+
+test('an entry with no paint still yields nonnegative components', () => {
+  const { interactions } = foldInteractions([
+    entry({ startTime: 1000, processingStart: 1010, processingEnd: 1200, duration: 100 }),
+  ]);
+  const i = interactions.get(1);
+  assert.ok(i.presentationMs >= 0, 'processingEnd past the paint must not go negative');
+});
+
+test('late entries update an existing interaction only when longer', () => {
+  const first = foldInteractions([entry({ duration: 200 })]);
+  const second = foldInteractions([entry({ duration: 40 })], first);
+  assert.equal(second.interactions.get(1).totalMs, 200);
+  const third = foldInteractions([entry({ duration: 260 })], second);
+  assert.equal(third.interactions.get(1).totalMs, 260);
+});
+
+test('duplicate identical entries do not inflate the interaction count', () => {
+  const duplicated = [entry(), entry(), entry()];
+  const { interactions } = foldInteractions(duplicated);
+  assert.equal(interactions.size, 1);
+});
+
+test('the tracked population is bounded against a hostile page', () => {
+  const entries = Array.from({ length: MAX_TRACKED_INTERACTIONS + 50 }, (_, index) =>
+    entry({ interactionId: index + 1, duration: 10 }));
+  const { interactions, dropped } = foldInteractions(entries);
+  assert.equal(interactions.size, MAX_TRACKED_INTERACTIONS);
+  assert.equal(dropped, 50, 'refusals are counted, not silent');
+});
+
+test('component totals sum across interactions', () => {
+  const { interactions } = foldInteractions([
+    entry({ interactionId: 1, startTime: 0, processingStart: 10, processingEnd: 30, duration: 50 }),
+    entry({ interactionId: 2, startTime: 0, processingStart: 5, processingEnd: 25, duration: 40 }),
+  ]);
+  const totals = componentTotals(interactions);
+  assert.equal(totals.inputDelay, 15);
+  assert.equal(totals.processing, 40);
+  assert.equal(totals.presentation, 35);
+});

@@ -7,7 +7,14 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-pub const WEBFLOW_SCHEMA_VERSION: u16 = 1;
+/// v2 adds the per-interaction fields (`inp_estimate_ms`, `interaction_count`,
+/// component totals) and renames the entry-duration tail. v1 payloads remain
+/// readable: every new field is `Option`/`default`, and a v1 producer simply
+/// reports no interaction data.
+pub const WEBFLOW_SCHEMA_VERSION: u16 = 2;
+pub const MIN_SUPPORTED_WEBFLOW_SCHEMA_VERSION: u16 = 1;
+/// An untrusted page must not be able to claim an unbounded interaction count.
+pub const MAX_WEBFLOW_INTERACTIONS: u32 = 4_096;
 pub const MAX_WEBFLOW_MESSAGE_BYTES: usize = 16 * 1024;
 pub const MAX_WEBFLOW_INGRESS_EVENTS: usize = 256;
 pub const MAX_WEBFLOW_EVENTS_PER_CYCLE: usize = 128;
@@ -118,7 +125,25 @@ pub struct WebFlowMetrics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lcp_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inp_ms: Option<u32>,
+    /// Max single `PerformanceEventTiming.duration`, not INP. See
+    /// `RuntimeMetrics::browser_event_duration_tail_ms`.
+    pub event_duration_ms: Option<u32>,
+    /// Web Vitals INP: high percentile over interactions grouped by
+    /// `interactionId`. Distinct series from `event_duration_ms`; never join them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inp_estimate_ms: Option<u32>,
+    /// Interactions (not entries) behind `inp_estimate_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interaction_count: Option<u32>,
+    /// Interactions the collector refused to track once bounded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interactions_dropped: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_delay_total_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processing_total_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation_total_ms: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cls_milli: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -140,7 +165,11 @@ impl WebFlowMetrics {
             self.dom_ready_ms,
             self.load_ms,
             self.lcp_ms,
-            self.inp_ms,
+            self.event_duration_ms,
+            self.inp_estimate_ms,
+            self.input_delay_total_ms,
+            self.processing_total_ms,
+            self.presentation_total_ms,
             self.long_task_total_ms,
         ]
         .into_iter()
@@ -149,6 +178,15 @@ impl WebFlowMetrics {
             if value > MAX_WEBFLOW_TIMING_MS {
                 return Err(WebFlowValidationError::MetricOutOfRange);
             }
+        }
+        if self
+            .interaction_count
+            .is_some_and(|value| value > MAX_WEBFLOW_INTERACTIONS)
+            || self
+                .interactions_dropped
+                .is_some_and(|value| value > MAX_WEBFLOW_INTERACTIONS)
+        {
+            return Err(WebFlowValidationError::MetricOutOfRange);
         }
         if self.cls_milli.is_some_and(|value| value > 100_000)
             || self
@@ -185,7 +223,9 @@ pub struct WebFlowEvent {
 
 impl WebFlowEvent {
     pub fn validate(&self) -> Result<(), WebFlowValidationError> {
-        if self.schema_version != WEBFLOW_SCHEMA_VERSION {
+        if self.schema_version > WEBFLOW_SCHEMA_VERSION
+            || self.schema_version < MIN_SUPPORTED_WEBFLOW_SCHEMA_VERSION
+        {
             return Err(WebFlowValidationError::UnsupportedSchema);
         }
         if self.sequence == 0 {
@@ -370,3 +410,116 @@ impl fmt::Display for WebFlowValidationError {
 }
 
 impl std::error::Error for WebFlowValidationError {}
+
+#[cfg(test)]
+mod schema_v2_tests {
+    use super::*;
+
+    fn opaque(byte: u8) -> OpaqueId {
+        OpaqueId::new([byte.max(1); 16]).expect("nonzero opaque id")
+    }
+
+    fn event(metrics: WebFlowMetrics) -> WebFlowEvent {
+        WebFlowEvent {
+            schema_version: WEBFLOW_SCHEMA_VERSION,
+            browser_session_id: opaque(1),
+            tab_session_id: opaque(2),
+            navigation_id: opaque(3),
+            sequence: 1,
+            phase: WebFlowPhase::Settled,
+            source: WebFlowSource::ExtensionVitals,
+            site_bucket: None,
+            metrics,
+        }
+    }
+
+    #[test]
+    fn a_v1_producer_still_validates_and_simply_reports_no_interactions() {
+        // The deployed extension is v1. Refusing its payloads would blind the
+        // daemon during the rollout window.
+        let mut legacy = event(WebFlowMetrics {
+            event_duration_ms: Some(440),
+            ..WebFlowMetrics::default()
+        });
+        legacy.schema_version = MIN_SUPPORTED_WEBFLOW_SCHEMA_VERSION;
+        assert!(legacy.validate().is_ok());
+        assert_eq!(legacy.metrics.inp_estimate_ms, None);
+        assert_eq!(legacy.metrics.interaction_count, None);
+    }
+
+    #[test]
+    fn a_future_schema_is_still_refused() {
+        let mut future = event(WebFlowMetrics::default());
+        future.schema_version = WEBFLOW_SCHEMA_VERSION + 1;
+        assert_eq!(
+            future.validate(),
+            Err(WebFlowValidationError::UnsupportedSchema)
+        );
+    }
+
+    #[test]
+    fn an_untrusted_interaction_count_cannot_be_unbounded() {
+        let hostile = event(WebFlowMetrics {
+            interaction_count: Some(MAX_WEBFLOW_INTERACTIONS + 1),
+            ..WebFlowMetrics::default()
+        });
+        assert_eq!(
+            hostile.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
+        let dropped = event(WebFlowMetrics {
+            interactions_dropped: Some(MAX_WEBFLOW_INTERACTIONS + 1),
+            ..WebFlowMetrics::default()
+        });
+        assert_eq!(
+            dropped.validate(),
+            Err(WebFlowValidationError::MetricOutOfRange)
+        );
+    }
+
+    #[test]
+    fn every_interaction_timing_is_range_checked_like_the_legacy_ones() {
+        for build in [
+            |value| WebFlowMetrics {
+                inp_estimate_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+            |value| WebFlowMetrics {
+                input_delay_total_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+            |value| WebFlowMetrics {
+                processing_total_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+            |value| WebFlowMetrics {
+                presentation_total_ms: Some(value),
+                ..WebFlowMetrics::default()
+            },
+        ] {
+            let hostile = event(build(MAX_WEBFLOW_TIMING_MS + 1));
+            assert_eq!(
+                hostile.validate(),
+                Err(WebFlowValidationError::MetricOutOfRange)
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_latency_series_travel_as_independent_fields() {
+        // Schema discontinuity made structural: a payload can carry the entry
+        // tail, the interaction estimate, both, or neither.
+        let both = event(WebFlowMetrics {
+            event_duration_ms: Some(440),
+            inp_estimate_ms: Some(184),
+            interaction_count: Some(312),
+            ..WebFlowMetrics::default()
+        });
+        assert!(both.validate().is_ok());
+        let round_trip = WebFlowEvent::from_bounded_json(&both.bounded_json().expect("encodes"))
+            .expect("decodes");
+        assert_eq!(round_trip.metrics.event_duration_ms, Some(440));
+        assert_eq!(round_trip.metrics.inp_estimate_ms, Some(184));
+        assert_eq!(round_trip.metrics.interaction_count, Some(312));
+    }
+}

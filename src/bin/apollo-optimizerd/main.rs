@@ -2643,7 +2643,18 @@ fn main() -> anyhow::Result<()> {
                     // WebFlowMetrics; before this these fields stayed None
                     // forever because nothing copied them out.
                     metrics.metrics.browser_lcp_p95_ms = webflow_output.lcp_p95_ms;
-                    metrics.metrics.browser_inp_p95_ms = webflow_output.inp_p95_ms;
+                    metrics.metrics.browser_event_duration_tail_ms =
+                        webflow_output.event_duration_tail_ms;
+                    metrics.metrics.browser_inp_estimate_ms = webflow_output.inp_estimate_ms;
+                    metrics.metrics.browser_interaction_samples = webflow_output.interaction_count;
+                    metrics.metrics.browser_interactions_dropped =
+                        webflow_output.interactions_dropped;
+                    metrics.metrics.browser_input_delay_total_ms =
+                        webflow_output.input_delay_total_ms;
+                    metrics.metrics.browser_processing_total_ms =
+                        webflow_output.processing_total_ms;
+                    metrics.metrics.browser_presentation_total_ms =
+                        webflow_output.presentation_total_ms;
                     metrics.metrics.browser_latency_samples = webflow_output.vitals_samples;
                     metrics.metrics.network_flow_active = networkflow_output.observation.active;
                     metrics.metrics.network_flow_traffic_bps =
