@@ -2811,7 +2811,16 @@ fn main() -> anyhow::Result<()> {
                         metrics.metrics.perceptual_invalid_total = store_metrics
                             .refused_correlation
                             .saturating_add(store_metrics.refused_capacity);
-                        metrics.metrics.perceptual_quality_q = perceptual_store.mean_quality_q();
+                        let modality_q = perceptual_store.quality_by_modality();
+                        metrics.metrics.perceptual_quality_q = modality_q.overall_q.unwrap_or(0);
+                        metrics.metrics.perceptual_quality_instrumented_q =
+                            modality_q.instrumented_q;
+                        metrics.metrics.perceptual_quality_instrumented_n =
+                            modality_q.instrumented_n;
+                        metrics.metrics.perceptual_quality_inferred_q = modality_q.inferred_q;
+                        metrics.metrics.perceptual_quality_inferred_n = modality_q.inferred_n;
+                        metrics.metrics.perceptual_quality_window_q = modality_q.window_q;
+                        metrics.metrics.perceptual_quality_window_n = modality_q.window_n;
                         // Newest record of each modality, sanitized by the type
                         // itself: hashes and closed categories, never a name.
                         //

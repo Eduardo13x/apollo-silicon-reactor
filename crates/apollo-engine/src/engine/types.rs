@@ -649,8 +649,29 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub perceptual_invalid_total: u64,
     /// Mean overall quality on a 0..=1000 scale, weakest-link per observation.
+    ///
+    /// Aggregate across every modality, so it moves with the evidence *mix*:
+    /// a burst of low-precision windows pulls it down while instrumented
+    /// episodes are unchanged. Prefer the per-modality figures below when
+    /// judging whether measurement actually got worse.
     #[serde(default)]
     pub perceptual_quality_q: u16,
+    /// Per-modality quality with the resident count behind each figure.
+    /// `None` means that modality has no resident observations — absence, not
+    /// a quality of zero. Counts are resident, so they pair with the means
+    /// above and never with the lifetime `*_total` counters.
+    #[serde(default)]
+    pub perceptual_quality_instrumented_q: Option<u16>,
+    #[serde(default)]
+    pub perceptual_quality_instrumented_n: u32,
+    #[serde(default)]
+    pub perceptual_quality_inferred_q: Option<u16>,
+    #[serde(default)]
+    pub perceptual_quality_inferred_n: u32,
+    #[serde(default)]
+    pub perceptual_quality_window_q: Option<u16>,
+    #[serde(default)]
+    pub perceptual_quality_window_n: u32,
     /// Stratified observational association. Correlation, never causation: the
     /// dashboard prints CAUSAL UNTESTED beside it for exactly that reason.
     #[serde(default)]

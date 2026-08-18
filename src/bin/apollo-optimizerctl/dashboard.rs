@@ -1003,11 +1003,17 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
     // A per-source figure like INP lives with its adapter, because printing a
     // zero for a source that cannot measure it would be a false reading.
     if m.perceptual_observations_total > 0 {
+        // Quality per modality, not the blend: the aggregate slides whenever
+        // low-precision windows outnumber instrumented episodes, which reads
+        // as decay when nothing measured has actually got worse. A modality
+        // with no resident observations prints "-", never a zero.
+        let q_of = |q: Option<u16>| q.map_or_else(|| "-".to_string(), |v| v.to_string());
         lines.push(format!(
-            "Perc-S src{} obs{} q{}",
+            "Perc-S src{} obs{} qi{} qw{}",
             m.perceptual_sources_active,
             compact_counter(m.perceptual_observations_total),
-            m.perceptual_quality_q,
+            q_of(m.perceptual_quality_instrumented_q),
+            q_of(m.perceptual_quality_window_q),
         ));
         let total = m
             .perceptual_instrumented_total
@@ -2533,6 +2539,27 @@ mod tests {
     }
 
     #[test]
+    fn a_modality_never_seen_renders_as_absent_rather_than_zero() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_sources_active = 1;
+        status.metrics.perceptual_observations_total = 40;
+        status.metrics.perceptual_windows_total = 40;
+        status.metrics.perceptual_quality_q = 350;
+        status.metrics.perceptual_quality_window_q = Some(350);
+        status.metrics.perceptual_quality_window_n = 40;
+        // No instrumented source has ever reported here.
+        status.metrics.perceptual_quality_instrumented_q = None;
+
+        let think = render_think_q(&status);
+        assert!(
+            think
+                .iter()
+                .any(|line| line == "Perc-S src1 obs40 qi- qw350"),
+            "an unmeasured modality must not print a zero: {think:?}"
+        );
+    }
+
+    #[test]
     fn every_think_row_fits_the_quadrant_at_production_magnitudes() {
         // Values taken from a live daemon. Rows only render when their
         // subsystem has data, which is why the older width assertions never
@@ -2771,9 +2798,15 @@ mod tests {
         status.metrics.perceptual_valid_total = 1_233;
         status.metrics.perceptual_invalid_total = 51;
         status.metrics.perceptual_quality_q = 880;
+        status.metrics.perceptual_quality_instrumented_q = Some(910);
+        status.metrics.perceptual_quality_instrumented_n = 950;
+        status.metrics.perceptual_quality_window_q = Some(350);
+        status.metrics.perceptual_quality_window_n = 103;
 
         let think = render_think_q(&status);
-        assert!(think.iter().any(|line| line == "Perc-S src2 obs1k q880"));
+        assert!(think
+            .iter()
+            .any(|line| line == "Perc-S src2 obs1k qi910 qw350"));
         assert!(think
             .iter()
             .any(|line| line == "       ins74% inf18% win8%"));

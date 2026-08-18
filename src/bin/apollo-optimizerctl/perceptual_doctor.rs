@@ -153,6 +153,30 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
             m.perceptual_regimes_total
         ),
     ));
+    // The aggregate above blends modalities, so it tracks the evidence mix as
+    // much as the measurement. Split it out: a modality with no resident
+    // observations prints as absent, because zero would claim we measured it.
+    let q_of = |q: Option<u16>, n: u32| match q {
+        Some(v) => format!("{v} (n={n})"),
+        None => "absent".to_string(),
+    };
+    checks.push(Check::new(
+        "quality",
+        m.perceptual_observations_total > 0,
+        format!(
+            "instrumented={} inferred={} window={} | aggregate={} follows the mix",
+            q_of(
+                m.perceptual_quality_instrumented_q,
+                m.perceptual_quality_instrumented_n
+            ),
+            q_of(
+                m.perceptual_quality_inferred_q,
+                m.perceptual_quality_inferred_n
+            ),
+            q_of(m.perceptual_quality_window_q, m.perceptual_quality_window_n),
+            m.perceptual_quality_q
+        ),
+    ));
     // Informational: having nothing to compare is a legitimate state. A
     // machine with no varying contention produces no association, and calling
     // that a failure would push someone to manufacture one.
@@ -449,6 +473,7 @@ mod tests {
                 "transport",
                 "interactions",
                 "store",
+                "quality",
                 "association",
                 "components"
             ]

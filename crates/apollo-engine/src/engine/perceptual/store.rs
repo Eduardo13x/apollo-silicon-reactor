@@ -173,17 +173,66 @@ impl PerceptualObservationStore {
     }
 
     /// Mean quality on the 0..=1000 scale, over stored observations only.
+    /// Aggregate mean quality. Derived from the same walk as the per-modality
+    /// figures so a publish pays for one pass, not two.
     pub fn mean_quality_q(&self) -> u16 {
-        if self.observations.is_empty() {
-            return 0;
-        }
-        let sum: u64 = self
-            .observations
-            .iter()
-            .map(|o| u64::from(o.header().quality.overall_q()))
-            .sum();
-        (sum / self.observations.len() as u64).min(u64::from(QUALITY_SCALE)) as u16
+        self.quality_by_modality().overall_q.unwrap_or(0)
     }
+
+    /// Mean quality split by modality, each with the resident count it was
+    /// computed over.
+    ///
+    /// The aggregate `mean_quality_q` moves when the *mix* of evidence
+    /// changes, not only when measurement gets worse: a burst of low-precision
+    /// windows pulls it down while every instrumented episode stays exactly as
+    /// good as it was. Read alone it invites the wrong conclusion. Split, each
+    /// figure is stable and the mix shift becomes visible instead of hidden.
+    ///
+    /// A modality with no resident observations reports `None`, never `0`. Zero
+    /// is a measurement; absence is not.
+    ///
+    /// The counts are *resident*, matching the observations actually averaged.
+    /// Pairing these means with the lifetime totals would divide by the wrong n.
+    pub fn quality_by_modality(&self) -> ModalityQuality {
+        let mut acc = [(0u64, 0u32); 3];
+        for o in &self.observations {
+            let slot = match o {
+                PerceptualObservation::InstrumentedInteraction(_) => 0,
+                PerceptualObservation::InferredInteraction(_) => 1,
+                PerceptualObservation::PerceptualWindow(_) => 2,
+            };
+            acc[slot].0 += u64::from(o.header().quality.overall_q());
+            acc[slot].1 += 1;
+        }
+        let mean = |(sum, n): (u64, u32)| -> Option<u16> {
+            (n > 0).then(|| (sum / u64::from(n)).min(u64::from(QUALITY_SCALE)) as u16)
+        };
+        let total = acc
+            .iter()
+            .fold((0u64, 0u32), |(s, n), (bs, bn)| (s + bs, n + bn));
+        ModalityQuality {
+            overall_q: mean(total),
+            instrumented_q: mean(acc[0]),
+            instrumented_n: acc[0].1,
+            inferred_q: mean(acc[1]),
+            inferred_n: acc[1].1,
+            window_q: mean(acc[2]),
+            window_n: acc[2].1,
+        }
+    }
+}
+
+/// Per-modality quality with the resident count behind each figure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModalityQuality {
+    /// Mean across every modality — the figure that follows the evidence mix.
+    pub overall_q: Option<u16>,
+    pub instrumented_q: Option<u16>,
+    pub instrumented_n: u32,
+    pub inferred_q: Option<u16>,
+    pub inferred_n: u32,
+    pub window_q: Option<u16>,
+    pub window_n: u32,
 }
 
 /// Versioned persistence. Restored observations keep their provenance: nothing
@@ -438,6 +487,67 @@ mod tests {
         assert_eq!(instrumented.len(), 1);
         assert_eq!(windows.len(), 1);
         assert!(!instrumented[0].comparable_with(windows[0]));
+    }
+
+    #[test]
+    fn a_shift_in_the_evidence_mix_is_not_a_drop_in_quality() {
+        // The aggregate falls purely because low-precision windows arrive,
+        // while every instrumented episode stays exactly as good as it was.
+        // Reading the aggregate alone would call that a regression.
+        let mut store = PerceptualObservationStore::new();
+        store.record(observation(
+            1,
+            PerceptualSourceKind::BrowserChromium,
+            CorrelationState::Unique,
+            1,
+        ));
+        let only_instrumented = store.mean_quality_q();
+
+        for i in 0..9 {
+            store.record(window(10 + i));
+        }
+        let after_windows = store.mean_quality_q();
+        assert!(
+            after_windows < only_instrumented,
+            "aggregate should fall with the mix: {after_windows} vs {only_instrumented}"
+        );
+
+        // Split, neither modality moved. Only their proportion did.
+        let q = store.quality_by_modality();
+        assert_eq!(q.instrumented_q, Some(700));
+        assert_eq!(q.instrumented_n, 1);
+        assert_eq!(q.window_q, Some(300));
+        assert_eq!(q.window_n, 9);
+    }
+
+    #[test]
+    fn a_modality_with_no_observations_reports_absence_not_zero() {
+        let mut store = PerceptualObservationStore::new();
+        store.record(window(1));
+        let q = store.quality_by_modality();
+        assert_eq!(q.window_q, Some(300));
+        // Nothing instrumented and nothing inferred has been seen. Zero would
+        // claim we measured them and found them worthless.
+        assert_eq!(q.instrumented_q, None);
+        assert_eq!(q.instrumented_n, 0);
+        assert_eq!(q.inferred_q, None);
+        assert_eq!(q.inferred_n, 0);
+    }
+
+    #[test]
+    fn per_modality_counts_are_resident_not_lifetime() {
+        let mut store = PerceptualObservationStore::new();
+        for i in 0..(MAX_OBSERVATIONS + 20) {
+            store.record(window(i as u64 + 1));
+        }
+        let q = store.quality_by_modality();
+        assert_eq!(q.window_n as usize, store.len());
+        assert!(
+            (q.window_n as u64) < store.metrics.stored_total,
+            "resident {} must trail lifetime {}",
+            q.window_n,
+            store.metrics.stored_total
+        );
     }
 
     #[test]
