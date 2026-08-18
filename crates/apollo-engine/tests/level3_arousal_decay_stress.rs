@@ -95,6 +95,7 @@ fn ot_persisted_with_drift(dd: DriftDetector) -> OutcomeTrackerPersisted {
 /// baseline at boot).
 fn fresh_state(ot: OutcomeTrackerPersisted, arousal: Option<ArousalState>) -> LearnedState {
     LearnedState {
+        perceptual_store: None,
         version: 1,
         signal_intelligence: None,
         outcome_tracker: Some(ot),

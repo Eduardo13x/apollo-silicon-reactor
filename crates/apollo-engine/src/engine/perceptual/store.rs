@@ -18,6 +18,11 @@ pub const OBSERVATION_TTL_MS: u64 = 15 * 60 * 1000;
 /// instrumented apps — something is spoofing producer identities.
 pub const MAX_ACTIVE_PRODUCERS: usize = 16;
 pub const PERCEPTUAL_STORE_SCHEMA_VERSION: u16 = 1;
+/// Observations written to disk. Far below the in-memory capacity on purpose:
+/// persistence exists to survive a restart with recent evidence, not to archive
+/// a high-frequency stream. At roughly 500 bytes each this stays well inside a
+/// 2 MiB budget with room to spare.
+pub const MAX_PERSISTED_OBSERVATIONS: usize = 128;
 
 /// Counts that reconcile: every ingested observation lands in exactly one of
 /// `stored`, `refused_correlation` or `refused_capacity`.
@@ -192,12 +197,30 @@ pub struct PerceptualStorePersisted {
 }
 
 impl PerceptualObservationStore {
-    pub fn persisted(&self) -> PerceptualStorePersisted {
+    /// Snapshot for disk. Only the newest observations are written, and only
+    /// ones still inside their TTL as of `now_ms`: writing an already-expired
+    /// observation would restore evidence that was never valid again.
+    pub fn persisted_at(&self, now_ms: u64) -> PerceptualStorePersisted {
+        let fresh: Vec<PerceptualObservation> = self
+            .observations
+            .iter()
+            .filter(|o| now_ms.saturating_sub(o.header().observed_at_ms) <= OBSERVATION_TTL_MS)
+            .cloned()
+            .collect();
+        let start = fresh.len().saturating_sub(MAX_PERSISTED_OBSERVATIONS);
         PerceptualStorePersisted {
             schema_version: PERCEPTUAL_STORE_SCHEMA_VERSION,
-            observations: self.observations.iter().cloned().collect(),
+            observations: fresh[start..].to_vec(),
             metrics: self.metrics,
         }
+    }
+
+    pub fn persisted(&self) -> PerceptualStorePersisted {
+        let newest = self
+            .observations
+            .back()
+            .map_or(0, |o| o.header().observed_at_ms);
+        self.persisted_at(newest)
     }
 
     /// Restore. A state from an unknown schema is discarded rather than
@@ -209,7 +232,16 @@ impl PerceptualObservationStore {
             return store;
         }
         store.metrics = state.metrics;
-        for observation in state.observations.into_iter().take(MAX_OBSERVATIONS) {
+        for observation in state
+            .observations
+            .into_iter()
+            .take(MAX_PERSISTED_OBSERVATIONS)
+        {
+            // A partially corrupt entry is skipped, not repaired: an identity
+            // we cannot trust must never re-enter the aggregate.
+            if observation.header().scope.producer_session_id.bytes() == [0; 16] {
+                continue;
+            }
             let header = observation.header();
             let producer = header.scope.producer_session_id.bytes();
             if !store.active_producers.contains(&producer)
@@ -451,5 +483,146 @@ mod tests {
         ));
         // overall_q is the minimum: 700 for the instrumented fixture.
         assert_eq!(store.mean_quality_q(), 700);
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    use crate::engine::perceptual::types::*;
+
+    fn obs(at_ms: u64, producer: u8) -> PerceptualObservation {
+        PerceptualObservation::PerceptualWindow(PerceptualWindowObservation {
+            header: ObservationHeader {
+                observed_at_ms: at_ms,
+                source_kind: PerceptualSourceKind::GenericForegroundApplication,
+                producer_kind: ProducerKind::MacOsObserver,
+                scope: InteractionScope {
+                    producer_session_id: PerceptualId::new([producer.max(1); 16]).expect("id"),
+                    ..InteractionScope::default()
+                },
+                quality: PerceptualQuality {
+                    source_trust_q: 900,
+                    measurement_quality_q: 350,
+                    temporal_confidence_q: 300,
+                    correlation_confidence_q: 400,
+                    attribution_confidence_q: 420,
+                },
+                correlation: CorrelationState::CompletedOnly,
+                transport: PerceptualTransportTrace::default(),
+                legacy_contract: false,
+            },
+            window_ms: 8_000,
+            signal_count: 6,
+            sluggishness_q: 210,
+            measurement: PerceptualMeasurement {
+                measurement_mode: MeasurementMode::AggregateWindow,
+                ..PerceptualMeasurement::default()
+            },
+        })
+    }
+
+    #[test]
+    fn only_a_bounded_recent_slice_reaches_disk() {
+        let mut store = PerceptualObservationStore::new();
+        for index in 0..(MAX_PERSISTED_OBSERVATIONS + 60) {
+            store.record(obs(index as u64, 1));
+        }
+        let state = store.persisted();
+        assert_eq!(state.observations.len(), MAX_PERSISTED_OBSERVATIONS);
+        // The newest survive, not the oldest.
+        let newest = state
+            .observations
+            .last()
+            .expect("some")
+            .header()
+            .observed_at_ms;
+        assert_eq!(newest, (MAX_PERSISTED_OBSERVATIONS + 59) as u64);
+    }
+
+    #[test]
+    fn an_already_expired_observation_is_never_written() {
+        let mut store = PerceptualObservationStore::new();
+        store.record(obs(0, 1));
+        store.record(obs(OBSERVATION_TTL_MS + 5_000, 1));
+        let state = store.persisted_at(OBSERVATION_TTL_MS + 5_000);
+        assert_eq!(
+            state.observations.len(),
+            1,
+            "stale evidence must not be restored as if it were current"
+        );
+    }
+
+    #[test]
+    fn an_empty_store_round_trips_to_an_empty_store() {
+        let store = PerceptualObservationStore::new();
+        let restored = PerceptualObservationStore::restore(store.persisted());
+        assert!(restored.is_empty());
+        assert_eq!(restored.active_sources(), 0);
+    }
+
+    #[test]
+    fn a_partially_corrupt_entry_is_skipped_rather_than_repaired() {
+        let mut store = PerceptualObservationStore::new();
+        store.record(obs(1, 1));
+        store.record(obs(2, 2));
+        let mut state = store.persisted();
+        // Zero the identity of one entry, as a truncated write would.
+        if let PerceptualObservation::PerceptualWindow(ref mut w) = state.observations[0] {
+            w.header.scope.producer_session_id = PerceptualId([0; 16]);
+        }
+        let restored = PerceptualObservationStore::restore(state);
+        assert_eq!(restored.len(), 1, "the trustworthy entry survives alone");
+    }
+
+    #[test]
+    fn a_restart_does_not_duplicate_what_it_restores() {
+        let mut store = PerceptualObservationStore::new();
+        for index in 0..10u64 {
+            store.record(obs(index, 1));
+        }
+        let restored = PerceptualObservationStore::restore(store.persisted());
+        assert_eq!(restored.len(), 10);
+        // Restoring the same state again yields the same count, not double.
+        let twice = PerceptualObservationStore::restore(restored.persisted());
+        assert_eq!(twice.len(), 10);
+    }
+
+    #[test]
+    fn source_kind_quality_and_correlation_survive_the_round_trip() {
+        let mut store = PerceptualObservationStore::new();
+        store.record(obs(1, 1));
+        let restored = PerceptualObservationStore::restore(store.persisted());
+        let header = restored.iter().next().expect("one").header();
+        assert_eq!(
+            header.source_kind,
+            PerceptualSourceKind::GenericForegroundApplication
+        );
+        assert_eq!(header.quality.measurement_quality_q, 350);
+        assert_eq!(header.correlation, CorrelationState::CompletedOnly);
+        assert_eq!(
+            restored.count_for(PerceptualSourceKind::GenericForegroundApplication),
+            1
+        );
+    }
+
+    #[test]
+    fn the_persisted_payload_stays_far_inside_the_disk_budget() {
+        let mut store = PerceptualObservationStore::new();
+        for index in 0..MAX_OBSERVATIONS {
+            store.record(obs(index as u64, 1));
+        }
+        let json = serde_json::to_vec(&store.persisted()).expect("encodes");
+        assert!(
+            json.len() < 2 * 1024 * 1024,
+            "persisted store is {} bytes, over the 2 MiB budget",
+            json.len()
+        );
+        // Recorded so a future change that inflates the entry is visible.
+        assert!(
+            json.len() < 256 * 1024,
+            "unexpectedly large: {}",
+            json.len()
+        );
     }
 }

@@ -1324,12 +1324,14 @@ fn main() -> anyhow::Result<()> {
             > = None;
             let mut restored_local_consolidator: Option<LocalConsolidator> = None;
             let mut restored_microexperiment_lab = None;
+            let mut restored_perceptual_store = None;
             if let Some(learned) = LearnedState::load(ls_path) {
                 persist_generations = learned.persist_generations;
                 last_restore_quality = learned.last_restore_quality;
                 restored_trial_skill = learned.pending_trial_skill.clone();
                 restored_local_consolidator = learned.local_consolidator.clone();
                 restored_microexperiment_lab = learned.microexperiment_lab.clone();
+                restored_perceptual_store = learned.perceptual_store.clone();
                 if let Some(persisted) = learned.exploration_scheduler.clone() {
                     let (restored, disposition) =
                         apollo_engine::engine::exploration_scheduler::ExplorationScheduler::restore(
@@ -1682,8 +1684,13 @@ fn main() -> anyhow::Result<()> {
             let mut perceptual_observatory =
                 apollo_engine::engine::perceptual_regime::PerceptualObservatory::new();
             // Agnostic core plus its two live adapters. Observational only.
-            let mut perceptual_store =
-                apollo_engine::engine::perceptual::PerceptualObservationStore::new();
+            // Restored evidence keeps its provenance: nothing gains confidence
+            // by surviving a restart, and an unknown schema is discarded rather
+            // than reinterpreted.
+            let mut perceptual_store = restored_perceptual_store.map_or_else(
+                apollo_engine::engine::perceptual::PerceptualObservationStore::new,
+                apollo_engine::engine::perceptual::PerceptualObservationStore::restore,
+            );
             let mut chromium_adapter =
                 apollo_engine::engine::chromium_perceptual_adapter::ChromiumWebFlowAdapter::new();
             let mut macos_adapter =
@@ -8448,6 +8455,7 @@ fn main() -> anyhow::Result<()> {
                     telemetry_medallion_state: Some(telemetry_medallion.snapshot()),
                     exploration_scheduler: Some(exploration_scheduler.persisted()),
                     microexperiment_lab: Some(microexperiment_runtime.persisted()),
+                    perceptual_store: Some(perceptual_store.persisted()),
                 },
             );
 
