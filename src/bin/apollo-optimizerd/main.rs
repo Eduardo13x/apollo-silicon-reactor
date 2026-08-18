@@ -1700,6 +1700,11 @@ fn main() -> anyhow::Result<()> {
                             .expect("static observer id"),
                     );
             let mut perceptual_last_interactions: u64 = 0;
+            // An association moves only over many samples; recomputing it more
+            // often buys nothing and costs the loop.
+            const PERCEPTUAL_ASSOC_CADENCE_EVENTS: u32 = 32;
+            const PERCEPTUAL_ASSOC_WINDOW: usize = 128;
+            let mut perceptual_assoc_countdown: u32 = 1;
             let mut perceptual_associations: Vec<
                 apollo_engine::engine::perceptual_regime::ObservationalAssociation,
             > = Vec::new();
@@ -2648,17 +2653,28 @@ fn main() -> anyhow::Result<()> {
                         }
                     }
                     perceptual_store.expire(webflow_now_ms);
-                    // Join every stored observation to the contention state and
-                    // recompute the with/without comparison. Observational: no
-                    // action, no credit, no Gold.
-                    let joined: Vec<perc::PerceptualRegimeEvidence> = perceptual_store
-                        .iter()
-                        .map(|observation| perc::PerceptualRegimeEvidence {
-                            observation: observation.clone(),
-                            contention: perceptual_last_contention.clone(),
-                        })
-                        .collect();
-                    perceptual_associations = perc::associate_by_contender(&joined);
+                    // Recompute the with/without comparison on a cadence over a
+                    // bounded tail. Doing it per event cloned the whole store —
+                    // observations and a contention snapshot each, both carrying
+                    // heap fields — which measured as roughly +5% cycle p95.
+                    // An association needs many samples to move at all, so it
+                    // gains nothing from running on every one of them.
+                    perceptual_assoc_countdown = perceptual_assoc_countdown.saturating_sub(1);
+                    if perceptual_assoc_countdown == 0 {
+                        perceptual_assoc_countdown = PERCEPTUAL_ASSOC_CADENCE_EVENTS;
+                        let tail = perceptual_store
+                            .len()
+                            .saturating_sub(PERCEPTUAL_ASSOC_WINDOW);
+                        let joined: Vec<perc::PerceptualRegimeEvidence> = perceptual_store
+                            .iter()
+                            .skip(tail)
+                            .map(|observation| perc::PerceptualRegimeEvidence {
+                                observation: observation.clone(),
+                                contention: perceptual_last_contention.clone(),
+                            })
+                            .collect();
+                        perceptual_associations = perc::associate_by_contender(&joined);
+                    }
                 }
                 // One window sample per vitals report that carried new
                 // interactions. The extension reports per-page aggregates, so a
