@@ -187,7 +187,14 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
     ));
 
     // Worst finding wins, and each verdict names the hop that produced it.
-    let verdict = if m.webflow_schema_rejected_total > 0 && !any_event {
+    // The core outranks any single adapter. A restored store with hundreds of
+    // observations is not "no data" merely because one producer is momentarily
+    // silent — reporting it as such sent me looking at the browser while the
+    // layer was demonstrably healthy.
+    let core_alive = m.perceptual_observations_total > 0;
+    let verdict = if core_alive && !any_event {
+        PerceptualVerdict::PerceptualCoreReady
+    } else if m.webflow_schema_rejected_total > 0 && !any_event {
         PerceptualVerdict::SchemaMismatch
     } else if !any_event {
         PerceptualVerdict::NoData
@@ -342,6 +349,27 @@ mod tests {
         let report = diagnose(&m);
         assert_eq!(report.verdict, PerceptualVerdict::PerceptualCoreReady);
         assert!(report.checks.iter().all(|c| c.ok), "{:?}", report.checks);
+    }
+
+    #[test]
+    fn a_restored_core_is_not_reported_as_no_data_when_an_adapter_is_silent() {
+        // Observed in runtime: 225 restored observations across two sources
+        // while the browser had not yet reported this boot. Calling that
+        // NO_DATA pointed at the one component that was fine.
+        let mut m = metrics();
+        m.perceptual_observations_total = 225;
+        m.perceptual_sources_active = 2;
+        m.perceptual_instrumented_total = 136;
+        m.perceptual_windows_total = 89;
+        m.perceptual_quality_q = 538;
+        let report = diagnose(&m);
+        assert_eq!(report.verdict, PerceptualVerdict::PerceptualCoreReady);
+        assert_ne!(report.verdict, PerceptualVerdict::NoData);
+    }
+
+    #[test]
+    fn a_truly_empty_system_still_reports_no_data() {
+        assert_eq!(diagnose(&metrics()).verdict, PerceptualVerdict::NoData);
     }
 
     #[test]

@@ -2793,6 +2793,26 @@ fn main() -> anyhow::Result<()> {
                             .refused_correlation
                             .saturating_add(store_metrics.refused_capacity);
                         metrics.metrics.perceptual_quality_q = perceptual_store.mean_quality_q();
+                        // Newest record of each modality, sanitized by the type
+                        // itself: hashes and closed categories, never a name.
+                        for observation in perceptual_store.iter() {
+                            let encoded = serde_json::to_string(observation)
+                                .unwrap_or_default()
+                                .chars()
+                                .take(600)
+                                .collect::<String>();
+                            match observation {
+                                apollo_engine::engine::perceptual::PerceptualObservation::
+                                    InstrumentedInteraction(_) => {
+                                    metrics.metrics.perceptual_sample_instrumented = encoded;
+                                }
+                                apollo_engine::engine::perceptual::PerceptualObservation::
+                                    PerceptualWindow(_) => {
+                                    metrics.metrics.perceptual_sample_window = encoded;
+                                }
+                                _ => {}
+                            }
+                        }
                         // Strongest observed association, if any. Co-occurrence
                         // only: the dashboard prints CAUSAL UNTESTED beside it.
                         if let Some(strongest) = perceptual_associations

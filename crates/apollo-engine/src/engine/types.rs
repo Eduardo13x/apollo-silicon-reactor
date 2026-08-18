@@ -661,6 +661,13 @@ pub struct RuntimeMetrics {
     pub perceptual_assoc_confidence_q: u16,
     #[serde(default)]
     pub perceptual_assoc_actionable: bool,
+    /// One sanitized record per modality, as JSON. Bounded to two by
+    /// construction, carries hashes and closed categories only, and exists so
+    /// the shape reaching the store can be inspected without a new RPC.
+    #[serde(default)]
+    pub perceptual_sample_instrumented: String,
+    #[serde(default)]
+    pub perceptual_sample_window: String,
     /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
     /// p95 over a full window are very different claims, and reading one as
     /// the other already produced a bogus 120000ms LCP once.
