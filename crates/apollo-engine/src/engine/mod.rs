@@ -112,6 +112,7 @@ pub mod optimization_skills;
 pub mod outcome_tracker;
 pub mod overflow_guard;
 pub mod page_reclaim;
+pub mod perceptual_regime;
 pub mod planner;
 pub mod platform;
 pub mod policy_feature_battery_cost;

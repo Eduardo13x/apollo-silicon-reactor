@@ -416,8 +416,10 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             compact_profile(&m.parallel_expected_profile),
             compact_profile(&m.parallel_compiled_profile),
         ));
+        // Intent and status are both unbounded words; together they outgrow the
+        // quadrant whenever either is longer than "seq"/"ok".
         lines.push(format!(
-            "       eff {} W{}/{} {} {}",
+            "       eff {} W{}/{} {}",
             compact_profile(&m.parallel_effective_profile),
             m.parallel_worker_threads,
             m.parallel_max_worker_threads,
@@ -426,8 +428,11 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             } else {
                 m.parallel_worker_qos_intent.as_str()
             },
+        ));
+        lines.push(format!(
+            "       qos {}",
             if !m.parallel_worker_qos_status.is_empty() {
-                m.parallel_worker_qos_status.clone()
+                m.parallel_worker_qos_status.chars().take(24).collect()
             } else if m.parallel_worker_qos_failures == 0 {
                 "unknown".to_string()
             } else {
@@ -992,6 +997,54 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             format_number(m.network_flow_renewed_total),
             format_number(m.network_flow_suppressed_exact_total),
         ));
+    }
+    // ── 0B observational state ───────────────────────────────────────────
+    // Deliberately says what it does not know. A regime classification is what
+    // the window supports saying, never a causal claim.
+    if m.perceptual_episodes_stored > 0 || m.perceptual_episodes_rejected > 0 {
+        lines.push(format!(
+            "Perc   ep{} rej{} reg{}",
+            compact_counter(m.perceptual_episodes_stored),
+            compact_counter(m.perceptual_episodes_rejected),
+            compact_counter(m.perceptual_regimes_total),
+        ));
+        let correlated = m
+            .perceptual_correlation_unique
+            .saturating_add(m.perceptual_correlation_ambiguous)
+            .saturating_add(m.perceptual_correlation_unmatched);
+        if correlated > 0 {
+            lines.push(format!(
+                "       uniq{} amb{} unm{}",
+                compact_counter(m.perceptual_correlation_unique),
+                compact_counter(m.perceptual_correlation_ambiguous),
+                compact_counter(m.perceptual_correlation_unmatched),
+            ));
+        }
+        if !m.perceptual_regime_class.is_empty() {
+            lines.push(format!(
+                "       {} {}",
+                m.perceptual_regime_class
+                    .chars()
+                    .take(20)
+                    .collect::<String>(),
+                m.perceptual_regime_level
+            ));
+            lines.push(format!(
+                "       i{} act{} med{}ms",
+                compact_counter(u64::from(m.perceptual_regime_interactions)),
+                m.perceptual_regime_actionable,
+                m.perceptual_regime_median_total_ms,
+            ));
+            if !m.perceptual_regime_dominant_family.is_empty() {
+                lines.push(format!(
+                    "       vs {}",
+                    m.perceptual_regime_dominant_family
+                        .chars()
+                        .take(24)
+                        .collect::<String>()
+                ));
+            }
+        }
     }
     let authority_phase = match m.world_model_context_authority_phase.as_str() {
         "calibrating" => "calibrating",
@@ -2602,6 +2655,39 @@ mod tests {
     }
 
     #[test]
+    fn the_0b_section_states_what_the_window_supports_saying() {
+        let mut status = dashboard_status();
+        status.metrics.perceptual_episodes_stored = 312;
+        status.metrics.perceptual_episodes_rejected = 18;
+        status.metrics.perceptual_regimes_total = 4;
+        status.metrics.perceptual_correlation_unique = 312;
+        status.metrics.perceptual_correlation_ambiguous = 11;
+        status.metrics.perceptual_correlation_unmatched = 7;
+        status.metrics.perceptual_regime_class = "contended-actuable".to_string();
+        status.metrics.perceptual_regime_level = "heavy".to_string();
+        status.metrics.perceptual_regime_interactions = 64;
+        status.metrics.perceptual_regime_actionable = 2;
+        status.metrics.perceptual_regime_median_total_ms = 184;
+        status.metrics.perceptual_regime_dominant_family = "compiler".to_string();
+
+        let think = render_think_q(&status);
+        assert!(think.iter().any(|line| line == "Perc   ep312 rej18 reg4"));
+        assert!(think.iter().any(|line| line == "       uniq312 amb11 unm7"));
+        assert!(think
+            .iter()
+            .any(|line| line == "       contended-actuable heavy"));
+        assert!(think.iter().any(|line| line == "       i64 act2 med184ms"));
+        assert!(think.iter().any(|line| line == "       vs compiler"));
+        assert!(think.iter().all(|line| display_width(line) <= QW));
+    }
+
+    #[test]
+    fn no_0b_section_before_any_episode_exists() {
+        let think = render_think_q(&dashboard_status());
+        assert!(!think.iter().any(|line| line.starts_with("Perc")));
+    }
+
+    #[test]
     fn a_stale_extension_explains_the_zeros_it_causes() {
         // Without this row, a v1 extension and an idle browser render
         // identically: every interaction counter at zero and no reason given.
@@ -2950,7 +3036,7 @@ mod tests {
             .any(|line| line == "CPU-P  exp multi build multi"));
         assert!(think
             .iter()
-            .any(|line| line == "       eff multi W4/4 utility ok"));
+            .any(|line| line == "       eff multi W4/4 utility"));
         assert!(think.iter().any(|line| line == "WM-S   V0 rank3"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }

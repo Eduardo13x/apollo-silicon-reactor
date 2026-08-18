@@ -596,6 +596,33 @@ pub struct RuntimeMetrics {
     pub webflow_last_event_at_ms: u64,
     #[serde(default)]
     pub webflow_capabilities_bits: u32,
+    /// Phase 0B observational state. None of it grants causal authority: these
+    /// are counts of what was seen, and the classification names what the
+    /// window supports saying rather than what caused it.
+    #[serde(default)]
+    pub perceptual_episodes_stored: u64,
+    #[serde(default)]
+    pub perceptual_episodes_rejected: u64,
+    #[serde(default)]
+    pub perceptual_correlation_unique: u64,
+    #[serde(default)]
+    pub perceptual_correlation_ambiguous: u64,
+    #[serde(default)]
+    pub perceptual_correlation_unmatched: u64,
+    #[serde(default)]
+    pub perceptual_regimes_total: u64,
+    #[serde(default)]
+    pub perceptual_regime_class: String,
+    #[serde(default)]
+    pub perceptual_regime_level: String,
+    #[serde(default)]
+    pub perceptual_regime_interactions: u32,
+    #[serde(default)]
+    pub perceptual_regime_actionable: u32,
+    #[serde(default)]
+    pub perceptual_regime_dominant_family: String,
+    #[serde(default)]
+    pub perceptual_regime_median_total_ms: u32,
     /// Samples backing the LCP/INP p95 above. A p95 over three samples and a
     /// p95 over a full window are very different claims, and reading one as
     /// the other already produced a bogus 120000ms LCP once.

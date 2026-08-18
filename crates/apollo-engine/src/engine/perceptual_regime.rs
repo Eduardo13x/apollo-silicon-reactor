@@ -1,0 +1,853 @@
+//! Observational base for phase 0B of the Perceptual Interaction Layer.
+//!
+//! Records what was true around each interaction and segments sustained windows
+//! of stable context. It **observes only**: nothing here emits an action, grants
+//! credit, or promotes anything to Gold, and an association it reports is never
+//! a causal claim.
+//!
+//! The distinction that drives the design: OS-level actuators can only
+//! plausibly influence input delay and presentation. Processing is the site's
+//! own JavaScript, and a regime dominated by it has no lever regardless of what
+//! is contending for CPU.
+
+use std::collections::VecDeque;
+
+use serde::{Deserialize, Serialize};
+
+/// Interactions retained for analysis. Bounded because an untrusted page
+/// controls the arrival rate.
+pub const MAX_EPISODES: usize = 512;
+/// Regimes retained. A regime summarises many episodes, so far fewer are needed.
+pub const MAX_REGIMES: usize = 64;
+/// An episode older than this cannot describe current conditions.
+pub const EPISODE_TTL_MS: u64 = 15 * 60 * 1000;
+/// Below this an association is noise, whatever it looks like.
+pub const MIN_REGIME_INTERACTIONS: u32 = 20;
+/// A gap longer than this ends the current regime: the context in between is
+/// unobserved, and stitching across it would invent continuity.
+pub const REGIME_MAX_GAP_MS: u64 = 60 * 1000;
+/// Contenders below this share of a core are not competition.
+pub const CONTENDER_MIN_CPU_PERCENT: f64 = 15.0;
+
+/// Why a contender cannot be acted upon. Closed set, low cardinality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum IneligibilityReason {
+    /// Chromium family root — the boost veto, three documented regressions.
+    BrowserFamily,
+    /// Classified interactive: the user is working in it.
+    Interactive,
+    /// Hard-protected system process.
+    Protected,
+    /// Below the CPU floor: not actually competing.
+    BelowCpuFloor,
+    /// Single-threaded: task-level scheduling already covers it.
+    SingleThreaded,
+}
+
+impl IneligibilityReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BrowserFamily => "browser-family",
+            Self::Interactive => "interactive",
+            Self::Protected => "protected",
+            Self::BelowCpuFloor => "below-cpu-floor",
+            Self::SingleThreaded => "single-threaded",
+        }
+    }
+}
+
+/// One process competing for CPU around an interaction.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Contender {
+    /// Stable hash of the process name. The name itself is never persisted:
+    /// a process list is user data.
+    pub name_hash: u64,
+    pub family: String,
+    pub pid: u32,
+    pub cpu_percent: f64,
+    pub thread_count: u32,
+    /// `None` when the process could be acted upon; `Some` names the veto.
+    pub ineligible: Option<IneligibilityReason>,
+}
+
+impl Contender {
+    pub fn is_actionable(&self) -> bool {
+        self.ineligible.is_none()
+    }
+}
+
+/// System conditions around one interaction. Captured, never inferred.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ContentionSnapshot {
+    pub foreground_name_hash: u64,
+    pub contenders: Vec<Contender>,
+    pub total_cpu_percent: f64,
+    pub runnable_threads: u32,
+    pub context_switches_per_sec: u64,
+    pub memory_pressure: f64,
+    pub thermal_level: String,
+    pub throttled: bool,
+    pub energy_watts: f64,
+}
+
+impl ContentionSnapshot {
+    /// Contender with the most CPU, whether or not it can be acted upon.
+    pub fn dominant(&self) -> Option<&Contender> {
+        self.contenders
+            .iter()
+            .max_by(|a, b| a.cpu_percent.total_cmp(&b.cpu_percent))
+    }
+
+    pub fn actionable_count(&self) -> usize {
+        self.contenders.iter().filter(|c| c.is_actionable()).count()
+    }
+
+    /// Coarse band, so strata stay low-cardinality.
+    pub fn contention_level(&self) -> ContentionLevel {
+        let peak = self
+            .contenders
+            .iter()
+            .map(|c| c.cpu_percent)
+            .fold(0.0_f64, f64::max);
+        if self.contenders.is_empty() || peak < CONTENDER_MIN_CPU_PERCENT {
+            ContentionLevel::None
+        } else if peak < 50.0 {
+            ContentionLevel::Moderate
+        } else {
+            ContentionLevel::Heavy
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContentionLevel {
+    #[default]
+    None,
+    Moderate,
+    Heavy,
+}
+
+impl ContentionLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Moderate => "moderate",
+            Self::Heavy => "heavy",
+        }
+    }
+}
+
+/// How confidently an episode's measurement can be trusted. Anything short of
+/// `Unique` is excluded from every aggregate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CorrelationState {
+    Unique,
+    Ambiguous,
+    UnmatchedCompleted,
+    Duplicate,
+    Expired,
+    InvalidComponents,
+    InvalidTiming,
+    #[default]
+    InvalidSchema,
+}
+
+impl CorrelationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unique => "unique",
+            Self::Ambiguous => "ambiguous",
+            Self::UnmatchedCompleted => "unmatched",
+            Self::Duplicate => "duplicate",
+            Self::Expired => "expired",
+            Self::InvalidComponents => "invalid-components",
+            Self::InvalidTiming => "invalid-timing",
+            Self::InvalidSchema => "invalid-schema",
+        }
+    }
+
+    /// Only a uniquely correlated episode may enter an aggregate. Every other
+    /// state is evidence about the measurement, not about the machine.
+    pub fn is_usable(self) -> bool {
+        matches!(self, Self::Unique)
+    }
+}
+
+/// One measured interaction with the conditions around it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerceptualInteractionEpisode {
+    pub observed_at_ms: u64,
+    pub context_hash: u64,
+    pub total_duration_ms: u32,
+    pub input_delay_ms: u32,
+    pub processing_ms: u32,
+    pub presentation_ms: u32,
+    pub correlation: CorrelationState,
+    /// Transport segment in the producer's own clock, when it reported one.
+    pub transport_ms: Option<u32>,
+    pub contention: ContentionSnapshot,
+}
+
+impl PerceptualInteractionEpisode {
+    /// The three parts must account for the whole, within the browser's own 8 ms
+    /// rounding of `duration`. A mismatch means the components describe some
+    /// other interaction.
+    pub fn components_reconcile(&self) -> bool {
+        let sum = self
+            .input_delay_ms
+            .saturating_add(self.processing_ms)
+            .saturating_add(self.presentation_ms);
+        sum.abs_diff(self.total_duration_ms) <= 8
+    }
+
+    pub fn is_usable(&self) -> bool {
+        self.correlation.is_usable() && self.components_reconcile()
+    }
+}
+
+/// What an observed window supports saying — and nothing more.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RegimeClassification {
+    /// Not enough usable episodes to say anything.
+    InsufficientSamples,
+    /// Episodes exist but none survived validation.
+    InvalidData,
+    /// No process was competing.
+    NoContention,
+    /// Competition exists, and at least one contender could legally be acted on.
+    ContendedActuable,
+    /// Competition exists but every contender is vetoed.
+    ContendedNonActuable,
+    /// Latency tracks contention across this window.
+    AssociationObserved,
+    /// Contention varied and latency did not follow.
+    AssociationNotFound,
+}
+
+impl RegimeClassification {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientSamples => "insufficient-samples",
+            Self::InvalidData => "invalid-data",
+            Self::NoContention => "no-contention",
+            Self::ContendedActuable => "contended-actuable",
+            Self::ContendedNonActuable => "contended-nonactuable",
+            Self::AssociationObserved => "association-observed",
+            Self::AssociationNotFound => "association-not-found",
+        }
+    }
+
+    /// No observational classification ever grants causal authority. Stated as
+    /// code so a later change has to argue with a test.
+    pub const fn grants_causal_credit(self) -> bool {
+        false
+    }
+}
+
+/// A sustained window of stable context.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContentionRegime {
+    pub regime_id: u64,
+    pub started_at_ms: u64,
+    pub ended_at_ms: u64,
+    pub foreground_name_hash: u64,
+    pub dominant_contender_hash: Option<u64>,
+    pub dominant_family: Option<String>,
+    pub level: ContentionLevel,
+    pub interactions: u32,
+    pub median_total_ms: u32,
+    pub median_input_delay_ms: u32,
+    pub median_processing_ms: u32,
+    pub median_presentation_ms: u32,
+    pub actionable_contenders: u32,
+    pub classification: RegimeClassification,
+}
+
+fn median(values: &mut [u32]) -> u32 {
+    if values.is_empty() {
+        return 0;
+    }
+    values.sort_unstable();
+    values[values.len() / 2]
+}
+
+/// Bounded store of episodes and the regimes derived from them.
+#[derive(Debug, Default)]
+pub struct PerceptualObservatory {
+    episodes: VecDeque<PerceptualInteractionEpisode>,
+    regimes: VecDeque<ContentionRegime>,
+    next_regime_id: u64,
+    pub dropped_capacity: u64,
+    pub dropped_ttl: u64,
+    pub rejected_unusable: u64,
+    correlation_counts: [u64; 8],
+}
+
+impl PerceptualObservatory {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one episode. Unusable episodes are counted by state and never
+    /// stored: keeping them would let a broken measurement reach an aggregate.
+    pub fn record(&mut self, episode: PerceptualInteractionEpisode) {
+        let slot = match episode.correlation {
+            CorrelationState::Unique => 0,
+            CorrelationState::Ambiguous => 1,
+            CorrelationState::UnmatchedCompleted => 2,
+            CorrelationState::Duplicate => 3,
+            CorrelationState::Expired => 4,
+            CorrelationState::InvalidComponents => 5,
+            CorrelationState::InvalidTiming => 6,
+            CorrelationState::InvalidSchema => 7,
+        };
+        self.correlation_counts[slot] = self.correlation_counts[slot].saturating_add(1);
+        if !episode.is_usable() {
+            self.rejected_unusable = self.rejected_unusable.saturating_add(1);
+            return;
+        }
+        if self.episodes.len() >= MAX_EPISODES {
+            self.episodes.pop_front();
+            self.dropped_capacity = self.dropped_capacity.saturating_add(1);
+        }
+        self.episodes.push_back(episode);
+    }
+
+    /// Drop episodes that can no longer describe current conditions.
+    pub fn expire(&mut self, now_ms: u64) {
+        while let Some(front) = self.episodes.front() {
+            if now_ms.saturating_sub(front.observed_at_ms) > EPISODE_TTL_MS {
+                self.episodes.pop_front();
+                self.dropped_ttl = self.dropped_ttl.saturating_add(1);
+            } else {
+                break;
+            }
+        }
+    }
+
+    pub fn episode_count(&self) -> usize {
+        self.episodes.len()
+    }
+
+    pub fn regimes(&self) -> impl Iterator<Item = &ContentionRegime> {
+        self.regimes.iter()
+    }
+
+    pub fn correlation_counts(&self) -> [u64; 8] {
+        self.correlation_counts
+    }
+
+    /// Segment stored episodes into regimes. A regime breaks when the
+    /// foreground changes, the contention band changes, or observation lapses
+    /// for longer than `REGIME_MAX_GAP_MS`.
+    pub fn segment(&mut self) -> usize {
+        self.regimes.clear();
+        let mut window: Vec<&PerceptualInteractionEpisode> = Vec::new();
+        let mut built = 0usize;
+        let mut pending: Vec<ContentionRegime> = Vec::new();
+        for episode in &self.episodes {
+            let breaks = window.last().is_some_and(|last| {
+                last.contention.foreground_name_hash != episode.contention.foreground_name_hash
+                    || last.contention.contention_level() != episode.contention.contention_level()
+                    || episode.observed_at_ms.saturating_sub(last.observed_at_ms)
+                        > REGIME_MAX_GAP_MS
+            });
+            if breaks {
+                if let Some(regime) = build_regime(&window, self.next_regime_id) {
+                    self.next_regime_id = self.next_regime_id.wrapping_add(1);
+                    pending.push(regime);
+                    built += 1;
+                }
+                window.clear();
+            }
+            window.push(episode);
+        }
+        if let Some(regime) = build_regime(&window, self.next_regime_id) {
+            self.next_regime_id = self.next_regime_id.wrapping_add(1);
+            pending.push(regime);
+            built += 1;
+        }
+        for regime in pending {
+            if self.regimes.len() >= MAX_REGIMES {
+                self.regimes.pop_front();
+            }
+            self.regimes.push_back(regime);
+        }
+        built
+    }
+}
+
+fn build_regime(
+    window: &[&PerceptualInteractionEpisode],
+    regime_id: u64,
+) -> Option<ContentionRegime> {
+    let first = window.first()?;
+    let last = window.last()?;
+    let mut totals: Vec<u32> = window.iter().map(|e| e.total_duration_ms).collect();
+    let mut inputs: Vec<u32> = window.iter().map(|e| e.input_delay_ms).collect();
+    let mut processing: Vec<u32> = window.iter().map(|e| e.processing_ms).collect();
+    let mut presentation: Vec<u32> = window.iter().map(|e| e.presentation_ms).collect();
+    let level = first.contention.contention_level();
+    let dominant = first.contention.dominant();
+    let actionable = first.contention.actionable_count() as u32;
+    let interactions = window.len() as u32;
+
+    let classification = if interactions < MIN_REGIME_INTERACTIONS {
+        RegimeClassification::InsufficientSamples
+    } else if level == ContentionLevel::None {
+        RegimeClassification::NoContention
+    } else if actionable == 0 {
+        RegimeClassification::ContendedNonActuable
+    } else {
+        RegimeClassification::ContendedActuable
+    };
+
+    Some(ContentionRegime {
+        regime_id,
+        started_at_ms: first.observed_at_ms,
+        ended_at_ms: last.observed_at_ms,
+        foreground_name_hash: first.contention.foreground_name_hash,
+        dominant_contender_hash: dominant.map(|c| c.name_hash),
+        dominant_family: dominant.map(|c| c.family.clone()),
+        level,
+        interactions,
+        median_total_ms: median(&mut totals),
+        median_input_delay_ms: median(&mut inputs),
+        median_processing_ms: median(&mut processing),
+        median_presentation_ms: median(&mut presentation),
+        actionable_contenders: actionable,
+        classification,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contender(pid: u32, cpu: f64, ineligible: Option<IneligibilityReason>) -> Contender {
+        Contender {
+            name_hash: u64::from(pid) * 7,
+            family: "compiler".to_string(),
+            pid,
+            cpu_percent: cpu,
+            thread_count: 8,
+            ineligible,
+        }
+    }
+
+    fn episode(at_ms: u64, total: u32, contenders: Vec<Contender>) -> PerceptualInteractionEpisode {
+        // Components chosen to reconcile exactly with the total.
+        let input = total / 10;
+        let processing = total / 10;
+        let presentation = total - input - processing;
+        PerceptualInteractionEpisode {
+            observed_at_ms: at_ms,
+            context_hash: 42,
+            total_duration_ms: total,
+            input_delay_ms: input,
+            processing_ms: processing,
+            presentation_ms: presentation,
+            correlation: CorrelationState::Unique,
+            transport_ms: Some(1),
+            contention: ContentionSnapshot {
+                foreground_name_hash: 99,
+                contenders,
+                ..ContentionSnapshot::default()
+            },
+        }
+    }
+
+    #[test]
+    fn components_must_account_for_the_whole_within_browser_rounding() {
+        let mut good = episode(0, 100, vec![]);
+        assert!(good.components_reconcile());
+        // `duration` is rounded to 8 ms by the browser, so small gaps are real.
+        good.presentation_ms += 8;
+        assert!(good.components_reconcile());
+        good.presentation_ms += 8;
+        assert!(
+            !good.components_reconcile(),
+            "a larger gap is another interaction"
+        );
+    }
+
+    #[test]
+    fn only_uniquely_correlated_episodes_enter_the_store() {
+        let mut observatory = PerceptualObservatory::new();
+        for state in [
+            CorrelationState::Ambiguous,
+            CorrelationState::Duplicate,
+            CorrelationState::InvalidTiming,
+            CorrelationState::UnmatchedCompleted,
+        ] {
+            let mut e = episode(0, 100, vec![]);
+            e.correlation = state;
+            observatory.record(e);
+        }
+        assert_eq!(observatory.episode_count(), 0);
+        assert_eq!(observatory.rejected_unusable, 4);
+        observatory.record(episode(0, 100, vec![]));
+        assert_eq!(observatory.episode_count(), 1);
+    }
+
+    #[test]
+    fn an_episode_whose_components_disagree_is_refused_even_when_unique() {
+        let mut broken = episode(0, 100, vec![]);
+        broken.presentation_ms = 900;
+        assert!(broken.correlation.is_usable());
+        let mut observatory = PerceptualObservatory::new();
+        observatory.record(broken);
+        assert_eq!(observatory.episode_count(), 0);
+        assert_eq!(observatory.rejected_unusable, 1);
+    }
+
+    #[test]
+    fn the_store_is_bounded_and_counts_what_it_drops() {
+        let mut observatory = PerceptualObservatory::new();
+        for index in 0..(MAX_EPISODES + 20) {
+            observatory.record(episode(index as u64, 100, vec![]));
+        }
+        assert_eq!(observatory.episode_count(), MAX_EPISODES);
+        assert_eq!(observatory.dropped_capacity, 20);
+    }
+
+    #[test]
+    fn stale_episodes_expire_rather_than_describing_the_present() {
+        let mut observatory = PerceptualObservatory::new();
+        observatory.record(episode(0, 100, vec![]));
+        observatory.record(episode(EPISODE_TTL_MS + 1, 100, vec![]));
+        observatory.expire(EPISODE_TTL_MS + 2);
+        assert_eq!(observatory.episode_count(), 1);
+        assert_eq!(observatory.dropped_ttl, 1);
+    }
+
+    #[test]
+    fn a_window_without_competition_is_no_contention() {
+        let mut observatory = PerceptualObservatory::new();
+        for index in 0..MIN_REGIME_INTERACTIONS {
+            observatory.record(episode(u64::from(index) * 100, 60, vec![]));
+        }
+        observatory.segment();
+        let regime = observatory.regimes().next().expect("one regime");
+        assert_eq!(regime.classification, RegimeClassification::NoContention);
+        assert_eq!(regime.level, ContentionLevel::None);
+    }
+
+    #[test]
+    fn competition_that_cannot_be_touched_is_named_nonactuable() {
+        // Every contender vetoed: the honest answer is that no lever exists,
+        // which is a valid terminal result rather than a failure.
+        let vetoed = vec![contender(
+            900,
+            80.0,
+            Some(IneligibilityReason::BrowserFamily),
+        )];
+        let mut observatory = PerceptualObservatory::new();
+        for index in 0..MIN_REGIME_INTERACTIONS {
+            observatory.record(episode(u64::from(index) * 100, 300, vetoed.clone()));
+        }
+        observatory.segment();
+        let regime = observatory.regimes().next().expect("one regime");
+        assert_eq!(
+            regime.classification,
+            RegimeClassification::ContendedNonActuable
+        );
+        assert_eq!(regime.actionable_contenders, 0);
+    }
+
+    #[test]
+    fn competition_with_a_legal_target_is_named_actuable() {
+        let actionable = vec![contender(901, 70.0, None)];
+        let mut observatory = PerceptualObservatory::new();
+        for index in 0..MIN_REGIME_INTERACTIONS {
+            observatory.record(episode(u64::from(index) * 100, 300, actionable.clone()));
+        }
+        observatory.segment();
+        let regime = observatory.regimes().next().expect("one regime");
+        assert_eq!(
+            regime.classification,
+            RegimeClassification::ContendedActuable
+        );
+        assert_eq!(regime.actionable_contenders, 1);
+        assert_eq!(regime.dominant_family.as_deref(), Some("compiler"));
+    }
+
+    #[test]
+    fn too_few_interactions_say_so_instead_of_guessing() {
+        let mut observatory = PerceptualObservatory::new();
+        for index in 0..(MIN_REGIME_INTERACTIONS - 1) {
+            observatory.record(episode(
+                u64::from(index) * 100,
+                300,
+                vec![contender(902, 70.0, None)],
+            ));
+        }
+        observatory.segment();
+        let regime = observatory.regimes().next().expect("one regime");
+        assert_eq!(
+            regime.classification,
+            RegimeClassification::InsufficientSamples
+        );
+    }
+
+    #[test]
+    fn an_observation_gap_breaks_the_regime_rather_than_inventing_continuity() {
+        let mut observatory = PerceptualObservatory::new();
+        for index in 0..5u64 {
+            observatory.record(episode(index * 100, 60, vec![]));
+        }
+        // Nothing observed for longer than the maximum gap.
+        for index in 0..5u64 {
+            observatory.record(episode(
+                REGIME_MAX_GAP_MS + 10_000 + index * 100,
+                60,
+                vec![],
+            ));
+        }
+        let built = observatory.segment();
+        assert_eq!(built, 2, "the unobserved gap must not be bridged");
+    }
+
+    #[test]
+    fn a_change_of_contention_band_starts_a_new_regime() {
+        let mut observatory = PerceptualObservatory::new();
+        for index in 0..5u64 {
+            observatory.record(episode(index * 100, 60, vec![]));
+        }
+        for index in 5..10u64 {
+            observatory.record(episode(index * 100, 300, vec![contender(903, 80.0, None)]));
+        }
+        assert_eq!(observatory.segment(), 2);
+    }
+
+    #[test]
+    fn no_observational_classification_ever_grants_causal_credit() {
+        for classification in [
+            RegimeClassification::InsufficientSamples,
+            RegimeClassification::InvalidData,
+            RegimeClassification::NoContention,
+            RegimeClassification::ContendedActuable,
+            RegimeClassification::ContendedNonActuable,
+            RegimeClassification::AssociationObserved,
+            RegimeClassification::AssociationNotFound,
+        ] {
+            assert!(
+                !classification.grants_causal_credit(),
+                "{} must never authorise an action",
+                classification.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_ineligibility_reason_is_a_closed_low_cardinality_label() {
+        let labels: Vec<_> = [
+            IneligibilityReason::BrowserFamily,
+            IneligibilityReason::Interactive,
+            IneligibilityReason::Protected,
+            IneligibilityReason::BelowCpuFloor,
+            IneligibilityReason::SingleThreaded,
+        ]
+        .into_iter()
+        .map(IneligibilityReason::as_str)
+        .collect();
+        assert_eq!(labels.len(), 5);
+        assert!(labels.iter().all(|l| l.len() <= 20 && !l.is_empty()));
+    }
+
+    #[test]
+    fn correlation_states_are_counted_even_when_the_episode_is_refused() {
+        let mut observatory = PerceptualObservatory::new();
+        let mut ambiguous = episode(0, 100, vec![]);
+        ambiguous.correlation = CorrelationState::Ambiguous;
+        observatory.record(ambiguous);
+        observatory.record(episode(1, 100, vec![]));
+        let counts = observatory.correlation_counts();
+        assert_eq!(counts[0], 1, "unique");
+        assert_eq!(counts[1], 1, "ambiguous, refused but counted");
+    }
+}
+
+/// Anonymised evidence export.
+///
+/// Carries hashes and closed categories only. No URL, page text, process name
+/// or any other user data crosses this boundary — a process list is as
+/// identifying as a browsing history, so names never leave as names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PerceptualExport {
+    pub schema_version: u16,
+    pub episodes: Vec<ExportedEpisode>,
+    pub regimes: Vec<ContentionRegime>,
+    pub correlation_counts: ExportedCorrelationCounts,
+    pub transport_quality: ExportedTransportQuality,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExportedEpisode {
+    pub observed_at_ms: u64,
+    pub context_hash: u64,
+    pub total_duration_ms: u32,
+    pub input_delay_ms: u32,
+    pub processing_ms: u32,
+    pub presentation_ms: u32,
+    pub contention_level: ContentionLevel,
+    pub dominant_contender_hash: Option<u64>,
+    pub dominant_family: Option<String>,
+    pub actionable_contenders: u32,
+    pub transport_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportedCorrelationCounts {
+    pub unique: u64,
+    pub ambiguous: u64,
+    pub unmatched: u64,
+    pub duplicate: u64,
+    pub expired: u64,
+    pub invalid_components: u64,
+    pub invalid_timing: u64,
+    pub invalid_schema: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExportedTransportQuality {
+    pub episodes_with_transport: u64,
+    pub episodes_without_transport: u64,
+    pub dropped_capacity: u64,
+    pub dropped_ttl: u64,
+    pub rejected_unusable: u64,
+}
+
+pub const PERCEPTUAL_EXPORT_SCHEMA_VERSION: u16 = 1;
+
+impl PerceptualObservatory {
+    pub fn export(&self) -> PerceptualExport {
+        let counts = self.correlation_counts;
+        let with_transport = self
+            .episodes
+            .iter()
+            .filter(|e| e.transport_ms.is_some())
+            .count() as u64;
+        PerceptualExport {
+            schema_version: PERCEPTUAL_EXPORT_SCHEMA_VERSION,
+            episodes: self
+                .episodes
+                .iter()
+                .map(|e| {
+                    let dominant = e.contention.dominant();
+                    ExportedEpisode {
+                        observed_at_ms: e.observed_at_ms,
+                        context_hash: e.context_hash,
+                        total_duration_ms: e.total_duration_ms,
+                        input_delay_ms: e.input_delay_ms,
+                        processing_ms: e.processing_ms,
+                        presentation_ms: e.presentation_ms,
+                        contention_level: e.contention.contention_level(),
+                        dominant_contender_hash: dominant.map(|c| c.name_hash),
+                        dominant_family: dominant.map(|c| c.family.clone()),
+                        actionable_contenders: e.contention.actionable_count() as u32,
+                        transport_ms: e.transport_ms,
+                    }
+                })
+                .collect(),
+            regimes: self.regimes.iter().cloned().collect(),
+            correlation_counts: ExportedCorrelationCounts {
+                unique: counts[0],
+                ambiguous: counts[1],
+                unmatched: counts[2],
+                duplicate: counts[3],
+                expired: counts[4],
+                invalid_components: counts[5],
+                invalid_timing: counts[6],
+                invalid_schema: counts[7],
+            },
+            transport_quality: ExportedTransportQuality {
+                episodes_with_transport: with_transport,
+                episodes_without_transport: self.episodes.len() as u64 - with_transport,
+                dropped_capacity: self.dropped_capacity,
+                dropped_ttl: self.dropped_ttl,
+                rejected_unusable: self.rejected_unusable,
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod export_tests {
+    use super::*;
+
+    #[test]
+    fn the_export_carries_no_process_name_or_page_identity() {
+        let mut observatory = PerceptualObservatory::new();
+        let mut episode = PerceptualInteractionEpisode {
+            observed_at_ms: 1,
+            context_hash: 0xDEAD_BEEF,
+            total_duration_ms: 100,
+            input_delay_ms: 10,
+            processing_ms: 10,
+            presentation_ms: 80,
+            correlation: CorrelationState::Unique,
+            transport_ms: Some(1),
+            contention: ContentionSnapshot::default(),
+        };
+        episode.contention.contenders.push(Contender {
+            name_hash: 0xC0FFEE,
+            family: "compiler".to_string(),
+            pid: 4242,
+            cpu_percent: 80.0,
+            thread_count: 8,
+            ineligible: None,
+        });
+        observatory.record(episode);
+
+        let json = serde_json::to_string(&observatory.export()).expect("export encodes");
+        let lower = json.to_lowercase();
+        for forbidden in [
+            "url", "origin", "title", "\"name\"", "path", "host", "cookie",
+        ] {
+            assert!(
+                !lower.contains(forbidden),
+                "export must not carry {forbidden}: {json}"
+            );
+        }
+        // The family is a closed category, and the identity is a hash.
+        assert!(lower.contains("compiler"));
+        assert!(lower.contains("dominant_contender_hash"));
+    }
+
+    #[test]
+    fn the_export_reconciles_with_what_was_observed() {
+        let mut observatory = PerceptualObservatory::new();
+        let base = PerceptualInteractionEpisode {
+            observed_at_ms: 1,
+            context_hash: 1,
+            total_duration_ms: 100,
+            input_delay_ms: 10,
+            processing_ms: 10,
+            presentation_ms: 80,
+            correlation: CorrelationState::Unique,
+            transport_ms: None,
+            contention: ContentionSnapshot::default(),
+        };
+        observatory.record(base.clone());
+        let mut ambiguous = base.clone();
+        ambiguous.correlation = CorrelationState::Ambiguous;
+        observatory.record(ambiguous);
+
+        let export = observatory.export();
+        assert_eq!(
+            export.episodes.len(),
+            1,
+            "only usable episodes are exported"
+        );
+        assert_eq!(export.correlation_counts.unique, 1);
+        assert_eq!(export.correlation_counts.ambiguous, 1);
+        assert_eq!(export.transport_quality.rejected_unusable, 1);
+        assert_eq!(export.transport_quality.episodes_without_transport, 1);
+        assert_eq!(export.schema_version, PERCEPTUAL_EXPORT_SCHEMA_VERSION);
+    }
+}
