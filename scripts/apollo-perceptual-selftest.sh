@@ -110,13 +110,20 @@ fi
 
 DOCTOR=$($CTL perceptual-doctor 2>/dev/null)
 VERDICT=$(printf '%s' "$DOCTOR" | awk '/verdict:/{print $2}')
+# Keep this list in sync with PerceptualVerdict::as_str in
+# src/bin/apollo-optimizerctl/perceptual_doctor.rs. An unlisted verdict falls
+# through to FAIL on purpose: a self-test must not pass on a word it cannot read.
 case "$VERDICT" in
-  READY_FOR_0B)        say ok      "circuit" "$VERDICT" ;;
-  OBSERVATION_PARTIAL) say PARTIAL "circuit" "$VERDICT — browser may be idle"; partial=1 ;;
-  STALE_EXTENSION)     say PARTIAL "circuit" "$VERDICT — reload the extension"; partial=1 ;;
-  NO_DATA)             say PARTIAL "circuit" "$VERDICT — extension not loaded"; partial=1 ;;
-  "")                  say FAIL    "circuit" "perceptual-doctor unavailable"; fail=1 ;;
-  *)                   say FAIL    "circuit" "$VERDICT"; fail=1 ;;
+  READY_FOR_0B)          say ok      "circuit" "$VERDICT" ;;
+  PERCEPTUAL_CORE_READY) say ok      "circuit" "$VERDICT — core fed by $(printf '%s' "$DOCTOR" | awk '/perceptual-core/{print $3}')" ;;
+  OBSERVATION_PARTIAL)   say PARTIAL "circuit" "$VERDICT — browser may be idle"; partial=1 ;;
+  COLLECTOR_SILENT)      say PARTIAL "circuit" "$VERDICT — transport up, no interactions yet"; partial=1 ;;
+  STALE_EXTENSION)       say PARTIAL "circuit" "$VERDICT — reload the extension"; partial=1 ;;
+  NO_DATA)               say PARTIAL "circuit" "$VERDICT — extension not loaded"; partial=1 ;;
+  SCHEMA_MISMATCH)       say FAIL    "circuit" "$VERDICT — redeploy all four binaries together"; fail=1 ;;
+  TRANSPORT_BROKEN)      say FAIL    "circuit" "$VERDICT — events leave the page but never land"; fail=1 ;;
+  "")                    say FAIL    "circuit" "perceptual-doctor unavailable"; fail=1 ;;
+  *)                     say FAIL    "circuit" "$VERDICT — unknown verdict, self-test is stale"; fail=1 ;;
 esac
 
 echo

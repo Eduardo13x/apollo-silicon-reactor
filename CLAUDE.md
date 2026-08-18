@@ -64,9 +64,28 @@ That difference matters when reading metrics. On a host with headroom, pressure 
 ## Build & Development Commands
 
 ```bash
-# Build
-cargo build --release
+# Build — ALWAYS through the hardware profile, never bare `cargo build --release`
+source scripts/hardware-build-profile.sh
+cargo build --workspace --bins --release "${APOLLO_CARGO_FEATURE_ARGS[@]}"
+# binaries land in $APOLLO_RELEASE_DIR, not target/release
+```
 
+**Why this matters:** `Cargo.toml` has `default = []`, and
+`scripts/hardware-build-profile.sh` adds `--features adaptive-multicore` on
+every arm64 Darwin host plus its own `CARGO_TARGET_DIR`. A bare
+`cargo build --release` produces a **sequential** binary with no rayon and no
+worker QoS. Deploying it to a host that expects `adaptive-multicore` makes
+`parallel_expected_profile != parallel_compiled_profile`, which fails
+`profile_matches` and blocks the Value scheduler, Reflex and WebFlow with
+`expected-profile-mismatch` — Apollo observes but refuses to act. It also
+costs cycle p95, so a wrongly built binary silently invalidates any
+before/after performance comparison. Observed 2026-08-17: several manual
+deploys shipped `sequential` and the resulting p95 delta was mistaken for a
+regression in application code.
+
+Prefer `./scripts/apollo-deploy-gate.sh`, which sources the profile itself.
+
+```bash
 # Run from source
 cargo run -- snapshot --output system_snapshot.json
 cargo run --bin apollo-optimizerd -- daemon --profile balanced-root
