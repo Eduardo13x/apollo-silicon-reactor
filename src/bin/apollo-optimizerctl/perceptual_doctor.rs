@@ -11,6 +11,8 @@ use apollo_engine::engine::types::RuntimeMetrics;
 pub enum PerceptualVerdict {
     ReadyFor0b,
     ObservationPartial,
+    /// Lifecycle events arrive but the content script has produced no vitals.
+    CollectorSilent,
     NoData,
     StaleExtension,
     SchemaMismatch,
@@ -22,6 +24,7 @@ impl PerceptualVerdict {
         match self {
             Self::ReadyFor0b => "READY_FOR_0B",
             Self::ObservationPartial => "OBSERVATION_PARTIAL",
+            Self::CollectorSilent => "COLLECTOR_SILENT",
             Self::NoData => "NO_DATA",
             Self::StaleExtension => "STALE_EXTENSION",
             Self::SchemaMismatch => "SCHEMA_MISMATCH",
@@ -84,6 +87,19 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
         format!("rejected={}", m.webflow_schema_rejected_total),
     ));
     checks.push(Check::new(
+        "vitals",
+        m.browser_latency_samples > 0,
+        format!(
+            "samples={} mode={}",
+            m.browser_latency_samples,
+            if m.webflow_mode.is_empty() {
+                "-"
+            } else {
+                m.webflow_mode.as_str()
+            }
+        ),
+    ));
+    checks.push(Check::new(
         "transport",
         m.webflow_transport_samples > 0,
         format!(
@@ -129,6 +145,11 @@ pub fn diagnose(m: &RuntimeMetrics) -> Report {
         PerceptualVerdict::NoData
     } else if m.webflow_accepted_v2_total == 0 {
         PerceptualVerdict::StaleExtension
+    } else if m.browser_latency_samples == 0 {
+        // Events reach the daemon, so the transport is intact end to end; the
+        // content script simply has not reported. Pages loaded before the last
+        // extension reload keep the injection list they were opened with.
+        PerceptualVerdict::CollectorSilent
     } else if m.webflow_transport_samples == 0 {
         PerceptualVerdict::TransportBroken
     } else if m.browser_interaction_samples == 0 || component_total == 0 {
@@ -167,6 +188,12 @@ pub fn render(report: &Report) -> String {
         PerceptualVerdict::SchemaMismatch => {
             "  payloads are refused as uninterpretable. Extension and daemon\n  \
              disagree on the wire schema; redeploy both from the same commit.\n"
+        }
+        PerceptualVerdict::CollectorSilent => {
+            "  navigation events arrive, so the whole transport works, but the\n  \
+             content script has reported no vitals. Tabs opened before the last\n  \
+             extension reload keep their original injection: reload the open\n  \
+             tabs (or open a new one) and interact with the page.\n"
         }
         PerceptualVerdict::TransportBroken => {
             "  events arrive without transport stamps. The bridge or the service\n  \
@@ -210,9 +237,22 @@ mod tests {
     }
 
     #[test]
-    fn events_without_transport_stamps_are_transport_broken() {
+    fn lifecycle_only_traffic_is_a_silent_collector_not_a_broken_transport() {
+        // The production case: nine navigation events landed, so every hop
+        // works, yet the content script had reported nothing.
+        let mut m = metrics();
+        m.webflow_accepted_v2_total = 9;
+        m.webflow_mode = "lifecycle".to_string();
+        let report = diagnose(&m);
+        assert_eq!(report.verdict, PerceptualVerdict::CollectorSilent);
+        assert!(render(&report).contains("reload the open"));
+    }
+
+    #[test]
+    fn vitals_without_transport_stamps_are_transport_broken() {
         let mut m = metrics();
         m.webflow_accepted_v2_total = 40;
+        m.browser_latency_samples = 12;
         assert_eq!(diagnose(&m).verdict, PerceptualVerdict::TransportBroken);
     }
 
@@ -220,6 +260,7 @@ mod tests {
     fn an_idle_browser_is_partial_rather_than_broken() {
         let mut m = metrics();
         m.webflow_accepted_v2_total = 40;
+        m.browser_latency_samples = 12;
         m.webflow_transport_samples = 40;
         let report = diagnose(&m);
         assert_eq!(report.verdict, PerceptualVerdict::ObservationPartial);
@@ -230,6 +271,7 @@ mod tests {
     fn a_complete_circuit_is_ready_for_0b() {
         let mut m = metrics();
         m.webflow_accepted_v2_total = 40;
+        m.browser_latency_samples = 64;
         m.webflow_transport_samples = 40;
         m.browser_interaction_samples = 312;
         m.browser_inp_estimate_ms = Some(184.0);
@@ -250,6 +292,7 @@ mod tests {
             vec![
                 "extension",
                 "schema",
+                "vitals",
                 "transport",
                 "interactions",
                 "components"
