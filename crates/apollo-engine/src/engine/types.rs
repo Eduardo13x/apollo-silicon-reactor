@@ -3163,13 +3163,20 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub markov_shadow_misses: u64,
     /// The two opposite failures `markov_shadow_misses` hides. Wrong-app is the
-    /// model being wrong; no-switch is the model being right about an event
-    /// that had not happened when the window closed. They call for different
-    /// fixes, and 1 hit against 10 misses says nothing until they are split.
+    /// model predicting the wrong target. Timeout means only that no transition
+    /// happened inside the horizon — **not** that the prediction was right and
+    /// late, which is a separate observation counted as `late_hit`.
     #[serde(default)]
     pub markov_shadow_miss_wrong_app: u64,
     #[serde(default)]
-    pub markov_shadow_miss_no_switch: u64,
+    pub markov_shadow_miss_timeout: u64,
+    /// A timed-out prediction whose target did appear during the grace window.
+    /// This, and only this, is evidence of correct-but-late.
+    #[serde(default)]
+    pub markov_shadow_late_hits: u64,
+    /// Timeouts whose grace window closed without the target appearing.
+    #[serde(default)]
+    pub markov_shadow_timeout_unresolved: u64,
     /// Hits, by whether a real pre-warm could have been issued at the moment
     /// the prediction was made. A correct prediction blocked by resources is a
     /// different problem from a correct prediction nobody could act on in time.

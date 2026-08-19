@@ -232,6 +232,23 @@ pub struct MarkovShadowTracker {
     sampled_pair: Option<(String, String)>,
     temporal_last_app: Option<String>,
     temporal_last_at: Option<Instant>,
+    /// Predictions that timed out, kept just long enough to notice the switch
+    /// arriving late. A timeout only proves no transition happened inside the
+    /// horizon; whether the prediction was *correct* is a different question,
+    /// and answering it needs someone to still be watching afterwards.
+    tombstones: Vec<ShadowTombstone>,
+}
+
+/// The minimum needed to recognise a late arrival. Deliberately not the whole
+/// lease: this is a memory of a closed prediction, not an open one.
+#[derive(Debug, Clone)]
+struct ShadowTombstone {
+    source_app: String,
+    predicted_app: String,
+    opened_at: Instant,
+    expires_at: Instant,
+    grace_until: Instant,
+    blocker_at_open: &'static str,
 }
 
 #[derive(Debug)]
@@ -454,6 +471,50 @@ pub fn run_markov_tick(
         shadow_resolution,
         LeaseResolution::Hit | LeaseResolution::Miss
     ) {
+        // Late arrivals. A timeout only proved no transition happened inside the
+        // horizon; if the predicted target shows up during the grace window the
+        // prediction was correct and merely late, which is a different finding
+        // from the model being wrong. Nothing else may produce a `late_hit`.
+        if !markov_shadow.tombstones.is_empty() {
+            let mut late = 0_u64;
+            let mut unresolved = 0_u64;
+            markov_shadow.tombstones.retain(|t| {
+                if foreground_app
+                    .map(|app| app_names_match(app, &t.predicted_app))
+                    .unwrap_or(false)
+                {
+                    late += 1;
+                    tracing::info!(
+                        predicted_target = %t.predicted_app,
+                        source_app = %t.source_app,
+                        lead_ms = now.duration_since(t.opened_at).as_millis() as u64,
+                        overdue_ms = now
+                            .checked_duration_since(t.expires_at)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0),
+                        blocker_at_open = t.blocker_at_open,
+                        outcome = "late-hit",
+                        "markov shadow resolution"
+                    );
+                    return false;
+                }
+                if now >= t.grace_until {
+                    unresolved += 1;
+                    return false;
+                }
+                true
+            });
+            if late > 0 || unresolved > 0 {
+                let mut m = state.metrics.lock_recover();
+                m.metrics.markov_shadow_late_hits =
+                    m.metrics.markov_shadow_late_hits.saturating_add(late);
+                m.metrics.markov_shadow_timeout_unresolved = m
+                    .metrics
+                    .markov_shadow_timeout_unresolved
+                    .saturating_add(unresolved);
+            }
+        }
+
         if let Some(lease) = markov_shadow.active.take() {
             let hit = shadow_resolution == LeaseResolution::Hit;
             focus_markov.record_prewarm_outcome_with_context(
@@ -468,29 +529,67 @@ pub fn run_markov_tick(
                 .metrics
                 .markov_shadow_resolved_total
                 .saturating_add(1);
+            // The gate that matters is the one standing when the prediction
+            // resolved, not the one captured when it opened — production showed
+            // the blocker moving from `timing` to `resource-gate` during a
+            // single observation window. Both are recorded; the causal
+            // classification uses the one at resolution.
+            let mut timed_out = false;
+            let blocker_at_resolution = if cache_warm_allowed {
+                "ready"
+            } else {
+                "resource-gate"
+            };
+            let lead_ms = now.duration_since(lease.opened_at).as_millis() as u64;
+            let outcome = if hit {
+                "hit"
+            } else {
+                match shadow_miss_reason(&lease, foreground_app, now) {
+                    ShadowMissReason::WrongApp => "miss-wrong-app",
+                    ShadowMissReason::Timeout => "miss-timeout",
+                }
+            };
+            tracing::info!(
+                predicted_target = %lease.predicted_app,
+                source_app = %lease.source_app,
+                opened_at_ms_ago = now.duration_since(lease.opened_at).as_millis() as u64,
+                resolved_at_cycle = cycle_count,
+                expires_in_ms = lease
+                    .expires_at
+                    .checked_duration_since(now)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0),
+                actual_foreground = foreground_app.unwrap_or("<none>"),
+                outcome,
+                blocker_at_open = lease.blocker_at_open,
+                blocker_at_resolution,
+                lead_ms,
+                "markov shadow resolution"
+            );
+
             if hit {
                 metrics.metrics.markov_shadow_hits =
                     metrics.metrics.markov_shadow_hits.saturating_add(1);
-                // Lead time on the shadow side: how far ahead the prediction
-                // was made. A hit with almost no lead was right but arrived too
-                // late to have been worth acting on.
-                let lead_ms = now.duration_since(lease.opened_at).as_millis() as u64;
                 metrics.metrics.markov_shadow_hit_lead_ms_total = metrics
                     .metrics
                     .markov_shadow_hit_lead_ms_total
                     .saturating_add(lead_ms);
-                // Would a real pre-warm have been possible at prediction time?
-                if lease.blocker_at_open == "ready" {
+                // Could a real pre-warm have run, judged by the gate standing
+                // at resolution?
+                if blocker_at_resolution == "ready" {
                     metrics.metrics.markov_shadow_hits_actionable = metrics
                         .metrics
                         .markov_shadow_hits_actionable
                         .saturating_add(1);
-                } else if lease.blocker_at_open == "resource-gate" {
+                } else {
                     metrics.metrics.markov_shadow_hits_blocked_resources = metrics
                         .metrics
                         .markov_shadow_hits_blocked_resources
                         .saturating_add(1);
-                } else if lease.blocker_at_open == "timing" {
+                }
+                // Timing is a property of the prediction, not of the moment it
+                // resolved, so it is read from the opening gate.
+                if lease.blocker_at_open == "timing" {
                     metrics.metrics.markov_shadow_hits_blocked_timing = metrics
                         .metrics
                         .markov_shadow_hits_blocked_timing
@@ -499,7 +598,6 @@ pub fn run_markov_tick(
             } else {
                 metrics.metrics.markov_shadow_misses =
                     metrics.metrics.markov_shadow_misses.saturating_add(1);
-                // Split the two opposite failures the aggregate hides.
                 match shadow_miss_reason(&lease, foreground_app, now) {
                     ShadowMissReason::WrongApp => {
                         metrics.metrics.markov_shadow_miss_wrong_app = metrics
@@ -507,13 +605,26 @@ pub fn run_markov_tick(
                             .markov_shadow_miss_wrong_app
                             .saturating_add(1)
                     }
-                    ShadowMissReason::NoSwitchInWindow => {
-                        metrics.metrics.markov_shadow_miss_no_switch = metrics
-                            .metrics
-                            .markov_shadow_miss_no_switch
-                            .saturating_add(1)
+                    ShadowMissReason::Timeout => {
+                        metrics.metrics.markov_shadow_miss_timeout =
+                            metrics.metrics.markov_shadow_miss_timeout.saturating_add(1);
+                        // Keep watching: a timeout says nothing about whether
+                        // the prediction was right, only that it had not come
+                        // true yet.
+                        timed_out = true;
                     }
                 }
+            }
+            drop(metrics);
+            if timed_out {
+                markov_shadow.tombstones.push(ShadowTombstone {
+                    source_app: lease.source_app.clone(),
+                    predicted_app: lease.predicted_app.clone(),
+                    opened_at: lease.opened_at,
+                    expires_at: lease.expires_at,
+                    grace_until: now + SHADOW_LATE_HIT_GRACE,
+                    blocker_at_open: lease.blocker_at_open,
+                });
             }
         }
     }
@@ -1778,13 +1889,20 @@ fn normalize_markov_timing(time_to_switch: f64) -> (f64, f64) {
 enum ShadowMissReason {
     /// The user switched to a different application. A prediction error.
     WrongApp,
-    /// The user never left the source application before the window expired.
-    /// The prediction may yet have been correct; it was not actionable.
-    NoSwitchInWindow,
+    /// No transition happened inside the horizon. This is **all** it means:
+    /// it is not evidence the prediction was correct-but-late, which needs a
+    /// later observation of the predicted target and is counted as `late_hit`.
+    Timeout,
 }
 
 /// Classify a miss. Kept separate from `shadow_lease_resolution` so the
 /// resolution logic that already exists is not disturbed.
+/// How long after a timeout the predicted target still counts as a late
+/// arrival. Long enough to catch a slow switch, short enough that an unrelated
+/// visit to the same app hours later is not mistaken for the prediction coming
+/// true.
+const SHADOW_LATE_HIT_GRACE: Duration = Duration::from_secs(60);
+
 fn shadow_miss_reason(
     lease: &MarkovShadowLease,
     foreground_app: Option<&str>,
@@ -1800,7 +1918,7 @@ fn shadow_miss_reason(
             now >= lease.expires_at,
             "a miss is either a switch or an expiry"
         );
-        ShadowMissReason::NoSwitchInWindow
+        ShadowMissReason::Timeout
     }
 }
 
@@ -2514,7 +2632,7 @@ mod tests {
         let expired = now + Duration::from_secs(11);
         assert_eq!(
             shadow_miss_reason(&lease, Some("Finder"), expired),
-            ShadowMissReason::NoSwitchInWindow
+            ShadowMissReason::Timeout
         );
 
         // And the classification never contradicts the resolution it explains.
@@ -2525,6 +2643,104 @@ mod tests {
         assert_eq!(
             shadow_lease_resolution(&lease, Some("Finder"), expired),
             LeaseResolution::Miss
+        );
+    }
+
+    #[test]
+    fn a_timeout_is_not_evidence_that_the_prediction_was_right() {
+        // The correction this test exists for: `miss_timeout` used to be read
+        // as "correct but out of window". It proves only that no transition
+        // happened inside the horizon. Whether the prediction was right needs a
+        // later sighting of the target, and that is `late_hit` — a different
+        // observation from a different moment.
+        let now = Instant::now();
+        let lease = MarkovShadowLease {
+            source_app: "Finder".to_string(),
+            predicted_app: "Terminal".to_string(),
+            expires_at: now + Duration::from_secs(10),
+            calibration_context: PrewarmContext::new("coding", 12, 0.30, false),
+            opened_at: now,
+            blocker_at_open: "ready",
+        };
+        let expired = now + Duration::from_secs(11);
+
+        // Still on the source app when the window closed: a timeout.
+        assert_eq!(
+            shadow_miss_reason(&lease, Some("Finder"), expired),
+            ShadowMissReason::Timeout
+        );
+        // Gone somewhere else: the model was wrong. These must never collapse.
+        assert_eq!(
+            shadow_miss_reason(&lease, Some("Brave Browser"), now),
+            ShadowMissReason::WrongApp
+        );
+        assert_ne!(
+            shadow_miss_reason(&lease, Some("Finder"), expired),
+            shadow_miss_reason(&lease, Some("Brave Browser"), now),
+            "a timeout and a wrong app are opposite findings"
+        );
+    }
+
+    #[test]
+    fn a_tombstone_recognises_the_target_only_inside_its_grace_window() {
+        let now = Instant::now();
+        let tomb = ShadowTombstone {
+            source_app: "Finder".to_string(),
+            predicted_app: "Terminal".to_string(),
+            opened_at: now,
+            expires_at: now + Duration::from_secs(10),
+            grace_until: now + Duration::from_secs(70),
+            blocker_at_open: "ready",
+        };
+        // The target appearing during grace is the late hit.
+        assert!(app_names_match("Terminal", &tomb.predicted_app));
+        // A different app is not.
+        assert!(!app_names_match("Brave Browser", &tomb.predicted_app));
+        // And the grace window is bounded, so an unrelated visit hours later
+        // cannot be mistaken for the prediction coming true.
+        let way_later = now + Duration::from_secs(3_600);
+        assert!(way_later >= tomb.grace_until);
+        assert_eq!(SHADOW_LATE_HIT_GRACE, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn the_blocker_can_differ_between_opening_and_resolution() {
+        // Production moved from `timing` to `resource-gate` inside one
+        // observation window, which is why the causal classification cannot
+        // rely on the gate captured at opening alone.
+        let opened_under = prewarm_blocker(0.70, 40.0, true, 0.50, PrewarmAdmission::Probe);
+        let resolved_under = prewarm_blocker(0.70, 8.0, false, 0.50, PrewarmAdmission::Probe);
+        assert_eq!(opened_under, "timing");
+        assert_eq!(resolved_under, "resource-gate");
+        assert_ne!(
+            opened_under, resolved_under,
+            "the gate standing at resolution is its own fact"
+        );
+    }
+
+    #[test]
+    fn the_causal_classification_reads_the_resolution_gate() {
+        // `blocker_at_resolution` is derived from the resource health standing
+        // when the prediction resolved, not from what was captured at opening.
+        // Both are recorded; only one decides whether a hit was actionable.
+        let healthy_at_resolution = true;
+        let blocker_at_resolution = if healthy_at_resolution {
+            "ready"
+        } else {
+            "resource-gate"
+        };
+        assert_eq!(blocker_at_resolution, "ready");
+
+        let starved_at_resolution = false;
+        let blocker_at_resolution = if starved_at_resolution {
+            "ready"
+        } else {
+            "resource-gate"
+        };
+        assert_eq!(
+            blocker_at_resolution, "resource-gate",
+            "a hit that resolved under resource pressure was not actionable, \
+             whatever the gate said when the prediction was made"
         );
     }
 
