@@ -3306,6 +3306,7 @@ fn main() -> anyhow::Result<()> {
                     temporal_hour: markov_temporal_hour,
                     temporal_weekday: markov_temporal_weekday,
                     decision_events: markov_decision_events,
+                    canary_utility_windows,
                 } = daemon_markov_tick::run_markov_tick(
                     foreground_app.as_deref(),
                     foreground_pid,
@@ -3328,6 +3329,36 @@ fn main() -> anyhow::Result<()> {
                     &mut exploration_scheduler,
                     &mut markov_exploration_environment,
                 );
+
+                // Micro-canary baseline. Opened here — after the tick, before
+                // `observe` — so `before` is the previous cycle's summary and
+                // therefore precedes this cycle's pre-warm. The property is not
+                // assumed: `TelemetryContextSummary` carries its own `cycle`,
+                // and tests pin `before.cycle < intervention_cycle`.
+                //
+                // Deliberately not a Medallion precondition: endpoint bindings
+                // open their windows after `observe` and are correct to do so.
+                // The ordering belongs to this experiment, not to the authority.
+                if let Some(req) = canary_utility_windows {
+                    let opened_treatment = telemetry_medallion.open_lab_utility_window(
+                        req.treatment_ledger_id,
+                        apollo_engine::engine::telemetry_medallion::ActuatorFamily::MarkovPrewarm,
+                        req.horizon_cycles,
+                        cycle_count,
+                    );
+                    let opened_control = telemetry_medallion.open_lab_utility_window(
+                        req.control_ledger_id,
+                        apollo_engine::engine::telemetry_medallion::ActuatorFamily::MarkovPrewarm,
+                        req.horizon_cycles,
+                        cycle_count,
+                    );
+                    if !(opened_treatment && opened_control) {
+                        state
+                            .micro_canary
+                            .lock_recover()
+                            .abandon_not_comparable(req.experiment_id);
+                    }
+                }
                 cycle_decision_events.extend_buffer(&markov_decision_events);
                 temporal_hour = markov_temporal_hour;
                 temporal_weekday = markov_temporal_weekday;
@@ -8134,6 +8165,65 @@ fn main() -> anyhow::Result<()> {
                         }
                     })
                     .collect();
+                // A utility sample whose key belongs to a canary arm closes that
+                // arm. Everything else goes to the endpoint adapter as before.
+                {
+                    let mut canary = state.micro_canary.lock_recover();
+                    for sample in &microexperiment_utilities {
+                        let Some((experiment_id, is_treatment)) =
+                            canary.arm_for_ledger_id(sample.decision_id)
+                        else {
+                            continue;
+                        };
+                        if sample.confounded {
+                            // A confounded window is not a comparable
+                            // observation. Recording it as a number would put a
+                            // measurement we do not trust into the estimator —
+                            // and recording it as zero would be worse, since a
+                            // measurement we did not take is not a measurement
+                            // of nothing. Censored, attributed to the arm that
+                            // lost it, so the attrition can be shown not to be
+                            // differential.
+                            canary.censor(
+                                experiment_id,
+                                Some(is_treatment),
+                                apollo_engine::engine::micro_canary::CensorCause::Confounded,
+                            );
+                            continue;
+                        }
+                        let terminal = if is_treatment {
+                            // Cache-only pre-warm: non-kernel, nothing to
+                            // revert, which is the closure the contract expects
+                            // for this family.
+                            apollo_engine::engine::exploration_pair::ArmTerminalState::AppliedNoRevertNeeded
+                        } else {
+                            apollo_engine::engine::exploration_pair::ArmTerminalState::WithheldByHoldout
+                        };
+                        let correlation =
+                            apollo_engine::engine::exploration_scheduler::ProbeCorrelation(
+                                sample.decision_id & !(1_u64 << 63),
+                            );
+                        if let Some(pair) = canary.record_arm(
+                            experiment_id,
+                            correlation,
+                            sample.resolved_cycle,
+                            terminal,
+                            sample.utility_micros,
+                        ) {
+                            let m = canary.metrics();
+                            let (issued, honoured) = (m.control_issued, m.control_honoured);
+                            drop(canary);
+                            let outcome = microexperiment_runtime
+                                .consume_exploration_pair(&pair, issued, honoured);
+                            tracing::info!(
+                                ?outcome,
+                                effect_micros = pair.effect_micros(),
+                                "micro-canary pair closed"
+                            );
+                            canary = state.micro_canary.lock_recover();
+                        }
+                    }
+                }
                 microexperiment_runtime.observe_utilities(&microexperiment_utilities, cycle_count);
 
                 // Push estado a suscriptores activos (menubar, etc.)

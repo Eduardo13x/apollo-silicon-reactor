@@ -1059,6 +1059,21 @@ pub struct RuntimeMetrics {
     /// not the one configured.
     #[serde(default)]
     pub canary_observed_per_mille: f64,
+    /// Attrition **by arm**. Excluding an unmeasurable window is correct, but
+    /// if one arm loses more than the other, excluding them quietly biases the
+    /// effect — the survivors would be the ones that went well. Split so the
+    /// loss can be shown non-differential instead of taken on trust.
+    #[serde(default)]
+    pub canary_treatment_confounded: u64,
+    #[serde(default)]
+    pub canary_control_confounded: u64,
+    #[serde(default)]
+    pub canary_treatment_incomplete: u64,
+    #[serde(default)]
+    pub canary_control_incomplete: u64,
+    /// Experiments that left the estimator without contributing an effect.
+    #[serde(default)]
+    pub canary_pairs_censored: u64,
     /// Pairs no longer open, whatever ended them. Renamed from
     /// `microexperiment_completed_pairs`, which read as "finished" while every
     /// one of the 9 it reported had been interrupted.

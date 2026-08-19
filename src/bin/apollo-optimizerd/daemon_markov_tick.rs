@@ -53,6 +53,22 @@ pub struct MarkovTickOutput {
     pub temporal_hour: u8,
     pub temporal_weekday: u8,
     pub decision_events: CycleDecisionEvents,
+    /// Utility windows the micro-canary needs opened this cycle: the
+    /// experiment and its two ledger keys. Returned rather than opened here,
+    /// because the medallion lives in the daemon loop and widening a
+    /// fourteen-parameter signature to reach it would be the worse trade.
+    ///
+    /// Both windows must open or neither is usable — the caller abandons the
+    /// experiment if only one does.
+    pub canary_utility_windows: Option<CanaryWindowRequest>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CanaryWindowRequest {
+    pub experiment_id: apollo_engine::engine::exploration_pair::ExperimentId,
+    pub treatment_ledger_id: u64,
+    pub control_ledger_id: u64,
+    pub horizon_cycles: u64,
 }
 
 fn reverify_member_identity(identity: &ProcessIdentity) -> bool {
@@ -115,6 +131,9 @@ fn temporal_reflex_safety(
 /// Policy version stamped on every micro-canary pair. Bump it when a change
 /// would make pairs from before and after incomparable.
 const MICRO_CANARY_POLICY_VERSION: u32 = 1;
+/// Utility window length for both arms. One constant, used for both, because
+/// the same horizon is what makes the two measurements comparable.
+const MICRO_CANARY_HORIZON_CYCLES: u64 = 20;
 
 fn withhold_markov_prewarm_for_control(
     exploration_scheduler: &mut apollo_engine::engine::exploration_scheduler::ExplorationScheduler,
@@ -392,6 +411,7 @@ pub fn run_markov_tick(
     exploration_scheduler: &mut ExplorationScheduler,
     exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
 ) -> MarkovTickOutput {
+    let mut canary_utility_windows: Option<CanaryWindowRequest> = None;
     let mut decision_events = CycleDecisionEvents::default();
     // Fight-hunt fix (2026-06-10): prefetch is a luxury. Under pressure the
     // maintenance/survival paths are EVICTING file cache while these
@@ -670,6 +690,36 @@ pub fn run_markov_tick(
             canary_decision,
             apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl { .. }
         );
+        // Both arms are measured on the same yardstick: one call, same family,
+        // same horizon, so the objective and its components are identical by
+        // construction. The window key is the correlation's ledger id, already
+        // namespaced by the scheduler, so it cannot collide with a real
+        // decision. Opening both here — before either arm runs — is what makes
+        // the only difference between them the actuation itself.
+        let canary_experiment = match &canary_decision {
+            apollo_engine::engine::micro_canary::ArmDecision::Treatment {
+                experiment_id, ..
+            }
+            | apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl {
+                experiment_id,
+                ..
+            } => Some(*experiment_id),
+            apollo_engine::engine::micro_canary::ArmDecision::Proceed => None,
+        };
+        if let Some(experiment_id) = canary_experiment {
+            if let Some((treatment, control)) = state
+                .micro_canary
+                .lock_recover()
+                .correlations(experiment_id)
+            {
+                canary_utility_windows = Some(CanaryWindowRequest {
+                    experiment_id,
+                    treatment_ledger_id: treatment.ledger_correlation_id(),
+                    control_ledger_id: control.ledger_correlation_id(),
+                    horizon_cycles: MICRO_CANARY_HORIZON_CYCLES,
+                });
+            }
+        }
 
         let (specialist_allowed, allow_kernel_acceleration) =
             markov_exploration_admission(admission, exploration_approval.is_some());
@@ -1251,6 +1301,7 @@ pub fn run_markov_tick(
         temporal_hour,
         temporal_weekday,
         decision_events,
+        canary_utility_windows,
     }
 }
 

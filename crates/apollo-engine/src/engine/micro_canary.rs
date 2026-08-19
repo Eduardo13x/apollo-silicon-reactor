@@ -55,6 +55,17 @@ pub const MAX_OPEN_GLOBAL: usize = 2;
 /// Cycles an experiment may stay open before both arms are abandoned.
 pub const EXPERIMENT_HORIZON_CYCLES: u64 = 240;
 
+/// Why an experiment left the estimator without contributing an effect.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CensorCause {
+    /// The measurement window was confounded.
+    Confounded,
+    /// An arm never produced a terminal observation.
+    Incomplete,
+    /// The two arms could not be measured on equal terms at all.
+    NotComparable,
+}
+
 /// What the caller should do with an opportunity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArmDecision {
@@ -115,6 +126,27 @@ pub struct MicroCanaryMetrics {
     pub arms_withheld: u64,
     /// Largest number of simultaneously open experiments seen this boot.
     pub open_high_watermark: u32,
+    /// Experiments abandoned because the arms could not be compared on equal
+    /// terms. Counted apart and never coerced to a zero-utility observation:
+    /// "we did not measure" and "we measured nothing" are different facts.
+    pub abandoned_not_comparable: u64,
+    /// Attrition, **by arm**. Not measuring is correct, but if the treatment
+    /// loses more windows than the control, excluding them quietly biases the
+    /// effect upward: the surviving treatments would be the ones that went
+    /// well. These make the loss visible so it can be shown non-differential.
+    pub treatment_confounded: u64,
+    pub control_confounded: u64,
+    pub treatment_incomplete: u64,
+    pub control_incomplete: u64,
+    /// Experiments that left the estimator without contributing an effect,
+    /// whatever the cause. The denominator for an attrition rate.
+    pub pairs_censored: u64,
+    /// Predictions that resolved, by arm. Diagnostic only — it shows whether
+    /// the two arms drew equivalent opportunities. It is never the effect,
+    /// because whether a prediction comes true is not something a pre-warm can
+    /// change; treating it as the outcome would measure noise and call it zero.
+    pub treatment_predictions_resolved: u64,
+    pub control_predictions_resolved: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -354,6 +386,97 @@ impl MicroCanary {
         })
     }
 
+    /// Which experiment and arm a utility-window key belongs to.
+    ///
+    /// The key is `ProbeCorrelation::ledger_correlation_id`, already namespaced
+    /// by the scheduler, so it cannot collide with a real decision id.
+    pub fn arm_for_ledger_id(&self, ledger_id: u64) -> Option<(ExperimentId, bool)> {
+        self.open.iter().find_map(|e| {
+            if e.treatment_correlation.ledger_correlation_id() == ledger_id {
+                Some((e.experiment_id, true))
+            } else if e.control_correlation.ledger_correlation_id() == ledger_id {
+                Some((e.experiment_id, false))
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Both correlations of an open experiment, for opening the two identical
+    /// utility windows.
+    pub fn correlations(
+        &self,
+        experiment_id: ExperimentId,
+    ) -> Option<(ProbeCorrelation, ProbeCorrelation)> {
+        self.open
+            .iter()
+            .find(|e| e.experiment_id == experiment_id)
+            .map(|e| (e.treatment_correlation, e.control_correlation))
+    }
+
+    /// Drop an experiment whose arms cannot be compared on equal terms.
+    ///
+    /// The case this exists for: an opportunity was assigned to treatment and
+    /// the pre-warm then did not actuate. Its arm is not a treatment, and
+    /// forcing it to a zero-utility observation would put a measurement that
+    /// never happened into the estimator.
+    pub fn abandon_not_comparable(&mut self, experiment_id: ExperimentId) -> bool {
+        self.censor(experiment_id, None, CensorCause::NotComparable)
+    }
+
+    /// Censor an experiment, naming the arm responsible when one is.
+    ///
+    /// `arm_is_treatment` is `None` when the loss belongs to the experiment
+    /// rather than to one side — both windows failing to open, for instance.
+    pub fn censor(
+        &mut self,
+        experiment_id: ExperimentId,
+        arm_is_treatment: Option<bool>,
+        cause: CensorCause,
+    ) -> bool {
+        let before = self.open.len();
+        self.open.retain(|e| e.experiment_id != experiment_id);
+        let dropped = before != self.open.len();
+        if !dropped {
+            return false;
+        }
+        self.metrics.pairs_censored = self.metrics.pairs_censored.saturating_add(1);
+        match (cause, arm_is_treatment) {
+            (CensorCause::Confounded, Some(true)) => {
+                self.metrics.treatment_confounded =
+                    self.metrics.treatment_confounded.saturating_add(1)
+            }
+            (CensorCause::Confounded, Some(false)) => {
+                self.metrics.control_confounded = self.metrics.control_confounded.saturating_add(1)
+            }
+            (CensorCause::Incomplete, Some(true)) => {
+                self.metrics.treatment_incomplete =
+                    self.metrics.treatment_incomplete.saturating_add(1)
+            }
+            (CensorCause::Incomplete, Some(false)) => {
+                self.metrics.control_incomplete = self.metrics.control_incomplete.saturating_add(1)
+            }
+            _ => {}
+        }
+        self.metrics.abandoned_not_comparable =
+            self.metrics.abandoned_not_comparable.saturating_add(1);
+        dropped
+    }
+
+    /// Record that a prediction resolved for one arm. Diagnostic: it shows the
+    /// two arms drew equivalent opportunities. Never an effect.
+    pub fn note_prediction_resolved(&mut self, treatment: bool) {
+        if treatment {
+            self.metrics.treatment_predictions_resolved = self
+                .metrics
+                .treatment_predictions_resolved
+                .saturating_add(1);
+        } else {
+            self.metrics.control_predictions_resolved =
+                self.metrics.control_predictions_resolved.saturating_add(1);
+        }
+    }
+
     /// Report a settled arm. Returns a completed pair once both have landed.
     pub fn record_arm(
         &mut self,
@@ -453,10 +576,36 @@ impl MicroCanary {
 
     /// Abandon experiments past their horizon. Call once per cycle.
     pub fn expire(&mut self, cycle: u64) -> u64 {
+        // Attribute the loss to the arm that never reported, so attrition can
+        // be shown non-differential rather than merely counted.
+        let missing: Vec<Option<bool>> = self
+            .open
+            .iter()
+            .filter(|e| cycle > e.expires_after_cycle)
+            .map(|e| match (e.treatment.is_some(), e.control.is_some()) {
+                (true, false) => Some(false),
+                (false, true) => Some(true),
+                _ => None,
+            })
+            .collect();
         let before = self.open.len();
         self.open.retain(|e| cycle <= e.expires_after_cycle);
         let dropped = (before - self.open.len()) as u64;
         self.metrics.pairs_expired = self.metrics.pairs_expired.saturating_add(dropped);
+        self.metrics.pairs_censored = self.metrics.pairs_censored.saturating_add(dropped);
+        for arm in missing {
+            match arm {
+                Some(true) => {
+                    self.metrics.treatment_incomplete =
+                        self.metrics.treatment_incomplete.saturating_add(1)
+                }
+                Some(false) => {
+                    self.metrics.control_incomplete =
+                        self.metrics.control_incomplete.saturating_add(1)
+                }
+                None => {}
+            }
+        }
         dropped
     }
 
@@ -487,6 +636,11 @@ impl MicroCanary {
         out.canary_open_experiments = self.open.len() as u64;
         out.canary_open_high_watermark = u64::from(m.open_high_watermark);
         out.canary_observed_per_mille = self.observed_per_mille();
+        out.canary_treatment_confounded = m.treatment_confounded;
+        out.canary_control_confounded = m.control_confounded;
+        out.canary_treatment_incomplete = m.treatment_incomplete;
+        out.canary_control_incomplete = m.control_incomplete;
+        out.canary_pairs_censored = m.pairs_censored;
     }
 
     /// Observed sampling rate per thousand. For a kill condition that reads
@@ -898,6 +1052,9 @@ mod tests {
         );
         assert_eq!(out.canary_pairs_completed, 1);
         assert_eq!(out.canary_assembly_refused, 0);
+        assert_eq!(out.canary_pairs_censored, 0);
+        assert_eq!(out.canary_treatment_confounded, 0);
+        assert_eq!(out.canary_control_incomplete, 0);
         assert!(out.canary_open_high_watermark >= 1);
         assert!(out.canary_observed_per_mille > 0.0);
         assert_eq!(
@@ -956,6 +1113,194 @@ mod tests {
             offer_until_sampled(&mut c, 1).is_some(),
             "and on means the draw resumes"
         );
+    }
+
+    // ── The four measurement invariants ─────────────────────────────────────
+
+    #[test]
+    fn invariant_1_the_arm_is_assigned_before_anything_could_act() {
+        // `offer` returns the assignment and takes no action itself. The caller
+        // cannot have emitted a pre-warm before it knows which arm it is in,
+        // because the answer is what tells it whether to emit one.
+        let mut c = canary();
+        let d = offer_until_sampled(&mut c, 10).expect("sampled");
+        let (id, _) = ids(&d);
+        assert_eq!(c.open_len(), 1, "the experiment exists at assignment time");
+        assert!(
+            c.correlations(id).is_some(),
+            "both correlations are minted up front, before either arm runs"
+        );
+        assert_eq!(c.metrics().arms_withheld, 0, "and nothing has settled yet");
+    }
+
+    #[test]
+    fn invariant_2_both_arms_are_measured_on_the_same_yardstick() {
+        // Both keys go to the same `open_lab_utility_window(family, horizon)`,
+        // so the objective and its components are identical by construction.
+        // What this test can pin is that the two keys are distinct and both
+        // namespaced, so neither arm can silently reuse the other's window.
+        let mut c = canary();
+        let d = offer_until_sampled(&mut c, 10).expect("sampled");
+        let (id, _) = ids(&d);
+        let (t, k) = c.correlations(id).expect("both correlations");
+        assert_ne!(t.ledger_correlation_id(), k.ledger_correlation_id());
+        assert_eq!(
+            c.arm_for_ledger_id(t.ledger_correlation_id()),
+            Some((id, true))
+        );
+        assert_eq!(
+            c.arm_for_ledger_id(k.ledger_correlation_id()),
+            Some((id, false))
+        );
+        assert_eq!(
+            c.arm_for_ledger_id(999_999),
+            None,
+            "a foreign key matches nothing"
+        );
+    }
+
+    #[test]
+    fn invariant_3_a_treatment_that_never_actuated_is_abandoned_not_zeroed() {
+        // The trap this closes: an opportunity assigned to treatment whose
+        // pre-warm then did not run. Its arm is not a treatment. Recording it
+        // as a zero-utility observation would put a measurement that never
+        // happened into the estimator.
+        let mut c = canary();
+        let d = offer_until_sampled(&mut c, 10).expect("sampled");
+        let (id, _) = ids(&d);
+        assert!(c.abandon_not_comparable(id));
+        assert_eq!(c.open_len(), 0);
+        assert_eq!(c.metrics().abandoned_not_comparable, 1);
+        assert_eq!(c.metrics().pairs_completed, 0, "and no pair was produced");
+        assert!(!c.abandon_not_comparable(id), "abandoning twice is a no-op");
+    }
+
+    #[test]
+    fn invariant_4_a_pair_closes_only_when_both_sides_have_a_terminal_observation() {
+        let mut c = canary();
+        let d = offer_until_sampled(&mut c, 10).expect("sampled");
+        let (id, corr) = ids(&d);
+        let state = match d {
+            ArmDecision::Treatment { .. } => ArmTerminalState::AppliedNoRevertNeeded,
+            _ => ArmTerminalState::WithheldByHoldout,
+        };
+        assert!(
+            c.record_arm(id, corr, 11, state, 500).is_none(),
+            "one side is not a pair"
+        );
+        assert_eq!(c.metrics().pairs_completed, 0);
+        let other = c.complementary_arm(id).expect("complement");
+        let (_, corr2) = ids(&other);
+        let state2 = match other {
+            ArmDecision::Treatment { .. } => ArmTerminalState::AppliedNoRevertNeeded,
+            _ => ArmTerminalState::WithheldByHoldout,
+        };
+        assert!(
+            c.record_arm(id, corr2, 12, state2, 200).is_some(),
+            "both sides terminal: now it is comparable"
+        );
+    }
+
+    #[test]
+    fn prediction_resolution_is_diagnostic_and_never_the_effect() {
+        // hit/miss shows the arms drew equivalent opportunities. It contributes
+        // nothing to the effect, which is utility_treatment - utility_control.
+        let mut c = canary();
+        c.note_prediction_resolved(true);
+        c.note_prediction_resolved(false);
+        let m = c.metrics();
+        assert_eq!(m.treatment_predictions_resolved, 1);
+        assert_eq!(m.control_predictions_resolved, 1);
+        assert_eq!(m.pairs_completed, 0, "diagnostics close no pair");
+
+        let pair = complete_one(&mut c, 10).expect("pair");
+        assert_eq!(
+            pair.effect_micros(),
+            60,
+            "the effect is the utility difference, nothing else"
+        );
+    }
+
+    #[test]
+    fn a_confounded_arm_is_censored_by_arm_and_never_becomes_a_zero() {
+        // Not measuring is correct. Measuring zero is a lie. And if one arm
+        // loses more windows than the other, excluding them quietly would bias
+        // the effect: the surviving treatments would be the ones that went
+        // well. So the loss is named, and named by arm.
+        let mut c = canary();
+        let d = offer_until_sampled(&mut c, 10).expect("sampled");
+        let (id, _) = ids(&d);
+        let was_treatment = matches!(d, ArmDecision::Treatment { .. });
+
+        assert!(c.censor(id, Some(was_treatment), CensorCause::Confounded));
+
+        let m = c.metrics();
+        assert_eq!(m.pairs_censored, 1, "the pair left the estimator");
+        assert_eq!(m.pairs_completed, 0, "it contributed no effect");
+        if was_treatment {
+            assert_eq!(m.treatment_confounded, 1);
+            assert_eq!(m.control_confounded, 0);
+        } else {
+            assert_eq!(m.control_confounded, 1);
+            assert_eq!(m.treatment_confounded, 0);
+        }
+        // The utility counters are untouched: nothing was recorded as zero.
+        assert_eq!(m.arms_withheld, 0);
+        assert_eq!(m.arms_applied_reverted + m.arms_applied_no_revert, 0);
+        assert_eq!(c.open_len(), 0);
+        assert!(
+            !c.censor(id, Some(was_treatment), CensorCause::Confounded),
+            "censoring twice is a no-op"
+        );
+    }
+
+    #[test]
+    fn an_expired_experiment_names_the_arm_that_never_reported() {
+        let mut c = canary();
+        let d = offer_until_sampled(&mut c, 10).expect("sampled");
+        let (id, corr) = ids(&d);
+        let first_is_treatment = matches!(d, ArmDecision::Treatment { .. });
+        let state = if first_is_treatment {
+            ArmTerminalState::AppliedNoRevertNeeded
+        } else {
+            ArmTerminalState::WithheldByHoldout
+        };
+        // One side reports; the other never does.
+        assert!(c.record_arm(id, corr, 11, state, 77).is_none());
+        c.expire(11 + EXPERIMENT_HORIZON_CYCLES);
+
+        let m = c.metrics();
+        assert_eq!(m.pairs_expired, 1);
+        assert_eq!(m.pairs_censored, 1);
+        if first_is_treatment {
+            assert_eq!(m.control_incomplete, 1, "the control never reported");
+            assert_eq!(m.treatment_incomplete, 0);
+        } else {
+            assert_eq!(m.treatment_incomplete, 1);
+            assert_eq!(m.control_incomplete, 0);
+        }
+        assert_eq!(m.pairs_completed, 0);
+    }
+
+    #[test]
+    fn attrition_can_be_shown_non_differential() {
+        // The property the counters exist to support: with censoring split by
+        // arm, a reader can compare the two sides instead of taking a single
+        // aggregate on trust.
+        let mut c = canary();
+        for seq in 0..6u64 {
+            let d = offer_until_sampled(&mut c, seq * 100 + 1);
+            let Some(d) = d else { break };
+            let (id, _) = ids(&d);
+            c.censor(id, Some(seq % 2 == 0), CensorCause::Confounded);
+        }
+        let m = c.metrics();
+        assert_eq!(
+            m.treatment_confounded + m.control_confounded,
+            m.pairs_censored,
+            "every censored pair is attributable to a side"
+        );
+        assert_eq!(m.pairs_completed, 0);
     }
 
     // ── 10. contractual reachability ────────────────────────────────────────

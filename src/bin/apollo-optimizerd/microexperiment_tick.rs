@@ -181,6 +181,18 @@ impl MicroexperimentRuntime {
         self.adapter.drain_new_bindings()
     }
 
+    /// Hand a certified causal pair to the lab, read-only. Delegates: the
+    /// runtime adds no policy, it only owns the lab instance.
+    pub fn consume_exploration_pair(
+        &mut self,
+        pair: &apollo_engine::engine::exploration_pair::CompletedExplorationPair,
+        control_issued: u64,
+        control_honoured: u64,
+    ) -> apollo_engine::engine::microexperiment_lab::PairConsumption {
+        self.lab
+            .consume_exploration_pair(pair, control_issued, control_honoured)
+    }
+
     pub fn adapter_counters(&self) -> EndpointAdapterCounters {
         self.adapter.counters()
     }

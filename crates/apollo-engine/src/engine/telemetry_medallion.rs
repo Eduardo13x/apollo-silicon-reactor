@@ -5223,6 +5223,118 @@ mod tests {
         })
     }
 
+    /// A window opened **before** `observe(N)` carries a baseline from an
+    /// earlier cycle. This is the property the micro-canary's causal validity
+    /// rests on, and it is asserted rather than assumed: the arms are measured
+    /// from a state that precedes the intervention.
+    #[test]
+    fn a_window_opened_before_observe_has_a_baseline_from_an_earlier_cycle() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+
+        // Cycle 2: open before observing cycle 2.
+        assert!(medallion.open_lab_utility_window(771, ActuatorFamily::MarkovPrewarm, 3, 2));
+        let baseline = medallion
+            .lab_windows
+            .iter()
+            .find(|w| w.decision_id == 771)
+            .map(|w| w.before.cycle)
+            .expect("window open");
+        assert!(
+            baseline < 2,
+            "baseline cycle {baseline} must precede the intervention cycle 2"
+        );
+    }
+
+    /// The complementary semantics, documented on purpose: endpoint bindings
+    /// legitimately open after `observe`, and their baseline is this cycle's.
+    /// Both are valid, which is why the ordering belongs to the caller and is
+    /// not a Medallion precondition.
+    #[test]
+    fn a_window_opened_after_observe_has_this_cycles_baseline() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        observe(&mut medallion, 2, &outcomes, &runtime);
+
+        assert!(medallion.open_lab_utility_window(772, ActuatorFamily::MarkovPrewarm, 3, 2));
+        let baseline = medallion
+            .lab_windows
+            .iter()
+            .find(|w| w.decision_id == 772)
+            .map(|w| w.before.cycle)
+            .expect("window open");
+        assert_eq!(
+            baseline, 2,
+            "opened after observe, the baseline is this cycle"
+        );
+    }
+
+    /// `before` is a snapshot. A later `observe` cannot reach back and change
+    /// what the window was measured against.
+    #[test]
+    fn a_later_observe_cannot_mutate_a_windows_baseline() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        assert!(medallion.open_lab_utility_window(773, ActuatorFamily::MarkovPrewarm, 5, 2));
+        let captured = medallion
+            .lab_windows
+            .iter()
+            .find(|w| w.decision_id == 773)
+            .map(|w| w.before.clone())
+            .expect("window open");
+
+        for cycle in 2..=4 {
+            observe(&mut medallion, cycle, &outcomes, &runtime);
+        }
+        let still = medallion
+            .lab_windows
+            .iter()
+            .find(|w| w.decision_id == 773)
+            .map(|w| w.before.clone())
+            .expect("still open");
+        assert_eq!(
+            captured.cycle, still.cycle,
+            "the baseline is a snapshot, not a live view of latest"
+        );
+        assert_eq!(captured.timestamp_unix, still.timestamp_unix);
+    }
+
+    /// Opening a few lines earlier must not change how many cycles the outcome
+    /// spans: the horizon is counted from the opening cycle, not from the
+    /// baseline's.
+    #[test]
+    fn the_horizon_is_counted_from_the_opening_cycle_not_the_baseline() {
+        let mut medallion = TelemetryMedallion::new(LOCAL_ID);
+        let outcomes = ExecuteOutcomes::default();
+        let runtime = healthy_runtime();
+        observe(&mut medallion, 1, &outcomes, &runtime);
+        assert!(medallion.open_lab_utility_window(774, ActuatorFamily::MarkovPrewarm, 3, 5));
+        let w = medallion
+            .lab_windows
+            .iter()
+            .find(|w| w.decision_id == 774)
+            .expect("window open");
+        assert_eq!(
+            w.opened_cycle, 5,
+            "counted from the opening, not the baseline"
+        );
+        assert_eq!(
+            w.deadline_cycle,
+            5 + 3 + LAB_WINDOW_GRACE_CYCLES,
+            "horizon plus grace, from the opening cycle"
+        );
+        assert!(
+            w.before.cycle < w.opened_cycle,
+            "and the baseline still precedes it, however far back it sits"
+        );
+    }
+
     #[test]
     fn a_lab_arm_window_is_measured_without_touching_any_learning_aggregate() {
         let mut medallion = TelemetryMedallion::new(LOCAL_ID);
