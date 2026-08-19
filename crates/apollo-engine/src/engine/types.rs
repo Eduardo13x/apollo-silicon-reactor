@@ -1016,8 +1016,14 @@ pub struct RuntimeMetrics {
     pub microexperiment_endpoints_pending_utility: u64,
     #[serde(default)]
     pub microexperiment_endpoint_action_mismatch_total: u64,
+    /// Ordinary traffic no experiment was waiting on. Large by nature; a big
+    /// number here is not a defect. Was `..._unknown_arm_total`, which made
+    /// 7,809 routine decisions read as failures.
     #[serde(default)]
-    pub microexperiment_endpoint_unknown_arm_total: u64,
+    pub microexperiment_endpoint_routine_unclaimed_total: u64,
+    /// An episode for a watched action that could not fill its arm role.
+    #[serde(default)]
+    pub microexperiment_endpoint_invalid_experimental_total: u64,
     #[serde(default)]
     pub microexperiment_endpoint_duplicate_total: u64,
     #[serde(default)]

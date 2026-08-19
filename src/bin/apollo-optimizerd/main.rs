@@ -3278,8 +3278,14 @@ fn main() -> anyhow::Result<()> {
                         .metrics
                         .microexperiment_endpoint_action_mismatch_total =
                         endpoint.rejected_action_mismatch;
-                    metrics.metrics.microexperiment_endpoint_unknown_arm_total =
-                        endpoint.rejected_unknown_arm;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_routine_unclaimed_total =
+                        endpoint.routine_unclaimed;
+                    metrics
+                        .metrics
+                        .microexperiment_endpoint_invalid_experimental_total =
+                        endpoint.invalid_experimental;
                     metrics.metrics.microexperiment_endpoint_duplicate_total =
                         endpoint.rejected_duplicate;
                     metrics.metrics.microexperiment_endpoint_expired_total =

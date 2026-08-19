@@ -307,7 +307,7 @@ fn no_prefix_fallback_lets_the_parent_key_close_a_variant_experiment() {
         11,
     );
     assert_eq!(adapter.counters().bound_decisions, 0);
-    assert_eq!(adapter.counters().rejected_unknown_arm, 1);
+    assert_eq!(adapter.counters().routine_unclaimed, 1);
 }
 
 #[test]
@@ -613,7 +613,7 @@ fn a_restart_never_reuses_old_observations_as_new_evidence() {
     // A fresh generation has no outstanding arm, so the batch is skipped
     // wholesale — the old observation is not evidence for anything.
     assert_eq!(restarted.counters().episodes_skipped_idle, 1);
-    assert_eq!(restarted.counters().rejected_unknown_arm, 0);
+    assert_eq!(restarted.counters().routine_unclaimed, 0);
     assert!(restarted.drain_ready().is_empty());
     assert!(!restarted.contract_ready(11, 7));
 }
@@ -1075,7 +1075,7 @@ fn routine_traffic_never_inflates_the_rejection_counters() {
     assert_eq!(idle.observed_episodes, 0);
     assert_eq!(idle.rejected_action_mismatch, 0);
     assert_eq!(idle.rejected_authority, 0);
-    assert_eq!(idle.rejected_unknown_arm, 0);
+    assert_eq!(idle.routine_unclaimed, 0);
 
     // With an arm open, uncatalogued families are counted as routine traffic
     // and still never touch a rejection counter.
@@ -1098,10 +1098,20 @@ fn routine_traffic_never_inflates_the_rejection_counters() {
     // The open arm is Control; the two catalogued episodes are a treatment and
     // an unattributed markov no-op, so neither can bind.
     assert_eq!(busy.bound_decisions, 0);
-    assert!(
-        busy.rejected_unknown_arm + busy.rejected_authority == 2,
-        "only the two catalogued episodes are classified"
-    );
+    // The treatment episode arrives for an action an experiment IS watching,
+    // but cannot fill the Control role that is open — a genuine experimental
+    // anomaly, not passing traffic. Under the old single `unknown_arm` bucket
+    // it was indistinguishable from the daemon's routine work.
+    // The two catalogued episodes now separate instead of sharing one bucket:
+    //  - the interaction_qos treatment names an action an experiment IS
+    //    watching but cannot fill the open Control role: a real anomaly;
+    //  - the markov no-op belongs to a family no arm is waiting on at all:
+    //    ordinary traffic.
+    // Under the old single `unknown_arm` counter both read as failures, and
+    // production showed 7,809 of them.
+    assert_eq!(busy.invalid_experimental, 1, "treatment for a control arm");
+    assert_eq!(busy.routine_unclaimed, 1, "another family, nobody waiting");
+    assert_eq!(busy.rejected_authority, 0);
 }
 
 /// A genuine key mismatch must remain visible rather than being absorbed as

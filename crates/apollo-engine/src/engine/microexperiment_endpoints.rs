@@ -58,8 +58,14 @@ pub const OBSERVATION_LIVENESS_CYCLES: u64 = 8;
 pub enum EndpointReject {
     /// Action key is uncatalogued, legacy, malformed, or names another family.
     ActionKeyMismatch,
-    /// No outstanding arm is waiting for that action in that arm role.
-    UnknownArm,
+    /// Nothing is waiting on this action at all. This is the daemon's ordinary
+    /// traffic passing by, not a defect: most decisions in a cycle are simply
+    /// outside any open experiment. Production read 7,809 of these under the
+    /// name `unknown_arm`, which made routine work look broken.
+    RoutineUnclaimed,
+    /// An experiment is waiting on this action, but the episode does not fit
+    /// the arm role it would have to fill. This one is a real anomaly.
+    InvalidExperimental,
     /// Decision id was already bound to an arm.
     Duplicate,
     /// Settled after the arm's grace deadline, or before it was issued.
@@ -91,7 +97,12 @@ pub struct EndpointAdapterCounters {
     pub emitted_endpoints: u64,
     pub pending_utility: u64,
     pub rejected_action_mismatch: u64,
-    pub rejected_unknown_arm: u64,
+    /// Ordinary daemon traffic no open experiment was waiting on. Expected to
+    /// be large and to mean nothing is wrong.
+    pub routine_unclaimed: u64,
+    /// An episode for an action an experiment *was* waiting on, that could not
+    /// fill the arm role. Small and worth reading.
+    pub invalid_experimental: u64,
     pub rejected_duplicate: u64,
     pub rejected_expired: u64,
     pub rejected_epoch: u64,
@@ -372,7 +383,7 @@ impl MicroexperimentEndpointAdapter {
             .iter()
             .any(|arm| arm.canonical.matches(canonical))
         {
-            return Err(EndpointReject::UnknownArm);
+            return Err(EndpointReject::RoutineUnclaimed);
         }
         if self.consumed.contains(&episode.id.0)
             || self
@@ -398,9 +409,12 @@ impl MicroexperimentEndpointAdapter {
                     .iter()
                     .any(|arm| arm.canonical.matches(canonical) && arm.arm == closures.arm)
                 {
+                    // Right action, right role, wrong window: late.
                     EndpointReject::Expired
                 } else {
-                    EndpointReject::UnknownArm
+                    // Right action, wrong role: an experiment was waiting and
+                    // this episode cannot fill the arm it would have to fill.
+                    EndpointReject::InvalidExperimental
                 }
             })?;
         if self.bound.len() >= MAX_BOUND_DECISIONS {
@@ -524,7 +538,8 @@ impl MicroexperimentEndpointAdapter {
     fn count_reject(&mut self, reject: EndpointReject) {
         let counter = match reject {
             EndpointReject::ActionKeyMismatch => &mut self.counters.rejected_action_mismatch,
-            EndpointReject::UnknownArm => &mut self.counters.rejected_unknown_arm,
+            EndpointReject::RoutineUnclaimed => &mut self.counters.routine_unclaimed,
+            EndpointReject::InvalidExperimental => &mut self.counters.invalid_experimental,
             EndpointReject::Duplicate => &mut self.counters.rejected_duplicate,
             EndpointReject::Expired => &mut self.counters.rejected_expired,
             EndpointReject::Epoch => &mut self.counters.rejected_epoch,

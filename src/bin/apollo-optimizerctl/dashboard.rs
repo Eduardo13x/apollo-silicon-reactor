@@ -623,7 +623,13 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         lines.push(format!("       ANE {ane}"));
         if !m.temporal_prediction_backend.is_empty() {
             lines.push(format!(
-                "Pred   {} {} p95{:.0}%",
+                // Five subsystems have a phase they call "shadow": the Fabric,
+                // Reflex, the Value Scheduler, the microexperiment Lab and this
+                // predictor. Every other line names its owner first — this one
+                // did not, and "cpu-utility shadow" was read as the Lab's. The
+                // predictor is not running a shadow experiment; it is simply
+                // not authoritative yet, which is what this now says.
+                "Pred   {} {} p{:.0}%",
                 m.temporal_prediction_backend
                     .chars()
                     .take(12)
@@ -631,7 +637,7 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
                 if m.temporal_prediction_authoritative {
                     "active"
                 } else {
-                    "shadow"
+                    "unproven"
                 },
                 m.temporal_prediction_p95 * 100.0,
             ));
@@ -706,7 +712,14 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
         let endpoint_rejects = [
             ("key", m.microexperiment_endpoint_action_mismatch_total),
             ("uncat", m.microexperiment_uncatalogued_episodes_total),
-            ("arm", m.microexperiment_endpoint_unknown_arm_total),
+            // Routine traffic is deliberately not in this list: it belongs to
+            // the daemon's ordinary work, not to a reject taxonomy. Printing it
+            // beside genuine anomalies is what made 7,809 harmless decisions
+            // look like the largest failure mode in the subsystem.
+            (
+                "inval",
+                m.microexperiment_endpoint_invalid_experimental_total,
+            ),
             ("dup", m.microexperiment_endpoint_duplicate_total),
             ("exp", m.microexperiment_endpoint_expired_total),
             ("epo", m.microexperiment_endpoint_epoch_rejected_total),
@@ -2548,6 +2561,30 @@ mod tests {
     }
 
     #[test]
+    fn every_visible_shadow_names_the_subsystem_that_owns_it() {
+        // Five subsystems have a phase called "shadow". A line that prints the
+        // word without its owner invites exactly the association that sent an
+        // investigation at the Lab when the reading belonged to the predictor.
+        let mut status = dashboard_status();
+        status.metrics.fabric_phase = "shadow".to_string();
+        status.metrics.reflex_phase = "shadow".to_string();
+        status.metrics.microexperiment_phase = "shadow".to_string();
+        status.metrics.microexperiment_rollout_required = 8;
+        status.metrics.temporal_prediction_authoritative = false;
+
+        let owners = ["Fabric", "Reflex", "Lab", "Pred", "WM-DYN", "Value"];
+        for line in render_think_q(&status) {
+            if !line.contains("shadow") {
+                continue;
+            }
+            assert!(
+                owners.iter().any(|owner| line.starts_with(owner)),
+                "a bare shadow with no owner: {line:?}"
+            );
+        }
+    }
+
+    #[test]
     fn a_modality_never_seen_renders_as_absent_rather_than_zero() {
         let mut status = dashboard_status();
         status.metrics.perceptual_sources_active = 1;
@@ -3176,7 +3213,7 @@ mod tests {
         assert!(think.iter().any(|line| line == "       ANE unobservable"));
         assert!(think
             .iter()
-            .any(|line| line == "Pred   cpu-utility shadow p9542%"));
+            .any(|line| line == "Pred   cpu-utility unproven p42%"));
         assert!(think.iter().all(|line| display_width(line) <= QW));
     }
 
