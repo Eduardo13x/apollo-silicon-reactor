@@ -610,6 +610,10 @@ pub struct SharedState {
     /// layer from re-proposing an action the executor will refuse again.
     /// See `throttle_refusal` module.
     pub throttle_refusal: Arc<Mutex<crate::engine::throttle_refusal::ThrottleRefusalCooldown>>,
+    /// Micro-canary producer. **Disabled at construction**: it samples nothing
+    /// and withholds nothing until something explicitly enables it, so a build
+    /// that merely contains it behaves exactly as the baseline.
+    pub micro_canary: Arc<Mutex<crate::engine::micro_canary::MicroCanary>>,
 
     /// S10 cutover (2026-06-06): Hellerstein settling-time observer.
     /// Producers in `execute_actions.rs` record post-Receipt; consumer

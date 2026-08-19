@@ -112,6 +112,10 @@ fn temporal_reflex_safety(
 /// `markov_prewarm:predicted_app` and the exploration scheduler admits a
 /// `Control` candidate under the same gates the treatment path uses. Returns
 /// `true` when the pre-warm was withheld.
+/// Policy version stamped on every micro-canary pair. Bump it when a change
+/// would make pairs from before and after incomparable.
+const MICRO_CANARY_POLICY_VERSION: u32 = 1;
+
 fn withhold_markov_prewarm_for_control(
     exploration_scheduler: &mut apollo_engine::engine::exploration_scheduler::ExplorationScheduler,
     gates: &apollo_engine::engine::exploration_scheduler::ExplorationGates,
@@ -643,9 +647,47 @@ pub fn run_markov_tick(
         } else {
             false
         };
+        // Micro-canary. The opportunity below already passed every normal gate,
+        // so nothing here creates eligibility — it only asks whether this one
+        // should be withheld as a control. Disabled by default: `offer` returns
+        // `Proceed` for everything and the branch is inert.
+        //
+        // The daemon owns no experimental logic. It executes the decision and
+        // reports the outcome; the producer decides, the lab evaluates.
+        let canary_decision = if base_eligible && !markov_control_withheld {
+            state.micro_canary.lock_recover().offer(
+                ActuatorFamily::MarkovPrewarm,
+                ActionClass::MarkovPredictedApp,
+                ExplorationArm::MarkovCacheOnly,
+                "markov_prewarm:predicted_app@cache_only",
+                MICRO_CANARY_POLICY_VERSION,
+                cycle_count,
+            )
+        } else {
+            apollo_engine::engine::micro_canary::ArmDecision::Proceed
+        };
+        let canary_withholds = matches!(
+            canary_decision,
+            apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl { .. }
+        );
+
         let (specialist_allowed, allow_kernel_acceleration) =
             markov_exploration_admission(admission, exploration_approval.is_some());
-        let mut prewarm_eligible = base_eligible && specialist_allowed && !markov_control_withheld;
+        let mut prewarm_eligible =
+            base_eligible && specialist_allowed && !markov_control_withheld && !canary_withholds;
+        if canary_withholds {
+            // `prewarm_eligible` only ever moves false from here, so the
+            // pre-warm cannot run for this prediction. Confirming now is
+            // confirming an outcome, not an intention.
+            debug_assert!(!prewarm_eligible);
+            state.micro_canary.lock_recover().confirm_control_honoured();
+            decision_events.push(markov_event(
+                pred.app_name.clone(),
+                cycle_count,
+                ActuatorDecisionOutcome::Blocked,
+                "micro-canary control: pre-warm withheld",
+            ));
+        }
         // Cache-only probes may test a cold/new context. Reversible acceleration
         // remains reserved for mature transition evidence.
         markov_acceleration_allowed = allow_kernel_acceleration && cache_warm_allowed;

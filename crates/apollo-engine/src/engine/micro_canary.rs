@@ -158,6 +158,21 @@ pub struct MicroCanary {
 }
 
 impl MicroCanary {
+    /// Construct **disabled**. The producer that ships in a binary must do
+    /// nothing until someone turns it on: a wired-but-dormant canary and a
+    /// baseline have to be indistinguishable, or the comparison B exists for
+    /// is worthless.
+    pub fn new_disabled(boot_epoch: u64) -> Self {
+        let mut c = Self::new(boot_epoch);
+        c.enabled = false;
+        c
+    }
+
+    /// Start sampling. The moment B begins.
+    pub fn enable(&mut self) {
+        self.enabled = true;
+    }
+
     pub fn new(boot_epoch: u64) -> Self {
         Self {
             boot_epoch,
@@ -889,6 +904,57 @@ mod tests {
             out.canary_treatment_issued + out.canary_control_issued,
             1,
             "one arm was handed out for the one experiment"
+        );
+    }
+
+    #[test]
+    fn a_disabled_producer_is_indistinguishable_from_not_having_one() {
+        // The property the whole pre-B baseline rests on. If a wired-but-off
+        // canary differed from no canary at all, every comparison against the
+        // baseline would be measuring the wiring instead of B.
+        let mut c = MicroCanary::new_disabled(BOOT);
+        assert!(!c.is_enabled());
+        for cycle in 0..100_000u64 {
+            assert_eq!(
+                c.offer(
+                    ActuatorFamily::MarkovPrewarm,
+                    ActionClass::MarkovPredictedApp,
+                    ExplorationArm::MarkovCacheOnly,
+                    "markov_prewarm:predicted_app@cache_only",
+                    1,
+                    cycle,
+                ),
+                ArmDecision::Proceed,
+                "a disabled producer never asks for anything to be withheld"
+            );
+        }
+        let m = c.metrics();
+        assert_eq!(m.sampled, 0);
+        assert_eq!(
+            m.control_issued, 0,
+            "no action was withheld from the machine"
+        );
+        assert_eq!(m.control_honoured, 0);
+        assert_eq!(m.treatment_issued, 0);
+        assert_eq!(m.pairs_completed, 0);
+        assert_eq!(c.open_len(), 0);
+        assert_eq!(m.refused_disabled, 100_000, "and the refusals are visible");
+
+        let mut out = crate::engine::types::RuntimeMetrics::default();
+        c.publish(&mut out);
+        assert!(!out.canary_enabled);
+        assert_eq!(out.canary_control_issued, 0);
+        assert_eq!(out.canary_observed_per_mille, 0.0);
+    }
+
+    #[test]
+    fn enabling_is_the_only_thing_that_starts_it() {
+        let mut c = MicroCanary::new_disabled(BOOT);
+        assert!(offer_until_sampled(&mut c, 1).is_none(), "off means off");
+        c.enable();
+        assert!(
+            offer_until_sampled(&mut c, 1).is_some(),
+            "and on means the draw resumes"
         );
     }
 

@@ -528,6 +528,9 @@ mod tests {
                 apollo_engine::engine::freeze_cooldown::FreezeCooldown::new(),
             )),
             throttle_refusal: Default::default(),
+            micro_canary: Arc::new(Mutex::new(
+                apollo_engine::engine::micro_canary::MicroCanary::new_disabled(1),
+            )),
             effect_decay: Arc::new(Mutex::new(
                 apollo_engine::engine::effect_decay::DecayWatchdog::new(),
             )),

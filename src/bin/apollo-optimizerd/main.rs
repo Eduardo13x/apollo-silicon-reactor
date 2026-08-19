@@ -726,6 +726,21 @@ fn main() -> anyhow::Result<()> {
                 throttle_refusal: Arc::new(Mutex::new(
                     apollo_engine::engine::throttle_refusal::ThrottleRefusalCooldown::new(),
                 )),
+                // Disabled. A binary that merely contains the micro-canary must
+                // be indistinguishable from the baseline; enabling it is the
+                // separate, explicit act that starts B.
+                micro_canary: Arc::new(Mutex::new(
+                    // Boot epoch from the wall clock: distinct across restarts,
+                    // which is what keeps an experiment id from a previous boot
+                    // out of this one.
+                    apollo_engine::engine::micro_canary::MicroCanary::new_disabled(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(1)
+                            .max(1),
+                    ),
+                )),
                 effect_decay: Arc::new(Mutex::new(
                     apollo_engine::engine::effect_decay::DecayWatchdog::new(),
                 )),
@@ -3201,6 +3216,10 @@ fn main() -> anyhow::Result<()> {
                         &mut metrics.metrics,
                         micro_metrics,
                     );
+                    state
+                        .micro_canary
+                        .lock_recover()
+                        .publish(&mut metrics.metrics);
 
                     let endpoint = microexperiment_runtime.adapter_counters();
                     metrics.metrics.microexperiment_endpoint_contract_ready =

@@ -330,6 +330,9 @@ mod tests {
             mach_qos: Arc::new(Mutex::new(MachQoSManager::new())),
             freeze_cooldown: Arc::new(Mutex::new(Default::default())),
             throttle_refusal: Default::default(),
+            micro_canary: Arc::new(Mutex::new(
+                apollo_engine::engine::micro_canary::MicroCanary::new_disabled(1),
+            )),
             effect_decay: Arc::new(Mutex::new(Default::default())),
             stop: Arc::new(AtomicBool::new(false)),
             revert_sysctls_requested: Arc::new(AtomicBool::new(false)),
