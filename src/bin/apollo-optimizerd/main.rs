@@ -3340,19 +3340,16 @@ fn main() -> anyhow::Result<()> {
                 // open their windows after `observe` and are correct to do so.
                 // The ordering belongs to this experiment, not to the authority.
                 if let Some(req) = canary_utility_windows {
-                    let opened_treatment = telemetry_medallion.open_lab_utility_window(
-                        req.treatment_ledger_id,
+                    // One window, for the arm served this cycle. The medallion
+                    // scores a system-wide objective over the window, so two
+                    // windows opened on the same cycle would subtract one
+                    // delta from itself and call the zero an effect.
+                    if !telemetry_medallion.open_lab_utility_window(
+                        req.served_ledger_id,
                         apollo_engine::engine::telemetry_medallion::ActuatorFamily::MarkovPrewarm,
                         req.horizon_cycles,
                         cycle_count,
-                    );
-                    let opened_control = telemetry_medallion.open_lab_utility_window(
-                        req.control_ledger_id,
-                        apollo_engine::engine::telemetry_medallion::ActuatorFamily::MarkovPrewarm,
-                        req.horizon_cycles,
-                        cycle_count,
-                    );
-                    if !(opened_treatment && opened_control) {
+                    ) {
                         state
                             .micro_canary
                             .lock_recover()
@@ -7276,19 +7273,16 @@ fn main() -> anyhow::Result<()> {
                 // that just ran. Same ordering property as the markov path, pinned by the
                 // medallion tests.
                 if let Some(req) = acceleration_output.canary_utility_windows {
-                    let opened_treatment = telemetry_medallion.open_lab_utility_window(
-                        req.treatment_ledger_id,
+                    // One window, for the arm served this cycle. The medallion
+                    // scores a system-wide objective over the window, so two
+                    // windows opened on the same cycle would subtract one
+                    // delta from itself and call the zero an effect.
+                    if !telemetry_medallion.open_lab_utility_window(
+                        req.served_ledger_id,
                         apollo_engine::engine::telemetry_medallion::ActuatorFamily::InteractionQos,
                         req.horizon_cycles,
                         cycle_count,
-                    );
-                    let opened_control = telemetry_medallion.open_lab_utility_window(
-                        req.control_ledger_id,
-                        apollo_engine::engine::telemetry_medallion::ActuatorFamily::InteractionQos,
-                        req.horizon_cycles,
-                        cycle_count,
-                    );
-                    if !(opened_treatment && opened_control) {
+                    ) {
                         state
                             .micro_canary
                             .lock_recover()

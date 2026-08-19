@@ -184,6 +184,11 @@ struct OpenExperiment {
     /// until something settles — which is exactly when the caller needs it,
     /// since it has to run the other half before either can settle.
     treatment_issued_first: bool,
+    /// Whether the second arm has been handed to a caller at its **own**
+    /// opportunity. An experiment is two opportunities, not one: the arms have
+    /// to be measured over different intervals or the comparison is a window
+    /// against itself.
+    complement_served: bool,
     treatment: Option<ExplorationArmOutcome>,
     control: Option<ExplorationArmOutcome>,
 }
@@ -352,6 +357,16 @@ impl MicroCanary {
             self.metrics.refused_family = self.metrics.refused_family.saturating_add(1);
             return ArmDecision::Proceed;
         }
+        // An experiment already waiting for its other half claims this
+        // opportunity before any new draw. This is what makes a pair a
+        // comparison: arm A was measured over the interval after *its*
+        // opportunity, and arm B must be measured over the interval after a
+        // different one. Opening both windows at a single opportunity would
+        // subtract one system-wide utility delta from itself, which is zero by
+        // construction and describes an action that was never taken.
+        if let Some(pending) = self.serve_pending_complement(family, canonical_key) {
+            return pending;
+        }
         // Draw first, budget second: a budget-refused draw must still consume
         // its share of the rate, or a full budget would silently raise the
         // sampling rate of everything that follows.
@@ -394,6 +409,7 @@ impl MicroCanary {
             opened_cycle: cycle,
             expires_after_cycle: cycle.saturating_add(EXPERIMENT_HORIZON_CYCLES),
             treatment_issued_first: treatment_first,
+            complement_served: false,
             treatment: None,
             control: None,
         });
@@ -436,6 +452,37 @@ impl MicroCanary {
 
     /// The complementary arm for an experiment already open, so the caller can
     /// run the half it has not run yet.
+    /// Hand the waiting second arm to a caller that has a real opportunity for
+    /// it. Consumes no draw and no burst: the experiment was already paid for
+    /// when its first arm was issued.
+    fn serve_pending_complement(
+        &mut self,
+        family: ActuatorFamily,
+        canonical_key: &str,
+    ) -> Option<ArmDecision> {
+        let id = self
+            .open
+            .iter()
+            .find(|e| {
+                e.family == family && e.canonical_key == canonical_key && !e.complement_served
+            })
+            .map(|e| e.experiment_id)?;
+        let decision = self.complementary_arm(id)?;
+        if let Some(e) = self.open.iter_mut().find(|e| e.experiment_id == id) {
+            e.complement_served = true;
+        }
+        match decision {
+            ArmDecision::Treatment { .. } => {
+                self.metrics.treatment_issued = self.metrics.treatment_issued.saturating_add(1);
+            }
+            ArmDecision::WithholdAsControl { .. } => {
+                self.metrics.control_issued = self.metrics.control_issued.saturating_add(1);
+            }
+            ArmDecision::Proceed => {}
+        }
+        Some(decision)
+    }
+
     pub fn complementary_arm(&self, experiment_id: ExperimentId) -> Option<ArmDecision> {
         let e = self
             .open
@@ -937,8 +984,21 @@ mod tests {
         let mut c = canary();
         offer_until_sampled(&mut c, 10).expect("first sampled");
         assert_eq!(c.open_len(), 1);
-        // MarkovPrewarm allows one open experiment. Every further draw is
-        // refused for budget, never silently admitted.
+        // The open experiment's own key claims one more opportunity, for its
+        // complement — that is the pair, not a second experiment.
+        let complement = c.offer(
+            ActuatorFamily::MarkovPrewarm,
+            ActionClass::MarkovPredictedApp,
+            ExplorationArm::MarkovCacheOnly,
+            "markov_prewarm:predicted_app@cache_only",
+            3,
+            11,
+        );
+        assert_ne!(complement, ArmDecision::Proceed, "the complement is served");
+        assert_eq!(c.open_len(), 1, "still one experiment, now with both arms");
+        // MarkovPrewarm allows one open experiment. Every further draw — the
+        // complement included, once served — is refused for budget, never
+        // silently admitted.
         for _ in 0..20_000 {
             let d = c.offer(
                 ActuatorFamily::MarkovPrewarm,
@@ -1553,6 +1613,140 @@ mod tests {
         assert_eq!(c.metrics().sampled, 0);
     }
 
+    // ── an experiment is two opportunities ──────────────────────────────────
+
+    #[test]
+    fn one_opportunity_cannot_complete_a_pair() {
+        // The defect this pins: both arms were served at a single opportunity
+        // and both utility windows opened on the same cycle. The medallion
+        // scores a system-wide objective, so the two arms subtracted one
+        // delta from itself — zero effect by construction — and the arm
+        // labelled Treatment described an action that never ran.
+        let mut c = canary();
+        c.arm_burst(1, 0);
+        let first = offer_qos(&mut c, 0);
+        assert_ne!(first, ArmDecision::Proceed, "the opportunity is sampled");
+        let (id, corr) = ids(&first);
+
+        // Only the served arm exists so far. Its complement has no window,
+        // because it has had no opportunity.
+        assert!(
+            c.record_arm(id, corr, 1, term(&first), 100).is_none(),
+            "one arm cannot close a pair"
+        );
+        assert_eq!(c.metrics().pairs_completed, 0);
+    }
+
+    #[test]
+    fn the_complement_is_served_at_its_own_later_opportunity() {
+        let mut c = canary();
+        c.arm_burst(1, 0);
+        let first = offer_qos(&mut c, 0);
+        let (id, corr_a) = ids(&first);
+        assert!(c.record_arm(id, corr_a, 1, term(&first), 100).is_none());
+
+        // A later opportunity for the same key is claimed by the waiting
+        // experiment, not by a new draw.
+        let sampled_before = c.metrics().sampled;
+        let second = offer_qos(&mut c, 40);
+        assert_ne!(second, ArmDecision::Proceed, "the complement is served");
+        assert_eq!(
+            c.metrics().sampled,
+            sampled_before,
+            "serving a complement is not a new draw"
+        );
+        assert_eq!(c.metrics().forced_draws, 1, "and it spends no burst");
+
+        let (id2, corr_b) = ids(&second);
+        assert_eq!(id2, id, "same experiment");
+        assert_ne!(corr_a, corr_b, "different arm");
+        assert!(
+            matches!(first, ArmDecision::Treatment { .. })
+                != matches!(second, ArmDecision::Treatment { .. }),
+            "one arm is the treatment and the other is the control"
+        );
+
+        let pair = c
+            .record_arm(id, corr_b, 41, term(&second), 40)
+            .expect("now the pair completes");
+        assert_eq!(pair.family, ActuatorFamily::InteractionQos);
+        // The two arms settled at different cycles, which is the whole point:
+        // each measures the interval after its own opportunity.
+        assert_ne!(
+            pair.treatment.settled_cycle, pair.control.settled_cycle,
+            "the arms must be measured over different intervals"
+        );
+        assert_eq!(pair.effect_micros(), 60);
+    }
+
+    #[test]
+    fn a_pending_complement_outranks_a_new_draw_but_not_the_kill_switch() {
+        let mut c = canary();
+        c.arm_burst(1, 0);
+        let first = offer_qos(&mut c, 0);
+        assert_ne!(first, ArmDecision::Proceed);
+        c.disable();
+        for cycle in 1..500u64 {
+            assert_eq!(
+                offer_qos(&mut c, cycle),
+                ArmDecision::Proceed,
+                "a disabled canary serves nothing, complement included"
+            );
+        }
+    }
+
+    #[test]
+    fn a_complement_is_only_served_for_its_own_family_and_key() {
+        let mut c = canary();
+        c.arm_burst(1, 0);
+        let first = offer_qos(&mut c, 0);
+        assert_ne!(first, ArmDecision::Proceed);
+        // Same family, different action: not this experiment's other half.
+        assert_eq!(
+            c.offer(
+                ActuatorFamily::InteractionQos,
+                ActionClass::InteractionForeground,
+                ExplorationArm::InteractionQosStandard,
+                "interaction_qos:foreground@other",
+                1,
+                1,
+            ),
+            ArmDecision::Proceed
+        );
+        // Different family entirely.
+        assert_eq!(
+            c.offer(
+                ActuatorFamily::MarkovPrewarm,
+                ActionClass::MarkovPredictedApp,
+                ExplorationArm::MarkovCacheOnly,
+                "interaction_qos:foreground@standard",
+                1,
+                1,
+            ),
+            ArmDecision::Proceed
+        );
+    }
+
+    #[test]
+    fn a_complement_is_served_once_and_not_again() {
+        let mut c = canary();
+        c.arm_burst(1, 0);
+        assert_ne!(offer_qos(&mut c, 0), ArmDecision::Proceed);
+        assert_ne!(offer_qos(&mut c, 1), ArmDecision::Proceed, "complement");
+        for cycle in 2..2_000u64 {
+            assert_eq!(
+                offer_qos(&mut c, cycle),
+                ArmDecision::Proceed,
+                "a fully-served experiment claims no further opportunity"
+            );
+        }
+        assert_eq!(
+            c.open_len(),
+            1,
+            "still open, waiting for both arms to settle"
+        );
+    }
+
     // ── bounded burst ───────────────────────────────────────────────────────
 
     #[test]
@@ -1687,8 +1881,20 @@ mod tests {
         // First offer opens an experiment and holds the family's only slot.
         assert!(!matches!(offer_qos(&mut c, 0), ArmDecision::Proceed));
         assert_eq!(c.burst_remaining(), 1);
-        // Second offer is forced but the budget is full.
-        assert_eq!(offer_qos(&mut c, 1), ArmDecision::Proceed);
+        // A second *different* opportunity is forced but the budget is full.
+        // (The same key would be served the first experiment's complement,
+        // which is a pair completing, not a new experiment.)
+        assert_eq!(
+            c.offer(
+                ActuatorFamily::InteractionQos,
+                ActionClass::InteractionForeground,
+                ExplorationArm::InteractionQosStandard,
+                "interaction_qos:foreground@other",
+                1,
+                1,
+            ),
+            ArmDecision::Proceed
+        );
         assert_eq!(
             c.burst_remaining(),
             1,

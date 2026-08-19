@@ -53,21 +53,21 @@ pub struct MarkovTickOutput {
     pub temporal_hour: u8,
     pub temporal_weekday: u8,
     pub decision_events: CycleDecisionEvents,
-    /// Utility windows the micro-canary needs opened this cycle: the
-    /// experiment and its two ledger keys. Returned rather than opened here,
-    /// because the medallion lives in the daemon loop and widening a
-    /// fourteen-parameter signature to reach it would be the worse trade.
+    /// The utility window for the arm the micro-canary served this cycle.
+    /// Returned rather than opened here, because the medallion lives in the
+    /// daemon loop and widening a fourteen-parameter signature to reach it
+    /// would be the worse trade.
     ///
-    /// Both windows must open or neither is usable — the caller abandons the
-    /// experiment if only one does.
+    /// One window, not two: the other arm gets its own window at its own
+    /// opportunity. Opening both here would measure a single interval twice.
     pub canary_utility_windows: Option<CanaryWindowRequest>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub struct CanaryWindowRequest {
     pub experiment_id: apollo_engine::engine::exploration_pair::ExperimentId,
-    pub treatment_ledger_id: u64,
-    pub control_ledger_id: u64,
+    /// Ledger key of the arm that was actually served at this opportunity.
+    pub served_ledger_id: u64,
     pub horizon_cycles: u64,
 }
 
@@ -981,29 +981,23 @@ pub fn run_markov_tick(
             canary_decision,
             apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl { .. }
         );
-        if let Some(experiment_id) = match &canary_decision {
+        // One window for the arm served here. Its complement gets its own
+        // window at its own opportunity; that is what the pair compares.
+        canary_utility_windows = match &canary_decision {
             apollo_engine::engine::micro_canary::ArmDecision::Treatment {
-                experiment_id, ..
+                experiment_id,
+                correlation,
             }
             | apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl {
                 experiment_id,
-                ..
-            } => Some(*experiment_id),
+                correlation,
+            } => Some(CanaryWindowRequest {
+                experiment_id: *experiment_id,
+                served_ledger_id: correlation.ledger_correlation_id(),
+                horizon_cycles: MICRO_CANARY_HORIZON_CYCLES,
+            }),
             apollo_engine::engine::micro_canary::ArmDecision::Proceed => None,
-        } {
-            if let Some((treatment, control)) = state
-                .micro_canary
-                .lock_recover()
-                .correlations(experiment_id)
-            {
-                canary_utility_windows = Some(CanaryWindowRequest {
-                    experiment_id,
-                    treatment_ledger_id: treatment.ledger_correlation_id(),
-                    control_ledger_id: control.ledger_correlation_id(),
-                    horizon_cycles: MICRO_CANARY_HORIZON_CYCLES,
-                });
-            }
-        }
+        };
         if canary_withholds {
             state.micro_canary.lock_recover().confirm_control_honoured();
             decision_events.push(markov_event(

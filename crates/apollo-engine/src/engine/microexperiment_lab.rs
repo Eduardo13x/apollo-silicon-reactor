@@ -48,7 +48,15 @@ pub const SHADOW_MIN_DURATION_MS: u64 = 15 * 60 * 1_000;
 pub const CANARY_MIN_OPPORTUNITIES: u64 = 500;
 pub const CANARY_PERCENT: u8 = 10;
 pub const ENDPOINT_GRACE_CYCLES: u64 = 12;
-const LAB_SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 on 2026-08-19. Version 1 state contains pair counters produced
+/// by a micro-canary that opened both arms' utility windows on a single cycle.
+/// The medallion scores a system-wide objective, so those two windows shared a
+/// `before` and an `after`: every such pair had zero effect by construction,
+/// and its treatment arm described an action that never ran. Four of them
+/// reached `lab_pairs_accepted` in production. They are not measurements, so
+/// the counter that would carry them forward is discarded rather than
+/// explained in a footnote nobody will read next to the number.
+const LAB_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
