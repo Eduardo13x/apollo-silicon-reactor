@@ -5,6 +5,7 @@
 //! one local treatment, and emits one deduplicated Pair Gold record after all
 //! execution, horizon, and rollback facts close independently.
 
+use crate::engine::exploration_pair::{CompletedExplorationPair, ExperimentId};
 use std::collections::{BTreeSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,9 @@ use crate::engine::telemetry_medallion::ActuatorFamily;
 pub const MAX_OPEN_PAIRS: usize = 32;
 /// Terminalised shadow pair ids kept so a late endpoint can be named as late.
 pub const MAX_SHADOW_TERMINAL_MEMORY: usize = 64;
+/// Experiment ids remembered as already counted. Bounded, and large enough
+/// that a replay cannot outlive the memory before the gate is satisfied.
+pub const MAX_CONSUMED_EXPERIMENTS: usize = 512;
 /// Shadow arms issued per cycle.
 ///
 /// The emit→expire→emit loop is already rate-limited upstream: a shadow pair
@@ -376,6 +380,25 @@ struct IssuedArm {
     expires_after_cycle: u64,
 }
 
+/// What the lab did with a certified pair. `Accepted` names the experiment it
+/// came from: a gate observation that cannot say which experiment produced it
+/// is a counter, not evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairConsumption {
+    Accepted { experiment_id: ExperimentId },
+    Duplicate,
+    Rejected(PairRejection),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRejection {
+    /// A control was issued and never confirmed honoured, so some pair in this
+    /// run has a control arm that is not a control.
+    ControlNotHonoured,
+    /// From a family the gate does not trust for causal evidence.
+    UnexpectedFamily,
+}
+
 /// A pair the lab tracks **without acting**.
 ///
 /// Deliberately a different type in a different collection from `PairRecord`.
@@ -467,6 +490,13 @@ pub struct LabMetrics {
     /// Shadow closures refused for an endpoint that was not a clean observed
     /// non-synthetic control no-op.
     pub shadow_measurements_refused_total: u64,
+    /// Certified pairs offered, and what became of each.
+    pub lab_pairs_seen: u64,
+    pub lab_pairs_accepted: u64,
+    pub lab_pairs_duplicate: u64,
+    pub lab_pairs_rejected: u64,
+    /// Distinct causal experiments counted — what the gate reads.
+    pub causal_pairs_consumed: u64,
     /// Arms that passed their deadline (a detection).
     pub shadow_pairs_expired_total: u64,
     /// Shadow pairs actually removed from the collection (a removal).
@@ -540,6 +570,12 @@ pub struct MicroexperimentLabPersisted {
     /// here can become a real directive. See `ShadowPairRecord`.
     #[serde(default)]
     shadow_open: Vec<ShadowPairRecord>,
+    /// Experiments already counted. **Persisted**: if this lived only in RAM, a
+    /// crash between accepting a pair and the next write would let a replay
+    /// count the same experiment twice, and the gate would advance on evidence
+    /// that existed once.
+    #[serde(default)]
+    consumed_experiments: VecDeque<ExperimentId>,
     completed: VecDeque<CompletedPairSummary>,
     gold_dedup: VecDeque<PairId>,
     metrics: PersistedMetrics,
@@ -573,6 +609,16 @@ struct PersistedMetrics {
     /// measurement can be told apart from one that never tried.
     #[serde(default)]
     shadow_measurements_refused_total: u64,
+    #[serde(default)]
+    lab_pairs_seen: u64,
+    #[serde(default)]
+    lab_pairs_accepted: u64,
+    #[serde(default)]
+    lab_pairs_duplicate: u64,
+    #[serde(default)]
+    lab_pairs_rejected: u64,
+    #[serde(default)]
+    causal_pairs_consumed: u64,
     /// Arms that passed their deadline. A *detection* event, distinct from the
     /// removal below: contrasting the two is how a pair that expires without
     /// being removed becomes visible instead of quietly holding a slot.
@@ -608,7 +654,16 @@ struct PersistedRollout {
     /// EXPOSURE. Candidates seen in Shadow. Kept because it describes the host,
     /// but it no longer gates anything — seeing a candidate is not measuring.
     shadow_eligible: u64,
-    /// EVIDENCE. Shadow pairs closed with a valid, observed control endpoint.
+    /// EVIDENCE the gate actually reads: distinct certified causal pairs
+    /// consumed. New field, so state written under the previous rule carries
+    /// nothing into it.
+    causal_pairs_consumed: u64,
+    /// Retained, and currently unreachable. A Shadow measurement was a real
+    /// form of evidence, but Shadow cannot obtain a control endpoint — that
+    /// needs a deliberate holdout, and Shadow's contract is to change nothing.
+    /// Kept rather than deleted because the shape is right and a future phase
+    /// that *can* withhold could produce it.
+    #[allow(dead_code)]
     ///
     /// A new field on purpose: state persisted under the old semantics carries
     /// no value for it and deserialises to 0, so the exposure a previous boot
@@ -628,12 +683,17 @@ impl PersistedRollout {
     /// never produced opportunities in the first place.
     #[must_use]
     fn reset_to_shadow(&mut self, now_millis: u64) -> u64 {
-        let dropped = self.shadow_eligible;
+        // The quantity that actually gated. It used to report `shadow_eligible`
+        // — exposure — which after the gate moved to causal evidence would have
+        // made a reset that discarded real evidence render as discarding
+        // nothing.
+        let dropped = self.causal_pairs_consumed;
         self.phase = LabPhase::Shadow;
         self.phase_started_millis = now_millis;
         self.last_monotonic_millis = now_millis;
         self.shadow_eligible = 0;
         self.shadow_measurements_proven = 0;
+        self.causal_pairs_consumed = 0;
         self.canary_eligible = 0;
         self.canary_opened = 0;
         self.canary_completed = 0;
@@ -651,6 +711,7 @@ impl Default for MicroexperimentLabPersisted {
             next_pair_sequence: 0,
             open: Vec::new(),
             shadow_open: Vec::new(),
+            consumed_experiments: VecDeque::new(),
             completed: VecDeque::new(),
             gold_dedup: VecDeque::new(),
             metrics: PersistedMetrics::default(),
@@ -710,6 +771,8 @@ pub struct MicroexperimentLab {
     /// Shadow-phase bookkeeping. Never read by `issue_ready_arms`, so nothing
     /// here can become a real directive. See `ShadowPairRecord`.
     shadow_open: Vec<ShadowPairRecord>,
+    /// Experiments already counted, persisted so idempotency survives a crash.
+    consumed_experiments: VecDeque<ExperimentId>,
     /// Ids of shadow pairs already terminalised. An endpoint arriving after its
     /// pair was reaped is late, not evidence: without this it would find no
     /// record, fall through as an unknown pair, and the reason it was refused
@@ -750,6 +813,7 @@ impl MicroexperimentLab {
             next_pair_sequence: 0,
             open: Vec::with_capacity(MAX_OPEN_PAIRS),
             shadow_open: Vec::new(),
+            consumed_experiments: VecDeque::new(),
             shadow_terminal: VecDeque::new(),
             completed: VecDeque::with_capacity(MAX_COMPLETED_PAIRS),
             gold_dedup: VecDeque::with_capacity(MAX_GOLD_DEDUP),
@@ -923,6 +987,51 @@ impl MicroexperimentLab {
         directives
     }
 
+    /// Consume one certified pair. Read-only with respect to everything else:
+    /// it touches no producer, no arm, no budget and no daemon decision.
+    ///
+    /// Idempotent on `experiment_id`, never on an arm or a timestamp. The same
+    /// pair delivered once or a hundred times advances the gate exactly once,
+    /// and the memory is persisted so a crash between accepting and writing
+    /// cannot turn a replay into fresh evidence.
+    pub fn consume_exploration_pair(
+        &mut self,
+        pair: &CompletedExplorationPair,
+        control_issued: u64,
+        control_honoured: u64,
+    ) -> PairConsumption {
+        self.metrics.lab_pairs_seen = self.metrics.lab_pairs_seen.saturating_add(1);
+
+        if self.consumed_experiments.contains(&pair.experiment_id) {
+            self.metrics.lab_pairs_duplicate = self.metrics.lab_pairs_duplicate.saturating_add(1);
+            return PairConsumption::Duplicate;
+        }
+        // A control that was issued and not honoured means some pair in this
+        // run has a control arm that is not a control. Which one is unknowable
+        // from here, so no pair from that run is counted.
+        if control_honoured < control_issued {
+            self.metrics.lab_pairs_rejected = self.metrics.lab_pairs_rejected.saturating_add(1);
+            return PairConsumption::Rejected(PairRejection::ControlNotHonoured);
+        }
+        // Only the family the micro-canary is enabled for. A pair from anywhere
+        // else did not come from the authority this gate trusts.
+        if pair.family != ActuatorFamily::MarkovPrewarm {
+            self.metrics.lab_pairs_rejected = self.metrics.lab_pairs_rejected.saturating_add(1);
+            return PairConsumption::Rejected(PairRejection::UnexpectedFamily);
+        }
+
+        if self.consumed_experiments.len() >= MAX_CONSUMED_EXPERIMENTS {
+            self.consumed_experiments.pop_front();
+        }
+        self.consumed_experiments.push_back(pair.experiment_id);
+        self.metrics.lab_pairs_accepted = self.metrics.lab_pairs_accepted.saturating_add(1);
+        self.metrics.causal_pairs_consumed = self.metrics.causal_pairs_consumed.saturating_add(1);
+        self.rollout.causal_pairs_consumed = self.rollout.causal_pairs_consumed.saturating_add(1);
+        PairConsumption::Accepted {
+            experiment_id: pair.experiment_id,
+        }
+    }
+
     /// Terminalise one shadow pair: drop it and remember the id so a late
     /// endpoint can be named. Idempotent — reaping an id twice is a no-op, so
     /// expiry, endpoint arrival, a safety cancellation and shutdown can all
@@ -1059,7 +1168,7 @@ impl MicroexperimentLab {
     pub fn rollout_progress(&self) -> (u64, u64) {
         match self.rollout.phase {
             LabPhase::Shadow => (
-                self.rollout.shadow_measurements_proven,
+                self.rollout.causal_pairs_consumed,
                 self.rollout_config.shadow_min_measurements,
             ),
             LabPhase::Canary => (
@@ -1565,6 +1674,7 @@ impl MicroexperimentLab {
             next_pair_sequence: self.next_pair_sequence,
             open: self.open.clone(),
             shadow_open: self.shadow_open.clone(),
+            consumed_experiments: self.consumed_experiments.clone(),
             completed: self.completed.clone(),
             gold_dedup: self.gold_dedup.clone(),
             metrics: self.metrics,
@@ -1596,6 +1706,9 @@ impl MicroexperimentLab {
             // Carried so a pair that had not yet issued can re-issue on this
             // boot. The ones that had are dropped below, with their arms.
             shadow_open: persisted.shadow_open,
+            // Carried across the restart on purpose: this is the memory that
+            // makes a replay after a crash a duplicate instead of new evidence.
+            consumed_experiments: persisted.consumed_experiments,
             shadow_terminal: VecDeque::new(),
             completed: persisted.completed,
             gold_dedup: persisted.gold_dedup,
@@ -1668,16 +1781,18 @@ impl MicroexperimentLab {
         // stays produced across a restart. Exposure is carried too, but only
         // because it describes the host — it no longer gates anything.
         let shadow_measurements_proven = lab.rollout.shadow_measurements_proven;
+        let causal_pairs_consumed = lab.rollout.causal_pairs_consumed;
         let _deliberately_carried_forward = lab.rollout.reset_to_shadow(0);
         lab.rollout.shadow_eligible = shadow_eligible;
         lab.rollout.shadow_measurements_proven = shadow_measurements_proven;
+        lab.rollout.causal_pairs_consumed = causal_pairs_consumed;
         // Boot-scoped provenance: the value the operator should see published
         // before the new boot has run a cycle. It must mirror what
         // `rollout_progress` reports, which is evidence — publishing restored
         // *exposure* beside an evidence gate reads as a counter that fell from
         // 304 to 0 across the restart, the exact confusion this whole change
         // set out to remove.
-        lab.restored_progress = shadow_measurements_proven;
+        lab.restored_progress = causal_pairs_consumed;
         let disposition = if interrupted == 0 {
             RestoreDisposition::Restored
         } else {
@@ -1719,6 +1834,11 @@ impl MicroexperimentLab {
             shadow_would_open_total: self.metrics.shadow_would_open_total,
             shadow_measurements_proven_total: self.metrics.shadow_measurements_proven_total,
             shadow_measurements_refused_total: self.metrics.shadow_measurements_refused_total,
+            lab_pairs_seen: self.metrics.lab_pairs_seen,
+            lab_pairs_accepted: self.metrics.lab_pairs_accepted,
+            lab_pairs_duplicate: self.metrics.lab_pairs_duplicate,
+            lab_pairs_rejected: self.metrics.lab_pairs_rejected,
+            causal_pairs_consumed: self.metrics.causal_pairs_consumed,
             shadow_pairs_expired_total: self.metrics.shadow_pairs_expired_total,
             shadow_pairs_reaped_total: self.metrics.shadow_pairs_reaped_total,
             shadow_open_pairs: self.shadow_open.len(),
@@ -1795,9 +1915,13 @@ impl MicroexperimentLab {
             // closes one measurement stays in Shadow forever, which is the
             // correct outcome. The duration remains as a floor — it can only
             // delay a graduation, never cause one.
+            // The gate's input is a certified causal pair and nothing else. It
+            // does not learn how the experiment was obtained, which is what
+            // stops a phase from being asked for evidence it cannot produce —
+            // the failure this whole line of work started from.
             LabPhase::Shadow
                 if gates_enabled
-                    && self.rollout.shadow_measurements_proven
+                    && self.rollout.causal_pairs_consumed
                         >= self.rollout_config.shadow_min_measurements
                     && now_millis.saturating_sub(self.rollout.phase_started_millis)
                         >= self.rollout_config.shadow_min_duration_ms =>
@@ -2306,6 +2430,18 @@ mod rollout_tests {
         assert_eq!(lab.metrics().open_pairs, 0);
     }
 
+    /// Advance the gate the only way it can now be advanced: by consuming
+    /// certified causal pairs. Shadow measurements no longer count, because
+    /// Shadow cannot obtain a control endpoint at all.
+    fn consume_pairs(lab: &mut MicroexperimentLab, n: u64, seq_base: u64) {
+        for i in 0..n {
+            assert!(matches!(
+                lab.consume_exploration_pair(&markov_pair(seq_base + i), 0, 0),
+                PairConsumption::Accepted { .. }
+            ));
+        }
+    }
+
     /// Drives the lab to Canary with `earned` **measurements** banked — the
     /// shape production reaches before it issues its first real arm.
     ///
@@ -2321,9 +2457,7 @@ mod rollout_tests {
             canary_percent: 100,
             canary_min_opportunities: 500,
         };
-        for index in 0..earned {
-            prove_shadow_measurement(&mut lab, index + 1, index + 1, index * 2);
-        }
+        consume_pairs(&mut lab, earned, 1);
         lab.advance_cycle(earned + 1, earned * 2, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Canary, "setup must reach canary");
         lab
@@ -2507,8 +2641,8 @@ mod rollout_tests {
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        // Canary is now reached by measuring, not by being looked at.
-        prove_shadow_measurement(&mut lab, 1, 1, 0);
+        // Canary is now reached by a certified causal pair.
+        consume_pairs(&mut lab, 1, 1);
         lab.advance_cycle(2, 11, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Canary);
 
@@ -2562,7 +2696,7 @@ mod rollout_tests {
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        prove_shadow_measurement(&mut lab, 1, 1, 1_000);
+        consume_pairs(&mut lab, 1, 1);
         assert_eq!(lab.phase(), LabPhase::Shadow);
 
         let (mut restored, disposition) = MicroexperimentLab::restore(lab.persisted(), origin());
@@ -2570,7 +2704,7 @@ mod rollout_tests {
         assert_eq!(disposition, RestoreDisposition::Restored);
         assert_eq!(restored.phase(), LabPhase::Shadow);
         // Evidence the host actually produced is durable across the restart.
-        assert_eq!(restored.rollout.shadow_measurements_proven, 1);
+        assert_eq!(restored.rollout.causal_pairs_consumed, 1);
 
         // The duration gate must NOT be instantly satisfiable after restore:
         // the phase clock re-arms on the first candidate of the new boot.
@@ -2601,7 +2735,7 @@ mod rollout_tests {
         let mut lab = MicroexperimentLab::cold_start(origin());
         // Earn the evidence first: `shadow_open` is bounded, so a pair created
         // after the flood would never be tracked and could never be measured.
-        prove_shadow_measurement(&mut lab, 900, 1, 500);
+        consume_pairs(&mut lab, 1, 900);
         for sequence in 1..=413u64 {
             lab.consider_candidate(
                 candidate(sequence),
@@ -2615,7 +2749,7 @@ mod rollout_tests {
         // One measurement earned, 413 candidates merely seen: the gate reads
         // the first number and ignores the second.
         assert_eq!(lab.rollout_progress(), (1, SHADOW_MIN_MEASUREMENTS));
-        assert_eq!(lab.metrics().shadow_would_open_total, 414);
+        assert_eq!(lab.metrics().shadow_would_open_total, 413);
 
         let encoded = serde_json::to_string(&lab.persisted()).expect("encode");
         let decoded: MicroexperimentLabPersisted = serde_json::from_str(&encoded).expect("decode");
@@ -2670,6 +2804,163 @@ mod rollout_tests {
         restored.rollout_config = lab.rollout_config;
         assert_eq!(restored.rollout_progress(), (0, 1));
         assert_eq!(restored.metrics().eligible_total, 2);
+    }
+
+    // ── Causal pair consumption ─────────────────────────────────────────────
+
+    fn markov_pair(seq: u64) -> CompletedExplorationPair {
+        use crate::engine::exploration_pair::{ArmTerminalState, ExplorationArmOutcome};
+        use crate::engine::exploration_scheduler::ProbeCorrelation;
+        let outcome = |c: u64, st, u| ExplorationArmOutcome {
+            correlation_id: ProbeCorrelation(c),
+            arm: ExplorationArm::MarkovCacheOnly,
+            issued_cycle: 10,
+            settled_cycle: 14,
+            terminal_state: st,
+            utility_micros: u,
+        };
+        CompletedExplorationPair::assemble(
+            ExperimentId::new(7, seq).expect("id"),
+            ActuatorFamily::MarkovPrewarm,
+            ActionClass::MarkovPredictedApp,
+            "markov_prewarm:predicted_app@cache_only".to_string(),
+            3,
+            7,
+            outcome(seq * 2, ArmTerminalState::AppliedNoRevertNeeded, 100),
+            outcome(seq * 2 + 1, ArmTerminalState::WithheldByHoldout, 40),
+            20,
+            20,
+        )
+        .expect("valid pair")
+    }
+
+    #[test]
+    fn the_same_experiment_advances_the_gate_exactly_once() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = markov_pair(1);
+        assert_eq!(
+            lab.consume_exploration_pair(&pair, 1, 1),
+            PairConsumption::Accepted {
+                experiment_id: pair.experiment_id
+            }
+        );
+        for _ in 0..100 {
+            assert_eq!(
+                lab.consume_exploration_pair(&pair, 1, 1),
+                PairConsumption::Duplicate
+            );
+        }
+        assert_eq!(
+            lab.rollout_progress().0,
+            1,
+            "one hundred deliveries, one advance"
+        );
+        let m = lab.metrics();
+        assert_eq!(m.lab_pairs_seen, 101);
+        assert_eq!(m.lab_pairs_accepted, 1);
+        assert_eq!(m.lab_pairs_duplicate, 100);
+        assert_eq!(m.lab_pairs_rejected, 0);
+    }
+
+    #[test]
+    fn an_accepted_pair_names_the_experiment_it_came_from() {
+        // A gate observation with no provenance is a counter, not evidence.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = markov_pair(9);
+        match lab.consume_exploration_pair(&pair, 0, 0) {
+            PairConsumption::Accepted { experiment_id } => {
+                assert_eq!(experiment_id, pair.experiment_id)
+            }
+            other => panic!("expected acceptance, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_control_that_was_never_honoured_blocks_the_gate() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = markov_pair(2);
+        assert_eq!(
+            lab.consume_exploration_pair(&pair, 3, 2),
+            PairConsumption::Rejected(PairRejection::ControlNotHonoured)
+        );
+        assert_eq!(lab.rollout_progress().0, 0);
+        assert_eq!(lab.metrics().lab_pairs_rejected, 1);
+    }
+
+    #[test]
+    fn a_pair_from_an_untrusted_family_is_refused() {
+        use crate::engine::exploration_pair::{ArmTerminalState, ExplorationArmOutcome};
+        use crate::engine::exploration_scheduler::ProbeCorrelation;
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let outcome = |c: u64, st| ExplorationArmOutcome {
+            correlation_id: ProbeCorrelation(c),
+            arm: ExplorationArm::BoostOmission,
+            issued_cycle: 10,
+            settled_cycle: 14,
+            terminal_state: st,
+            utility_micros: 0,
+        };
+        let pair = CompletedExplorationPair::assemble(
+            ExperimentId::new(7, 3).expect("id"),
+            ActuatorFamily::Boost,
+            ActionClass::BoostBackground,
+            "boost:background@omission".to_string(),
+            3,
+            7,
+            outcome(1, ArmTerminalState::AppliedAndReverted),
+            outcome(2, ArmTerminalState::WithheldByHoldout),
+            20,
+            20,
+        )
+        .expect("assembles");
+        assert_eq!(
+            lab.consume_exploration_pair(&pair, 0, 0),
+            PairConsumption::Rejected(PairRejection::UnexpectedFamily)
+        );
+        assert_eq!(lab.rollout_progress().0, 0);
+    }
+
+    #[test]
+    fn a_crash_after_accepting_cannot_turn_a_replay_into_new_evidence() {
+        // The ugliest boundary: pair accepted, process dies, the ledger replays
+        // it on the next boot. If "already consumed" lived only in RAM, the
+        // gate would advance twice on evidence that existed once.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = markov_pair(4);
+        assert!(matches!(
+            lab.consume_exploration_pair(&pair, 1, 1),
+            PairConsumption::Accepted { .. }
+        ));
+        assert_eq!(lab.rollout_progress().0, 1);
+
+        // Crash: only what reached disk survives.
+        let encoded = serde_json::to_string(&lab.persisted()).expect("encode");
+        let decoded: MicroexperimentLabPersisted = serde_json::from_str(&encoded).expect("decode");
+        let (mut restarted, _) = MicroexperimentLab::restore(decoded, origin());
+
+        assert_eq!(
+            restarted.consume_exploration_pair(&pair, 1, 1),
+            PairConsumption::Duplicate,
+            "the replay must be recognised across the restart"
+        );
+        assert_eq!(
+            restarted.rollout_progress().0,
+            1,
+            "and the gate must not move again"
+        );
+    }
+
+    #[test]
+    fn distinct_experiments_each_advance_the_gate_once() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        for seq in 1..=5 {
+            assert!(matches!(
+                lab.consume_exploration_pair(&markov_pair(seq), 0, 0),
+                PairConsumption::Accepted { .. }
+            ));
+        }
+        assert_eq!(lab.rollout_progress().0, 5);
+        assert_eq!(lab.metrics().causal_pairs_consumed, 5);
     }
 
     // ── Shadow evidence invariants ──────────────────────────────────────────
@@ -2756,12 +3047,16 @@ mod rollout_tests {
     fn a_shadow_measurement_never_becomes_causal_evidence() {
         let mut lab = MicroexperimentLab::cold_start(origin());
         prove_shadow_measurement(&mut lab, 1, 1, 1_000);
-        assert_eq!(lab.rollout_progress().0, 1);
+        // A shadow measurement proves the pipeline can measure. It is not a
+        // controlled comparison, so it moves no causal quantity at all — the
+        // gate included.
         assert_eq!(
-            lab.metrics().pair_gold_total,
+            lab.rollout_progress().0,
             0,
-            "measurement capability is not a causal claim"
+            "shadow proves capability, not cause"
         );
+        assert_eq!(lab.metrics().shadow_measurements_proven_total, 1);
+        assert_eq!(lab.metrics().pair_gold_total, 0);
         assert_eq!(lab.metrics().effective_total, 0);
     }
 
@@ -2775,15 +3070,13 @@ mod rollout_tests {
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        for seq in 1..=2 {
-            prove_shadow_measurement(&mut lab, seq, seq, seq * 1_000);
-        }
+        consume_pairs(&mut lab, 2, 1);
         // Monotonic throughout: a clock that goes backwards is itself a reset
         // trigger, and this test is about the threshold, not about regression.
         lab.advance_cycle(3, 3_000, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Shadow, "threshold - 1 stays Shadow");
 
-        prove_shadow_measurement(&mut lab, 3, 4, 4_000);
+        consume_pairs(&mut lab, 1, 3);
         lab.advance_cycle(5, 5_000, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Canary, "threshold promotes");
     }
@@ -2791,8 +3084,7 @@ mod rollout_tests {
     #[test]
     fn a_restart_keeps_earned_evidence_and_invents_none() {
         let mut lab = MicroexperimentLab::cold_start(origin());
-        prove_shadow_measurement(&mut lab, 1, 1, 1_000);
-        prove_shadow_measurement(&mut lab, 2, 2, 2_000);
+        consume_pairs(&mut lab, 2, 1);
         assert_eq!(lab.rollout_progress().0, 2);
 
         let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
@@ -3049,7 +3341,7 @@ mod rollout_tests {
         for seq in 1..=20 {
             let _ = lab.consider_candidate(candidate(seq), PairGates::healthy_enabled(), seq * 100);
         }
-        prove_shadow_measurement(&mut lab, 900, 1, 3_000);
+        consume_pairs(&mut lab, 1, 900);
         let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
         assert_eq!(
             restored.restored_progress,
@@ -3094,7 +3386,7 @@ mod rollout_tests {
             canary_percent: 100,
             canary_min_opportunities: 1,
         };
-        prove_shadow_measurement(&mut lab, 1, 1, 10);
+        consume_pairs(&mut lab, 1, 1);
         lab.advance_cycle(2, 20, PairGates::healthy_enabled());
         assert_eq!(lab.phase(), LabPhase::Canary);
 

@@ -60,6 +60,11 @@ pub struct MicroexperimentTickMetrics {
     pub shadow_would_open_total: u64,
     pub open_pairs: u64,
     pub shadow_measurements_proven_total: u64,
+    pub lab_pairs_seen: u64,
+    pub lab_pairs_accepted: u64,
+    pub lab_pairs_duplicate: u64,
+    pub lab_pairs_rejected: u64,
+    pub causal_pairs_consumed: u64,
     pub shadow_pairs_expired_total: u64,
     pub shadow_pairs_reaped_total: u64,
     pub shadow_open_pairs: u64,
@@ -399,6 +404,11 @@ impl MicroexperimentRuntime {
             shadow_would_open_total: metrics.shadow_would_open_total,
             open_pairs: metrics.open_pairs as u64,
             shadow_measurements_proven_total: metrics.shadow_measurements_proven_total,
+            lab_pairs_seen: metrics.lab_pairs_seen,
+            lab_pairs_accepted: metrics.lab_pairs_accepted,
+            lab_pairs_duplicate: metrics.lab_pairs_duplicate,
+            lab_pairs_rejected: metrics.lab_pairs_rejected,
+            causal_pairs_consumed: metrics.causal_pairs_consumed,
             shadow_pairs_expired_total: metrics.shadow_pairs_expired_total,
             shadow_pairs_reaped_total: metrics.shadow_pairs_reaped_total,
             shadow_open_pairs: metrics.shadow_open_pairs as u64,
@@ -528,6 +538,11 @@ pub fn publish_microexperiment_metrics(
         micro_metrics.shadow_measurements_proven_total;
     out.microexperiment_shadow_measurements_refused_total =
         micro_metrics.shadow_measurements_refused_total;
+    out.microexperiment_lab_pairs_seen = micro_metrics.lab_pairs_seen;
+    out.microexperiment_lab_pairs_accepted = micro_metrics.lab_pairs_accepted;
+    out.microexperiment_lab_pairs_duplicate = micro_metrics.lab_pairs_duplicate;
+    out.microexperiment_lab_pairs_rejected = micro_metrics.lab_pairs_rejected;
+    out.microexperiment_causal_pairs_consumed = micro_metrics.causal_pairs_consumed;
     out.microexperiment_shadow_pairs_expired_total = micro_metrics.shadow_pairs_expired_total;
     out.microexperiment_shadow_pairs_reaped_total = micro_metrics.shadow_pairs_reaped_total;
     out.microexperiment_shadow_open_pairs = micro_metrics.shadow_open_pairs;

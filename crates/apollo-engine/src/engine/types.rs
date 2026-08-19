@@ -984,6 +984,21 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub microexperiment_shadow_open_high_watermark: u64,
 
+    /// Certified pairs offered to the lab, and what became of each. If
+    /// `canary_pairs_completed` grows and the gate does not, these say whether
+    /// the pair never arrived, was rejected, or was a replay.
+    #[serde(default)]
+    pub microexperiment_lab_pairs_seen: u64,
+    #[serde(default)]
+    pub microexperiment_lab_pairs_accepted: u64,
+    #[serde(default)]
+    pub microexperiment_lab_pairs_duplicate: u64,
+    #[serde(default)]
+    pub microexperiment_lab_pairs_rejected: u64,
+    /// Distinct causal experiments counted — the quantity the gate reads.
+    #[serde(default)]
+    pub microexperiment_causal_pairs_consumed: u64,
+
     // ── Micro-canary (MarkovPrewarm only, disabled until explicitly enabled) ──
     /// Whether the producer is sampling at all. False means every counter
     /// below is frozen by design and the daemon behaves exactly as baseline.
