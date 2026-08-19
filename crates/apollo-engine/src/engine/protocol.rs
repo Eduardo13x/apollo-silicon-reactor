@@ -50,6 +50,12 @@ pub enum DaemonRequest {
     UsageExplain {
         name: String,
     },
+    /// Turn the micro-canary on or off. Mutating: enabling it makes the daemon
+    /// start withholding real pre-warms, so it needs the same authority as a
+    /// profile change and is never available to a read-only client.
+    SetCanaryEnabled {
+        enabled: bool,
+    },
     Feedback {
         rating: String,
         note: Option<String>,
@@ -106,6 +112,7 @@ impl DaemonRequest {
             | Self::Restore
             | Self::PanicRestore
             | Self::Feedback { .. }
+            | Self::SetCanaryEnabled { .. }
             | Self::RevertSysctls
             | Self::Purge => true,
         }
@@ -172,6 +179,15 @@ pub enum DaemonResponse {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn enabling_the_canary_requires_the_same_authority_as_a_profile_change() {
+        // Enabling makes the daemon withhold real pre-warms. A read-only client
+        // must never be able to start an intervention.
+        assert!(DaemonRequest::SetCanaryEnabled { enabled: true }.is_privileged());
+        assert!(DaemonRequest::SetCanaryEnabled { enabled: false }.is_privileged());
+        assert!(!DaemonRequest::GetMetrics.is_privileged());
+    }
+
     use super::*;
     use crate::engine::webflow_types::{
         OpaqueId, WebFlowEvent, WebFlowMetrics, WebFlowPhase, WebFlowSource, WEBFLOW_SCHEMA_VERSION,

@@ -65,6 +65,20 @@ enum Commands {
         target: String,
     },
     DumpPolicy,
+    /// Turn the MarkovPrewarm micro-canary on or off.
+    ///
+    /// Enabling it starts B: from the next eligible opportunity the daemon may
+    /// withhold a real pre-warm as an experimental control. At most one in a
+    /// hundred eligible opportunities, one open experiment at a time, and only
+    /// MarkovPrewarm. Withholding a pre-warm removes speculative work rather
+    /// than adding any.
+    ///
+    /// Disabling stops the sampling and lets open experiments drain, so an arm
+    /// already withheld still reaches its pair.
+    Canary {
+        #[arg(value_parser = ["on", "off"])]
+        state: String,
+    },
     Feedback {
         #[arg(value_parser = ["good", "bad"])]
         rating: String,
@@ -303,6 +317,9 @@ fn main() -> anyhow::Result<()> {
             target: to_latency_target(&target),
         }),
         Commands::DumpPolicy => send_request(DaemonRequest::GetLearnedPolicy),
+        Commands::Canary { state } => send_request(DaemonRequest::SetCanaryEnabled {
+            enabled: state == "on",
+        }),
         Commands::Feedback { rating, note } => {
             send_request(DaemonRequest::Feedback { rating, note })
         }

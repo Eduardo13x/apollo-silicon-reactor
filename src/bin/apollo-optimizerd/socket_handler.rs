@@ -688,6 +688,27 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             append_jsonl(&feedback_path, &entry);
             DaemonResponse::Ok
         }
+        DaemonRequest::SetCanaryEnabled { enabled } => {
+            // Enabling starts B: from the next eligible opportunity the daemon
+            // may withhold a real pre-warm. Disabling stops the sampling and
+            // lets open experiments drain, so an arm already taken from the
+            // machine still reaches its pair.
+            let mut canary = state.micro_canary.lock_recover();
+            if enabled {
+                canary.enable();
+            } else {
+                canary.disable();
+            }
+            let m = canary.metrics();
+            tracing::warn!(
+                enabled,
+                sampled = m.sampled,
+                control_issued = m.control_issued,
+                control_honoured = m.control_honoured,
+                "micro-canary switch"
+            );
+            DaemonResponse::Ok
+        }
         DaemonRequest::GetSysctlGovernor => {
             let status = state.hardware.lock_recover().sysctl_governor_status.clone();
             DaemonResponse::SysctlGovernor(status)
