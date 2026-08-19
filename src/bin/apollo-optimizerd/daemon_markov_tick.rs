@@ -667,77 +667,16 @@ pub fn run_markov_tick(
         } else {
             false
         };
-        // Micro-canary. The opportunity below already passed every normal gate,
-        // so nothing here creates eligibility — it only asks whether this one
-        // should be withheld as a control. Disabled by default: `offer` returns
-        // `Proceed` for everything and the branch is inert.
-        //
-        // The daemon owns no experimental logic. It executes the decision and
-        // reports the outcome; the producer decides, the lab evaluates.
-        let canary_decision = if base_eligible && !markov_control_withheld {
-            state.micro_canary.lock_recover().offer(
-                ActuatorFamily::MarkovPrewarm,
-                ActionClass::MarkovPredictedApp,
-                ExplorationArm::MarkovCacheOnly,
-                "markov_prewarm:predicted_app@cache_only",
-                MICRO_CANARY_POLICY_VERSION,
-                cycle_count,
-            )
-        } else {
-            apollo_engine::engine::micro_canary::ArmDecision::Proceed
-        };
-        let canary_withholds = matches!(
-            canary_decision,
-            apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl { .. }
-        );
         // Both arms are measured on the same yardstick: one call, same family,
         // same horizon, so the objective and its components are identical by
         // construction. The window key is the correlation's ledger id, already
         // namespaced by the scheduler, so it cannot collide with a real
         // decision. Opening both here — before either arm runs — is what makes
         // the only difference between them the actuation itself.
-        let canary_experiment = match &canary_decision {
-            apollo_engine::engine::micro_canary::ArmDecision::Treatment {
-                experiment_id, ..
-            }
-            | apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl {
-                experiment_id,
-                ..
-            } => Some(*experiment_id),
-            apollo_engine::engine::micro_canary::ArmDecision::Proceed => None,
-        };
-        if let Some(experiment_id) = canary_experiment {
-            if let Some((treatment, control)) = state
-                .micro_canary
-                .lock_recover()
-                .correlations(experiment_id)
-            {
-                canary_utility_windows = Some(CanaryWindowRequest {
-                    experiment_id,
-                    treatment_ledger_id: treatment.ledger_correlation_id(),
-                    control_ledger_id: control.ledger_correlation_id(),
-                    horizon_cycles: MICRO_CANARY_HORIZON_CYCLES,
-                });
-            }
-        }
 
         let (specialist_allowed, allow_kernel_acceleration) =
             markov_exploration_admission(admission, exploration_approval.is_some());
-        let mut prewarm_eligible =
-            base_eligible && specialist_allowed && !markov_control_withheld && !canary_withholds;
-        if canary_withholds {
-            // `prewarm_eligible` only ever moves false from here, so the
-            // pre-warm cannot run for this prediction. Confirming now is
-            // confirming an outcome, not an intention.
-            debug_assert!(!prewarm_eligible);
-            state.micro_canary.lock_recover().confirm_control_honoured();
-            decision_events.push(markov_event(
-                pred.app_name.clone(),
-                cycle_count,
-                ActuatorDecisionOutcome::Blocked,
-                "micro-canary control: pre-warm withheld",
-            ));
-        }
+        let mut prewarm_eligible = base_eligible && specialist_allowed && !markov_control_withheld;
         // Cache-only probes may test a cold/new context. Reversible acceleration
         // remains reserved for mature transition evidence.
         markov_acceleration_allowed = allow_kernel_acceleration && cache_warm_allowed;
@@ -855,7 +794,69 @@ pub fn run_markov_tick(
             prewarm_eligible = false;
         }
 
-        if markov_prewarm.is_none() && prewarm_eligible {
+        // Micro-canary. Offered here and nowhere earlier: at this point every
+        // normal gate has passed — eligibility, the specialist, the late
+        // recheck, no lease already held, a resolved pid — and Apollo is about
+        // to pre-warm.
+        //
+        // Offering sooner counted opportunities the daemon was not going to act
+        // on: production showed 75 of them against 0 pre-warms. The control
+        // would have withheld something that was never going to happen, and the
+        // treatment would have treated nothing.
+        //
+        // The assignment still precedes the action: this runs before the block
+        // below, and both utility windows open before `observe`.
+        let canary_decision =
+            if markov_prewarm.is_none() && prewarm_eligible && predicted_pid.is_some() {
+                state.micro_canary.lock_recover().offer(
+                    ActuatorFamily::MarkovPrewarm,
+                    ActionClass::MarkovPredictedApp,
+                    ExplorationArm::MarkovCacheOnly,
+                    "markov_prewarm:predicted_app@cache_only",
+                    MICRO_CANARY_POLICY_VERSION,
+                    cycle_count,
+                )
+            } else {
+                apollo_engine::engine::micro_canary::ArmDecision::Proceed
+            };
+        let canary_withholds = matches!(
+            canary_decision,
+            apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl { .. }
+        );
+        if let Some(experiment_id) = match &canary_decision {
+            apollo_engine::engine::micro_canary::ArmDecision::Treatment {
+                experiment_id, ..
+            }
+            | apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl {
+                experiment_id,
+                ..
+            } => Some(*experiment_id),
+            apollo_engine::engine::micro_canary::ArmDecision::Proceed => None,
+        } {
+            if let Some((treatment, control)) = state
+                .micro_canary
+                .lock_recover()
+                .correlations(experiment_id)
+            {
+                canary_utility_windows = Some(CanaryWindowRequest {
+                    experiment_id,
+                    treatment_ledger_id: treatment.ledger_correlation_id(),
+                    control_ledger_id: control.ledger_correlation_id(),
+                    horizon_cycles: MICRO_CANARY_HORIZON_CYCLES,
+                });
+            }
+        }
+        if canary_withholds {
+            state.micro_canary.lock_recover().confirm_control_honoured();
+            decision_events.push(markov_event(
+                pred.app_name.clone(),
+                cycle_count,
+                ActuatorDecisionOutcome::Blocked,
+                "micro-canary control: pre-warm withheld",
+            ));
+        }
+
+        if markov_prewarm.is_none() && prewarm_eligible && !canary_withholds {
             if let Some(pid) = predicted_pid {
                 if markov_shadow.active.take().is_some() {
                     let mut metrics = state.metrics.lock_recover();
