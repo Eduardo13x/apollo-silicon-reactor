@@ -2963,6 +2963,224 @@ mod rollout_tests {
         assert_eq!(lab.metrics().causal_pairs_consumed, 5);
     }
 
+    // ── Crash boundaries around the durable commit ──────────────────────────
+
+    /// Simulate a crash: only what reached disk survives.
+    fn crash_and_restart(snapshot: &MicroexperimentLabPersisted) -> MicroexperimentLab {
+        let encoded = serde_json::to_string(snapshot).expect("encode");
+        let decoded: MicroexperimentLabPersisted = serde_json::from_str(&encoded).expect("decode");
+        MicroexperimentLab::restore(decoded, origin()).0
+    }
+
+    #[test]
+    fn a_crash_before_the_durable_commit_loses_the_advance_with_the_dedupe() {
+        // The dangerous asymmetry would be losing the dedupe while keeping the
+        // gate advance. They live in one serialised object written by one
+        // atomic rename, so a snapshot taken before the acceptance carries
+        // neither, and the replay is legitimately new work.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let before = lab.persisted();
+        let pair = markov_pair(11);
+        assert!(matches!(
+            lab.consume_exploration_pair(&pair, 0, 0),
+            PairConsumption::Accepted { .. }
+        ));
+        assert_eq!(lab.rollout_progress().0, 1);
+
+        // Crash before that state was written: roll back to the older snapshot.
+        let mut restarted = crash_and_restart(&before);
+        assert_eq!(
+            restarted.rollout_progress().0,
+            0,
+            "the advance was lost too"
+        );
+        assert!(
+            matches!(
+                restarted.consume_exploration_pair(&pair, 0, 0),
+                PairConsumption::Accepted { .. }
+            ),
+            "with neither durable, the replay is new work and counts once"
+        );
+        assert_eq!(restarted.rollout_progress().0, 1);
+    }
+
+    #[test]
+    fn a_crash_after_the_durable_commit_makes_the_replay_a_duplicate() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = markov_pair(12);
+        assert!(matches!(
+            lab.consume_exploration_pair(&pair, 0, 0),
+            PairConsumption::Accepted { .. }
+        ));
+        let after = lab.persisted();
+        let mut restarted = crash_and_restart(&after);
+        assert_eq!(
+            restarted.consume_exploration_pair(&pair, 0, 0),
+            PairConsumption::Duplicate
+        );
+        assert_eq!(restarted.rollout_progress().0, 1, "exactly +1, still");
+    }
+
+    #[test]
+    fn a_replayed_experiment_leaves_the_gate_at_exactly_plus_one() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = markov_pair(13);
+        lab.consume_exploration_pair(&pair, 0, 0);
+        let mut restarted = crash_and_restart(&lab.persisted());
+        for _ in 0..50 {
+            assert_eq!(
+                restarted.consume_exploration_pair(&pair, 0, 0),
+                PairConsumption::Duplicate
+            );
+        }
+        assert_eq!(restarted.rollout_progress().0, 1);
+        assert_eq!(restarted.metrics().lab_pairs_duplicate, 50);
+    }
+
+    #[test]
+    fn no_snapshot_can_hold_a_gate_advance_without_its_dedupe_entry() {
+        // The property the three boundaries above depend on, asserted directly
+        // rather than left as an accident of which struct a field landed in.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        for seq in 1..=6 {
+            lab.consume_exploration_pair(&markov_pair(seq), 0, 0);
+            let snapshot = lab.persisted();
+            let encoded = serde_json::to_string(&snapshot).expect("encode");
+            let decoded: MicroexperimentLabPersisted =
+                serde_json::from_str(&encoded).expect("decode");
+            let (restored, _) = MicroexperimentLab::restore(decoded, origin());
+            assert_eq!(
+                restored.rollout_progress().0 as usize,
+                restored.consumed_experiments.len(),
+                "gate advances and dedupe entries must survive together"
+            );
+        }
+    }
+
+    // ── End to end, synthetic ───────────────────────────────────────────────
+
+    #[test]
+    fn producer_to_pair_to_lab_to_gate_end_to_end() {
+        use crate::engine::exploration_pair::ArmTerminalState;
+        use crate::engine::micro_canary::{ArmDecision, MicroCanary};
+
+        let mut canary = MicroCanary::new(0x5EED);
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let mut produced = 0_u64;
+        let mut cycle = 0_u64;
+
+        while produced < 3 && cycle < 200_000 {
+            cycle += 1;
+            let decision = canary.offer(
+                ActuatorFamily::MarkovPrewarm,
+                ActionClass::MarkovPredictedApp,
+                ExplorationArm::MarkovCacheOnly,
+                "markov_prewarm:predicted_app@cache_only",
+                3,
+                cycle,
+            );
+            let ArmDecision::Proceed = decision else {
+                // Sampled. Run both arms and honour a control if asked.
+                let (id, corr, state) = match &decision {
+                    ArmDecision::Treatment {
+                        experiment_id,
+                        correlation,
+                    } => (
+                        *experiment_id,
+                        *correlation,
+                        ArmTerminalState::AppliedNoRevertNeeded,
+                    ),
+                    ArmDecision::WithholdAsControl {
+                        experiment_id,
+                        correlation,
+                    } => {
+                        canary.confirm_control_honoured();
+                        (
+                            *experiment_id,
+                            *correlation,
+                            ArmTerminalState::WithheldByHoldout,
+                        )
+                    }
+                    ArmDecision::Proceed => unreachable!(),
+                };
+                let utility = if matches!(state, ArmTerminalState::WithheldByHoldout) {
+                    40
+                } else {
+                    100
+                };
+                assert!(canary
+                    .record_arm(id, corr, cycle + 1, state, utility)
+                    .is_none());
+
+                let other = canary.complementary_arm(id).expect("complement");
+                let (corr2, state2) = match &other {
+                    ArmDecision::Treatment { correlation, .. } => {
+                        (*correlation, ArmTerminalState::AppliedNoRevertNeeded)
+                    }
+                    ArmDecision::WithholdAsControl { correlation, .. } => {
+                        canary.confirm_control_honoured();
+                        (*correlation, ArmTerminalState::WithheldByHoldout)
+                    }
+                    ArmDecision::Proceed => unreachable!(),
+                };
+                let utility2 = if matches!(state2, ArmTerminalState::WithheldByHoldout) {
+                    40
+                } else {
+                    100
+                };
+                let pair = canary
+                    .record_arm(id, corr2, cycle + 2, state2, utility2)
+                    .expect("the pair completes");
+                assert_eq!(pair.effect_micros(), 60, "treatment 100 - control 40");
+
+                let m = canary.metrics();
+                assert_eq!(
+                    m.control_issued, m.control_honoured,
+                    "every withheld control was honoured"
+                );
+                assert!(matches!(
+                    lab.consume_exploration_pair(&pair, m.control_issued, m.control_honoured),
+                    PairConsumption::Accepted { .. }
+                ));
+                produced += 1;
+                continue;
+            };
+            canary.expire(cycle + 1_000);
+        }
+
+        assert_eq!(produced, 3, "the producer reached three pairs");
+        assert_eq!(
+            lab.rollout_progress().0,
+            3,
+            "and the gate counted each once"
+        );
+        assert_eq!(lab.metrics().lab_pairs_accepted, 3);
+        assert_eq!(lab.metrics().lab_pairs_rejected, 0);
+        assert_eq!(canary.metrics().assembly_refused, 0);
+    }
+
+    #[test]
+    fn a_run_with_an_unhonoured_control_moves_the_gate_not_at_all() {
+        // The negative path end to end: a certified pair arrives, but the run
+        // it came from left a control unhonoured, so no pair from that run can
+        // be trusted and the gate stays where it was.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = markov_pair(21);
+        assert_eq!(
+            lab.consume_exploration_pair(&pair, 2, 1),
+            PairConsumption::Rejected(PairRejection::ControlNotHonoured)
+        );
+        assert_eq!(lab.rollout_progress().0, 0);
+        assert_eq!(lab.metrics().lab_pairs_rejected, 1);
+        assert_eq!(lab.metrics().lab_pairs_accepted, 0);
+        // And once the gap closes, the same pair is still allowed through.
+        assert!(matches!(
+            lab.consume_exploration_pair(&pair, 2, 2),
+            PairConsumption::Accepted { .. }
+        ));
+        assert_eq!(lab.rollout_progress().0, 1);
+    }
+
     // ── Shadow evidence invariants ──────────────────────────────────────────
 
     #[test]
