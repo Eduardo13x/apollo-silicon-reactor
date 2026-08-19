@@ -65,19 +65,32 @@ enum Commands {
         target: String,
     },
     DumpPolicy,
-    /// Turn the MarkovPrewarm micro-canary on or off.
+    /// Turn the micro-canary on or off.
     ///
     /// Enabling it starts B: from the next eligible opportunity the daemon may
-    /// withhold a real pre-warm as an experimental control. At most one in a
-    /// hundred eligible opportunities, one open experiment at a time, and only
-    /// MarkovPrewarm. Withholding a pre-warm removes speculative work rather
-    /// than adding any.
+    /// withhold a real action as an experimental control. Two families are
+    /// enabled — MarkovPrewarm at 1%, where withholding removes speculative
+    /// work rather than adding any, and InteractionQos at 0.5%, where
+    /// withholding declines one foreground acceleration for its TTL and
+    /// nothing else. Boost stays out. One open experiment per family, two
+    /// globally.
     ///
-    /// Disabling stops the sampling and lets open experiments drain, so an arm
-    /// already withheld still reaches its pair.
+    /// Disabling stops the sampling, clears any armed burst, and lets open
+    /// experiments drain, so an arm already withheld still reaches its pair.
     Canary {
         #[arg(value_parser = ["on", "off"])]
         state: String,
+    },
+    /// Arm a bounded one-shot so the next few eligible opportunities skip the
+    /// sampling lottery. Everything else still applies: the canary must be on,
+    /// the family must be enabled, and the concurrency caps are unchanged.
+    ///
+    /// This exists because the honest rate is too slow to observe, not to
+    /// raise it: the burst is capped, self-expiring, cleared by `canary off`,
+    /// and the pairs it produces are counted separately.
+    CanaryBurst {
+        #[arg(value_parser = clap::value_parser!(u32).range(1..=24))]
+        draws: u32,
     },
     Feedback {
         #[arg(value_parser = ["good", "bad"])]
@@ -320,6 +333,7 @@ fn main() -> anyhow::Result<()> {
         Commands::Canary { state } => send_request(DaemonRequest::SetCanaryEnabled {
             enabled: state == "on",
         }),
+        Commands::CanaryBurst { draws } => send_request(DaemonRequest::ArmCanaryBurst { draws }),
         Commands::Feedback { rating, note } => {
             send_request(DaemonRequest::Feedback { rating, note })
         }

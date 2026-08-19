@@ -57,6 +57,12 @@ pub const INTERACTION_QOS_SAMPLE_PER_MILLE: u64 = 5;
 
 /// Open experiments per family, and in total. One and two: enough to prove the
 /// cycle, small enough that a mistake costs a single withheld prewarm.
+/// Hard ceiling on one burst. A burst is a one-shot to make a rare protocol
+/// observable, not a second sampling rate hiding behind a command.
+pub const MAX_BURST_DRAWS: u32 = 24;
+/// An armed burst lapses on its own, so it cannot sit for days and then fire
+/// against a machine whose state no longer resembles the one it was armed for.
+pub const BURST_TTL_CYCLES: u64 = 5_000;
 pub const MAX_OPEN_PER_FAMILY: usize = 1;
 pub const MAX_OPEN_GLOBAL: usize = 2;
 
@@ -118,6 +124,11 @@ pub struct MicroCanaryMetrics {
     /// Pairs that failed assembly. Non-zero means the producer emitted
     /// something the contract refuses, which is a bug here and not there.
     pub assembly_refused: u64,
+    /// Experiments opened because a burst forced the draw rather than the
+    /// lottery granting it. Reported separately because evidence gathered
+    /// under a forced draw was not sampled at the declared rate, and saying
+    /// otherwise would misdescribe how it was obtained.
+    pub forced_draws: u64,
     /// Treatment arms handed to the caller.
     pub treatment_issued: u64,
     /// Control arms handed to the caller — each one is a real action withheld
@@ -193,6 +204,11 @@ pub struct MicroCanary {
     /// Deterministic stream, so a run can be replayed exactly.
     rng_state: u64,
     enabled: bool,
+    /// Remaining forced draws. Bounded by construction and consumed only when
+    /// an experiment actually opens.
+    burst_remaining: u32,
+    /// Cycle at which an unused burst lapses on its own.
+    burst_expires_cycle: u64,
     open: Vec<OpenExperiment>,
     metrics: MicroCanaryMetrics,
 }
@@ -222,6 +238,8 @@ impl MicroCanary {
             // across boots, so a restart does not replay the same draws.
             rng_state: boot_epoch | 1,
             enabled: true,
+            burst_remaining: 0,
+            burst_expires_cycle: 0,
             open: Vec::with_capacity(MAX_OPEN_GLOBAL),
             metrics: MicroCanaryMetrics::default(),
         }
@@ -239,6 +257,35 @@ impl MicroCanary {
     /// so an arm already withheld still gets its pair.
     pub fn disable(&mut self) {
         self.enabled = false;
+        // A burst is an intent to sample now. Turning the canary off withdraws
+        // that intent; leaving it armed would make the next `on` fire draws
+        // nobody asked for at that moment.
+        self.burst_remaining = 0;
+    }
+
+    /// Arm a bounded burst: the next `draws` eligible opportunities skip the
+    /// lottery, and nothing else.
+    ///
+    /// This exists because the honest sampling rate is too slow to observe.
+    /// InteractionQos reaches its offer on roughly 2.7% of cycles, so 5‰ is
+    /// well under one draw per daemon lifetime — the protocol would be
+    /// unobservable, not because it is broken but because it is rare.
+    ///
+    /// What a burst does **not** do: it does not raise the concurrent exposure
+    /// caps, does not enable a family, does not survive the kill switch, does
+    /// not extend a horizon, and does not decide which arm is the treatment.
+    /// Only the question "is this opportunity an experiment at all" is forced;
+    /// the coin that splits Treatment from Withhold is untouched, which is what
+    /// keeps the resulting pairs valid rather than merely numerous.
+    pub fn arm_burst(&mut self, draws: u32, cycle: u64) -> u32 {
+        let granted = draws.min(MAX_BURST_DRAWS);
+        self.burst_remaining = granted;
+        self.burst_expires_cycle = cycle.saturating_add(BURST_TTL_CYCLES);
+        granted
+    }
+
+    pub fn burst_remaining(&self) -> u32 {
+        self.burst_remaining
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -308,7 +355,8 @@ impl MicroCanary {
         // Draw first, budget second: a budget-refused draw must still consume
         // its share of the rate, or a full budget would silently raise the
         // sampling rate of everything that follows.
-        if self.next_u64() % 1_000 >= Self::sample_per_mille(family) {
+        let forced = self.burst_remaining > 0 && cycle < self.burst_expires_cycle;
+        if !forced && self.next_u64() % 1_000 >= Self::sample_per_mille(family) {
             return ArmDecision::Proceed;
         }
         if !self.budget_allows(family) {
@@ -323,6 +371,13 @@ impl MicroCanary {
             return ArmDecision::Proceed;
         };
         self.next_sequence = sequence;
+        if forced {
+            // Consumed here and not at the draw: a forced draw that the budget
+            // then refused produced no experiment, and charging it would spend
+            // the burst on nothing.
+            self.burst_remaining = self.burst_remaining.saturating_sub(1);
+            self.metrics.forced_draws = self.metrics.forced_draws.saturating_add(1);
+        }
         let treatment_correlation = ProbeCorrelation(self.mint_correlation());
         let control_correlation = ProbeCorrelation(self.mint_correlation());
         let treatment_first = self.next_u64() & 1 == 0;
@@ -657,6 +712,8 @@ impl MicroCanary {
         out.canary_endpoints_late = m.endpoints_late;
         out.canary_endpoints_duplicate = m.endpoints_duplicate;
         out.canary_assembly_refused = m.assembly_refused;
+        out.canary_forced_draws = m.forced_draws;
+        out.canary_burst_remaining = u64::from(self.burst_remaining);
         out.canary_open_experiments = self.open.len() as u64;
         out.canary_open_high_watermark = u64::from(m.open_high_watermark);
         out.canary_observed_per_mille = self.observed_per_mille();
@@ -1330,6 +1387,13 @@ mod tests {
 
     // ── InteractionQos bootstrap ────────────────────────────────────────────
 
+    fn term(d: &ArmDecision) -> ArmTerminalState {
+        match d {
+            ArmDecision::Treatment { .. } => ArmTerminalState::AppliedAndReverted,
+            _ => ArmTerminalState::WithheldByHoldout,
+        }
+    }
+
     fn offer_qos(c: &mut MicroCanary, cycle: u64) -> ArmDecision {
         c.offer(
             ActuatorFamily::InteractionQos,
@@ -1487,6 +1551,150 @@ mod tests {
         }
         assert_eq!(c.metrics().refused_family, 5_000);
         assert_eq!(c.metrics().sampled, 0);
+    }
+
+    // ── bounded burst ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_burst_forces_the_draw_and_nothing_else() {
+        let mut c = canary();
+        c.arm_burst(4, 0);
+        let mut opened = 0u64;
+        for cycle in 0..4u64 {
+            // Each experiment must close before the next can open, because the
+            // burst does not lift MAX_OPEN_PER_FAMILY.
+            match offer_qos(&mut c, cycle * 10) {
+                ArmDecision::Proceed => {}
+                d => {
+                    opened += 1;
+                    let (id, corr) = ids(&d);
+                    c.record_arm(id, corr, cycle * 10 + 1, term(&d), 100);
+                    let other = c.complementary_arm(id).expect("complement");
+                    let (_, corr2) = ids(&other);
+                    c.record_arm(id, corr2, cycle * 10 + 2, term(&other), 40);
+                }
+            }
+        }
+        assert_eq!(opened, 4, "all four forced draws opened");
+        assert_eq!(c.metrics().forced_draws, 4);
+        assert_eq!(c.burst_remaining(), 0, "the burst is spent, not standing");
+
+        // And afterwards the lottery is back. 2000 more opportunities at 5‰
+        // expect about 10 draws — the test is that none of them are *forced*,
+        // and that the rate is the declared one rather than the burst's.
+        let before = c.metrics().sampled;
+        for cycle in 100..2_100u64 {
+            if !matches!(offer_qos(&mut c, cycle), ArmDecision::Proceed) {
+                c.expire(cycle + EXPERIMENT_HORIZON_CYCLES + 1);
+            }
+        }
+        assert_eq!(
+            c.metrics().forced_draws,
+            4,
+            "the burst did not become a permanent rate"
+        );
+        let after = c.metrics().sampled - before;
+        assert!(
+            after < 40,
+            "post-burst sampling is back near 5‰, got {after} of 2000"
+        );
+    }
+
+    #[test]
+    fn a_burst_does_not_choose_the_arm() {
+        // The whole validity of the evidence rests on this: forcing *whether*
+        // an opportunity is an experiment must not touch *which* arm it gets.
+        let mut treatments_first = 0u32;
+        for seed in 0..200u64 {
+            let mut c = MicroCanary::new(BOOT + seed);
+            c.arm_burst(1, 0);
+            let d = offer_qos(&mut c, 0);
+            if matches!(d, ArmDecision::Treatment { .. }) {
+                treatments_first += 1;
+            }
+        }
+        assert!(
+            (60..=140).contains(&treatments_first),
+            "arm assignment is still a coin flip: {treatments_first}/200 treatment-first"
+        );
+    }
+
+    #[test]
+    fn a_burst_is_bounded_and_cannot_be_asked_for_more() {
+        let mut c = canary();
+        assert_eq!(c.arm_burst(10_000, 0), MAX_BURST_DRAWS);
+        assert_eq!(c.burst_remaining(), MAX_BURST_DRAWS);
+    }
+
+    #[test]
+    fn an_unused_burst_lapses_on_its_own() {
+        let mut c = canary();
+        c.arm_burst(8, 0);
+        // Nothing offered until well past the TTL.
+        let late = BURST_TTL_CYCLES + 1;
+        let mut forced = 0u64;
+        for cycle in late..late + 200 {
+            if !matches!(offer_qos(&mut c, cycle), ArmDecision::Proceed) {
+                forced += 1;
+                c.expire(cycle + EXPERIMENT_HORIZON_CYCLES + 1);
+            }
+        }
+        assert_eq!(
+            c.metrics().forced_draws,
+            0,
+            "an expired burst forces nothing"
+        );
+        assert!(forced <= 2, "only the lottery remained: {forced}");
+    }
+
+    #[test]
+    fn a_burst_does_not_survive_the_kill_switch() {
+        let mut c = canary();
+        c.arm_burst(24, 0);
+        c.disable();
+        assert_eq!(c.burst_remaining(), 0);
+        for cycle in 0..1_000u64 {
+            assert_eq!(offer_qos(&mut c, cycle), ArmDecision::Proceed);
+        }
+        assert_eq!(c.metrics().forced_draws, 0);
+    }
+
+    #[test]
+    fn a_burst_does_not_enable_a_family() {
+        let mut c = canary();
+        c.arm_burst(24, 0);
+        for cycle in 0..500u64 {
+            assert_eq!(
+                c.offer(
+                    ActuatorFamily::Boost,
+                    ActionClass::BoostBackground,
+                    ExplorationArm::BoostOmission,
+                    "boost:background@omission",
+                    1,
+                    cycle,
+                ),
+                ArmDecision::Proceed
+            );
+        }
+        assert_eq!(c.metrics().forced_draws, 0);
+        assert_eq!(c.burst_remaining(), MAX_BURST_DRAWS, "nothing was spent");
+    }
+
+    #[test]
+    fn a_forced_draw_the_budget_refuses_is_not_charged() {
+        let mut c = canary();
+        c.arm_burst(2, 0);
+        // First offer opens an experiment and holds the family's only slot.
+        assert!(!matches!(offer_qos(&mut c, 0), ArmDecision::Proceed));
+        assert_eq!(c.burst_remaining(), 1);
+        // Second offer is forced but the budget is full.
+        assert_eq!(offer_qos(&mut c, 1), ArmDecision::Proceed);
+        assert_eq!(
+            c.burst_remaining(),
+            1,
+            "a draw that produced no experiment must not spend the burst"
+        );
+        assert_eq!(c.metrics().refused_budget, 1);
     }
 
     // ── 10. contractual reachability ────────────────────────────────────────

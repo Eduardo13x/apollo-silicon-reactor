@@ -709,6 +709,21 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
             );
             DaemonResponse::Ok
         }
+        DaemonRequest::ArmCanaryBurst { draws } => {
+            // Arming does not enable: a burst on a disabled canary sits at zero
+            // because `disable` clears it, and the operator has to turn the
+            // canary on deliberately either way.
+            let cycle = state.metrics.lock_recover().metrics.cycles;
+            let granted = state.micro_canary.lock_recover().arm_burst(draws, cycle);
+            tracing::warn!(
+                requested = draws,
+                granted,
+                cycle,
+                "micro-canary burst armed — the next {granted} eligible \
+                 opportunities skip the lottery"
+            );
+            DaemonResponse::Ok
+        }
         DaemonRequest::GetSysctlGovernor => {
             let status = state.hardware.lock_recover().sysctl_governor_status.clone();
             DaemonResponse::SysctlGovernor(status)

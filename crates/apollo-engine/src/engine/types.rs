@@ -1057,6 +1057,14 @@ pub struct RuntimeMetrics {
     /// Pairs the contract refused. Non-zero is a defect in the producer.
     #[serde(default)]
     pub canary_assembly_refused: u64,
+    /// Experiments opened because a burst forced the draw. Separate from
+    /// `canary_sampled` on purpose: evidence gathered this way was not drawn
+    /// at the declared rate.
+    #[serde(default)]
+    pub canary_forced_draws: u64,
+    /// Forced draws still armed.
+    #[serde(default)]
+    pub canary_burst_remaining: u64,
     /// Currently open experiments, and the largest number seen this boot.
     #[serde(default)]
     pub canary_open_experiments: u64,

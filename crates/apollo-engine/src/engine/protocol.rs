@@ -56,6 +56,12 @@ pub enum DaemonRequest {
     SetCanaryEnabled {
         enabled: bool,
     },
+    /// Arm a bounded one-shot: the next `draws` eligible opportunities skip the
+    /// sampling lottery and nothing else. Mutating for the same reason as
+    /// `SetCanaryEnabled` — it makes real withholds happen sooner.
+    ArmCanaryBurst {
+        draws: u32,
+    },
     Feedback {
         rating: String,
         note: Option<String>,
@@ -113,6 +119,7 @@ impl DaemonRequest {
             | Self::PanicRestore
             | Self::Feedback { .. }
             | Self::SetCanaryEnabled { .. }
+            | Self::ArmCanaryBurst { .. }
             | Self::RevertSysctls
             | Self::Purge => true,
         }
@@ -185,6 +192,7 @@ mod tests {
         // must never be able to start an intervention.
         assert!(DaemonRequest::SetCanaryEnabled { enabled: true }.is_privileged());
         assert!(DaemonRequest::SetCanaryEnabled { enabled: false }.is_privileged());
+        assert!(DaemonRequest::ArmCanaryBurst { draws: 8 }.is_privileged());
         assert!(!DaemonRequest::GetMetrics.is_privileged());
     }
 
