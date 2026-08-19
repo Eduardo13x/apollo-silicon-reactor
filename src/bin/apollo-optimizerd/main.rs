@@ -7271,6 +7271,30 @@ fn main() -> anyhow::Result<()> {
                     &mut exploration_scheduler,
                     &mut qos_exploration_environment,
                 );
+                // Micro-canary QoS: both windows open here, before `observe`, so the
+                // baseline is the previous cycle's summary and precedes the acceleration
+                // that just ran. Same ordering property as the markov path, pinned by the
+                // medallion tests.
+                if let Some(req) = acceleration_output.canary_utility_windows {
+                    let opened_treatment = telemetry_medallion.open_lab_utility_window(
+                        req.treatment_ledger_id,
+                        apollo_engine::engine::telemetry_medallion::ActuatorFamily::InteractionQos,
+                        req.horizon_cycles,
+                        cycle_count,
+                    );
+                    let opened_control = telemetry_medallion.open_lab_utility_window(
+                        req.control_ledger_id,
+                        apollo_engine::engine::telemetry_medallion::ActuatorFamily::InteractionQos,
+                        req.horizon_cycles,
+                        cycle_count,
+                    );
+                    if !(opened_treatment && opened_control) {
+                        state
+                            .micro_canary
+                            .lock_recover()
+                            .abandon_not_comparable(req.experiment_id);
+                    }
+                }
                 cycle_decision_events.extend_buffer(&acceleration_output.decision_events);
                 // Snapshot causal QoS preferences before exec_outcomes consumes final_actions.
                 // FreezeProcess actions for CPU-dominant processes will be upgraded to
@@ -8170,7 +8194,7 @@ fn main() -> anyhow::Result<()> {
                 {
                     let mut canary = state.micro_canary.lock_recover();
                     for sample in &microexperiment_utilities {
-                        let Some((experiment_id, is_treatment)) =
+                        let Some((experiment_id, is_treatment, family)) =
                             canary.arm_for_ledger_id(sample.decision_id)
                         else {
                             continue;
@@ -8192,10 +8216,16 @@ fn main() -> anyhow::Result<()> {
                             continue;
                         }
                         let terminal = if is_treatment {
-                            // Cache-only pre-warm: non-kernel, nothing to
-                            // revert, which is the closure the contract expects
-                            // for this family.
-                            apollo_engine::engine::exploration_pair::ArmTerminalState::AppliedNoRevertNeeded
+                            // The honest closure differs by family. A cache-only
+                            // pre-warm holds no kernel state and needs no
+                            // revert; a QoS acceleration is applied and then
+                            // released at its TTL, and saying otherwise would
+                            // describe an effect that is still standing.
+                            if family == apollo_engine::engine::telemetry_medallion::ActuatorFamily::InteractionQos {
+                                apollo_engine::engine::exploration_pair::ArmTerminalState::AppliedAndReverted
+                            } else {
+                                apollo_engine::engine::exploration_pair::ArmTerminalState::AppliedNoRevertNeeded
+                            }
                         } else {
                             apollo_engine::engine::exploration_pair::ArmTerminalState::WithheldByHoldout
                         };

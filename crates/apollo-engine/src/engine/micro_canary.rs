@@ -411,12 +411,15 @@ impl MicroCanary {
     ///
     /// The key is `ProbeCorrelation::ledger_correlation_id`, already namespaced
     /// by the scheduler, so it cannot collide with a real decision id.
-    pub fn arm_for_ledger_id(&self, ledger_id: u64) -> Option<(ExperimentId, bool)> {
+    pub fn arm_for_ledger_id(
+        &self,
+        ledger_id: u64,
+    ) -> Option<(ExperimentId, bool, ActuatorFamily)> {
         self.open.iter().find_map(|e| {
             if e.treatment_correlation.ledger_correlation_id() == ledger_id {
-                Some((e.experiment_id, true))
+                Some((e.experiment_id, true, e.family))
             } else if e.control_correlation.ledger_correlation_id() == ledger_id {
-                Some((e.experiment_id, false))
+                Some((e.experiment_id, false, e.family))
             } else {
                 None
             }
@@ -1168,11 +1171,11 @@ mod tests {
         assert_ne!(t.ledger_correlation_id(), k.ledger_correlation_id());
         assert_eq!(
             c.arm_for_ledger_id(t.ledger_correlation_id()),
-            Some((id, true))
+            Some((id, true, ActuatorFamily::MarkovPrewarm))
         );
         assert_eq!(
             c.arm_for_ledger_id(k.ledger_correlation_id()),
-            Some((id, false))
+            Some((id, false, ActuatorFamily::MarkovPrewarm))
         );
         assert_eq!(
             c.arm_for_ledger_id(999_999),
@@ -1323,6 +1326,167 @@ mod tests {
             "every censored pair is attributable to a side"
         );
         assert_eq!(m.pairs_completed, 0);
+    }
+
+    // ── InteractionQos bootstrap ────────────────────────────────────────────
+
+    fn offer_qos(c: &mut MicroCanary, cycle: u64) -> ArmDecision {
+        c.offer(
+            ActuatorFamily::InteractionQos,
+            ActionClass::InteractionForeground,
+            ExplorationArm::InteractionQosStandard,
+            "interaction_qos:foreground@standard",
+            1,
+            cycle,
+        )
+    }
+
+    #[test]
+    fn a_qos_opportunity_reaches_the_producer_and_is_counted() {
+        // The gap this closes: the family was enabled while nothing ever asked
+        // the canary about it, so production ran 24 real activations against
+        // `canary_eligible_seen = 0`.
+        let mut c = canary();
+        for cycle in 0..500u64 {
+            offer_qos(&mut c, cycle);
+        }
+        assert_eq!(
+            c.metrics().eligible_seen,
+            500,
+            "every offered opportunity is counted, sampled or not"
+        );
+        assert_eq!(c.metrics().refused_family, 0, "QoS is an enabled family");
+    }
+
+    #[test]
+    fn qos_is_sampled_at_half_the_markov_rate() {
+        // 5‰ against 10‰. The split between Treatment and Withhold happens
+        // *inside* the sampled set — it does not add a second 5‰ on top.
+        assert_eq!(INTERACTION_QOS_SAMPLE_PER_MILLE, 5);
+        assert_eq!(MARKOV_SAMPLE_PER_MILLE, 10);
+
+        let mut c = canary();
+        for cycle in 0..300_000u64 {
+            offer_qos(&mut c, cycle);
+            c.expire(cycle + EXPERIMENT_HORIZON_CYCLES + 1);
+        }
+        let rate = c.observed_per_mille();
+        assert!(
+            rate <= INTERACTION_QOS_SAMPLE_PER_MILLE as f64 * 1.25,
+            "observed {rate:.2}‰ over the 5‰ ceiling"
+        );
+        let m = c.metrics();
+        assert_eq!(
+            m.treatment_issued + m.control_issued,
+            m.sampled,
+            "the arms partition the sampled set; Withhold is not additional exposure"
+        );
+    }
+
+    #[test]
+    fn an_unsampled_qos_opportunity_behaves_exactly_as_production() {
+        let mut c = canary();
+        let mut proceeded = 0u64;
+        for cycle in 0..2_000u64 {
+            if matches!(offer_qos(&mut c, cycle), ArmDecision::Proceed) {
+                proceeded += 1;
+            }
+        }
+        assert!(
+            proceeded >= 1_900,
+            "the overwhelming majority must be untouched: {proceeded}/2000"
+        );
+    }
+
+    #[test]
+    fn a_disabled_canary_never_withholds_a_qos_acceleration() {
+        let mut c = MicroCanary::new_disabled(BOOT);
+        for cycle in 0..50_000u64 {
+            assert_eq!(offer_qos(&mut c, cycle), ArmDecision::Proceed);
+        }
+        assert_eq!(c.metrics().control_issued, 0);
+        assert_eq!(c.metrics().sampled, 0);
+        assert_eq!(c.metrics().refused_disabled, 50_000);
+    }
+
+    #[test]
+    fn a_qos_experiment_carries_its_family_through_to_the_pair() {
+        // Family identity must survive the whole chain, or the lab cannot tell
+        // protocol evidence from Markov authority.
+        let mut c = canary();
+        let mut decision = None;
+        let mut sampled_at = 0u64;
+        for cycle in 0..100_000u64 {
+            match offer_qos(&mut c, cycle) {
+                ArmDecision::Proceed => continue,
+                other => {
+                    decision = Some(other);
+                    sampled_at = cycle;
+                    break;
+                }
+            }
+        }
+        let d = decision.expect("QoS is sampled eventually");
+        let (id, corr) = ids(&d);
+        let (_, _, family) = c
+            .arm_for_ledger_id(corr.ledger_correlation_id())
+            .expect("the arm is findable by its window key");
+        assert_eq!(family, ActuatorFamily::InteractionQos);
+
+        let first_state = match d {
+            ArmDecision::Treatment { .. } => ArmTerminalState::AppliedAndReverted,
+            _ => ArmTerminalState::WithheldByHoldout,
+        };
+        let first_u = if matches!(d, ArmDecision::Treatment { .. }) {
+            100
+        } else {
+            40
+        };
+        assert!(c
+            .record_arm(id, corr, sampled_at + 1, first_state, first_u)
+            .is_none());
+
+        let other = c.complementary_arm(id).expect("complement");
+        let (_, corr2) = ids(&other);
+        let second_state = match other {
+            ArmDecision::Treatment { .. } => ArmTerminalState::AppliedAndReverted,
+            _ => ArmTerminalState::WithheldByHoldout,
+        };
+        let second_u = if matches!(other, ArmDecision::Treatment { .. }) {
+            100
+        } else {
+            40
+        };
+        let pair = c
+            .record_arm(id, corr2, sampled_at + 2, second_state, second_u)
+            .expect("the pair completes");
+        assert_eq!(pair.family, ActuatorFamily::InteractionQos);
+        assert_eq!(pair.effect_micros(), 60);
+        assert_eq!(
+            pair.treatment.terminal_state,
+            ArmTerminalState::AppliedAndReverted,
+            "a QoS acceleration is applied and released, not left standing"
+        );
+    }
+
+    #[test]
+    fn boost_is_still_refused_by_the_producer() {
+        let mut c = canary();
+        for cycle in 0..5_000u64 {
+            assert_eq!(
+                c.offer(
+                    ActuatorFamily::Boost,
+                    ActionClass::BoostBackground,
+                    ExplorationArm::BoostOmission,
+                    "boost:background@omission",
+                    1,
+                    cycle,
+                ),
+                ArmDecision::Proceed
+            );
+        }
+        assert_eq!(c.metrics().refused_family, 5_000);
+        assert_eq!(c.metrics().sampled, 0);
     }
 
     // ── 10. contractual reachability ────────────────────────────────────────

@@ -336,7 +336,28 @@ fn decide_acceleration_lanes(
 #[derive(Debug, Default)]
 pub struct AccelerationTickOutput {
     pub decision_events: CycleDecisionEvents,
+    /// Utility windows the micro-canary needs opened this cycle. Returned
+    /// rather than opened here, for the same reason as the markov path: the
+    /// Medallion lives in the daemon loop, and the caller opens both windows
+    /// before `observe`, so the baseline precedes the intervention.
+    pub canary_utility_windows: Option<CanaryWindowRequest>,
 }
+
+/// Mirrors the markov path's request. Duplicated deliberately rather than
+/// shared: the two ticks are independent modules, and a shared type would
+/// couple them for the sake of six fields.
+#[derive(Debug, Clone, Copy)]
+pub struct CanaryWindowRequest {
+    pub experiment_id: apollo_engine::engine::exploration_pair::ExperimentId,
+    pub treatment_ledger_id: u64,
+    pub control_ledger_id: u64,
+    pub horizon_cycles: u64,
+}
+
+/// Utility window length for both arms of a QoS experiment.
+const QOS_CANARY_HORIZON_CYCLES: u64 = 20;
+/// Policy version stamped on every QoS micro-canary pair.
+const QOS_CANARY_POLICY_VERSION: u32 = 1;
 
 fn capture_acceleration_forecasts(
     events: &CycleDecisionEvents,
@@ -1835,7 +1856,8 @@ fn update_acceleration_lease_inner(
     cycle: u64,
     exploration_scheduler: &mut ExplorationScheduler,
     exploration_environment: &mut dyn FnMut() -> (ExplorationGates, TimePoint),
-) -> CycleDecisionEvents {
+) -> (CycleDecisionEvents, Option<CanaryWindowRequest>) {
+    let mut canary_utility_windows: Option<CanaryWindowRequest> = None;
     let mut decision_events = CycleDecisionEvents::default();
     let now = Instant::now();
     let acceleration_hint = acceleration_hint.filter(|hint| hint.valid_for(foreground_pid));
@@ -1861,7 +1883,7 @@ fn update_acceleration_lease_inner(
 
     if thermal_action.force_ecores {
         decision_events.extend_buffer(&release_acceleration_lease(controller, state, cycle));
-        return decision_events;
+        return (decision_events, canary_utility_windows);
     }
 
     if controller
@@ -1871,7 +1893,7 @@ fn update_acceleration_lease_inner(
     {
         decision_events.extend_buffer(&release_acceleration_lease(controller, state, cycle));
         controller.cooldown_until = Some(now + LEASE_COOLDOWN);
-        return decision_events;
+        return (decision_events, canary_utility_windows);
     }
 
     let must_release = controller.active.as_ref().is_some_and(|lease| {
@@ -1906,7 +1928,7 @@ fn update_acceleration_lease_inner(
         || target_pid.is_none()
         || controller.cooldown_until.is_some_and(|until| now < until)
     {
-        return decision_events;
+        return (decision_events, canary_utility_windows);
     }
 
     let interaction_bias = reasoning_advice.interaction_bias;
@@ -1939,7 +1961,7 @@ fn update_acceleration_lease_inner(
                         "interaction_qos:foreground".to_string();
                     metrics.metrics.world_model_contextual_last_bias = interaction_bias.score;
                 }
-                return decision_events;
+                return (decision_events, canary_utility_windows);
             }
         }
 
@@ -1962,7 +1984,7 @@ fn update_acceleration_lease_inner(
                 cycle,
             ) {
                 decision_events.extend_buffer(&events);
-                return decision_events;
+                return (decision_events, canary_utility_windows);
             }
             let mut exploration_approval = ExplorationCandidate::new(
                 ActuatorFamily::InteractionQos,
@@ -2068,7 +2090,71 @@ fn update_acceleration_lease_inner(
                     ActuatorDecisionOutcome::NoOp,
                     "all reflex acceleration lanes omitted",
                 ));
-                return decision_events;
+                return (decision_events, canary_utility_windows);
+            }
+            // Micro-canary. Every normal gate has passed — reflex safety, lane
+            // admission, identity, kill switch — and the lease is about to be
+            // acquired. Offering here and nowhere earlier is what makes an
+            // "eligible opportunity" mean one Apollo was going to take.
+            let canary_decision = state.micro_canary.lock_recover().offer(
+                ActuatorFamily::InteractionQos,
+                ActionClass::InteractionForeground,
+                ExplorationArm::InteractionQosStandard,
+                "interaction_qos:foreground@standard",
+                QOS_CANARY_POLICY_VERSION,
+                cycle,
+            );
+            if let Some(experiment_id) = match &canary_decision {
+                apollo_engine::engine::micro_canary::ArmDecision::Treatment {
+                    experiment_id,
+                    ..
+                }
+                | apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl {
+                    experiment_id,
+                    ..
+                } => Some(*experiment_id),
+                apollo_engine::engine::micro_canary::ArmDecision::Proceed => None,
+            } {
+                if let Some((treatment, control)) = state
+                    .micro_canary
+                    .lock_recover()
+                    .correlations(experiment_id)
+                {
+                    canary_utility_windows = Some(CanaryWindowRequest {
+                        experiment_id,
+                        treatment_ledger_id: treatment.ledger_correlation_id(),
+                        control_ledger_id: control.ledger_correlation_id(),
+                        horizon_cycles: QOS_CANARY_HORIZON_CYCLES,
+                    });
+                }
+            }
+            if matches!(
+                canary_decision,
+                apollo_engine::engine::micro_canary::ArmDecision::WithholdAsControl { .. }
+            ) {
+                // The control arm: this one acceleration is withheld, and
+                // nothing else changes. Returning here skips exactly the lease
+                // acquisition below — no other policy, no other process, and
+                // nothing beyond this opportunity's own TTL.
+                //
+                // Deliberately absent: `controller.cooldown_until`. A withheld
+                // opportunity must not suppress the *next* one, or the holdout
+                // stops being one opportunity and becomes a policy change.
+                state.micro_canary.lock_recover().confirm_control_honoured();
+                if let Some(approval) = exploration_approval.take() {
+                    exploration_scheduler.cancel(
+                        approval.metadata.correlation,
+                        apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Cancelled,
+                    );
+                }
+                decision_events.push(acceleration_event(
+                    "interaction_qos:foreground",
+                    selection_root_pid,
+                    cycle,
+                    ActuatorDecisionOutcome::Blocked,
+                    "micro-canary control: acceleration withheld",
+                ));
+                return (decision_events, canary_utility_windows);
             }
             let (acquired, identity_recheck_failed) = acquire_acceleration_lease(
                 state,
@@ -2093,7 +2179,7 @@ fn update_acceleration_lease_inner(
                         exploration_environment().1,
                         CommitEvidence::StaleIdentity,
                     );
-                    return decision_events;
+                    return (decision_events, canary_utility_windows);
                 }
                 let mutated = controller
                     .active
@@ -2132,7 +2218,7 @@ fn update_acceleration_lease_inner(
             }
         }
     }
-    decision_events
+    (decision_events, canary_utility_windows)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2159,7 +2245,7 @@ pub fn update_acceleration_lease(
     let expired = controller.active.as_ref().is_some_and(|lease| {
         Instant::now() >= lease.expires_at || Instant::now() >= lease.hard_deadline
     });
-    let decision_events = update_acceleration_lease_inner(
+    let (decision_events, canary_utility_windows) = update_acceleration_lease_inner(
         state,
         controller,
         fluidity_state,
@@ -2185,7 +2271,10 @@ pub fn update_acceleration_lease(
         .or(prior_root)
         .or(foreground_pid)
         .unwrap_or(0);
-    let mut output = AccelerationTickOutput { decision_events };
+    let mut output = AccelerationTickOutput {
+        decision_events,
+        canary_utility_windows,
+    };
     let interaction_action_key = {
         let metrics = state.metrics.lock_recover();
         match (
