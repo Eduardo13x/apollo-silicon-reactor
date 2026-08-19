@@ -15,6 +15,16 @@ use crate::engine::exploration_scheduler::{
 use crate::engine::telemetry_medallion::ActuatorFamily;
 
 pub const MAX_OPEN_PAIRS: usize = 32;
+/// Terminalised shadow pair ids kept so a late endpoint can be named as late.
+pub const MAX_SHADOW_TERMINAL_MEMORY: usize = 64;
+/// Shadow arms issued per cycle.
+///
+/// The emit→expire→emit loop is already rate-limited upstream: a shadow pair
+/// issues its arm exactly once and is reaped on expiry, so new arms need new
+/// candidates, and the tick produces at most two per cycle. This cap is the
+/// belt to that braces — it makes the bound a property of this module rather
+/// than of a caller that could change.
+pub const MAX_SHADOW_ARMS_PER_CYCLE: usize = 4;
 pub const MAX_COMPLETED_PAIRS: usize = 128;
 pub const MAX_GOLD_DEDUP: usize = 128;
 pub const MAX_SERIALIZED_BYTES: usize = 64 * 1024;
@@ -457,6 +467,10 @@ pub struct LabMetrics {
     /// Shadow closures refused for an endpoint that was not a clean observed
     /// non-synthetic control no-op.
     pub shadow_measurements_refused_total: u64,
+    /// Shadow pairs reaped for passing their deadline.
+    pub shadow_pairs_expired_total: u64,
+    /// Endpoints that arrived after their pair was terminalised.
+    pub shadow_endpoints_late_total: u64,
     pub invalidated_total: u64,
     pub deadline_expired_total: u64,
     /// Arms that expired without ever reporting, outside Shadow. Counted apart
@@ -552,6 +566,14 @@ struct PersistedMetrics {
     /// measurement can be told apart from one that never tried.
     #[serde(default)]
     shadow_measurements_refused_total: u64,
+    /// Shadow pairs reaped because their arm passed its deadline.
+    #[serde(default)]
+    shadow_pairs_expired_total: u64,
+    /// Endpoints that arrived after their pair was terminalised. Named rather
+    /// than silently refused, so a slow observation route is distinguishable
+    /// from a broken one.
+    #[serde(default)]
+    shadow_endpoints_late_total: u64,
     invalidated_total: u64,
     deadline_expired_total: u64,
     #[serde(default)]
@@ -670,6 +692,14 @@ pub struct MicroexperimentLab {
     /// Shadow-phase bookkeeping. Never read by `issue_ready_arms`, so nothing
     /// here can become a real directive. See `ShadowPairRecord`.
     shadow_open: Vec<ShadowPairRecord>,
+    /// Ids of shadow pairs already terminalised. An endpoint arriving after its
+    /// pair was reaped is late, not evidence: without this it would find no
+    /// record, fall through as an unknown pair, and the reason it was refused
+    /// would be indistinguishable from a genuine identity failure.
+    ///
+    /// Bounded and FIFO — remembering every id forever is how a leak comes back
+    /// wearing a different hat.
+    shadow_terminal: VecDeque<PairId>,
     completed: VecDeque<CompletedPairSummary>,
     gold_dedup: VecDeque<PairId>,
     pending_gold: VecDeque<PairGoldRecord>,
@@ -702,6 +732,7 @@ impl MicroexperimentLab {
             next_pair_sequence: 0,
             open: Vec::with_capacity(MAX_OPEN_PAIRS),
             shadow_open: Vec::new(),
+            shadow_terminal: VecDeque::new(),
             completed: VecDeque::with_capacity(MAX_COMPLETED_PAIRS),
             gold_dedup: VecDeque::with_capacity(MAX_GOLD_DEDUP),
             pending_gold: VecDeque::with_capacity(MAX_GOLD_DEDUP),
@@ -832,8 +863,11 @@ impl MicroexperimentLab {
         if self.rollout.phase != LabPhase::Shadow || !gates.inherited_safe {
             return Vec::new();
         }
-        let mut directives = Vec::new();
+        let mut directives = Vec::with_capacity(MAX_SHADOW_ARMS_PER_CYCLE);
         for record in &mut self.shadow_open {
+            if directives.len() >= MAX_SHADOW_ARMS_PER_CYCLE {
+                break;
+            }
             if record.issued.is_some() || record.control_endpoint.is_some() {
                 continue;
             }
@@ -867,6 +901,58 @@ impl MicroexperimentLab {
         directives
     }
 
+    /// Terminalise one shadow pair: drop it and remember the id so a late
+    /// endpoint can be named. Idempotent — reaping an id twice is a no-op, so
+    /// expiry, endpoint arrival, a safety cancellation and shutdown can all
+    /// call it without coordinating.
+    fn terminalise_shadow_pair(&mut self, pair_id: PairId) -> bool {
+        let existed = if let Some(index) = self
+            .shadow_open
+            .iter()
+            .position(|record| record.assignment.id == pair_id)
+        {
+            self.shadow_open.swap_remove(index);
+            true
+        } else {
+            false
+        };
+        if !self.shadow_terminal.contains(&pair_id) {
+            if self.shadow_terminal.len() >= MAX_SHADOW_TERMINAL_MEMORY {
+                self.shadow_terminal.pop_front();
+            }
+            self.shadow_terminal.push_back(pair_id);
+        }
+        existed
+    }
+
+    /// Reap shadow pairs whose arm passed its deadline.
+    ///
+    /// Without this the collection filled with pairs that had already issued,
+    /// `issue_shadow_arms` skipped every one of them, and the whole route went
+    /// quiet — production reached exactly `MAX_OPEN_PAIRS` arms registered and
+    /// the same number expired, then stopped forever.
+    fn reap_expired_shadow_pairs(&mut self, cycle: u64) -> u64 {
+        let expired: Vec<PairId> = self
+            .shadow_open
+            .iter()
+            .filter(|record| {
+                record
+                    .issued
+                    .is_some_and(|issued| cycle > issued.expires_after_cycle)
+            })
+            .map(|record| record.assignment.id)
+            .collect();
+        let mut reaped = 0_u64;
+        for pair_id in expired {
+            if self.terminalise_shadow_pair(pair_id) {
+                reaped += 1;
+                self.metrics.shadow_pairs_expired_total =
+                    self.metrics.shadow_pairs_expired_total.saturating_add(1);
+            }
+        }
+        reaped
+    }
+
     /// Bind an observed endpoint to a shadow pair.
     ///
     /// Accepts only a control arm that genuinely ran as a no-op and completed
@@ -880,6 +966,14 @@ impl MicroexperimentLab {
             .iter()
             .position(|record| record.assignment.id == observation.pair_id)
         else {
+            // Already terminalised. Name it late rather than letting it read as
+            // an unknown pair, and grant nothing: the arm it answers no longer
+            // exists, so the measurement it claims was never bounded by one.
+            if self.shadow_terminal.contains(&observation.pair_id) {
+                self.metrics.shadow_endpoints_late_total =
+                    self.metrics.shadow_endpoints_late_total.saturating_add(1);
+                return true;
+            }
             return false;
         };
         let endpoint = &observation.endpoint;
@@ -889,7 +983,9 @@ impl MicroexperimentLab {
             && endpoint.observed_local
             && !endpoint.synthetic
             && endpoint_matches(&self.shadow_open[index].candidate, endpoint);
+        let pair_id = self.shadow_open[index].assignment.id;
         let record = self.shadow_open.swap_remove(index);
+        self.terminalise_shadow_pair(pair_id);
         if valid {
             self.rollout.shadow_measurements_proven =
                 self.rollout.shadow_measurements_proven.saturating_add(1);
@@ -1075,6 +1171,10 @@ impl MicroexperimentLab {
                 invalidated.push(record);
             }
         }
+        // Shadow pairs expire on the same clock as real ones, and must be reaped
+        // on the same tick. Leaving them behind is what silently closed the
+        // route in production.
+        self.reap_expired_shadow_pairs(cycle);
         if self.rollout.phase != LabPhase::Shadow && self.rollout.canary_failures > 0 {
             invalidated.extend(self.invalidate_all(PairInvalidationReason::Unauthoritative));
             let dropped = self.rollout.reset_to_shadow(now_millis);
@@ -1467,7 +1567,10 @@ impl MicroexperimentLab {
             origin: expected_origin,
             next_pair_sequence: persisted.next_pair_sequence,
             open: Vec::with_capacity(MAX_OPEN_PAIRS),
-            shadow_open: Vec::new(),
+            // Carried so a pair that had not yet issued can re-issue on this
+            // boot. The ones that had are dropped below, with their arms.
+            shadow_open: persisted.shadow_open,
+            shadow_terminal: VecDeque::new(),
             completed: persisted.completed,
             gold_dedup: persisted.gold_dedup,
             pending_gold: VecDeque::with_capacity(MAX_GOLD_DEDUP),
@@ -1516,6 +1619,21 @@ impl MicroexperimentLab {
         // evidence about the host and is carried forward, but the duration gate
         // re-arms from this boot because `now_millis` is monotonic-since-boot
         // and would otherwise be satisfied instantly.
+        // The adapter is new, so any arm registered before the restart is gone
+        // with it. A pair still carrying `issued` can never be answered and
+        // would occupy a slot forever; un-issued pairs are still legitimate and
+        // simply re-issue on this boot.
+        let stale_shadow = lab
+            .shadow_open
+            .iter()
+            .filter(|record| record.issued.is_some())
+            .count();
+        lab.shadow_open.retain(|record| record.issued.is_none());
+        lab.metrics.shadow_pairs_expired_total = lab
+            .metrics
+            .shadow_pairs_expired_total
+            .saturating_add(stale_shadow as u64);
+        lab.shadow_terminal.clear();
         let shadow_eligible = lab.rollout.shadow_eligible;
         // Evidence earned is durable: a measurement the host actually produced
         // stays produced across a restart. Exposure is carried too, but only
@@ -1572,6 +1690,8 @@ impl MicroexperimentLab {
             shadow_would_open_total: self.metrics.shadow_would_open_total,
             shadow_measurements_proven_total: self.metrics.shadow_measurements_proven_total,
             shadow_measurements_refused_total: self.metrics.shadow_measurements_refused_total,
+            shadow_pairs_expired_total: self.metrics.shadow_pairs_expired_total,
+            shadow_endpoints_late_total: self.metrics.shadow_endpoints_late_total,
             invalidated_total: self.metrics.invalidated_total,
             deadline_expired_total: self.metrics.deadline_expired_total,
             unbound_expiries_total: self.metrics.unbound_expiries_total,
@@ -1996,13 +2116,22 @@ mod rollout_tests {
         let cand = candidate(sequence);
         lab.consider_candidate(cand.clone(), PairGates::healthy_enabled(), now_millis)
             .expect("shadow candidate accepted");
-        let directives = lab.issue_shadow_arms(cycle, PairGates::healthy_enabled());
-        // Candidates share an action_key; the stratum hash is what makes this
-        // one distinct, so bind by that or a later pair steals the endpoint.
-        let directive = directives
-            .iter()
-            .find(|d| d.stratum_hash == cand.stratum_hash)
-            .expect("shadow arm issued");
+        // Arms are rate-limited per cycle, so the pair we just created may sit
+        // behind others. Drain in bounded rounds until ours is issued.
+        let mut directive = None;
+        for round in 0..64 {
+            let issued = lab.issue_shadow_arms(cycle + round, PairGates::healthy_enabled());
+            // Candidates share an action_key; the stratum hash is what makes
+            // this one distinct, so bind by that or another pair steals it.
+            if let Some(found) = issued
+                .into_iter()
+                .find(|d| d.stratum_hash == cand.stratum_hash)
+            {
+                directive = Some(found);
+                break;
+            }
+        }
+        let directive = &directive.expect("shadow arm issued");
         assert!(directive.observe_only, "a shadow arm must be observe-only");
         let observation = endpoint(&cand, directive, 0);
         let disposition = lab
@@ -2641,6 +2770,153 @@ mod rollout_tests {
             "evidence actually earned survives a restart"
         );
         assert_eq!(restored.phase(), LabPhase::Shadow);
+    }
+
+    // ── Shadow lifecycle / soak, on a controlled clock ──────────────────────
+
+    /// Create a tracked shadow pair and issue its arm, returning the deadline.
+    fn open_shadow_arm(lab: &mut MicroexperimentLab, seq: u64, cycle: u64) -> u64 {
+        let cand = candidate(seq);
+        lab.consider_candidate(cand.clone(), PairGates::healthy_enabled(), cycle * 10)
+            .expect("candidate accepted");
+        let directives = lab.issue_shadow_arms(cycle, PairGates::healthy_enabled());
+        directives
+            .iter()
+            .find(|d| d.stratum_hash == cand.stratum_hash)
+            .map(|d| d.expires_after_cycle)
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_full_shadow_collection_drains_on_expiry_and_accepts_new_work() {
+        // Production shape: exactly MAX_OPEN_PAIRS arms registered, exactly that
+        // many expired, and then silence. Nothing reaped the pairs, so every
+        // slot stayed occupied by a pair that had already issued.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let mut deadline = 0;
+        let mut cycle = 1;
+        while lab.shadow_open.len() < MAX_OPEN_PAIRS {
+            // Arms are rate-limited per cycle, so filling takes several ticks.
+            let d = open_shadow_arm(&mut lab, cycle, cycle);
+            deadline = deadline.max(d);
+            cycle += 1;
+            assert!(cycle < 500, "filling must terminate");
+        }
+        assert_eq!(lab.shadow_open.len(), MAX_OPEN_PAIRS);
+
+        // Push the clock past every deadline and tick once.
+        let after = deadline + 1;
+        lab.advance_cycle(after, after * 10, PairGates::healthy_enabled());
+        assert_eq!(
+            lab.shadow_open.len(),
+            0,
+            "every expired shadow pair must be reaped, not left holding a slot"
+        );
+        assert_eq!(
+            lab.metrics().shadow_pairs_expired_total,
+            MAX_OPEN_PAIRS as u64
+        );
+
+        // Slot 33 is now reachable.
+        let d = open_shadow_arm(&mut lab, 9_001, after + 1);
+        assert!(d > 0, "a new arm must issue once the collection drained");
+        assert_eq!(lab.shadow_open.len(), 1);
+    }
+
+    #[test]
+    fn repeated_fill_and_expiry_stays_bounded() {
+        // Soak: the emit→expire→emit loop must not grow anything without bound.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let mut cycle = 1_u64;
+        let mut seq = 1_u64;
+        for _round in 0..6 {
+            let mut deadline = 0;
+            for _ in 0..MAX_OPEN_PAIRS {
+                deadline = deadline.max(open_shadow_arm(&mut lab, seq, cycle));
+                seq += 1;
+                cycle += 1;
+            }
+            cycle = cycle.max(deadline + 1);
+            lab.advance_cycle(cycle, cycle * 10, PairGates::healthy_enabled());
+            assert!(
+                lab.shadow_open.len() <= MAX_OPEN_PAIRS,
+                "the collection must never exceed its ceiling"
+            );
+            assert!(
+                lab.shadow_terminal.len() <= MAX_SHADOW_TERMINAL_MEMORY,
+                "terminal memory must stay bounded: {}",
+                lab.shadow_terminal.len()
+            );
+            cycle += 1;
+        }
+        assert_eq!(lab.shadow_open.len(), 0);
+        assert_eq!(lab.rollout_progress().0, 0, "churn is not evidence");
+    }
+
+    #[test]
+    fn a_late_endpoint_neither_resurrects_a_pair_nor_pays_twice() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let cand = candidate(1);
+        lab.consider_candidate(cand.clone(), PairGates::healthy_enabled(), 10)
+            .unwrap();
+        let directives = lab.issue_shadow_arms(1, PairGates::healthy_enabled());
+        let directive = directives[0].clone();
+        let deadline = directive.expires_after_cycle;
+
+        lab.advance_cycle(
+            deadline + 1,
+            (deadline + 1) * 10,
+            PairGates::healthy_enabled(),
+        );
+        assert_eq!(lab.shadow_open.len(), 0);
+
+        // The endpoint arrives after the reaping.
+        let observation = endpoint(&cand, &directive, 0);
+        assert!(lab.record_shadow_endpoint(&observation));
+        assert_eq!(
+            lab.rollout_progress().0,
+            0,
+            "a late endpoint answers an arm that no longer exists"
+        );
+        assert_eq!(lab.metrics().shadow_endpoints_late_total, 1);
+        assert_eq!(lab.shadow_open.len(), 0, "and must not resurrect the pair");
+
+        // A duplicate of the same late endpoint pays nothing either.
+        assert!(lab.record_shadow_endpoint(&observation));
+        assert_eq!(lab.metrics().shadow_endpoints_late_total, 2);
+        assert_eq!(lab.rollout_progress().0, 0);
+    }
+
+    #[test]
+    fn terminalising_the_same_pair_twice_is_a_no_op() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.consider_candidate(candidate(1), PairGates::healthy_enabled(), 10)
+            .unwrap();
+        let id = lab.shadow_open[0].assignment.id;
+        assert!(lab.terminalise_shadow_pair(id), "first call removes it");
+        assert!(
+            !lab.terminalise_shadow_pair(id),
+            "second call finds nothing"
+        );
+        assert_eq!(lab.shadow_terminal.iter().filter(|x| **x == id).count(), 1);
+    }
+
+    #[test]
+    fn a_restart_drops_shadow_pairs_whose_arm_no_longer_exists() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        open_shadow_arm(&mut lab, 1, 1);
+        lab.consider_candidate(candidate(2), PairGates::healthy_enabled(), 20)
+            .unwrap();
+        assert_eq!(lab.shadow_open.len(), 2);
+
+        let (restored, _) = MicroexperimentLab::restore(lab.persisted(), origin());
+        assert_eq!(
+            restored.shadow_open.len(),
+            1,
+            "the issued pair answers an adapter that died with the old boot"
+        );
+        assert!(restored.shadow_open[0].issued.is_none());
+        assert!(restored.shadow_terminal.is_empty());
     }
 
     #[test]
