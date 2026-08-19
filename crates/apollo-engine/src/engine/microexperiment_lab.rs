@@ -467,8 +467,15 @@ pub struct LabMetrics {
     /// Shadow closures refused for an endpoint that was not a clean observed
     /// non-synthetic control no-op.
     pub shadow_measurements_refused_total: u64,
-    /// Shadow pairs reaped for passing their deadline.
+    /// Arms that passed their deadline (a detection).
     pub shadow_pairs_expired_total: u64,
+    /// Shadow pairs actually removed from the collection (a removal).
+    pub shadow_pairs_reaped_total: u64,
+    /// Current size of the shadow collection. The quantity a baseline needs to
+    /// assert `shadow_open < MAX_OPEN_PAIRS` directly instead of inferring it.
+    pub shadow_open_pairs: usize,
+    /// Largest size seen this boot.
+    pub shadow_open_high_watermark: u32,
     /// Endpoints that arrived after their pair was terminalised.
     pub shadow_endpoints_late_total: u64,
     pub invalidated_total: u64,
@@ -566,9 +573,20 @@ struct PersistedMetrics {
     /// measurement can be told apart from one that never tried.
     #[serde(default)]
     shadow_measurements_refused_total: u64,
-    /// Shadow pairs reaped because their arm passed its deadline.
+    /// Arms that passed their deadline. A *detection* event, distinct from the
+    /// removal below: contrasting the two is how a pair that expires without
+    /// being removed becomes visible instead of quietly holding a slot.
     #[serde(default)]
     shadow_pairs_expired_total: u64,
+    /// Shadow pairs actually removed from the collection, whatever removed
+    /// them — deadline, endpoint, or a restart discarding a stale arm.
+    #[serde(default)]
+    shadow_pairs_reaped_total: u64,
+    /// Largest `shadow_open` ever observed this boot. A gauge read once a
+    /// cycle can sit at zero through a burst that touched the ceiling; the
+    /// high-water mark cannot.
+    #[serde(default)]
+    shadow_open_high_watermark: u32,
     /// Endpoints that arrived after their pair was terminalised. Named rather
     /// than silently refused, so a slow observation route is distinguishable
     /// from a broken one.
@@ -848,6 +866,10 @@ impl MicroexperimentLab {
                 issued: None,
                 control_endpoint: None,
             });
+            let len = self.shadow_open.len() as u32;
+            if len > self.metrics.shadow_open_high_watermark {
+                self.metrics.shadow_open_high_watermark = len;
+            }
         }
         Ok(assignment)
     }
@@ -916,6 +938,10 @@ impl MicroexperimentLab {
         } else {
             false
         };
+        if existed {
+            self.metrics.shadow_pairs_reaped_total =
+                self.metrics.shadow_pairs_reaped_total.saturating_add(1);
+        }
         if !self.shadow_terminal.contains(&pair_id) {
             if self.shadow_terminal.len() >= MAX_SHADOW_TERMINAL_MEMORY {
                 self.shadow_terminal.pop_front();
@@ -1629,9 +1655,12 @@ impl MicroexperimentLab {
             .filter(|record| record.issued.is_some())
             .count();
         lab.shadow_open.retain(|record| record.issued.is_none());
-        lab.metrics.shadow_pairs_expired_total = lab
+        // A restart discarding a stale arm is a removal, not a deadline. Folding
+        // it into `expired` would break the `expired == reaped` contrast that
+        // makes an un-reaped expiry visible.
+        lab.metrics.shadow_pairs_reaped_total = lab
             .metrics
-            .shadow_pairs_expired_total
+            .shadow_pairs_reaped_total
             .saturating_add(stale_shadow as u64);
         lab.shadow_terminal.clear();
         let shadow_eligible = lab.rollout.shadow_eligible;
@@ -1691,6 +1720,9 @@ impl MicroexperimentLab {
             shadow_measurements_proven_total: self.metrics.shadow_measurements_proven_total,
             shadow_measurements_refused_total: self.metrics.shadow_measurements_refused_total,
             shadow_pairs_expired_total: self.metrics.shadow_pairs_expired_total,
+            shadow_pairs_reaped_total: self.metrics.shadow_pairs_reaped_total,
+            shadow_open_pairs: self.shadow_open.len(),
+            shadow_open_high_watermark: self.metrics.shadow_open_high_watermark,
             shadow_endpoints_late_total: self.metrics.shadow_endpoints_late_total,
             invalidated_total: self.metrics.invalidated_total,
             deadline_expired_total: self.metrics.deadline_expired_total,
@@ -2821,6 +2853,67 @@ mod rollout_tests {
         let d = open_shadow_arm(&mut lab, 9_001, after + 1);
         assert!(d > 0, "a new arm must issue once the collection drained");
         assert_eq!(lab.shadow_open.len(), 1);
+    }
+
+    #[test]
+    fn the_shadow_collection_is_observable_and_stays_under_its_ceiling() {
+        // The previous baseline asserted this through `open_pairs`, which is
+        // `self.open` — the *real* pair collection, always empty in Shadow. It
+        // passed by vacuity. These are the shadow collection's own numbers.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        assert_eq!(lab.metrics().shadow_open_pairs, 0);
+        assert_eq!(lab.metrics().shadow_open_high_watermark, 0);
+
+        let mut deadline = 0;
+        let mut cycle = 1;
+        while lab.shadow_open.len() < MAX_OPEN_PAIRS {
+            deadline = deadline.max(open_shadow_arm(&mut lab, cycle, cycle));
+            cycle += 1;
+            assert!(cycle < 500, "filling must terminate");
+            assert!(
+                lab.metrics().shadow_open_pairs <= MAX_OPEN_PAIRS,
+                "the ceiling is never exceeded"
+            );
+        }
+        assert_eq!(lab.metrics().shadow_open_pairs, MAX_OPEN_PAIRS);
+        assert_eq!(
+            lab.metrics().shadow_open_high_watermark,
+            MAX_OPEN_PAIRS as u32,
+            "a burst that touched the ceiling must remain visible after it drains"
+        );
+
+        let after = deadline + 1;
+        lab.advance_cycle(after, after * 10, PairGates::healthy_enabled());
+        assert_eq!(
+            lab.metrics().shadow_open_pairs,
+            0,
+            "the gauge follows the drain"
+        );
+        assert_eq!(
+            lab.metrics().shadow_open_high_watermark,
+            MAX_OPEN_PAIRS as u32,
+            "the high-water mark does not fall back with the gauge"
+        );
+    }
+
+    #[test]
+    fn an_expiry_that_is_not_reaped_would_be_visible() {
+        // The two counters answer different questions on purpose: one counts
+        // deadlines detected, the other slots actually freed. They agreed here,
+        // and a future divergence is precisely the silent-slot bug returning.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let mut deadline = 0;
+        for seq in 1..=5 {
+            deadline = deadline.max(open_shadow_arm(&mut lab, seq, seq));
+        }
+        let after = deadline + 1;
+        lab.advance_cycle(after, after * 10, PairGates::healthy_enabled());
+        let m = lab.metrics();
+        assert_eq!(m.shadow_pairs_expired_total, 5);
+        assert_eq!(
+            m.shadow_pairs_reaped_total, m.shadow_pairs_expired_total,
+            "every deadline detected must have freed its slot"
+        );
     }
 
     #[test]

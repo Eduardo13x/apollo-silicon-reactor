@@ -969,6 +969,20 @@ pub struct RuntimeMetrics {
     /// Endpoints that arrived after their pair was terminalised.
     #[serde(default)]
     pub microexperiment_shadow_endpoints_late_total: u64,
+    /// Shadow pairs actually removed. Contrast with `..._expired_total`: an
+    /// expiry that never becomes a removal is a slot held forever, which is
+    /// how the route went silent in the first place.
+    #[serde(default)]
+    pub microexperiment_shadow_pairs_reaped_total: u64,
+    /// Current size of the shadow collection — the quantity a baseline needs
+    /// in order to assert the ceiling directly rather than infer it from arms
+    /// still being registered.
+    #[serde(default)]
+    pub microexperiment_shadow_open_pairs: u64,
+    /// Largest size seen this boot. A gauge sampled once a cycle can read zero
+    /// straight through a burst that touched the ceiling.
+    #[serde(default)]
+    pub microexperiment_shadow_open_high_watermark: u64,
     /// Pairs no longer open, whatever ended them. Renamed from
     /// `microexperiment_completed_pairs`, which read as "finished" while every
     /// one of the 9 it reported had been interrupted.

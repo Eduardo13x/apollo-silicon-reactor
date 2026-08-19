@@ -61,6 +61,9 @@ pub struct MicroexperimentTickMetrics {
     pub open_pairs: u64,
     pub shadow_measurements_proven_total: u64,
     pub shadow_pairs_expired_total: u64,
+    pub shadow_pairs_reaped_total: u64,
+    pub shadow_open_pairs: u64,
+    pub shadow_open_high_watermark: u64,
     pub shadow_endpoints_late_total: u64,
     pub shadow_measurements_refused_total: u64,
     pub terminal_pairs: u64,
@@ -397,6 +400,9 @@ impl MicroexperimentRuntime {
             open_pairs: metrics.open_pairs as u64,
             shadow_measurements_proven_total: metrics.shadow_measurements_proven_total,
             shadow_pairs_expired_total: metrics.shadow_pairs_expired_total,
+            shadow_pairs_reaped_total: metrics.shadow_pairs_reaped_total,
+            shadow_open_pairs: metrics.shadow_open_pairs as u64,
+            shadow_open_high_watermark: u64::from(metrics.shadow_open_high_watermark),
             shadow_endpoints_late_total: metrics.shadow_endpoints_late_total,
             shadow_measurements_refused_total: metrics.shadow_measurements_refused_total,
             terminal_pairs: metrics.terminal_pairs as u64,
@@ -523,6 +529,9 @@ pub fn publish_microexperiment_metrics(
     out.microexperiment_shadow_measurements_refused_total =
         micro_metrics.shadow_measurements_refused_total;
     out.microexperiment_shadow_pairs_expired_total = micro_metrics.shadow_pairs_expired_total;
+    out.microexperiment_shadow_pairs_reaped_total = micro_metrics.shadow_pairs_reaped_total;
+    out.microexperiment_shadow_open_pairs = micro_metrics.shadow_open_pairs;
+    out.microexperiment_shadow_open_high_watermark = micro_metrics.shadow_open_high_watermark;
     out.microexperiment_shadow_endpoints_late_total = micro_metrics.shadow_endpoints_late_total;
     out.microexperiment_terminal_pairs = micro_metrics.terminal_pairs;
     out.microexperiment_completed_pairs_valid = micro_metrics.completed_pairs_valid;
