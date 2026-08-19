@@ -99,6 +99,22 @@ pub struct MicroCanaryMetrics {
     /// Pairs that failed assembly. Non-zero means the producer emitted
     /// something the contract refuses, which is a bug here and not there.
     pub assembly_refused: u64,
+    /// Treatment arms handed to the caller.
+    pub treatment_issued: u64,
+    /// Control arms handed to the caller — each one is a real action withheld
+    /// from the machine, so this is the number that measures the intervention.
+    pub control_issued: u64,
+    /// Controls the caller reported it actually honoured. It should track
+    /// `control_issued`; a gap means something was asked to be withheld and
+    /// went ahead anyway, which is the one outcome that would invalidate a
+    /// pair without any counter noticing.
+    pub control_honoured: u64,
+    /// Arms reported in each terminal state.
+    pub arms_applied_reverted: u64,
+    pub arms_applied_no_revert: u64,
+    pub arms_withheld: u64,
+    /// Largest number of simultaneously open experiments seen this boot.
+    pub open_high_watermark: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -260,17 +276,32 @@ impl MicroCanary {
         });
         self.metrics.sampled = self.metrics.sampled.saturating_add(1);
 
+        let open_len = self.open.len() as u32;
+        if open_len > self.metrics.open_high_watermark {
+            self.metrics.open_high_watermark = open_len;
+        }
+
         if treatment_first {
+            self.metrics.treatment_issued = self.metrics.treatment_issued.saturating_add(1);
             ArmDecision::Treatment {
                 experiment_id,
                 correlation: treatment_correlation,
             }
         } else {
+            self.metrics.control_issued = self.metrics.control_issued.saturating_add(1);
             ArmDecision::WithholdAsControl {
                 experiment_id,
                 correlation: control_correlation,
             }
         }
+    }
+
+    /// The caller confirms it actually withheld the action it was asked to
+    /// withhold. Separate from issuing on purpose: a control that was issued
+    /// and then quietly performed anyway produces a pair whose control arm is
+    /// not a control, and no other counter would show it.
+    pub fn confirm_control_honoured(&mut self) {
+        self.metrics.control_honoured = self.metrics.control_honoured.saturating_add(1);
     }
 
     fn mint_correlation(&mut self) -> u64 {
@@ -335,6 +366,7 @@ impl MicroCanary {
             terminal_state,
             utility_micros,
         };
+        let complete;
         {
             let e = &mut self.open[index];
             let slot = if correlation == e.treatment_correlation {
@@ -352,9 +384,26 @@ impl MicroCanary {
                 return None;
             }
             *slot = Some(outcome);
-            if !e.is_complete() {
-                return None;
+            complete = e.is_complete();
+        }
+        // Counted where the arm is recorded, not where the pair completes: the
+        // first arm of every experiment returns early, so counting after the
+        // completeness check would have made half of them invisible.
+        match terminal_state {
+            ArmTerminalState::AppliedAndReverted => {
+                self.metrics.arms_applied_reverted =
+                    self.metrics.arms_applied_reverted.saturating_add(1)
             }
+            ArmTerminalState::AppliedNoRevertNeeded => {
+                self.metrics.arms_applied_no_revert =
+                    self.metrics.arms_applied_no_revert.saturating_add(1)
+            }
+            ArmTerminalState::WithheldByHoldout => {
+                self.metrics.arms_withheld = self.metrics.arms_withheld.saturating_add(1)
+            }
+        }
+        if !complete {
+            return None;
         }
 
         let e = self.open.swap_remove(index);
@@ -394,6 +443,35 @@ impl MicroCanary {
         let dropped = (before - self.open.len()) as u64;
         self.metrics.pairs_expired = self.metrics.pairs_expired.saturating_add(dropped);
         dropped
+    }
+
+    /// Copy this producer's accounting onto `RuntimeMetrics`.
+    ///
+    /// Lives here rather than in the daemon loop: three counters were added to
+    /// the lab and never reached that struct, each time because the mapping sat
+    /// inline where no test could walk it.
+    pub fn publish(&self, out: &mut crate::engine::types::RuntimeMetrics) {
+        let m = &self.metrics;
+        out.canary_enabled = self.enabled;
+        out.canary_eligible_seen = m.eligible_seen;
+        out.canary_sampled = m.sampled;
+        out.canary_refused_budget = m.refused_budget;
+        out.canary_refused_family = m.refused_family;
+        out.canary_refused_disabled = m.refused_disabled;
+        out.canary_treatment_issued = m.treatment_issued;
+        out.canary_control_issued = m.control_issued;
+        out.canary_control_honoured = m.control_honoured;
+        out.canary_arms_applied_reverted = m.arms_applied_reverted;
+        out.canary_arms_applied_no_revert = m.arms_applied_no_revert;
+        out.canary_arms_withheld = m.arms_withheld;
+        out.canary_pairs_completed = m.pairs_completed;
+        out.canary_pairs_expired = m.pairs_expired;
+        out.canary_endpoints_late = m.endpoints_late;
+        out.canary_endpoints_duplicate = m.endpoints_duplicate;
+        out.canary_assembly_refused = m.assembly_refused;
+        out.canary_open_experiments = self.open.len() as u64;
+        out.canary_open_high_watermark = u64::from(m.open_high_watermark);
+        out.canary_observed_per_mille = self.observed_per_mille();
     }
 
     /// Observed sampling rate per thousand. For a kill condition that reads
@@ -718,6 +796,100 @@ mod tests {
             _ => ArmTerminalState::WithheldByHoldout,
         };
         assert!(c.record_arm(id, corr2, 12, state2, 1).is_some());
+    }
+
+    #[test]
+    fn an_issued_control_that_was_never_honoured_is_visible() {
+        // The one failure no other counter would show: the caller is told to
+        // withhold, goes ahead anyway, and the pair's control arm is not a
+        // control. Issuing and honouring are counted separately so the gap
+        // between them is readable.
+        let mut c = canary();
+        let mut issued_controls = 0;
+        for cycle in 0..40_000u64 {
+            if let ArmDecision::WithholdAsControl { .. } = c.offer(
+                ActuatorFamily::MarkovPrewarm,
+                ActionClass::MarkovPredictedApp,
+                ExplorationArm::MarkovCacheOnly,
+                "markov_prewarm:predicted_app@cache_only",
+                3,
+                cycle,
+            ) {
+                issued_controls += 1;
+                if issued_controls > 1 {
+                    // Deliberately do not confirm this one.
+                    break;
+                }
+                c.confirm_control_honoured();
+            }
+            c.expire(cycle + EXPERIMENT_HORIZON_CYCLES + 1);
+        }
+        assert!(issued_controls >= 2, "the draw must reach two controls");
+        assert_eq!(c.metrics().control_issued, issued_controls);
+        assert_eq!(
+            c.metrics().control_honoured,
+            issued_controls - 1,
+            "the unhonoured control shows as a gap, not as silence"
+        );
+    }
+
+    #[test]
+    fn terminal_states_and_the_open_watermark_are_counted() {
+        let mut c = canary();
+        let pair = complete_one(&mut c, 10).expect("pair");
+        let m = c.metrics();
+        assert_eq!(m.arms_withheld, 1, "exactly one control arm settled");
+        assert_eq!(
+            m.arms_applied_reverted + m.arms_applied_no_revert,
+            1,
+            "and exactly one treatment arm"
+        );
+        assert!(m.open_high_watermark >= 1, "the peak is remembered");
+        assert_eq!(m.pairs_completed, 1);
+        assert_eq!(
+            pair.control.terminal_state,
+            ArmTerminalState::WithheldByHoldout
+        );
+    }
+
+    #[test]
+    fn every_canary_counter_reaches_runtime_metrics() {
+        // The same walk that caught three counters stopping short of
+        // `RuntimeMetrics` in the lab. Drive one full experiment so nothing is
+        // zero by accident, then require each field to arrive.
+        let mut c = canary();
+        complete_one(&mut c, 10).expect("pair");
+        c.confirm_control_honoured();
+        c.offer(
+            ActuatorFamily::Boost,
+            ActionClass::BoostBackground,
+            ExplorationArm::BoostOmission,
+            "boost:background@omission",
+            3,
+            11,
+        );
+        let mut out = crate::engine::types::RuntimeMetrics::default();
+        c.publish(&mut out);
+
+        assert!(out.canary_enabled);
+        assert_eq!(out.canary_eligible_seen, c.metrics().eligible_seen);
+        assert_eq!(out.canary_sampled, 1);
+        assert_eq!(out.canary_refused_family, 1);
+        assert_eq!(out.canary_control_honoured, 1);
+        assert_eq!(out.canary_arms_withheld, 1);
+        assert_eq!(
+            out.canary_arms_applied_reverted + out.canary_arms_applied_no_revert,
+            1
+        );
+        assert_eq!(out.canary_pairs_completed, 1);
+        assert_eq!(out.canary_assembly_refused, 0);
+        assert!(out.canary_open_high_watermark >= 1);
+        assert!(out.canary_observed_per_mille > 0.0);
+        assert_eq!(
+            out.canary_treatment_issued + out.canary_control_issued,
+            1,
+            "one arm was handed out for the one experiment"
+        );
     }
 
     // ── 10. contractual reachability ────────────────────────────────────────

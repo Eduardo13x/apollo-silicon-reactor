@@ -983,6 +983,67 @@ pub struct RuntimeMetrics {
     /// straight through a burst that touched the ceiling.
     #[serde(default)]
     pub microexperiment_shadow_open_high_watermark: u64,
+
+    // ── Micro-canary (MarkovPrewarm only, disabled until explicitly enabled) ──
+    /// Whether the producer is sampling at all. False means every counter
+    /// below is frozen by design and the daemon behaves exactly as baseline.
+    #[serde(default)]
+    pub canary_enabled: bool,
+    /// Opportunities offered, all of them already eligible.
+    #[serde(default)]
+    pub canary_eligible_seen: u64,
+    /// Opportunities drawn into an experiment.
+    #[serde(default)]
+    pub canary_sampled: u64,
+    /// Draws refused because a budget was full, a family is not enabled, or
+    /// the kill switch is off. Kept apart so a quiet canary can be told from a
+    /// blocked one.
+    #[serde(default)]
+    pub canary_refused_budget: u64,
+    #[serde(default)]
+    pub canary_refused_family: u64,
+    #[serde(default)]
+    pub canary_refused_disabled: u64,
+    /// Arms handed to the caller. `control_issued` counts real actions
+    /// withheld from the machine — the size of the intervention.
+    #[serde(default)]
+    pub canary_treatment_issued: u64,
+    #[serde(default)]
+    pub canary_control_issued: u64,
+    /// Controls the caller confirmed it honoured. A gap against
+    /// `canary_control_issued` means something was asked to be withheld and
+    /// went ahead, which no other counter would reveal.
+    #[serde(default)]
+    pub canary_control_honoured: u64,
+    /// Arms by terminal state.
+    #[serde(default)]
+    pub canary_arms_applied_reverted: u64,
+    #[serde(default)]
+    pub canary_arms_applied_no_revert: u64,
+    #[serde(default)]
+    pub canary_arms_withheld: u64,
+    /// Experiments that produced a certified pair.
+    #[serde(default)]
+    pub canary_pairs_completed: u64,
+    /// Experiments abandoned at their horizon with an arm missing.
+    #[serde(default)]
+    pub canary_pairs_expired: u64,
+    #[serde(default)]
+    pub canary_endpoints_late: u64,
+    #[serde(default)]
+    pub canary_endpoints_duplicate: u64,
+    /// Pairs the contract refused. Non-zero is a defect in the producer.
+    #[serde(default)]
+    pub canary_assembly_refused: u64,
+    /// Currently open experiments, and the largest number seen this boot.
+    #[serde(default)]
+    pub canary_open_experiments: u64,
+    #[serde(default)]
+    pub canary_open_high_watermark: u64,
+    /// Observed sampling rate per thousand eligible. The rate that happened,
+    /// not the one configured.
+    #[serde(default)]
+    pub canary_observed_per_mille: f64,
     /// Pairs no longer open, whatever ended them. Renamed from
     /// `microexperiment_completed_pairs`, which read as "finished" while every
     /// one of the 9 it reported had been interrupted.
