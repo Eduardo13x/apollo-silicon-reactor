@@ -98,6 +98,7 @@ pub mod mediator;
 pub mod memory_analyzer;
 pub mod memory_budget;
 pub mod meta_cognition;
+pub mod micro_canary;
 pub mod microexperiment_actions;
 pub mod microexperiment_endpoints;
 pub mod microexperiment_lab;
