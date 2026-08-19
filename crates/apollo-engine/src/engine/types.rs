@@ -955,8 +955,24 @@ pub struct RuntimeMetrics {
     pub microexperiment_shadow_would_open_total: u64,
     #[serde(default)]
     pub microexperiment_open_pairs: u64,
+    /// EVIDENCE. Shadow pairs closed on a valid observed control endpoint —
+    /// the quantity that actually gates promotion out of Shadow. Distinct from
+    /// `microexperiment_shadow_would_open_total`, which is exposure.
     #[serde(default)]
-    pub microexperiment_completed_pairs: u64,
+    pub microexperiment_shadow_measurements_proven_total: u64,
+    #[serde(default)]
+    pub microexperiment_shadow_measurements_refused_total: u64,
+    /// Pairs no longer open, whatever ended them. Renamed from
+    /// `microexperiment_completed_pairs`, which read as "finished" while every
+    /// one of the 9 it reported had been interrupted.
+    #[serde(default)]
+    pub microexperiment_terminal_pairs: u64,
+    /// Pairs that closed without interruption — the number to read when asking
+    /// whether the lab finished anything.
+    #[serde(default)]
+    pub microexperiment_completed_pairs_valid: u64,
+    #[serde(default)]
+    pub microexperiment_interrupted_pairs: u64,
     #[serde(default)]
     pub microexperiment_control_endpoints_total: u64,
     #[serde(default)]

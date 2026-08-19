@@ -3217,7 +3217,19 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.microexperiment_shadow_would_open_total =
                         micro_metrics.shadow_would_open_total;
                     metrics.metrics.microexperiment_open_pairs = micro_metrics.open_pairs;
-                    metrics.metrics.microexperiment_completed_pairs = micro_metrics.completed_pairs;
+                    metrics
+                        .metrics
+                        .microexperiment_shadow_measurements_proven_total =
+                        micro_metrics.shadow_measurements_proven_total;
+                    metrics
+                        .metrics
+                        .microexperiment_shadow_measurements_refused_total =
+                        micro_metrics.shadow_measurements_refused_total;
+                    metrics.metrics.microexperiment_terminal_pairs = micro_metrics.terminal_pairs;
+                    metrics.metrics.microexperiment_completed_pairs_valid =
+                        micro_metrics.completed_pairs_valid;
+                    metrics.metrics.microexperiment_interrupted_pairs =
+                        micro_metrics.interrupted_pairs;
                     metrics.metrics.microexperiment_control_endpoints_total =
                         micro_metrics.control_endpoints_total;
                     metrics.metrics.microexperiment_treatment_endpoints_total =

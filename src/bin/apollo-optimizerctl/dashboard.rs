@@ -650,14 +650,23 @@ fn render_think_q(status: &DaemonStatus) -> Vec<String> {
             m.microexperiment_phase,
             compact_counter(m.microexperiment_shadow_would_open_total),
             compact_counter(m.microexperiment_open_pairs),
-            // Shadow issues no arms at all, so a pair can never close Gold in
-            // this phase. Printing 0 reads as a measured failure rather than a
-            // quantity that is not yet defined.
+            // Shadow issues observe-only arms and can prove it measures, but a
+            // Gold closure needs an applied treatment, which Shadow never does.
+            // Printing 0 would read as a measured failure rather than a
+            // quantity that is not yet defined in this phase.
             if m.microexperiment_phase == "shadow" && m.microexperiment_pair_gold_total == 0 {
                 "Gn/a".to_string()
             } else {
                 format!("G{}", compact_counter(m.microexperiment_pair_gold_total))
             },
+        ));
+        // Exposure and evidence side by side. They were the same number until
+        // the gate was corrected, and printing only one of them is how a lab
+        // that had measured nothing looked like a lab making progress.
+        lines.push(format!(
+            "       seen{} meas{}",
+            compact_counter(m.microexperiment_shadow_would_open_total),
+            compact_counter(m.microexperiment_shadow_measurements_proven_total),
         ));
         if m.microexperiment_rollout_required > 0 {
             lines.push(format!(

@@ -464,7 +464,15 @@ pub struct LabMetrics {
     pub unbound_expiries_total: u64,
     pub rollback_failed_total: u64,
     pub open_pairs: usize,
-    pub completed_pairs: usize,
+    /// Pairs no longer open, **whatever ended them** — a clean closure and an
+    /// interrupted one both land here. Named for what it counts: production
+    /// read 9 "completed" while all 9 were interrupted.
+    pub terminal_pairs: usize,
+    /// Pairs that reached a closure without being interrupted. This is the one
+    /// to read when asking whether the lab finished anything.
+    pub completed_pairs_valid: usize,
+    /// Pairs that ended by interruption, invalidation or deadline.
+    pub interrupted_pairs: usize,
     pub mean_effect: f64,
 }
 
@@ -1569,7 +1577,17 @@ impl MicroexperimentLab {
             unbound_expiries_total: self.metrics.unbound_expiries_total,
             rollback_failed_total: self.metrics.rollback_failed_total,
             open_pairs: self.open.len(),
-            completed_pairs: self.completed.len(),
+            terminal_pairs: self.completed.len(),
+            completed_pairs_valid: self
+                .completed
+                .iter()
+                .filter(|summary| !summary.interrupted)
+                .count(),
+            interrupted_pairs: self
+                .completed
+                .iter()
+                .filter(|summary| summary.interrupted)
+                .count(),
             mean_effect,
         }
     }
@@ -2623,6 +2641,35 @@ mod rollout_tests {
             "evidence actually earned survives a restart"
         );
         assert_eq!(restored.phase(), LabPhase::Shadow);
+    }
+
+    #[test]
+    fn an_interrupted_pair_is_never_counted_as_a_completed_one() {
+        // Production shape: 9 terminal pairs, every one of them interrupted,
+        // published as `completed_pairs = 9`. A reader could not tell that the
+        // lab had finished exactly nothing.
+        let mut lab = active_lab();
+        for seq in 1..=9u64 {
+            let assignment = match lab
+                .consider_candidate(candidate(seq), PairGates::healthy_enabled(), seq * 10)
+                .expect("pair opens in Active")
+            {
+                CandidateDisposition::Opened(assignment) => assignment,
+                other => panic!("expected an opened pair, got {other:?}"),
+            };
+            lab.invalidate_pair(assignment.id, PairInvalidationReason::DeadlineExpired)
+                .expect("pair invalidated");
+        }
+        let metrics = lab.metrics();
+        assert_eq!(metrics.terminal_pairs, 9, "nine pairs did end");
+        assert_eq!(
+            metrics.interrupted_pairs, 9,
+            "and all nine ended by interruption"
+        );
+        assert_eq!(
+            metrics.completed_pairs_valid, 0,
+            "so the lab finished nothing, and the number must say so"
+        );
     }
 
     #[test]
