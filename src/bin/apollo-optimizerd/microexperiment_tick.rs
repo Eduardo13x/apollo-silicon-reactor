@@ -65,6 +65,7 @@ pub struct MicroexperimentTickMetrics {
     pub lab_pairs_duplicate: u64,
     pub lab_pairs_rejected: u64,
     pub causal_pairs_consumed: u64,
+    pub protocol_pairs_validated: u64,
     pub shadow_pairs_expired_total: u64,
     pub shadow_pairs_reaped_total: u64,
     pub shadow_open_pairs: u64,
@@ -421,6 +422,7 @@ impl MicroexperimentRuntime {
             lab_pairs_duplicate: metrics.lab_pairs_duplicate,
             lab_pairs_rejected: metrics.lab_pairs_rejected,
             causal_pairs_consumed: metrics.causal_pairs_consumed,
+            protocol_pairs_validated: metrics.protocol_pairs_validated,
             shadow_pairs_expired_total: metrics.shadow_pairs_expired_total,
             shadow_pairs_reaped_total: metrics.shadow_pairs_reaped_total,
             shadow_open_pairs: metrics.shadow_open_pairs as u64,
@@ -555,6 +557,7 @@ pub fn publish_microexperiment_metrics(
     out.microexperiment_lab_pairs_duplicate = micro_metrics.lab_pairs_duplicate;
     out.microexperiment_lab_pairs_rejected = micro_metrics.lab_pairs_rejected;
     out.microexperiment_causal_pairs_consumed = micro_metrics.causal_pairs_consumed;
+    out.microexperiment_protocol_pairs_validated = micro_metrics.protocol_pairs_validated;
     out.microexperiment_shadow_pairs_expired_total = micro_metrics.shadow_pairs_expired_total;
     out.microexperiment_shadow_pairs_reaped_total = micro_metrics.shadow_pairs_reaped_total;
     out.microexperiment_shadow_open_pairs = micro_metrics.shadow_open_pairs;

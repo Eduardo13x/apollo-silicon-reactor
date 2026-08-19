@@ -46,6 +46,14 @@ use crate::engine::telemetry_medallion::ActuatorFamily;
 /// one pair has ever completed would be optimising a rate that has never once
 /// produced a result.
 pub const MARKOV_SAMPLE_PER_MILLE: u64 = 10;
+/// InteractionQos, at half the Markov rate. Enabled as a **bootstrap**: Markov
+/// pre-warms never fire on this host, so the causal chain has never once run
+/// end to end. QoS actuates for real, so it can prove the machinery works.
+///
+/// Its evidence proves the protocol and nothing else — `consume_exploration_pair`
+/// keeps `causal_pairs_consumed` to MarkovPrewarm, so no number of QoS pairs
+/// can move `LabPhase` or hand any family authority it did not earn.
+pub const INTERACTION_QOS_SAMPLE_PER_MILLE: u64 = 5;
 
 /// Open experiments per family, and in total. One and two: enough to prove the
 /// cycle, small enough that a mistake costs a single withheld prewarm.
@@ -237,10 +245,23 @@ impl MicroCanary {
         self.enabled
     }
 
-    /// Only MarkovPrewarm, and only for now. Widening this is a decision with
-    /// evidence behind it, not a constant someone edits.
+    /// MarkovPrewarm and, as a bootstrap, InteractionQos. Boost stays out.
     fn family_enabled(family: ActuatorFamily) -> bool {
-        matches!(family, ActuatorFamily::MarkovPrewarm)
+        matches!(
+            family,
+            ActuatorFamily::MarkovPrewarm | ActuatorFamily::InteractionQos
+        )
+    }
+
+    /// Sampling ceiling per family. Different rates because the families carry
+    /// different risk: withholding a speculative pre-warm removes work, while
+    /// withholding a QoS activation touches something the user is interacting
+    /// with, so it is drawn half as often.
+    fn sample_per_mille(family: ActuatorFamily) -> u64 {
+        match family {
+            ActuatorFamily::InteractionQos => INTERACTION_QOS_SAMPLE_PER_MILLE,
+            _ => MARKOV_SAMPLE_PER_MILLE,
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -287,7 +308,7 @@ impl MicroCanary {
         // Draw first, budget second: a budget-refused draw must still consume
         // its share of the rate, or a full budget would silently raise the
         // sampling rate of everything that follows.
-        if self.next_u64() % 1_000 >= MARKOV_SAMPLE_PER_MILLE {
+        if self.next_u64() % 1_000 >= Self::sample_per_mille(family) {
             return ArmDecision::Proceed;
         }
         if !self.budget_allows(family) {
@@ -904,11 +925,12 @@ mod tests {
 
     #[test]
     fn a_blocked_family_never_starves_the_others() {
-        // Only MarkovPrewarm is enabled, so every other family must pass
-        // through untouched however long Markov holds its slot.
+        // Boost is not enabled, so it must pass through untouched however long
+        // an enabled family holds its slot. InteractionQos is enabled now as a
+        // bootstrap, so it is no longer the example of a blocked family.
         let mut c = canary();
         offer_until_sampled(&mut c, 10).expect("markov holds its slot");
-        for family in [ActuatorFamily::Boost, ActuatorFamily::InteractionQos] {
+        for family in [ActuatorFamily::Boost] {
             for _ in 0..1_000 {
                 assert_eq!(
                     c.offer(

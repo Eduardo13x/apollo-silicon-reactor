@@ -495,8 +495,11 @@ pub struct LabMetrics {
     pub lab_pairs_accepted: u64,
     pub lab_pairs_duplicate: u64,
     pub lab_pairs_rejected: u64,
-    /// Distinct causal experiments counted — what the gate reads.
+    /// Distinct causal experiments counted — what the gate reads. Markov only.
     pub causal_pairs_consumed: u64,
+    /// Complete causal chains observed that grant no authority. Derived from
+    /// the two counters above, not stored.
+    pub protocol_pairs_validated: u64,
     /// Arms that passed their deadline (a detection).
     pub shadow_pairs_expired_total: u64,
     /// Shadow pairs actually removed from the collection (a removal).
@@ -1013,23 +1016,56 @@ impl MicroexperimentLab {
             self.metrics.lab_pairs_rejected = self.metrics.lab_pairs_rejected.saturating_add(1);
             return PairConsumption::Rejected(PairRejection::ControlNotHonoured);
         }
-        // Only the family the micro-canary is enabled for. A pair from anywhere
-        // else did not come from the authority this gate trusts.
-        if pair.family != ActuatorFamily::MarkovPrewarm {
+        // Two kinds of acceptance, and the difference is authority.
+        //
+        // A pair proves the experimental protocol works end to end whatever
+        // family produced it — that is a statement about the machinery. It is
+        // not a statement about the family the *gate* governs. `LabPhase` is
+        // global, so letting any family's evidence advance it would hand every
+        // other family mutation authority it never earned.
+        //
+        // So only MarkovPrewarm touches `causal_pairs_consumed`, the quantity
+        // `advance_rollout` reads. Everything else is recorded, deduplicated
+        // and counted, and moves no phase.
+        // Boost is not an authorised family for the micro-canary, so a pair
+        // claiming to be one did not come from the producer this lab trusts.
+        // Refused rather than merely un-counted: an unexpected origin is a fact
+        // worth surfacing, not silence.
+        if !matches!(
+            pair.family,
+            ActuatorFamily::MarkovPrewarm | ActuatorFamily::InteractionQos
+        ) {
             self.metrics.lab_pairs_rejected = self.metrics.lab_pairs_rejected.saturating_add(1);
             return PairConsumption::Rejected(PairRejection::UnexpectedFamily);
         }
+        let governs_rollout = pair.family == ActuatorFamily::MarkovPrewarm;
 
         if self.consumed_experiments.len() >= MAX_CONSUMED_EXPERIMENTS {
             self.consumed_experiments.pop_front();
         }
         self.consumed_experiments.push_back(pair.experiment_id);
         self.metrics.lab_pairs_accepted = self.metrics.lab_pairs_accepted.saturating_add(1);
-        self.metrics.causal_pairs_consumed = self.metrics.causal_pairs_consumed.saturating_add(1);
-        self.rollout.causal_pairs_consumed = self.rollout.causal_pairs_consumed.saturating_add(1);
+        if governs_rollout {
+            self.metrics.causal_pairs_consumed =
+                self.metrics.causal_pairs_consumed.saturating_add(1);
+            self.rollout.causal_pairs_consumed =
+                self.rollout.causal_pairs_consumed.saturating_add(1);
+        }
         PairConsumption::Accepted {
             experiment_id: pair.experiment_id,
         }
+    }
+
+    /// Complete causal chains observed that grant no authority to anyone.
+    ///
+    /// **Derived, not stored.** Accepted pairs minus the ones that govern the
+    /// rollout is exactly the set that proved the protocol without promoting a
+    /// family. A separate persisted counter would be a second source of truth
+    /// for a fact these two already contain.
+    pub fn protocol_pairs_validated(&self) -> u64 {
+        self.metrics
+            .lab_pairs_accepted
+            .saturating_sub(self.metrics.causal_pairs_consumed)
     }
 
     /// Terminalise one shadow pair: drop it and remember the id so a late
@@ -1839,6 +1875,7 @@ impl MicroexperimentLab {
             lab_pairs_duplicate: self.metrics.lab_pairs_duplicate,
             lab_pairs_rejected: self.metrics.lab_pairs_rejected,
             causal_pairs_consumed: self.metrics.causal_pairs_consumed,
+            protocol_pairs_validated: self.protocol_pairs_validated(),
             shadow_pairs_expired_total: self.metrics.shadow_pairs_expired_total,
             shadow_pairs_reaped_total: self.metrics.shadow_pairs_reaped_total,
             shadow_open_pairs: self.shadow_open.len(),
@@ -2961,6 +2998,120 @@ mod rollout_tests {
         }
         assert_eq!(lab.rollout_progress().0, 5);
         assert_eq!(lab.metrics().causal_pairs_consumed, 5);
+    }
+
+    fn qos_pair(seq: u64) -> CompletedExplorationPair {
+        use crate::engine::exploration_pair::{ArmTerminalState, ExplorationArmOutcome};
+        use crate::engine::exploration_scheduler::ProbeCorrelation;
+        let outcome = |c: u64, st, u| ExplorationArmOutcome {
+            correlation_id: ProbeCorrelation(c),
+            arm: ExplorationArm::InteractionQosStandard,
+            issued_cycle: 10,
+            settled_cycle: 14,
+            terminal_state: st,
+            utility_micros: u,
+        };
+        CompletedExplorationPair::assemble(
+            ExperimentId::new(7, 5_000 + seq).expect("id"),
+            ActuatorFamily::InteractionQos,
+            ActionClass::InteractionForeground,
+            "interaction_qos:foreground@standard".to_string(),
+            3,
+            7,
+            outcome(9_000 + seq * 2, ArmTerminalState::AppliedAndReverted, 100),
+            outcome(9_001 + seq * 2, ArmTerminalState::WithheldByHoldout, 40),
+            20,
+            20,
+        )
+        .expect("valid pair")
+    }
+
+    #[test]
+    fn eight_qos_pairs_cannot_promote_the_phase_or_let_markov_open_a_real_pair() {
+        // The test that decides whether the bootstrap is safe at all. `LabPhase`
+        // is global, so if QoS evidence could advance it, MarkovPrewarm would
+        // gain the authority to open real pairs on evidence it never produced.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.rollout_config = LabRolloutConfig {
+            shadow_min_opportunities: 1,
+            shadow_min_measurements: 8,
+            shadow_min_duration_ms: 0,
+            canary_percent: 100,
+            canary_min_opportunities: 1,
+        };
+
+        for seq in 1..=8 {
+            assert!(
+                matches!(
+                    lab.consume_exploration_pair(&qos_pair(seq), 0, 0),
+                    PairConsumption::Accepted { .. }
+                ),
+                "a QoS pair is valid evidence of the protocol"
+            );
+        }
+
+        // The protocol was demonstrated eight times.
+        assert_eq!(lab.protocol_pairs_validated(), 8);
+        assert_eq!(lab.metrics().lab_pairs_accepted, 8);
+        // And the gate has not moved a single step.
+        assert_eq!(
+            lab.rollout_progress().0,
+            0,
+            "QoS evidence must not advance the Markov gate"
+        );
+        assert_eq!(lab.metrics().causal_pairs_consumed, 0);
+
+        lab.advance_cycle(100, 100_000, PairGates::healthy_enabled());
+        assert_eq!(
+            lab.phase(),
+            LabPhase::Shadow,
+            "eight QoS pairs must leave the phase exactly where it was"
+        );
+
+        // And with the phase still Shadow, a Markov candidate cannot open a
+        // real pair — the authority was never transferred.
+        let disposition = lab
+            .consider_candidate(candidate(1), PairGates::healthy_enabled(), 200_000)
+            .expect("candidate considered");
+        assert!(
+            matches!(disposition, CandidateDisposition::Shadow(_)),
+            "Markov must still be simulated, not opened: {disposition:?}"
+        );
+        assert!(lab.open.is_empty(), "no real pair was opened");
+    }
+
+    #[test]
+    fn markov_evidence_still_moves_the_gate_and_qos_evidence_does_not() {
+        // The two are recorded side by side and only one carries authority.
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        lab.consume_exploration_pair(&qos_pair(1), 0, 0);
+        assert_eq!(lab.rollout_progress().0, 0);
+        assert_eq!(lab.protocol_pairs_validated(), 1);
+
+        lab.consume_exploration_pair(&markov_pair(1), 0, 0);
+        assert_eq!(lab.rollout_progress().0, 1, "Markov evidence gates");
+        assert_eq!(
+            lab.protocol_pairs_validated(),
+            1,
+            "and is not double counted as protocol-only validation"
+        );
+    }
+
+    #[test]
+    fn a_qos_pair_is_deduplicated_like_any_other() {
+        let mut lab = MicroexperimentLab::cold_start(origin());
+        let pair = qos_pair(3);
+        assert!(matches!(
+            lab.consume_exploration_pair(&pair, 0, 0),
+            PairConsumption::Accepted { .. }
+        ));
+        for _ in 0..20 {
+            assert_eq!(
+                lab.consume_exploration_pair(&pair, 0, 0),
+                PairConsumption::Duplicate
+            );
+        }
+        assert_eq!(lab.protocol_pairs_validated(), 1);
     }
 
     // ── Crash boundaries around the durable commit ──────────────────────────

@@ -996,8 +996,15 @@ pub struct RuntimeMetrics {
     #[serde(default)]
     pub microexperiment_lab_pairs_rejected: u64,
     /// Distinct causal experiments counted — the quantity the gate reads.
+    /// MarkovPrewarm only: `LabPhase` is global, so letting another family's
+    /// evidence advance it would hand every family authority it never earned.
     #[serde(default)]
     pub microexperiment_causal_pairs_consumed: u64,
+    /// Complete causal chains observed end to end that grant no authority to
+    /// anyone — the bootstrap evidence that the experimental machinery works.
+    /// Derived from accepted minus gating pairs, not separately stored.
+    #[serde(default)]
+    pub microexperiment_protocol_pairs_validated: u64,
 
     // ── Micro-canary (MarkovPrewarm only, disabled until explicitly enabled) ──
     /// Whether the producer is sampling at all. False means every counter
