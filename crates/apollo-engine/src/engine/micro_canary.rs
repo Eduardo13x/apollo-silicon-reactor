@@ -528,8 +528,16 @@ impl MicroCanary {
         })
     }
 
-    /// Both correlations of an open experiment, for opening the two identical
-    /// utility windows.
+    /// Both correlations of an open experiment.
+    ///
+    /// **Not for opening both utility windows on one cycle.** The medallion
+    /// scores a system-wide objective from a `before` and an `after` summary
+    /// and ignores the key entirely, so two windows opened on the same cycle
+    /// share both endpoints and yield the same number — an effect of zero by
+    /// construction, for an arm that may never have run. Each arm's window
+    /// belongs to its own opportunity; callers get that key from the
+    /// `ArmDecision` they were handed. This accessor exists for identity
+    /// checks.
     pub fn correlations(
         &self,
         experiment_id: ExperimentId,
@@ -1277,10 +1285,12 @@ mod tests {
 
     #[test]
     fn invariant_2_both_arms_are_measured_on_the_same_yardstick() {
-        // Both keys go to the same `open_lab_utility_window(family, horizon)`,
-        // so the objective and its components are identical by construction.
-        // What this test can pin is that the two keys are distinct and both
-        // namespaced, so neither arm can silently reuse the other's window.
+        // Same objective and horizon for both arms, so the yardstick is
+        // identical — but each window opens at its own arm's opportunity, so
+        // the two measure different intervals. What this test pins is that the
+        // keys are distinct and both namespaced, so neither arm can silently
+        // reuse the other's window. That the intervals differ is pinned by
+        // `the_complement_is_served_at_its_own_later_opportunity`.
         let mut c = canary();
         let d = offer_until_sampled(&mut c, 10).expect("sampled");
         let (id, _) = ids(&d);
