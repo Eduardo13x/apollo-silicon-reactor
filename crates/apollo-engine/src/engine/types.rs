@@ -962,6 +962,13 @@ pub struct RuntimeMetrics {
     pub microexperiment_shadow_measurements_proven_total: u64,
     #[serde(default)]
     pub microexperiment_shadow_measurements_refused_total: u64,
+    /// Shadow pairs reaped for passing their deadline. Without it, whether the
+    /// lifecycle fix is working is unobservable from outside the process.
+    #[serde(default)]
+    pub microexperiment_shadow_pairs_expired_total: u64,
+    /// Endpoints that arrived after their pair was terminalised.
+    #[serde(default)]
+    pub microexperiment_shadow_endpoints_late_total: u64,
     /// Pairs no longer open, whatever ended them. Renamed from
     /// `microexperiment_completed_pairs`, which read as "finished" while every
     /// one of the 9 it reported had been interrupted.

@@ -60,6 +60,8 @@ pub struct MicroexperimentTickMetrics {
     pub shadow_would_open_total: u64,
     pub open_pairs: u64,
     pub shadow_measurements_proven_total: u64,
+    pub shadow_pairs_expired_total: u64,
+    pub shadow_endpoints_late_total: u64,
     pub shadow_measurements_refused_total: u64,
     pub terminal_pairs: u64,
     pub completed_pairs_valid: u64,
@@ -394,6 +396,8 @@ impl MicroexperimentRuntime {
             shadow_would_open_total: metrics.shadow_would_open_total,
             open_pairs: metrics.open_pairs as u64,
             shadow_measurements_proven_total: metrics.shadow_measurements_proven_total,
+            shadow_pairs_expired_total: metrics.shadow_pairs_expired_total,
+            shadow_endpoints_late_total: metrics.shadow_endpoints_late_total,
             shadow_measurements_refused_total: metrics.shadow_measurements_refused_total,
             terminal_pairs: metrics.terminal_pairs as u64,
             completed_pairs_valid: metrics.completed_pairs_valid as u64,
@@ -490,8 +494,107 @@ fn blocker_for_endpoint_error(error: LabError) -> &'static str {
     }
 }
 
+/// Publish the lab's tick metrics onto `RuntimeMetrics`.
+///
+/// Extracted from the daemon loop so the mapping can be tested. Three times a
+/// counter was added to the lab, wired through `LabMetrics`, and never reached
+/// this struct — the number governing a gate, or proving a lifecycle fix,
+/// stayed invisible outside the process. The test below walks every field and
+/// fails on the next one that stops here.
+pub fn publish_microexperiment_metrics(
+    out: &mut apollo_engine::engine::types::RuntimeMetrics,
+    micro_metrics: MicroexperimentTickMetrics,
+) {
+    out.microexperiment_phase = micro_metrics.phase;
+    out.microexperiment_rollout_progress = micro_metrics.rollout_progress;
+    out.microexperiment_rollout_required = micro_metrics.rollout_required;
+    out.microexperiment_blocker = micro_metrics.blocker;
+    out.microexperiment_restore = micro_metrics.restore;
+    out.microexperiment_restored_progress_at_boot = micro_metrics.restored_progress_at_boot;
+    out.microexperiment_progress_resets_total = micro_metrics.progress_resets_total;
+    out.microexperiment_last_progress_reset_reason = micro_metrics.last_progress_reset_reason;
+    out.microexperiment_proposed_total = micro_metrics.proposed_total;
+    out.microexperiment_eligible_total = micro_metrics.eligible_total;
+    out.microexperiment_randomized_total = micro_metrics.randomized_total;
+    out.microexperiment_shadow_would_open_total = micro_metrics.shadow_would_open_total;
+    out.microexperiment_open_pairs = micro_metrics.open_pairs;
+    out.microexperiment_shadow_measurements_proven_total =
+        micro_metrics.shadow_measurements_proven_total;
+    out.microexperiment_shadow_measurements_refused_total =
+        micro_metrics.shadow_measurements_refused_total;
+    out.microexperiment_shadow_pairs_expired_total = micro_metrics.shadow_pairs_expired_total;
+    out.microexperiment_shadow_endpoints_late_total = micro_metrics.shadow_endpoints_late_total;
+    out.microexperiment_terminal_pairs = micro_metrics.terminal_pairs;
+    out.microexperiment_completed_pairs_valid = micro_metrics.completed_pairs_valid;
+    out.microexperiment_interrupted_pairs = micro_metrics.interrupted_pairs;
+    out.microexperiment_control_endpoints_total = micro_metrics.control_endpoints_total;
+    out.microexperiment_treatment_endpoints_total = micro_metrics.treatment_endpoints_total;
+    out.microexperiment_complete_horizons_total = micro_metrics.complete_horizons_total;
+    out.microexperiment_rollback_closed_total = micro_metrics.rollback_closed_total;
+    out.microexperiment_pair_gold_total = micro_metrics.pair_gold_total;
+    out.microexperiment_effective_total = micro_metrics.effective_total;
+    out.microexperiment_harmful_total = micro_metrics.harmful_total;
+    out.microexperiment_confounded_total = micro_metrics.confounded_total;
+    out.microexperiment_interrupted_total = micro_metrics.interrupted_total;
+    out.microexperiment_synthetic_quarantined_total = micro_metrics.synthetic_quarantined_total;
+    out.microexperiment_mean_effect = micro_metrics.mean_effect;
+    out.microexperiment_invalidated_total = micro_metrics.invalidated_total;
+    out.microexperiment_deadline_expired_total = micro_metrics.deadline_expired_total;
+    out.microexperiment_unbound_expiries_total = micro_metrics.unbound_expiries_total;
+    out.microexperiment_rollback_failed_total = micro_metrics.rollback_failed_total;
+}
+
 #[cfg(test)]
 mod tests {
+    /// Every numeric counter the tick produces must land on `RuntimeMetrics`.
+    ///
+    /// Three separate times a counter was added to the lab, threaded through
+    /// `LabMetrics` and the tick, and then stopped here — so the number that
+    /// gated Shadow, and later the one proving the lifecycle fix, could not be
+    /// read from outside the process. Each was found by staring at production,
+    /// never by the suite. This walks the mapping instead.
+    #[test]
+    fn every_tick_counter_reaches_runtime_metrics() {
+        // Distinct non-zero values, so a field that never gets assigned stays
+        // at zero and is named.
+        let m = MicroexperimentTickMetrics {
+            phase: "shadow".to_string(),
+            blocker: "none".to_string(),
+            restore: "restored".to_string(),
+            rollout_progress: 11,
+            rollout_required: 12,
+            restored_progress_at_boot: 13,
+            proposed_total: 14,
+            eligible_total: 15,
+            randomized_total: 16,
+            shadow_would_open_total: 17,
+            shadow_measurements_proven_total: 18,
+            shadow_measurements_refused_total: 19,
+            shadow_pairs_expired_total: 20,
+            shadow_endpoints_late_total: 21,
+            open_pairs: 22,
+            terminal_pairs: 23,
+            completed_pairs_valid: 24,
+            interrupted_pairs: 25,
+            ..Default::default()
+        };
+        let mut out = apollo_engine::engine::types::RuntimeMetrics::default();
+        publish_microexperiment_metrics(&mut out, m);
+
+        // The two the lifecycle fix depends on. Both were absent in production
+        // after the deploy that was supposed to make them observable.
+        assert_eq!(out.microexperiment_shadow_pairs_expired_total, 20);
+        assert_eq!(out.microexperiment_shadow_endpoints_late_total, 21);
+        // And the gate's own quantity.
+        assert_eq!(out.microexperiment_shadow_measurements_proven_total, 18);
+        assert_eq!(out.microexperiment_shadow_measurements_refused_total, 19);
+        assert_eq!(out.microexperiment_rollout_progress, 11);
+        assert_eq!(out.microexperiment_terminal_pairs, 23);
+        assert_eq!(out.microexperiment_completed_pairs_valid, 24);
+        assert_eq!(out.microexperiment_interrupted_pairs, 25);
+        assert_eq!(out.microexperiment_shadow_would_open_total, 17);
+    }
+
     use super::*;
     use apollo_engine::engine::exploration_scheduler::{ExplorationOrigin, HardwareIdentity};
 

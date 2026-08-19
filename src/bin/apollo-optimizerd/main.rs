@@ -3197,65 +3197,10 @@ fn main() -> anyhow::Result<()> {
                 }
                 {
                     let mut metrics = state.metrics.lock_recover();
-                    metrics.metrics.microexperiment_phase = micro_metrics.phase;
-                    metrics.metrics.microexperiment_rollout_progress =
-                        micro_metrics.rollout_progress;
-                    metrics.metrics.microexperiment_rollout_required =
-                        micro_metrics.rollout_required;
-                    metrics.metrics.microexperiment_blocker = micro_metrics.blocker;
-                    metrics.metrics.microexperiment_restore = micro_metrics.restore;
-                    metrics.metrics.microexperiment_restored_progress_at_boot =
-                        micro_metrics.restored_progress_at_boot;
-                    metrics.metrics.microexperiment_progress_resets_total =
-                        micro_metrics.progress_resets_total;
-                    metrics.metrics.microexperiment_last_progress_reset_reason =
-                        micro_metrics.last_progress_reset_reason;
-                    metrics.metrics.microexperiment_proposed_total = micro_metrics.proposed_total;
-                    metrics.metrics.microexperiment_eligible_total = micro_metrics.eligible_total;
-                    metrics.metrics.microexperiment_randomized_total =
-                        micro_metrics.randomized_total;
-                    metrics.metrics.microexperiment_shadow_would_open_total =
-                        micro_metrics.shadow_would_open_total;
-                    metrics.metrics.microexperiment_open_pairs = micro_metrics.open_pairs;
-                    metrics
-                        .metrics
-                        .microexperiment_shadow_measurements_proven_total =
-                        micro_metrics.shadow_measurements_proven_total;
-                    metrics
-                        .metrics
-                        .microexperiment_shadow_measurements_refused_total =
-                        micro_metrics.shadow_measurements_refused_total;
-                    metrics.metrics.microexperiment_terminal_pairs = micro_metrics.terminal_pairs;
-                    metrics.metrics.microexperiment_completed_pairs_valid =
-                        micro_metrics.completed_pairs_valid;
-                    metrics.metrics.microexperiment_interrupted_pairs =
-                        micro_metrics.interrupted_pairs;
-                    metrics.metrics.microexperiment_control_endpoints_total =
-                        micro_metrics.control_endpoints_total;
-                    metrics.metrics.microexperiment_treatment_endpoints_total =
-                        micro_metrics.treatment_endpoints_total;
-                    metrics.metrics.microexperiment_complete_horizons_total =
-                        micro_metrics.complete_horizons_total;
-                    metrics.metrics.microexperiment_rollback_closed_total =
-                        micro_metrics.rollback_closed_total;
-                    metrics.metrics.microexperiment_pair_gold_total = micro_metrics.pair_gold_total;
-                    metrics.metrics.microexperiment_effective_total = micro_metrics.effective_total;
-                    metrics.metrics.microexperiment_harmful_total = micro_metrics.harmful_total;
-                    metrics.metrics.microexperiment_confounded_total =
-                        micro_metrics.confounded_total;
-                    metrics.metrics.microexperiment_interrupted_total =
-                        micro_metrics.interrupted_total;
-                    metrics.metrics.microexperiment_synthetic_quarantined_total =
-                        micro_metrics.synthetic_quarantined_total;
-                    metrics.metrics.microexperiment_mean_effect = micro_metrics.mean_effect;
-                    metrics.metrics.microexperiment_invalidated_total =
-                        micro_metrics.invalidated_total;
-                    metrics.metrics.microexperiment_deadline_expired_total =
-                        micro_metrics.deadline_expired_total;
-                    metrics.metrics.microexperiment_unbound_expiries_total =
-                        micro_metrics.unbound_expiries_total;
-                    metrics.metrics.microexperiment_rollback_failed_total =
-                        micro_metrics.rollback_failed_total;
+                    microexperiment_tick::publish_microexperiment_metrics(
+                        &mut metrics.metrics,
+                        micro_metrics,
+                    );
 
                     let endpoint = microexperiment_runtime.adapter_counters();
                     metrics.metrics.microexperiment_endpoint_contract_ready =
