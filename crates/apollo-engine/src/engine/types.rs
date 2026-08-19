@@ -3162,6 +3162,26 @@ pub struct RuntimeMetrics {
     pub markov_shadow_hits: u64,
     #[serde(default)]
     pub markov_shadow_misses: u64,
+    /// The two opposite failures `markov_shadow_misses` hides. Wrong-app is the
+    /// model being wrong; no-switch is the model being right about an event
+    /// that had not happened when the window closed. They call for different
+    /// fixes, and 1 hit against 10 misses says nothing until they are split.
+    #[serde(default)]
+    pub markov_shadow_miss_wrong_app: u64,
+    #[serde(default)]
+    pub markov_shadow_miss_no_switch: u64,
+    /// Hits, by whether a real pre-warm could have been issued at the moment
+    /// the prediction was made. A correct prediction blocked by resources is a
+    /// different problem from a correct prediction nobody could act on in time.
+    #[serde(default)]
+    pub markov_shadow_hits_actionable: u64,
+    #[serde(default)]
+    pub markov_shadow_hits_blocked_resources: u64,
+    #[serde(default)]
+    pub markov_shadow_hits_blocked_timing: u64,
+    /// Summed lead time over hits, for a mean without keeping a histogram.
+    #[serde(default)]
+    pub markov_shadow_hit_lead_ms_total: u64,
     #[serde(default)]
     pub markov_shadow_active: bool,
     #[serde(default)]

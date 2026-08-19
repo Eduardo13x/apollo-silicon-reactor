@@ -240,6 +240,13 @@ struct MarkovShadowLease {
     predicted_app: String,
     expires_at: Instant,
     calibration_context: PrewarmContext,
+    /// When the prediction was made. Without it a shadow arm has no lead time,
+    /// so "the prediction was right but too late to act on" is indistinguishable
+    /// from "the prediction was wrong" — the very split this investigation needs.
+    opened_at: Instant,
+    /// The gate that was blocking a real pre-warm when this prediction was
+    /// made. Answers "would it have been actionable?" without re-deriving it.
+    blocker_at_open: &'static str,
 }
 
 #[derive(Debug)]
@@ -464,9 +471,49 @@ pub fn run_markov_tick(
             if hit {
                 metrics.metrics.markov_shadow_hits =
                     metrics.metrics.markov_shadow_hits.saturating_add(1);
+                // Lead time on the shadow side: how far ahead the prediction
+                // was made. A hit with almost no lead was right but arrived too
+                // late to have been worth acting on.
+                let lead_ms = now.duration_since(lease.opened_at).as_millis() as u64;
+                metrics.metrics.markov_shadow_hit_lead_ms_total = metrics
+                    .metrics
+                    .markov_shadow_hit_lead_ms_total
+                    .saturating_add(lead_ms);
+                // Would a real pre-warm have been possible at prediction time?
+                if lease.blocker_at_open == "ready" {
+                    metrics.metrics.markov_shadow_hits_actionable = metrics
+                        .metrics
+                        .markov_shadow_hits_actionable
+                        .saturating_add(1);
+                } else if lease.blocker_at_open == "resource-gate" {
+                    metrics.metrics.markov_shadow_hits_blocked_resources = metrics
+                        .metrics
+                        .markov_shadow_hits_blocked_resources
+                        .saturating_add(1);
+                } else if lease.blocker_at_open == "timing" {
+                    metrics.metrics.markov_shadow_hits_blocked_timing = metrics
+                        .metrics
+                        .markov_shadow_hits_blocked_timing
+                        .saturating_add(1);
+                }
             } else {
                 metrics.metrics.markov_shadow_misses =
                     metrics.metrics.markov_shadow_misses.saturating_add(1);
+                // Split the two opposite failures the aggregate hides.
+                match shadow_miss_reason(&lease, foreground_app, now) {
+                    ShadowMissReason::WrongApp => {
+                        metrics.metrics.markov_shadow_miss_wrong_app = metrics
+                            .metrics
+                            .markov_shadow_miss_wrong_app
+                            .saturating_add(1)
+                    }
+                    ShadowMissReason::NoSwitchInWindow => {
+                        metrics.metrics.markov_shadow_miss_no_switch = metrics
+                            .metrics
+                            .markov_shadow_miss_no_switch
+                            .saturating_add(1)
+                    }
+                }
             }
         }
     }
@@ -1035,6 +1082,8 @@ pub fn run_markov_tick(
                 predicted_app: pair.1.clone(),
                 expires_at: now + Duration::from_secs_f64(lease_secs),
                 calibration_context,
+                opened_at: now,
+                blocker_at_open: blocker,
             });
             markov_shadow.sampled_pair = Some(pair);
             let mut metrics = state.metrics.lock_recover();
@@ -1721,6 +1770,40 @@ fn normalize_markov_timing(time_to_switch: f64) -> (f64, f64) {
     (time_to_switch.max(0.0), (-time_to_switch).max(0.0))
 }
 
+/// Why a shadow prediction failed. `markov_shadow_misses` collapses these two
+/// into one number, and they mean opposite things: one is the model being
+/// wrong, the other is the model being right about an event that had not
+/// happened yet when the window closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShadowMissReason {
+    /// The user switched to a different application. A prediction error.
+    WrongApp,
+    /// The user never left the source application before the window expired.
+    /// The prediction may yet have been correct; it was not actionable.
+    NoSwitchInWindow,
+}
+
+/// Classify a miss. Kept separate from `shadow_lease_resolution` so the
+/// resolution logic that already exists is not disturbed.
+fn shadow_miss_reason(
+    lease: &MarkovShadowLease,
+    foreground_app: Option<&str>,
+    now: Instant,
+) -> ShadowMissReason {
+    let left_source = foreground_app
+        .map(|app| !app_names_match(app, &lease.source_app))
+        .unwrap_or(false);
+    if left_source {
+        ShadowMissReason::WrongApp
+    } else {
+        debug_assert!(
+            now >= lease.expires_at,
+            "a miss is either a switch or an expiry"
+        );
+        ShadowMissReason::NoSwitchInWindow
+    }
+}
+
 fn shadow_lease_resolution(
     lease: &MarkovShadowLease,
     foreground_app: Option<&str>,
@@ -2405,6 +2488,72 @@ mod tests {
     }
 
     #[test]
+    fn a_miss_says_which_kind_of_wrong_it_was() {
+        // `markov_shadow_misses` collapses two opposite facts. Production shows
+        // 10 misses against 1 hit, and the aggregate cannot say whether the
+        // model is wrong or merely early: the first is a modelling problem, the
+        // second is a windowing one, and they call for different fixes.
+        let now = Instant::now();
+        let lease = MarkovShadowLease {
+            source_app: "Finder".to_string(),
+            predicted_app: "Terminal".to_string(),
+            expires_at: now + Duration::from_secs(10),
+            calibration_context: PrewarmContext::new("coding", 12, 0.30, false),
+            opened_at: now,
+            blocker_at_open: "ready",
+        };
+
+        // The user went somewhere else entirely: the model was wrong.
+        assert_eq!(
+            shadow_miss_reason(&lease, Some("Brave Browser"), now),
+            ShadowMissReason::WrongApp
+        );
+
+        // The user never left: the prediction may still come true, just not in
+        // time to have been worth acting on.
+        let expired = now + Duration::from_secs(11);
+        assert_eq!(
+            shadow_miss_reason(&lease, Some("Finder"), expired),
+            ShadowMissReason::NoSwitchInWindow
+        );
+
+        // And the classification never contradicts the resolution it explains.
+        assert_eq!(
+            shadow_lease_resolution(&lease, Some("Brave Browser"), now),
+            LeaseResolution::Miss
+        );
+        assert_eq!(
+            shadow_lease_resolution(&lease, Some("Finder"), expired),
+            LeaseResolution::Miss
+        );
+    }
+
+    #[test]
+    fn a_shadow_lease_carries_its_own_lead_time_and_blocker() {
+        // Without `opened_at` a shadow arm has no lead time at all, so a
+        // correct-but-late prediction reads exactly like a wrong one.
+        let now = Instant::now();
+        let lease = MarkovShadowLease {
+            source_app: "Finder".to_string(),
+            predicted_app: "Terminal".to_string(),
+            expires_at: now + Duration::from_secs(10),
+            calibration_context: PrewarmContext::new("coding", 12, 0.30, false),
+            opened_at: now,
+            blocker_at_open: "resource-gate",
+        };
+        let resolved = now + Duration::from_millis(2_500);
+        assert_eq!(
+            resolved.duration_since(lease.opened_at).as_millis(),
+            2_500,
+            "lead time is measurable on the shadow side too"
+        );
+        assert_eq!(
+            lease.blocker_at_open, "resource-gate",
+            "and the gate that would have stopped a real pre-warm is remembered"
+        );
+    }
+
+    #[test]
     fn shadow_prediction_scores_transition_or_deadline_without_actuation() {
         let now = Instant::now();
         let lease = MarkovShadowLease {
@@ -2412,6 +2561,8 @@ mod tests {
             predicted_app: "Terminal".to_string(),
             expires_at: now + Duration::from_secs(10),
             calibration_context: PrewarmContext::new("coding", 12, 0.30, false),
+            opened_at: Instant::now(),
+            blocker_at_open: "ready",
         };
         assert_eq!(
             shadow_lease_resolution(&lease, Some("Finder"), now),
