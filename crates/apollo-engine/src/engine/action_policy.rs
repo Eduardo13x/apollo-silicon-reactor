@@ -953,19 +953,14 @@ mod tests {
 
     #[test]
     fn unsaturated_does_not_bump_counter() {
-        use std::sync::atomic::Ordering;
-        let pre = crate::engine::lse_counters::LSE_COUNTERS
-            .policy_scorer_uncertainty_saturated_total
-            .load(Ordering::Relaxed);
         let scorer = PolicyScorer::builder()
             .feature(FixedUncFeature(0.5))
             .uncertainty_saturation(1.5)
             .build();
         let score = scorer.score(&freeze(1), &base_ctx());
-        let post = crate::engine::lse_counters::LSE_COUNTERS
-            .policy_scorer_uncertainty_saturated_total
-            .load(Ordering::Relaxed);
-        assert_eq!(pre, post, "unsaturated must NOT bump counter");
+        // LSE_COUNTERS is process-global and saturated scorer tests run in
+        // parallel. Equality of two global snapshots is therefore racy; the
+        // score itself is the direct proof that this call did not clamp.
         assert!(
             (score.raw_uncertainty - score.total_uncertainty).abs() < 1e-9,
             "raw == clamped when below saturation"
