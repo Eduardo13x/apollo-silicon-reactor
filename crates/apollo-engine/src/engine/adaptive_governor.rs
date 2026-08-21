@@ -1,5 +1,5 @@
-//! Adaptive Governor — ties together user profile, process classifier,
-//! and zombie hunter to produce concrete optimization decisions.
+//! Adaptive Governor — ties together user profile and process classification
+//! to produce concrete optimization decisions.
 //!
 //! This is the "brain" of the system.  It works entirely with heuristics:
 //!
@@ -17,7 +17,7 @@ use crate::engine::{
     swap_reclaim::SwapRisk,
     user_profile::{UserProfile, WorkloadType},
     workload_classifier::{WorkloadClassification, WorkloadClassifier},
-    zombie_hunter::{HuntSnapshot, ZombieAction, ZombieHunter},
+    zombie_hunter::HuntSnapshot,
 };
 
 // ── Foreground-helper table ──────────────────────────────────────────────────
@@ -125,7 +125,6 @@ impl Default for GovernorConfig {
 pub struct AdaptiveGovernor {
     pub config: GovernorConfig,
     classifier: ProcessClassifier,
-    zombie_hunter: ZombieHunter,
     pub user_profile: UserProfile,
     workload_classifier: WorkloadClassifier,
     last_classification: WorkloadClassification,
@@ -146,7 +145,6 @@ impl AdaptiveGovernor {
         Self {
             config,
             classifier: ProcessClassifier::new(),
-            zombie_hunter: ZombieHunter::new(),
             user_profile: UserProfile::new(),
             workload_classifier: WorkloadClassifier::new(),
             last_classification: WorkloadClassification {
@@ -308,15 +306,9 @@ impl AdaptiveGovernor {
 
         let workload = self.user_profile.current_workload();
 
-        // 2. Find zombies first — they always get Kill/Suspend regardless of profile
-        let mut dead_weight = self.zombie_hunter.evaluate_all(hunt_snaps);
-        dead_weight.retain(|candidate| !protected_pids.contains(&candidate.pid));
-
-        // Build a set of PIDs that have already been sentenced by zombie hunter
-        let zombie_pids: std::collections::HashSet<u32> =
-            dead_weight.iter().map(|d| d.pid).collect();
-
-        // 3. Classify & decide everything else
+        // The daemon-level ZombieHunter is the sole persistence and action
+        // owner. This governor only suppresses provisional ZombieOrphan tiers
+        // while that owner gathers confirmation.
         let classified: Vec<(&ProcessSnapshot, ProcessTier, f32)> = proc_snaps
             .iter()
             .filter(|snap| include_protected_observations || !protected_pids.contains(&snap.pid))
@@ -343,14 +335,10 @@ impl AdaptiveGovernor {
                 continue;
             }
 
-            if zombie_pids.contains(&snap.pid) {
-                continue; // Will be handled below
-            }
-
             // ProcessClassifier is stateless and can observe the normal,
             // transient SZOMB interval between child exit and parent wait().
-            // ZombieHunter owns persistence confirmation; until it confirms
-            // this PID, do not act on or publish the provisional tier.
+            // The daemon ZombieHunter owns persistence confirmation and the
+            // central action path; never manufacture a second decision here.
             if *tier == ProcessTier::ZombieOrphan
                 && hunt_snaps.iter().any(|hunt| hunt.pid == snap.pid)
             {
@@ -369,24 +357,6 @@ impl AdaptiveGovernor {
                 hour_of_day,
             );
             decisions.push(decision);
-        }
-
-        // 4. Append zombie / dead-weight decisions
-        for dw in &dead_weight {
-            let gov_decision = match dw.recommended_action {
-                ZombieAction::Kill => GovernorDecision::Kill,
-                ZombieAction::Suspend => GovernorDecision::Freeze,
-                ZombieAction::NiceToMax => GovernorDecision::Throttle,
-            };
-            decisions.push(ProcessDecision {
-                pid: dw.pid,
-                name: dw.name.clone(),
-                decision: gov_decision,
-                tier: ProcessTier::ZombieOrphan,
-                utility_score: 0.0,
-                waste_score: 1.0,
-                reason: dw.reason.clone(),
-            });
         }
 
         decisions
@@ -456,21 +426,19 @@ impl AdaptiveGovernor {
             }
         };
 
-        // Zombie/orphan handling: true zombies (is_zombie=true) need SIGKILL to
-        // reap their kernel entry. Mere orphans (parent died, but process is still
-        // running and may be in the middle of I/O) should be frozen, not killed —
-        // killing mid-write can corrupt data. A frozen orphan drains naturally once
-        // it tries to communicate with its dead parent.
+        // Zombie/orphan handling: signals cannot reap a true kernel zombie;
+        // only its parent can call wait(). Keep it observable but action-free.
+        // Mere orphans are still live and may be frozen conservatively.
         if tier == ProcessTier::ZombieOrphan {
             if snap.is_zombie {
                 return ProcessDecision {
                     pid: snap.pid,
                     name: snap.name.clone(),
-                    decision: GovernorDecision::Kill,
+                    decision: GovernorDecision::Allow,
                     tier,
                     utility_score: 0.0,
                     waste_score: 1.0,
-                    reason: "Zombie process — reap with SIGKILL".into(),
+                    reason: "Kernel zombie — parent must reap with wait(); observe only".into(),
                 };
             }
             return ProcessDecision {
@@ -1436,7 +1404,7 @@ mod tests {
     // ── Orphan (parent dead, non-zombie) ─────────────────────────────────────
 
     #[test]
-    fn orphan_non_zombie_is_frozen_not_killed() {
+    fn orphan_non_zombie_is_delegated_to_daemon_zombie_owner() {
         let mut gov = governor();
         let snap = ProcessSnapshot {
             is_zombie: false,
@@ -1478,11 +1446,9 @@ mod tests {
             )
             .is_empty());
         let decisions = gov.decide_all(&[snap], &[hunt], None, &[], 14);
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(
-            decisions[0].decision,
-            GovernorDecision::Freeze,
-            "Non-zombie orphan (parent dead) must be Frozen, not Killed"
+        assert!(
+            decisions.is_empty(),
+            "the daemon ZombieHunter must own confirmed orphan handling"
         );
     }
 

@@ -903,6 +903,9 @@ fn temporal_boost_intent(action: &RootAction, cycle: u64) -> Option<ReflexIntent
         return None;
     };
     let trigger = match decision_reason {
+        DecisionReason::DisplayPipeline | DecisionReason::CompositorPriority => {
+            ReflexTrigger::WindowOperation
+        }
         DecisionReason::CausalInference => ReflexTrigger::Prediction,
         DecisionReason::MLWorkload => ReflexTrigger::BuildStart,
         _ => ReflexTrigger::Input,
@@ -923,6 +926,27 @@ fn temporal_boost_intent(action: &RootAction, cycle: u64) -> Option<ReflexIntent
     .ok()
 }
 
+/// Exact cooperative display exceptions. These are boosts of protected macOS
+/// services, not permission to freeze, throttle, or mutate arbitrary Apple
+/// processes. Keep the reason/name pairs closed and case-sensitive.
+fn cooperative_system_boost(action: &RootAction) -> bool {
+    matches!(
+        action,
+        RootAction::BoostProcess {
+            name,
+            decision_reason: DecisionReason::DisplayPipeline,
+            ..
+        } if matches!(name.as_str(), "WindowServer" | "Dock" | "SystemUIServer")
+    ) || matches!(
+        action,
+        RootAction::BoostProcess {
+            name,
+            decision_reason: DecisionReason::CompositorPriority,
+            ..
+        } if name == "WindowServer"
+    )
+}
+
 fn reflex_boost_safety(action: &RootAction, gates: ExplorationGates) -> ReflexSafetyContext {
     let RootAction::BoostProcess {
         pid,
@@ -934,6 +958,7 @@ fn reflex_boost_safety(action: &RootAction, gates: ExplorationGates) -> ReflexSa
     else {
         return ReflexSafetyContext::default();
     };
+    let cooperative_display = cooperative_system_boost(action);
     ReflexSafetyContext {
         identity_present: *start_sec > 0 || *start_usec > 0,
         identity_start_nonzero: *start_sec > 0 || *start_usec > 0,
@@ -943,8 +968,10 @@ fn reflex_boost_safety(action: &RootAction, gates: ExplorationGates) -> ReflexSa
             *start_sec,
             *start_usec,
         ),
-        target_protected: apollo_engine::engine::safety::is_boost_forbidden(name),
-        target_apple_owned: apollo_engine::engine::apple_owned::is_apple_owned(*pid),
+        target_protected: apollo_engine::engine::safety::is_boost_forbidden(name)
+            && !cooperative_display,
+        target_apple_owned: apollo_engine::engine::apple_owned::is_apple_owned(*pid)
+            && !cooperative_display,
         capability_available: true,
         kill_switch: gates.kill_switch || gates.daemon_shutdown,
         thermal_force_ecores: !gates.thermal_available || !gates.thermal_nominal,
@@ -2260,7 +2287,7 @@ mod tests {
     }
 
     #[test]
-    fn compositor_reason_never_exempts_a_protected_process_from_reflex_safety() {
+    fn exact_compositor_reason_authorizes_windowserver_cooperative_boost() {
         let action = RootAction::BoostProcess {
             pid: 42,
             name: "WindowServer".to_string(),
@@ -2272,7 +2299,43 @@ mod tests {
 
         let safety = reflex_boost_safety(&action, ExplorationGates::healthy());
 
-        assert!(safety.target_protected);
+        assert!(!safety.target_protected);
+        let intent = temporal_boost_intent(&action, 31).expect("display intent");
+        assert_eq!(intent.trigger, ReflexTrigger::WindowOperation);
+    }
+
+    #[test]
+    fn display_cooperative_authorization_is_closed_to_exact_reason_name_pairs() {
+        let cases = [
+            (DecisionReason::DisplayPipeline, "WindowServer", true),
+            (DecisionReason::DisplayPipeline, "Dock", true),
+            (DecisionReason::DisplayPipeline, "SystemUIServer", true),
+            (DecisionReason::CompositorPriority, "WindowServer", true),
+            (DecisionReason::CompositorPriority, "Dock", false),
+            (DecisionReason::InteractiveFocus, "WindowServer", false),
+            (
+                DecisionReason::DisplayPipeline,
+                "WindowServer-helper",
+                false,
+            ),
+            (DecisionReason::CompositorPriority, "kernel_task", false),
+        ];
+
+        for (decision_reason, name, expected) in cases {
+            let action = RootAction::BoostProcess {
+                pid: 42,
+                name: name.to_string(),
+                reason: "display test".to_string(),
+                decision_reason,
+                start_sec: 100,
+                start_usec: 7,
+            };
+            assert_eq!(
+                cooperative_system_boost(&action),
+                expected,
+                "unexpected cooperative authorization for {name}"
+            );
+        }
     }
 
     fn thread_qos(pid: u32, thread_index: u32) -> RootAction {

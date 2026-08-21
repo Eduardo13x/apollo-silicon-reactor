@@ -793,6 +793,26 @@ pub struct RuntimeMetrics {
     pub apollo_overhead_holt_skips_total: u64,
     #[serde(default)]
     pub apollo_overhead_page_reclaim_skips_total: u64,
+    /// Learned, workload-local early warning for microstutter precursors.
+    /// It may only tighten the fixed safety envelope, never relax it.
+    #[serde(default)]
+    pub adaptive_stutter_phase: String,
+    #[serde(default)]
+    pub adaptive_stutter_regime: String,
+    #[serde(default)]
+    pub adaptive_stutter_risk: String,
+    #[serde(default)]
+    pub adaptive_stutter_score: f64,
+    #[serde(default)]
+    pub adaptive_stutter_samples: u64,
+    #[serde(default)]
+    pub adaptive_stutter_shadow_would_guard_cycles: u64,
+    #[serde(default)]
+    pub adaptive_stutter_protection_cycles: u64,
+    #[serde(default)]
+    pub adaptive_stutter_persist_drops_total: u64,
+    #[serde(default)]
+    pub adaptive_stutter_persist_failures_total: u64,
     /// Option C global optional-work scheduler. Shadow is observational and
     /// cannot alter legacy execution or grant action authority.
     #[serde(default)]

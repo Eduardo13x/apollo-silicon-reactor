@@ -6,6 +6,7 @@ pub struct FluidityTickInput<'a> {
     pub proc_snaps: &'a [ProcessSnapshot],
     pub cycle_hw_snap: Option<&'a HardwareSnapshot>,
     pub cycle_dt_secs: f32,
+    pub hardware_cores: u32,
     pub fluidity_state: &'a mut FluidityState,
 }
 
@@ -13,14 +14,22 @@ pub struct FluidityTickOutput {
     pub fl_signal: FluiditySignal,
 }
 
+fn normalized_gpu_load(gpu_watts: Option<f32>, hardware_cores: u32) -> f32 {
+    gpu_watts
+        .map(|watts| {
+            (watts / super::daemon_thermal_tick::gpu_power_reference_watts(hardware_cores))
+                .clamp(0.0, 1.0)
+        })
+        .unwrap_or(0.0)
+}
+
 pub fn run_fluidity_tick(input: FluidityTickInput) -> FluidityTickOutput {
     // Migrated from main.rs:2291-2310 (Strangler Fig).
     // Compute GPU load 0-1 from package watts.
-    let fl_gpu_load = input
-        .cycle_hw_snap
-        .and_then(|hw| hw.power.gpu_watts)
-        .map(|w| (w / 15.0).clamp(0.0, 1.0))
-        .unwrap_or(0.0);
+    let fl_gpu_load = normalized_gpu_load(
+        input.cycle_hw_snap.and_then(|hw| hw.power.gpu_watts),
+        input.hardware_cores,
+    );
 
     input.fluidity_state.update(
         input
@@ -76,6 +85,7 @@ mod tests {
             proc_snaps: &proc_snaps,
             cycle_hw_snap: None,
             cycle_dt_secs: 0.5,
+            hardware_cores: 8,
             fluidity_state: &mut state,
         };
 
@@ -84,6 +94,7 @@ mod tests {
                 proc_snaps: &proc_snaps,
                 cycle_hw_snap: None,
                 cycle_dt_secs: 0.5,
+                hardware_cores: 8,
                 fluidity_state: input.fluidity_state,
             });
         }
@@ -96,5 +107,12 @@ mod tests {
         let _sig = apollo_engine::engine::fluidity::FluiditySignal::from(&state);
         // Mutating state after snapshot must not affect snapshot
         state.update(vec![(415, "WindowServer", 50.0)], 0.0, 0.5);
+    }
+
+    #[test]
+    fn gpu_load_normalization_scales_with_detected_capacity() {
+        assert!((normalized_gpu_load(Some(8.0), 8) - 0.50).abs() < f32::EPSILON);
+        assert!((normalized_gpu_load(Some(8.0), 10) - 0.40).abs() < f32::EPSILON);
+        assert_eq!(normalized_gpu_load(None, 10), 0.0);
     }
 }

@@ -495,12 +495,11 @@ mod scenarios {
         );
     }
 
-    /// BOSS 59: True zombie process — is_zombie=true means the process has already
-    /// exited but the kernel entry is not reaped. It holds 50MB of kernel memory
-    /// indefinitely. No signal can affect it except SIGKILL (to its parent).
-    /// Apollo must always KILL zombies. KILL.
+    /// BOSS 59: A true zombie has already exited. Signals sent to that PID are
+    /// ineffective; only its parent can reap it with wait(). Apollo observes it
+    /// without manufacturing a fake Kill/Freeze action.
     #[test]
-    fn s79_true_zombie_always_killed() {
+    fn s79_true_zombie_is_observation_only() {
         let mut s = snap(
             7900,
             "com.apple.WebKit.Networking",
@@ -517,8 +516,8 @@ mod scenarios {
         let d = find_decision(&results, "com.apple.WebKit.Networking");
         assert_eq!(
             d,
-            GovernorDecision::Kill,
-            "True zombie must always receive KILL decision. Got {:?}",
+            GovernorDecision::Allow,
+            "True zombie must remain observation-only. Got {:?}",
             d
         );
     }

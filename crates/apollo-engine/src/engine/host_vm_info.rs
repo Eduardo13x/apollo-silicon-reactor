@@ -121,6 +121,11 @@ impl VmRate {
             + self.decompressions_per_sec
             + self.reactivations_per_sec
     }
+
+    /// Working-set pages faulted back from disk or the compressor per second.
+    pub fn refaults_per_sec(&self) -> f64 {
+        self.pageins_per_sec + self.swapins_per_sec + self.decompressions_per_sec
+    }
 }
 
 impl VmPageStats {
@@ -395,6 +400,18 @@ mod tests {
         assert_eq!(rate.reactivations_per_sec, 200.0);
         // Thrashing score = 3*(50+25) + 2*1000 + 250 + 200 = 225 + 2000 + 450 = 2675.
         assert!((rate.thrashing_score() - 2675.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn refault_rate_combines_fault_in_paths() {
+        let rate = VmRate {
+            pageins_per_sec: 100.0,
+            decompressions_per_sec: 250.0,
+            swapins_per_sec: 50.0,
+            ..Default::default()
+        };
+
+        assert_eq!(rate.refaults_per_sec(), 400.0);
     }
 
     #[test]

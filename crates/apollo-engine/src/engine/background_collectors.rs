@@ -14,6 +14,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::engine::lock_ext::LockRecover;
 
+/// Fast enough to observe short memory-flow bursts without polling subprocesses.
+pub const RESPONSIVE_PRESSURE_INTERVAL: Duration = Duration::from_millis(500);
+pub const RESPONSIVE_PRESSURE_MAX_AGE: Duration = Duration::from_secs(2);
+
 /// Cached memory/swap pressure data.
 #[derive(Debug, Clone)]
 pub struct PressureData {
@@ -23,8 +27,10 @@ pub struct PressureData {
     pub swap_used_bytes: u64,
     /// Total swap capacity.
     pub swap_total_bytes: u64,
-    /// Swap growth rate in bytes/sec (positive = growing).
+    /// Swap change rate in bytes/sec (positive = growing, negative = shrinking).
     pub swap_delta_bps: f64,
+    /// Native VM page size for converting page rates into comparable byte rates.
+    pub page_size_bytes: u64,
     /// When this data was last refreshed.
     pub updated_at: Instant,
     /// Per-second VM flow rates derived from host_statistics64 cumulative
@@ -58,11 +64,18 @@ impl Default for PressureData {
             swap_used_bytes: 0,
             swap_total_bytes: 0,
             swap_delta_bps: 0.0,
+            page_size_bytes: 0,
             updated_at: Instant::now(),
             vm_rate: VmRate::default(),
             thrashing_score: 0.0,
             cpu_saturation: CpuSaturation::default(),
         }
+    }
+}
+
+impl PressureData {
+    pub fn is_fresh(&self, max_age: Duration) -> bool {
+        self.updated_at.elapsed() <= max_age
     }
 }
 
@@ -86,8 +99,7 @@ impl PressureCollector {
         if let Err(e) = thread::Builder::new()
             .name("pressure-collector".into())
             .spawn(move || {
-                let mut prev_swap_used: Option<u64> = None;
-                let mut prev_swap_at: Option<Instant> = None;
+                let mut swap_tracker = SwapRateTracker::default();
                 // Previous VM sample + its wall-clock timestamp for rate
                 // derivation. Separate from swap bookkeeping because the
                 // VM stats come from a different kernel call and we want
@@ -100,21 +112,15 @@ impl PressureCollector {
                 let mut prev_cpu_ticks: Vec<PerCoreTicks> = Vec::new();
 
                 loop {
-                    let (mem_pressure, vm_sample, swap_used, swap_total) = collect_pressure_facts();
+                    let (mem_pressure, vm_sample, swap_sample) = collect_pressure_facts();
                     let curr_cpu_ticks = cpu_sat::read_per_core_ticks();
                     let now = Instant::now();
-                    let swap_delta = match (prev_swap_used, prev_swap_at) {
-                        (Some(prev), Some(at)) => {
-                            let dt = now.duration_since(at).as_secs_f64().max(0.001);
-                            (swap_used.saturating_sub(prev) as f64) / dt
-                        }
-                        _ => 0.0,
-                    };
-                    prev_swap_used = Some(swap_used);
-                    prev_swap_at = Some(now);
+                    let (swap_used, swap_total, swap_delta) =
+                        swap_tracker.observe(swap_sample, now);
 
                     // VM flow rates: derive from prev sample if we have one,
                     // zero-filled on first iteration.
+                    let page_size_bytes = vm_sample.as_ref().map_or(0, |sample| sample.page_size);
                     let (vm_rate, thrashing_score) = match (&vm_sample, &prev_vm) {
                         (Some(curr), Some((prev, prev_at))) => {
                             let dt = now.duration_since(*prev_at).as_secs_f64();
@@ -139,6 +145,7 @@ impl PressureCollector {
                         swap_used_bytes: swap_used,
                         swap_total_bytes: swap_total,
                         swap_delta_bps: swap_delta,
+                        page_size_bytes,
                         updated_at: now,
                         vm_rate,
                         thrashing_score,
@@ -196,6 +203,44 @@ impl PressureCollector {
     }
 }
 
+fn signed_byte_rate(previous: u64, current: u64, dt_secs: f64) -> f64 {
+    if !dt_secs.is_finite() || dt_secs <= 0.0 {
+        return 0.0;
+    }
+    (current as i128 - previous as i128) as f64 / dt_secs
+}
+
+#[derive(Debug, Default)]
+struct SwapRateTracker {
+    used_bytes: Option<u64>,
+    total_bytes: Option<u64>,
+    observed_at: Option<Instant>,
+}
+
+impl SwapRateTracker {
+    fn observe(&mut self, sample: Option<(u64, u64)>, now: Instant) -> (u64, u64, f64) {
+        let Some((total_bytes, used_bytes)) = sample else {
+            return (
+                self.used_bytes.unwrap_or(0),
+                self.total_bytes.unwrap_or(0),
+                0.0,
+            );
+        };
+        let delta_bps = match (self.used_bytes, self.observed_at) {
+            (Some(previous), Some(observed_at)) => signed_byte_rate(
+                previous,
+                used_bytes,
+                now.saturating_duration_since(observed_at).as_secs_f64(),
+            ),
+            _ => 0.0,
+        };
+        self.used_bytes = Some(used_bytes);
+        self.total_bytes = Some(total_bytes);
+        self.observed_at = Some(now);
+        (used_bytes, total_bytes, delta_bps)
+    }
+}
+
 /// Collect a raw sample of kernel memory+swap facts for the collector thread.
 ///
 /// Returns the pressure percentage, the full VmPageStats sample (so the
@@ -203,15 +248,15 @@ impl PressureCollector {
 /// VmPageStats is returned as `Option` because host_statistics64 can
 /// theoretically fail; the caller's rate computation already handles
 /// the None case by zero-filling.
-fn collect_pressure_facts() -> (f64, Option<VmPageStats>, u64, u64) {
+fn collect_pressure_facts() -> (f64, Option<VmPageStats>, Option<(u64, u64)>) {
     // Memory pressure via Mach host_statistics64 (~1µs vs 50ms for subprocess).
     let vm_stats = host_vm_info::read_vm_stats();
     let memory_pressure = vm_stats.as_ref().map(|s| s.pressure()).unwrap_or(0.0);
 
     // Swap usage via direct sysctl struct read (~1µs vs 10ms for subprocess).
-    let (swap_total_bytes, swap_used_bytes) = sysctl_direct::read_swap_usage().unwrap_or((0, 0));
+    let swap_usage = sysctl_direct::read_swap_usage();
 
-    (memory_pressure, vm_stats, swap_used_bytes, swap_total_bytes)
+    (memory_pressure, vm_stats, swap_usage)
 }
 
 #[cfg(test)]
@@ -252,6 +297,49 @@ mod tests {
         assert_eq!(data.swap_used_bytes, 0);
         assert_eq!(data.swap_total_bytes, 0);
         assert!((data.swap_delta_bps - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn swap_delta_rate_preserves_growth_and_recovery() {
+        assert_eq!(signed_byte_rate(1_000, 1_500, 0.5), 1_000.0);
+        assert_eq!(signed_byte_rate(1_500, 1_000, 0.5), -1_000.0);
+    }
+
+    #[test]
+    fn swap_delta_rate_rejects_invalid_windows() {
+        assert_eq!(signed_byte_rate(1_000, 2_000, 0.0), 0.0);
+        assert_eq!(signed_byte_rate(1_000, 2_000, f64::NAN), 0.0);
+    }
+
+    #[test]
+    fn failed_swap_sample_preserves_last_valid_baseline() {
+        let started = Instant::now();
+        let mut tracker = SwapRateTracker::default();
+        assert_eq!(
+            tracker.observe(Some((8_000, 4_000)), started),
+            (4_000, 8_000, 0.0)
+        );
+        assert_eq!(
+            tracker.observe(None, started + Duration::from_millis(500)),
+            (4_000, 8_000, 0.0)
+        );
+        assert_eq!(
+            tracker.observe(Some((8_000, 5_000)), started + Duration::from_secs(1)),
+            (5_000, 8_000, 1_000.0)
+        );
+    }
+
+    #[test]
+    fn pressure_sample_freshness_is_bounded() {
+        let mut data = PressureData::default();
+        assert!(data.is_fresh(Duration::from_secs(2)));
+        data.updated_at = Instant::now() - Duration::from_secs(3);
+        assert!(!data.is_fresh(Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn responsive_pressure_interval_catches_short_bursts() {
+        assert!(RESPONSIVE_PRESSURE_INTERVAL <= Duration::from_millis(500));
     }
 
     #[test]

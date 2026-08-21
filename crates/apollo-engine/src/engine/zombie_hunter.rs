@@ -41,7 +41,11 @@ pub struct DeadWeightProcess {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ZombieAction {
-    /// Immediately send SIGKILL — safe for true zombies / clear orphans.
+    /// Observe and attribute only. A kernel zombie can only be reaped by its
+    /// parent calling wait(); signals sent to the zombie are ineffective.
+    ObserveOnly,
+    /// Immediately send SIGKILL — reserved for a live process with sufficient
+    /// lineage proof. True kernel zombies never use this recommendation.
     Kill,
     /// Send SIGSTOP — reversible, good for ghost helpers and hoarders.
     Suspend,
@@ -130,7 +134,7 @@ impl ZombieHunter {
                 zombie_class: ZombieClass::TrueZombie,
                 wasted_rss_bytes: snap.rss_bytes,
                 wakeups_per_sec: 0.0,
-                recommended_action: ZombieAction::Kill,
+                recommended_action: ZombieAction::ObserveOnly,
                 reason: "Process in kernel ZOMBIE state; parent must call wait()".into(),
             })
         } else if snap.pid > 1 && snap.ppid > 1 && !snap.parent_alive {
@@ -310,7 +314,7 @@ mod tests {
         assert!(result.is_some());
         let dw = result.unwrap();
         assert_eq!(dw.zombie_class, ZombieClass::TrueZombie);
-        assert_eq!(dw.recommended_action, ZombieAction::Kill);
+        assert_eq!(dw.recommended_action, ZombieAction::ObserveOnly);
     }
 
     #[test]

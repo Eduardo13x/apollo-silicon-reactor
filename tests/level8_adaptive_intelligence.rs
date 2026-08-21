@@ -231,7 +231,7 @@ fn test_zombie_hunter_detects_true_zombie() {
     assert!(result.is_some());
     let dw = result.unwrap();
     assert_eq!(dw.zombie_class, ZombieClass::TrueZombie);
-    assert_eq!(dw.recommended_action, ZombieAction::Kill);
+    assert_eq!(dw.recommended_action, ZombieAction::ObserveOnly);
 }
 
 #[test]
@@ -456,7 +456,7 @@ fn test_governor_protects_essentials() {
 }
 
 #[test]
-fn test_governor_kills_true_zombie() {
+fn test_governor_delegates_true_zombie_to_daemon_owner() {
     let mut gov = AdaptiveGovernor::new();
 
     let procs: Vec<ProcessSnapshot> = vec![];
@@ -468,9 +468,10 @@ fn test_governor_kills_true_zombie() {
     assert!(gov.decide_all(&procs, &hunts, None, &[], 10).is_empty());
     let decisions = gov.decide_all(&procs, &hunts, None, &[], 10);
 
-    let zombie = decisions.iter().find(|d| d.name == "crashed_app");
-    assert!(zombie.is_some());
-    assert_eq!(zombie.unwrap().decision, GovernorDecision::Kill);
+    assert!(
+        decisions.iter().all(|d| d.name != "crashed_app"),
+        "the daemon ZombieHunter is the sole owner of confirmed dead weight"
+    );
 }
 
 #[test]

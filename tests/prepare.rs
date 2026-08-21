@@ -15,7 +15,7 @@
 //!   - Memory pressure response (freeze the right processes)
 //!   - Performance protection (never throttle foreground/interactive)
 //!   - Workload awareness (coding → protect compilers, video → protect renderers)
-//!   - Waste detection (zombies, telemetry → always act)
+//!   - Waste detection (attribute zombies; act on reclaimable telemetry/dead weight)
 //!   - Edge cases (ephemeral XPC, app helpers, gray zones)
 //!   - Resource efficiency (don't over-throttle when pressure is low)
 
@@ -183,16 +183,15 @@ mod scenarios {
     }
 
     #[test]
-    fn s07_zombie_gets_killed_or_frozen() {
+    fn s07_kernel_zombie_is_observation_only() {
         let snaps = vec![zombie_snap(700, "dead_process")];
         let results = decide(&snaps, None);
         let d = find_decision(&results, "dead_process");
-        assert!(
-            d == GovernorDecision::Kill
-                || d == GovernorDecision::Freeze
-                || d == GovernorDecision::Throttle,
-            "Zombie should be killed/frozen/throttled, got {:?}",
-            d
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "Kernel zombie must be observed until its parent reaps it, got {:?}",
+            d,
         );
     }
 
@@ -888,19 +887,21 @@ mod scenarios {
 
     /// BOSS 20: Zombie disguised as useful.
     /// A process claiming 10% CPU and 500MB RSS but with dead parent.
-    /// The zombie hunter should catch it regardless of its "stats".
+    /// The zombie path should classify it regardless of stale sampled "stats",
+    /// but must not pretend a signal can affect an already-exited process.
     #[test]
-    fn s40_zombie_with_high_cpu_still_killed() {
+    fn s40_kernel_zombie_metrics_do_not_manufacture_an_action() {
         let mut z = snap(4000, "zombie_hog", 10.0, 500, false, 9999, 9999);
         z.is_zombie = true;
         z.parent_alive = false;
         let snaps = vec![z];
         let results = decide(&snaps, None);
         let d = find_decision(&results, "zombie_hog");
-        assert!(
-            d == GovernorDecision::Kill || d == GovernorDecision::Freeze,
-            "Zombie with dead parent must be killed/frozen regardless of CPU. Got {:?}",
-            d
+        assert_eq!(
+            d,
+            GovernorDecision::Allow,
+            "A kernel zombie can only be reaped by its parent, regardless of stale CPU metrics. Got {:?}",
+            d,
         );
     }
 

@@ -138,7 +138,7 @@ pub fn run_thermal_tick(
     }
 }
 
-fn gpu_power_reference_watts(hardware_cores: u32) -> f32 {
+pub(crate) fn gpu_power_reference_watts(hardware_cores: u32) -> f32 {
     (hardware_cores.max(4) as f32 * 2.0).clamp(12.0, 64.0)
 }
 

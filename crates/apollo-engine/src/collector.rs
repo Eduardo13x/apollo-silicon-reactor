@@ -75,8 +75,8 @@ pub struct PressureStats {
     /// app backgrounded under a high-volume workload). Distinct from
     /// `thrashing_score` (compression churn) and `swap_delta` (swap size). A
     /// transient spike here on a foreground switch is the microstutter signal.
-    /// 0.0 until the second sample. [Phase 0 telemetry — no decision consumes
-    /// it yet; baseline first, threshold in Phase 1.]
+    /// 0.0 until the second sample. The adaptive-overhead governor consumes
+    /// this signal to shed Apollo's optional work before pressure catches up.
     #[serde(default)]
     pub refault_delta_per_sec: f64,
 }

@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use apollo_engine::engine::platform::{MacOsPlatformAdapter, PlatformAdapter};
 
 mod adaptive_overhead;
+mod adaptive_stutter;
 /// Global stop flag for signal handlers (SIGTERM/SIGINT).
 /// Signal handlers cannot capture Arc/closures, so we use a static AtomicBool
 /// that the main loop checks alongside `state.stop`.
@@ -184,22 +185,24 @@ use apollo_engine::engine::actuation_broker::{ActuationBroker, ActuationRequest}
 use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
 use apollo_engine::engine::amx_detector;
 use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
-use apollo_engine::engine::background_collectors::PressureCollector;
+use apollo_engine::engine::background_collectors::{
+    PressureCollector, RESPONSIVE_PRESSURE_INTERVAL, RESPONSIVE_PRESSURE_MAX_AGE,
+};
 use apollo_engine::engine::capabilities::detect_capabilities;
 use apollo_engine::engine::causal_graph::CausalGraph;
 use apollo_engine::engine::compressor_aware::{
     decide_enhanced, query_memory_profile, sample_process_temperature, scan_regions, MemoryAction,
 };
 use apollo_engine::engine::daemon_helpers::{
-    audit_log, battery_pressure_boost, detect_prior_crash, frozen_state_path, governor_state_path,
-    holt_winters_path, hop_groups_path, installation_id_path, journal_path, kill_switch_path,
-    learned_state_path, load_frozen_state, load_governor_state, load_wake_state, markov_path,
-    merge_seed_into, metrics_path, overflow_history_path, parse_profile, pid_start_time,
-    predictive_agent_path, reflex_state_path, remove_crash_sentinel, rl_threshold_path,
-    signal_intelligence_path, skills_path, socket_path, telemetry_output_dir,
-    temporal_histograms_path, timeline_path, unfreeze_outcome_events, unfreeze_pids_outcome,
-    unfreeze_pids_verified_outcome, wake_state_path, write_frozen_state, write_governor_state,
-    AsyncCommandMetric, AsyncCommandQueue, AsyncCommandSubmitError,
+    adaptive_stutter_path, audit_log, battery_pressure_boost, detect_prior_crash,
+    frozen_state_path, governor_state_path, holt_winters_path, hop_groups_path,
+    installation_id_path, journal_path, kill_switch_path, learned_state_path, load_frozen_state,
+    load_governor_state, load_wake_state, markov_path, merge_seed_into, metrics_path,
+    overflow_history_path, parse_profile, pid_start_time, predictive_agent_path, reflex_state_path,
+    remove_crash_sentinel, rl_threshold_path, signal_intelligence_path, skills_path, socket_path,
+    telemetry_output_dir, temporal_histograms_path, timeline_path, unfreeze_outcome_events,
+    unfreeze_pids_outcome, unfreeze_pids_verified_outcome, wake_state_path, write_frozen_state,
+    write_governor_state, AsyncCommandMetric, AsyncCommandQueue, AsyncCommandSubmitError,
 };
 use apollo_engine::engine::focus_markov::FocusMarkov;
 use apollo_engine::engine::foreground::{ForegroundDetector, ForegroundState};
@@ -1192,7 +1195,7 @@ fn main() -> anyhow::Result<()> {
             // Audit fix #5: Background powermetrics polling (replaces 5-cycle IOKit tick).
             let mut smc_reader = SmcReader::spawn(Duration::from_secs(3));
             // Background pressure collector: moves memory_pressure + sysctl out of main loop.
-            let mut pressure_collector = PressureCollector::spawn(Duration::from_secs(3));
+            let mut pressure_collector = PressureCollector::spawn(RESPONSIVE_PRESSURE_INTERVAL);
             // Hierarchical planner — Strangler Fig Phase 0 (advisory only).
             // Reads runtime_metrics.json at 30-s cadence, derives forward-
             // looking hints from observed trends, writes them to
@@ -1692,6 +1695,10 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or(1)
                 ^ u64::from(std::process::id());
             let mut overhead_governor = adaptive_overhead::AdaptiveOverheadGovernor::default();
+            let adaptive_stutter_path = PathBuf::from(adaptive_stutter_path());
+            let mut adaptive_stutter_envelope =
+                adaptive_stutter::AdaptiveStutterEnvelope::load(&adaptive_stutter_path);
+            let adaptive_stutter_writer = adaptive_stutter::AdaptiveStutterWriter::spawn();
             let mut value_scheduler_runtime =
                 value_scheduler_tick::ValueSchedulerRuntime::new(runtime_capability_graph.revision);
             value_scheduler_runtime.connect_handoff_jobs(&[
@@ -1779,11 +1786,12 @@ fn main() -> anyhow::Result<()> {
             log_ingester.start_background();
             // B.6 gap fix (2026-06-10): zombie/dead-weight hunter. Classifies
             // GhostHelper / MemoryHoarder / WakeupBurner / TrueZombie / Orphan
-            // from the per-cycle hunt_snaps and emits CONSERVATIVE actions
+            // from the per-cycle hunt_snaps and emits conservative actions
             // (jetsam idle-band hints + non-aggressive throttles — never kills;
-            // the kernel keeps kill authority). Evaluated every 30 cycles —
-            // dead weight accumulates over minutes, not milliseconds.
-            // Persistent across cycles for its 3-cycle confirmation history.
+            // the kernel keeps kill authority). It is the sole persistence
+            // owner; AdaptiveGovernor only suppresses provisional suspects.
+            // Detection runs every cycle, while action emission stays at the
+            // existing 30-cycle cadence.
             let mut zombie_hunter = apollo_engine::engine::zombie_hunter::ZombieHunter::new();
             // Minimum cycle floor: prevent CPU burn from rapid condvar wakeups.
             let mut last_cycle_end = Instant::now() - Duration::from_secs(1);
@@ -2389,7 +2397,7 @@ fn main() -> anyhow::Result<()> {
                             if !pressure_alive {
                                 tracing::warn!("watchdog: PressureCollector stalled — respawning");
                                 pressure_collector =
-                                    PressureCollector::spawn(Duration::from_secs(3));
+                                    PressureCollector::spawn(RESPONSIVE_PRESSURE_INTERVAL);
                             }
                         }
                     }
@@ -2475,18 +2483,76 @@ fn main() -> anyhow::Result<()> {
                 );
                 cycle_decision_events.extend_buffer(&turbo_output.decision_events);
 
-                let overhead_input = {
+                // Use the already-cached context and pressure streams so the
+                // overhead governor protects realtime media and compressor
+                // flow before aggregate p95 has time to report the stutter.
+                let context_summary = state.latest_context_summary();
+                let context_realtime_media = context_summary.is_some_and(|summary| {
+                    use apollo_engine::engine::context_agent::TriState;
+                    summary.audio_output == TriState::Yes && summary.audio_input == TriState::Yes
+                });
+                let context_media_output = context_summary.is_some_and(|summary| {
+                    use apollo_engine::engine::context_agent::TriState;
+                    summary.audio_output == TriState::Yes
+                });
+                let context_interaction_q = context_summary
+                    .map(|summary| summary.interaction_q)
+                    .unwrap_or(0.0);
+                let overhead_pressure = pressure_collector.latest();
+                let overhead_pressure_stale =
+                    !overhead_pressure.is_fresh(RESPONSIVE_PRESSURE_MAX_AGE);
+                let overhead_hardware_stale = smc_reader.is_stale(Duration::from_secs(30));
+                let mut overhead_input = {
                     let metrics = state.metrics.lock_recover();
                     adaptive_overhead::OverheadInput {
                         p95_cycle_ms: metrics.metrics.p95_cycle_ms,
                         reason_avg_ms: metrics.metrics.stage_reason_avg_ms,
-                        memory_pressure: metrics.metrics.memory_pressure,
+                        memory_pressure: metrics
+                            .metrics
+                            .memory_pressure
+                            .max(overhead_pressure.memory_pressure),
+                        pressure_sample_stale: overhead_pressure_stale,
                         fluidity_degraded: metrics.metrics.fluidity_degraded,
+                        realtime_media_active: metrics.metrics.user_call_in_progress
+                            || context_realtime_media,
+                        media_output_active: metrics.metrics.user_audio_active
+                            || context_media_output,
+                        interaction_q: context_interaction_q,
+                        cpu_max_busy: metrics.metrics.cpu_max_busy,
+                        gpu_render_load: fluidity_state.gpu_render_load as f64,
+                        hardware_sample_stale: overhead_hardware_stale,
+                        compositor_cpu_pct: metrics.metrics.windowserver_cpu_pct as f64,
+                        predicted_fluidity_3s: metrics.metrics.fluidity_predicted_3s as f64,
+                        swap_delta_bps: overhead_pressure.swap_delta_bps,
+                        thrashing_score: overhead_pressure.thrashing_score,
+                        refault_delta_per_sec: overhead_pressure.vm_rate.refaults_per_sec(),
+                        vm_page_size_bytes: overhead_pressure.page_size_bytes,
+                        stall_fraction: metrics.metrics.stall_fraction,
+                        adaptive_stutter_guarded: false,
+                        adaptive_stutter_constrained: false,
                         holt_winters_avg_ms: metrics.metrics.stage_reason_holtwinters_avg_ms,
                         page_reclaim_avg_ms: metrics.metrics.stage_reason_pagereclaim_avg_ms,
                     }
                 };
+                let adaptive_stutter_decision = adaptive_stutter_envelope.observe(
+                    adaptive_stutter::StutterObservation::from_overhead(overhead_input),
+                );
+                overhead_input.adaptive_stutter_guarded = matches!(
+                    adaptive_stutter_decision.risk,
+                    adaptive_stutter::EnvelopeRisk::Guarded
+                        | adaptive_stutter::EnvelopeRisk::Constrained
+                );
+                overhead_input.adaptive_stutter_constrained = matches!(
+                    adaptive_stutter_decision.risk,
+                    adaptive_stutter::EnvelopeRisk::Constrained
+                );
                 let overhead_budget = overhead_governor.observe(overhead_input);
+                let adaptive_stutter_persist_dropped = cycle_count > 0
+                    && cycle_count.is_multiple_of(300)
+                    && !adaptive_stutter_writer.submit(
+                        adaptive_stutter_path.clone(),
+                        adaptive_stutter_envelope.clone(),
+                    );
                 {
                     let mut metrics = state.metrics.lock_recover();
                     metrics.metrics.apollo_overhead_level =
@@ -2509,6 +2575,35 @@ fn main() -> anyhow::Result<()> {
                         .saturating_add(u64::from(
                             overhead_budget.level == adaptive_overhead::OverheadLevel::Constrained,
                         ));
+                    metrics.metrics.adaptive_stutter_phase =
+                        adaptive_stutter_decision.phase.as_str().to_string();
+                    metrics.metrics.adaptive_stutter_regime =
+                        adaptive_stutter_decision.regime.as_str().to_string();
+                    metrics.metrics.adaptive_stutter_risk =
+                        adaptive_stutter_decision.risk.as_str().to_string();
+                    metrics.metrics.adaptive_stutter_score = adaptive_stutter_decision.score;
+                    metrics.metrics.adaptive_stutter_samples = adaptive_stutter_decision.samples;
+                    metrics.metrics.adaptive_stutter_shadow_would_guard_cycles = metrics
+                        .metrics
+                        .adaptive_stutter_shadow_would_guard_cycles
+                        .saturating_add(u64::from(
+                            adaptive_stutter_decision.phase
+                                == adaptive_stutter::EnvelopePhase::Shadow
+                                && adaptive_stutter_decision.would_guard,
+                        ));
+                    metrics.metrics.adaptive_stutter_protection_cycles = metrics
+                        .metrics
+                        .adaptive_stutter_protection_cycles
+                        .saturating_add(u64::from(
+                            adaptive_stutter_decision.risk
+                                != adaptive_stutter::EnvelopeRisk::Nominal,
+                        ));
+                    metrics.metrics.adaptive_stutter_persist_drops_total = metrics
+                        .metrics
+                        .adaptive_stutter_persist_drops_total
+                        .saturating_add(u64::from(adaptive_stutter_persist_dropped));
+                    metrics.metrics.adaptive_stutter_persist_failures_total =
+                        adaptive_stutter_writer.failures_total();
                 }
                 smc_reader.set_interval(Duration::from_secs(overhead_budget.sensor_interval_secs));
 
@@ -2547,6 +2642,8 @@ fn main() -> anyhow::Result<()> {
                         // active compressor churn even when absolute pressure
                         // hasn't hit the extreme threshold yet.
                         snapshot.pressure.thrashing_score = cached_pressure.thrashing_score;
+                        snapshot.pressure.refault_delta_per_sec =
+                            cached_pressure.vm_rate.refaults_per_sec();
                     }
                 }
                 snapshot.pressure.thermal_level =
@@ -2563,7 +2660,6 @@ fn main() -> anyhow::Result<()> {
                 let _t_tree_start = Instant::now();
                 let process_tree = daemon_process_collector::build_process_tree(&collector);
                 let process_tree_nanos = _t_tree_start.elapsed().as_nanos();
-                let context_summary = state.latest_context_summary();
                 let context_audio_active = context_summary.and_then(|summary| {
                     use apollo_engine::engine::context_agent::TriState;
                     match summary.audio_output {
@@ -3926,8 +4022,9 @@ fn main() -> anyhow::Result<()> {
                     metrics.metrics.swap_used_bytes = snapshot.pressure.swap_used_bytes;
                     metrics.metrics.swap_total_bytes = snapshot.pressure.swap_total_bytes;
                     metrics.metrics.swap_delta_bps = snapshot.pressure.swap_delta_bytes_per_sec;
-                    // Fault-in rate (the stall side) + session peak. [Phase 0
-                    // telemetry — no decision consumes this yet; baseline first.]
+                    // Fault-in rate (the stall side) + session peak. The
+                    // adaptive-overhead governor also consumes the faster
+                    // background sample before aggregate p95 can regress.
                     let refault = snapshot.pressure.refault_delta_per_sec;
                     metrics.metrics.refault_delta_per_sec = refault;
                     metrics.metrics.refault_peak_per_sec =
@@ -4298,6 +4395,7 @@ fn main() -> anyhow::Result<()> {
                                 proc_snaps: &proc_snaps,
                                 cycle_hw_snap: cycle_hw_snap.as_ref(),
                                 cycle_dt_secs: cycle_dt_secs as f32,
+                                hardware_cores: hw_cores,
                                 fluidity_state: &mut fluidity_state,
                             },
                         )
@@ -5728,10 +5826,12 @@ fn main() -> anyhow::Result<()> {
                 //   TrueZombie / Orphan → telemetry only: SIGKILL on a Z-state
                 //     process is a no-op (parent must wait()) and orphan kills
                 //     are too risky without lineage proof.
-                // Every 30 cycles — dead weight accumulates over minutes.
-                // Hunter has its own 3-cycle confirmation before classifying.
-                if cycle_count % 30 == 0 && !hunt_snaps.is_empty() {
-                    let dead_weight = zombie_hunter.evaluate_all(&hunt_snaps);
+                // One owner evaluates every cycle so its three confirmations
+                // are consecutive. Expensive actions retain the 30-cycle
+                // cadence and still enter the central accumulator.
+                let dead_weight = zombie_hunter.evaluate_all(&hunt_snaps);
+                let confirmed_dead_weight_this_cycle = dead_weight.len() as u64;
+                if cycle_count % 30 == 0 && !dead_weight.is_empty() {
                     // Phase 2: during a high-volume workload (call, media, or a
                     // fault-in storm), do not jetsam-demote apps. A demote makes
                     // the target more compressible/kill-prone — so demoting right
@@ -5747,52 +5847,51 @@ fn main() -> anyhow::Result<()> {
                             snapshot.pressure.refault_delta_per_sec,
                             high_bw_physical_pressure,
                         );
-                    if !dead_weight.is_empty() {
-                        let reclaimable_mb =
-                            apollo_engine::engine::zombie_hunter::ZombieHunter::total_reclaimable_bytes(
-                                &dead_weight,
-                            ) / 1024
-                                / 1024;
-                        let mut zombie_actions: Vec<RootAction> = Vec::new();
-                        for dw in &dead_weight {
-                            // 2026-06-20 (regression probe caught live: node
-                            // nominated 3x): hard_protected_contains only covers
-                            // the hard list — a dev-runtime (node/rustc) or infra
-                            // (docker/postgres) zombie slipped through and got
-                            // jetsam-demoted. is_protected_name covers all three
-                            // tiers. Additive — only adds protection.
-                            // 2026-06-21 (P1, playback-easing Wave 1): also never
-                            // nominate Chromium/Brave helpers — a live 4K renderer
-                            // helper has no window of its own so it looks like an
-                            // "idle MemoryHoarder", but demoting it under jetsam
-                            // during playback = frame drop. is_chromium_family
-                            // matches "Brave Browser Helper*". Was firing 974x
-                            // (always failing) on a live renderer — additive.
-                            // Reuse the full per-cycle envelope. It includes
-                            // Apple platform ownership and dynamic behavioral
-                            // protection, which name-only checks cannot see.
-                            if daemon_action_safety::is_protected_action_candidate(
-                                dw.pid,
-                                &dw.name,
-                                &heuristic_critical_pids,
-                            ) {
-                                continue;
+                    let reclaimable_mb =
+                        apollo_engine::engine::zombie_hunter::ZombieHunter::total_reclaimable_bytes(
+                            &dead_weight,
+                        ) / 1024
+                            / 1024;
+                    let mut zombie_actions: Vec<RootAction> = Vec::new();
+                    for dw in &dead_weight {
+                        // 2026-06-20 (regression probe caught live: node
+                        // nominated 3x): hard_protected_contains only covers
+                        // the hard list — a dev-runtime (node/rustc) or infra
+                        // (docker/postgres) zombie slipped through and got
+                        // jetsam-demoted. is_protected_name covers all three
+                        // tiers. Additive — only adds protection.
+                        // 2026-06-21 (P1, playback-easing Wave 1): also never
+                        // nominate Chromium/Brave helpers — a live 4K renderer
+                        // helper has no window of its own so it looks like an
+                        // "idle MemoryHoarder", but demoting it under jetsam
+                        // during playback = frame drop. is_chromium_family
+                        // matches "Brave Browser Helper*". Was firing 974x
+                        // (always failing) on a live renderer — additive.
+                        // Reuse the full per-cycle envelope. It includes
+                        // Apple platform ownership and dynamic behavioral
+                        // protection, which name-only checks cannot see.
+                        if daemon_action_safety::is_protected_action_candidate(
+                            dw.pid,
+                            &dw.name,
+                            &heuristic_critical_pids,
+                        ) {
+                            continue;
+                        }
+                        lf_metrics.inc_zombie_dead_weight_detected();
+                        use apollo_engine::engine::zombie_hunter::ZombieClass;
+                        match dw.zombie_class {
+                            ZombieClass::GhostHelper | ZombieClass::MemoryHoarder
+                                if high_bw_workload =>
+                            {
+                                // Hold the demote off during the workload.
+                                tracing::debug!(
+                                    pid = dw.pid,
+                                    name = %dw.name,
+                                    "phase2: jetsam-demote suppressed (high-bw workload)"
+                                );
                             }
-                            lf_metrics.inc_zombie_dead_weight_detected();
-                            use apollo_engine::engine::zombie_hunter::ZombieClass;
-                            match dw.zombie_class {
-                                ZombieClass::GhostHelper | ZombieClass::MemoryHoarder
-                                    if high_bw_workload =>
-                                {
-                                    // Hold the demote off during the workload.
-                                    tracing::debug!(
-                                        pid = dw.pid,
-                                        name = %dw.name,
-                                        "phase2: jetsam-demote suppressed (high-bw workload)"
-                                    );
-                                }
-                                ZombieClass::GhostHelper | ZombieClass::MemoryHoarder => {
-                                    zombie_actions.push(RootAction::set_memorystatus(
+                            ZombieClass::GhostHelper | ZombieClass::MemoryHoarder => {
+                                zombie_actions.push(RootAction::set_memorystatus(
                                         dw.pid,
                                         -1,
                                         format!(
@@ -5804,13 +5903,11 @@ fn main() -> anyhow::Result<()> {
                                         ),
                                         apollo_engine::engine::audit_types::DecisionReason::PressureContext,
                                     ));
-                                }
-                                ZombieClass::WakeupBurner => {
-                                    let (ss, su) =
-                                        apollo_engine::engine::daemon_helpers::pid_start_time(
-                                            dw.pid,
-                                        );
-                                    zombie_actions.push(RootAction::ThrottleProcess {
+                            }
+                            ZombieClass::WakeupBurner => {
+                                let (ss, su) =
+                                    apollo_engine::engine::daemon_helpers::pid_start_time(dw.pid);
+                                zombie_actions.push(RootAction::ThrottleProcess {
                                         pid: dw.pid,
                                         name: dw.name.clone(),
                                         aggressive: false,
@@ -5823,37 +5920,36 @@ fn main() -> anyhow::Result<()> {
                                         decision_reason:
                                             apollo_engine::engine::audit_types::DecisionReason::PressureContext,
                                     });
-                                }
-                                ZombieClass::TrueZombie | ZombieClass::Orphan => {
-                                    // Telemetry-only v1: no safe signal-based remedy.
-                                }
                             }
-                        }
-                        if !zombie_actions.is_empty() {
-                            tracing::info!(
-                                detected = dead_weight.len(),
-                                actions = zombie_actions.len(),
-                                reclaimable_mb,
-                                "zombie-hunter: dead weight marked for kernel reclaim"
-                            );
-                            for _ in 0..zombie_actions.len() {
-                                lf_metrics.inc_zombie_action_emitted();
+                            ZombieClass::TrueZombie | ZombieClass::Orphan => {
+                                // Telemetry-only v1: no safe signal-based remedy.
                             }
-                            acc.extend_raw(
-                                zombie_actions,
-                                EmitContext::new(
-                                    ActionPhase::StaleApps,
-                                    "main.rs zombie_hunter consumer",
-                                    "dead_weight_reclaim",
-                                ),
-                                lf_metrics,
-                            );
                         }
                     }
-                    // Drop confirmation history for PIDs that exited.
-                    let live: Vec<u32> = hunt_snaps.iter().map(|h| h.pid).collect();
-                    zombie_hunter.cleanup(&live);
+                    if !zombie_actions.is_empty() {
+                        tracing::info!(
+                            detected = dead_weight.len(),
+                            actions = zombie_actions.len(),
+                            reclaimable_mb,
+                            "zombie-hunter: dead weight marked for kernel reclaim"
+                        );
+                        for _ in 0..zombie_actions.len() {
+                            lf_metrics.inc_zombie_action_emitted();
+                        }
+                        acc.extend_raw(
+                            zombie_actions,
+                            EmitContext::new(
+                                ActionPhase::StaleApps,
+                                "main.rs zombie_hunter consumer",
+                                "dead_weight_reclaim",
+                            ),
+                            lf_metrics,
+                        );
+                    }
                 }
+                // Drop confirmation history for PIDs that exited.
+                let live: Vec<u32> = hunt_snaps.iter().map(|h| h.pid).collect();
+                zombie_hunter.cleanup(&live);
 
                 // Evolve iter-4 (2026-06-10): unified EffectLedger reconcile
                 // replaces the ad-hoc boost-decay sweep. ALL recorded kernel
@@ -6162,7 +6258,9 @@ fn main() -> anyhow::Result<()> {
                     m.metrics.heuristic_throttles += heuristic_stats.throttles;
                     m.metrics.heuristic_freezes += heuristic_stats.freezes;
                     m.metrics.heuristic_kills_downgraded += heuristic_stats.kills_downgraded;
-                    m.metrics.zombies_detected += heuristic_stats.zombies_detected;
+                    m.metrics.zombies_detected += heuristic_stats
+                        .zombies_detected
+                        .saturating_add(confirmed_dead_weight_this_cycle);
                     m.metrics.current_workload = current_workload_str;
                 }
                 // StabilityOracle: record zombie count + swap bytes + VM
@@ -6171,7 +6269,12 @@ fn main() -> anyhow::Result<()> {
                 // captures per-second compression/decompression/swap churn —
                 // the flow view of memory pressure that absolute percentages
                 // can't see.
-                stability_oracle.record_zombie_count(heuristic_stats.zombies_detected as usize);
+                stability_oracle.record_zombie_count(
+                    heuristic_stats
+                        .zombies_detected
+                        .saturating_add(confirmed_dead_weight_this_cycle)
+                        as usize,
+                );
                 stability_oracle.record_swap_bytes(snapshot.pressure.swap_used_bytes);
                 stability_oracle
                     .record_thrashing_score(pressure_collector.latest().thrashing_score);
@@ -8622,6 +8725,13 @@ fn main() -> anyhow::Result<()> {
                 acceleration_lease.rollout_state(),
                 Some(0o600),
             );
+            if !adaptive_stutter_writer.flush(
+                adaptive_stutter_path,
+                adaptive_stutter_envelope,
+                Duration::from_secs(2),
+            ) {
+                tracing::warn!("adaptive-stutter: final checkpoint timed out");
+            }
             // On clean shutdown, clear the pending trial: the result can't be measured
             // reliably after a restart since system pressure state will differ.
             let frozen_snap_shutdown: FrozenStatePersisted = {
