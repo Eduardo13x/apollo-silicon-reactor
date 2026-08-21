@@ -182,7 +182,12 @@ fn profile_emoji(p: OptimizationProfile) -> &'static str {
 /// takes precedence over raw signals that may have been deliberately gated.
 fn profile_activity_reason(status: &DaemonStatus) -> &'static str {
     if status.override_active {
-        "Override manual"
+        match status.override_origin {
+            Some(apollo_engine::engine::types::OverrideOrigin::Predictive) => {
+                "Auto: presión predictiva"
+            }
+            _ => "Override manual",
+        }
     } else if status.effective_profile == status.base_profile {
         "Base estable"
     } else if status.effective_profile == OptimizationProfile::SafeRoot
@@ -2299,7 +2304,7 @@ pub fn render_dashboard_v2(status: &DaemonStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use apollo_engine::engine::types::{LatencyTarget, RuntimeMetrics};
+    use apollo_engine::engine::types::{LatencyTarget, OverrideOrigin, RuntimeMetrics};
 
     fn dashboard_status() -> DaemonStatus {
         DaemonStatus {
@@ -2315,6 +2320,7 @@ mod tests {
             base_profile: OptimizationProfile::BalancedRoot,
             override_active: false,
             override_expires_at: None,
+            override_origin: None,
             transition_reason: String::new(),
             post_wake_grace_active: false,
             post_wake_grace_remaining_secs: 0,
@@ -3323,6 +3329,15 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_labels_predictive_override_as_automatic() {
+        let mut status = dashboard_status();
+        status.override_active = true;
+        status.override_origin = Some(OverrideOrigin::Predictive);
+
+        assert_eq!(profile_activity_reason(&status), "Auto: presión predictiva");
+    }
+
+    #[test]
     fn think_quadrant_surfaces_medallion_quality_and_ais_learning() {
         let mut status = dashboard_status();
         status.metrics.ais_score = 92.4;
@@ -3630,6 +3645,7 @@ mod tests {
             base_profile: OptimizationProfile::AggressiveRoot,
             override_active: false,
             override_expires_at: None,
+            override_origin: None,
             transition_reason: String::new(),
             post_wake_grace_active: false,
             post_wake_grace_remaining_secs: 0,

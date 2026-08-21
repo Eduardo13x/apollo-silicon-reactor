@@ -29,8 +29,11 @@ use apollo_engine::engine::decision_ledger::{
 use apollo_engine::engine::learned_state::LearnableParams;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
+use apollo_engine::engine::memory_regime::{MemoryRegime, MemoryRegimeEvidence};
 use apollo_engine::engine::overflow_guard::OverflowGuard;
-use apollo_engine::engine::safety::{survival_mode_active_total, swap_exhaustion_threshold_bytes};
+use apollo_engine::engine::safety::{
+    survival_mode_active_capacity, swap_exhaustion_threshold_bytes_for_ram,
+};
 use apollo_engine::engine::signal_intelligence::SignalDigest;
 use apollo_engine::engine::signal_intelligence::SignalIntelligence;
 
@@ -46,6 +49,27 @@ const SURVIVAL_JETSAM_TTL: Duration = Duration::from_secs(90);
 #[derive(Debug, Default)]
 pub struct SurvivalTickOutput {
     pub decision_events: CycleDecisionEvents,
+}
+
+fn should_enter_survival(
+    memory_pressure: f64,
+    p_oom_30s: f64,
+    cycle_count: u64,
+    memory_evidence: &MemoryRegimeEvidence,
+) -> bool {
+    let corroborated_prediction = cycle_count > 5
+        && p_oom_30s > 0.80
+        && memory_pressure >= 0.70
+        && memory_evidence.sustained
+        && memory_evidence.adverse_flow
+        && matches!(
+            memory_evidence.regime,
+            MemoryRegime::Contended | MemoryRegime::Crisis
+        );
+
+    memory_pressure > 0.85
+        || memory_evidence.physically_correlated_crisis()
+        || corroborated_prediction
 }
 
 fn survival_event(
@@ -147,6 +171,8 @@ fn apply_survival_jetsam_demotions(
 pub fn run_survival_tick(
     snapshot: &SystemSnapshot,
     signal_digest: &SignalDigest,
+    memory_evidence: &MemoryRegimeEvidence,
+    physical_memory_bytes: u64,
     cycle_count: u64,
     overflow_guard: &mut OverflowGuard,
     signal_intel: &mut SignalIntelligence,
@@ -158,12 +184,12 @@ pub fn run_survival_tick(
     async_commands: &AsyncCommandQueue,
 ) -> SurvivalTickOutput {
     let mut output = SurvivalTickOutput::default();
-    let p_oom_escalation = cycle_count > 5
-        && signal_digest.p_oom_30s > 0.80
-        && snapshot.pressure.memory_pressure >= 0.70;
-    let survival_mode = snapshot.pressure.memory_pressure > 0.85
-        || snapshot.pressure.swap_delta_bytes_per_sec > 1_000_000.0
-        || p_oom_escalation;
+    let survival_mode = should_enter_survival(
+        snapshot.pressure.memory_pressure,
+        signal_digest.p_oom_30s,
+        cycle_count,
+        memory_evidence,
+    );
 
     // Overflow guard: only record when real pressure (≥ 0.60). Swap storms at
     // 36-42% were poisoning the guard with false positives.
@@ -212,11 +238,13 @@ pub fn run_survival_tick(
     }
 
     // Observability: count one activation per cycle survival is active.
-    let survival_active = survival_mode_active_total(
-        snapshot.pressure.memory_pressure,
-        snapshot.pressure.swap_used_bytes,
-        snapshot.pressure.swap_total_bytes,
-    );
+    let survival_active = survival_mode
+        && survival_mode_active_capacity(
+            snapshot.pressure.memory_pressure,
+            snapshot.pressure.swap_used_bytes,
+            snapshot.pressure.swap_total_bytes,
+            physical_memory_bytes,
+        );
     if survival_active {
         let now = std::time::SystemTime::now();
         let mut guard = state.metrics.lock_recover();
@@ -247,7 +275,10 @@ pub fn run_survival_tick(
         // Last-resort page reclaim: spawn `purge` when swap crosses 80% of
         // exhaustion threshold. Survival reads its OWN local cooldown only —
         // asymmetric: never gated by shared maintenance_state.last_any_purge_at.
-        let threshold = swap_exhaustion_threshold_bytes(snapshot.pressure.swap_total_bytes);
+        let threshold = swap_exhaustion_threshold_bytes_for_ram(
+            snapshot.pressure.swap_total_bytes,
+            physical_memory_bytes,
+        );
         let swap_used = snapshot.pressure.swap_used_bytes;
         if swap_used as f64 >= threshold as f64 * 0.80 {
             let mut local = SURVIVAL_LOCAL_COOLDOWN
@@ -316,6 +347,39 @@ pub fn run_survival_tick(
 mod tests {
     use super::*;
     use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
+
+    fn evidence(regime: MemoryRegime, sustained: bool) -> MemoryRegimeEvidence {
+        MemoryRegimeEvidence {
+            regime,
+            generation: 1,
+            confidence: 1.0,
+            normalized_score: 0.9,
+            swap_fraction_of_ram: 0.4,
+            swap_growth_fraction_per_minute: 0.01,
+            adverse_flow: true,
+            sustained,
+        }
+    }
+
+    #[test]
+    fn one_swap_burst_without_sustained_evidence_cannot_enter_survival() {
+        assert!(!should_enter_survival(
+            0.70,
+            0.95,
+            10,
+            &evidence(MemoryRegime::Building, false),
+        ));
+    }
+
+    #[test]
+    fn predictive_survival_requires_correlated_sustained_memory_state() {
+        assert!(should_enter_survival(
+            0.75,
+            0.95,
+            10,
+            &evidence(MemoryRegime::Contended, true),
+        ));
+    }
 
     #[test]
     fn survival_actions_use_existing_pressure_relief_families() {

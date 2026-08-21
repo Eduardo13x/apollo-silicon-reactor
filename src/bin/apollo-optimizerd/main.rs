@@ -382,11 +382,17 @@ fn fingerprint_top_processes(top: &[apollo_engine::collector::ProcessStats]) -> 
     })
 }
 
-fn swap_reclaim_bypass_active(swap_used_bytes: u64, swap_total_bytes: u64, p_oom_30s: f64) -> bool {
-    apollo_engine::engine::safety::survival_mode_active_total(
+fn swap_reclaim_bypass_active(
+    swap_used_bytes: u64,
+    swap_total_bytes: u64,
+    physical_memory_bytes: u64,
+    p_oom_30s: f64,
+) -> bool {
+    apollo_engine::engine::safety::survival_mode_active_capacity(
         0.0,
         swap_used_bytes,
         swap_total_bytes,
+        physical_memory_bytes,
     ) || p_oom_30s >= 0.95
 }
 
@@ -1157,6 +1163,11 @@ fn main() -> anyhow::Result<()> {
             // Hardware capability scaling for SafetyPolicy::for_capabilities().
             // Detected once at startup via detect_hw_caps() (~1ms sysinfo query).
             let (hw_cores, hw_ram_gb) = daemon_init::detect_hw_caps();
+            let memory_capabilities = daemon_init::detect_memory_capabilities();
+            let mut memory_regime_detector =
+                apollo_engine::engine::memory_regime::MemoryRegimeDetector::default();
+            let mut last_memory_regime =
+                apollo_engine::engine::memory_regime::MemoryRegimeEvidence::default();
             let hierarchy_hardware = apollo_engine::engine::telemetry_medallion::HardwareRegime {
                 p_core_count: caps.p_core_count.unwrap_or(0),
                 e_core_count: caps.e_core_count.unwrap_or(0),
@@ -3758,12 +3769,6 @@ fn main() -> anyhow::Result<()> {
                     hw_cores,
                 );
 
-                // SwapPredictor: update trend forecast every cycle.
-                let swap_forecast = swap_predictor.update(
-                    snapshot.pressure.swap_used_bytes,
-                    snapshot.pressure.swap_total_bytes,
-                );
-
                 // PowerManager: advisory tick (no real sensor data yet).
                 let _power_rec = power_mgr.get_recommendation();
 
@@ -4646,7 +4651,7 @@ fn main() -> anyhow::Result<()> {
                         arousal_level: arousal_state.level as f64,
                         workload_mode: Some(workload_mode),
                         workload_onset,
-                        swap_used_bytes: snapshot.pressure.swap_used_bytes,
+                        memory_evidence: Some(last_memory_regime.clone()),
                     })
                 };
                 if governor_decision.transition_reason.contains("floor") {
@@ -4725,9 +4730,38 @@ fn main() -> anyhow::Result<()> {
                 // Swap Reclaim ODE — feed vm_rate from background collector.
                 // Produces SaturationForecast used by the freeze gate below.
                 // [Denning 1968; Zhao et al. 2009 WKdm rate model]
-                let reclaim_forecast = {
+                let (reclaim_forecast, normalized_memory_state, memory_regime, swap_forecast) = {
+                    use apollo_engine::engine::memory_regime::{
+                        MemoryNormalizer, MemoryObservation,
+                    };
                     use apollo_engine::engine::swap_reclaim::VmFlowSample;
                     let pd = pressure_collector.latest();
+                    let now = Instant::now();
+                    let capabilities =
+                        memory_capabilities.with_observed_page_size(pd.page_size_bytes);
+                    let observation = MemoryObservation {
+                        generation: pd.generation,
+                        observed_at: pd.updated_at,
+                        pressure: pd.memory_pressure,
+                        pressure_velocity_per_second: signal_digest.pressure_velocity,
+                        swap_used_bytes: pd.swap_used_bytes,
+                        swap_total_bytes: pd.swap_total_bytes,
+                        swap_delta_bytes_per_second: pd.swap_delta_bps,
+                        compressions_per_second: pd.vm_rate.compressions_per_sec,
+                        decompressions_per_second: pd.vm_rate.decompressions_per_sec,
+                        purges_per_second: pd.vm_rate.purges_per_sec,
+                        swapouts_per_second: pd.vm_rate.swapouts_per_sec,
+                        page_size_bytes: pd.page_size_bytes,
+                    };
+                    let normalized = MemoryNormalizer::normalize(&capabilities, &observation, now);
+                    let regime = memory_regime_detector.update(&normalized, now);
+                    let swap_forecast = swap_predictor.update_at(
+                        pd.generation,
+                        pd.updated_at,
+                        pd.swap_used_bytes,
+                        pd.swap_total_bytes,
+                        capabilities.physical_memory_bytes,
+                    );
                     let flow = VmFlowSample {
                         compressions_per_sec: pd.vm_rate.compressions_per_sec,
                         decompressions_per_sec: pd.vm_rate.decompressions_per_sec,
@@ -4736,8 +4770,17 @@ fn main() -> anyhow::Result<()> {
                         swap_used_bytes: pd.swap_used_bytes,
                         swap_total_bytes: pd.swap_total_bytes,
                     };
-                    swap_reclaim.update(&flow)
+                    let reclaim = swap_reclaim.update_at(
+                        &flow,
+                        pd.generation,
+                        pd.updated_at,
+                        capabilities.page_size_bytes,
+                        capabilities.physical_memory_bytes,
+                    );
+                    (reclaim, normalized, regime, swap_forecast)
                 };
+                last_memory_regime = memory_regime.clone();
+                let _ = &normalized_memory_state;
 
                 // Wire ODE σ into SignalDigest. [Øksendal 2003 §3] diffusion term.
                 let mut signal_digest = signal_digest;
@@ -4747,6 +4790,15 @@ fn main() -> anyhow::Result<()> {
                 // Consumed by ShadowEvaluator via shadow_signals::get_* — keeps
                 // decide_actions' signature stable while wiring predictive + context.
                 apollo_engine::engine::shadow_signals::set_p_oom_30s(signal_digest.p_oom_30s);
+                apollo_engine::engine::shadow_signals::set_memory_regime_corroborated(
+                    memory_regime.sustained
+                        && memory_regime.adverse_flow
+                        && matches!(
+                            memory_regime.regime,
+                            apollo_engine::engine::memory_regime::MemoryRegime::Contended
+                                | apollo_engine::engine::memory_regime::MemoryRegime::Crisis
+                        ),
+                );
                 apollo_engine::engine::shadow_signals::set_thermal_emergency(thermal_emergency);
                 apollo_engine::engine::shadow_signals::set_interrupt_phase(
                     state
@@ -4973,6 +5025,7 @@ fn main() -> anyhow::Result<()> {
                         &state,
                         &mut lctx,
                         &signal_digest,
+                        &memory_regime,
                         &mut specialist_feedback,
                         &mut overflow_thresholds,
                         linucb_choice,
@@ -5323,6 +5376,7 @@ fn main() -> anyhow::Result<()> {
                 let reclaim_bypass = swap_reclaim_bypass_active(
                     snapshot.pressure.swap_used_bytes,
                     snapshot.pressure.swap_total_bytes,
+                    snapshot.memory.total_ram,
                     signal_digest.p_oom_30s,
                 );
                 let empty_hab: HashSet<u32> = HashSet::new();
@@ -6005,6 +6059,8 @@ fn main() -> anyhow::Result<()> {
                 let survival_output = daemon_survival_tick::run_survival_tick(
                     &snapshot,
                     &signal_digest,
+                    &memory_regime,
+                    memory_capabilities.physical_memory_bytes,
                     cycle_count,
                     lctx.overflow_guard,
                     lctx.signal_intel,
@@ -9217,24 +9273,21 @@ mod tests {
     }
 
     #[test]
-    fn swap_reclaim_bypass_scales_with_swap_total() {
+    fn swap_reclaim_bypass_scales_with_physical_ram() {
         let gib = 1024u64 * 1024 * 1024;
         assert!(!swap_reclaim_bypass_active(
             (4.5 * gib as f64) as u64,
+            8 * gib,
             16 * gib,
             0.0,
         ));
-        assert!(swap_reclaim_bypass_active(6 * gib, 16 * gib, 0.0));
-        assert!(swap_reclaim_bypass_active(
-            (4.5 * gib as f64) as u64,
-            8 * gib,
-            0.0,
-        ));
+        assert!(swap_reclaim_bypass_active(8 * gib, 8 * gib, 16 * gib, 0.0,));
+        assert!(swap_reclaim_bypass_active(4 * gib, 4 * gib, 8 * gib, 0.0,));
     }
 
     #[test]
     fn swap_reclaim_bypass_still_honors_oom_probability() {
-        assert!(swap_reclaim_bypass_active(0, 0, 0.95));
-        assert!(!swap_reclaim_bypass_active(0, 0, 0.94));
+        assert!(swap_reclaim_bypass_active(0, 0, 0, 0.95));
+        assert!(!swap_reclaim_bypass_active(0, 0, 0, 0.94));
     }
 }

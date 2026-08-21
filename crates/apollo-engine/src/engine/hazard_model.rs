@@ -52,6 +52,10 @@ fn neon_dot4(a: &[f64; 4], b: &[f64; 4]) -> f64 {
 /// Modelo de hazard proporcional para estimar P(OOM).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HazardModel {
+    /// Feature semantics used when the persisted weights were trained.
+    /// Missing legacy state defaults to 0 and remains readable/advisory.
+    #[serde(default)]
+    feature_schema_version: u8,
     /// Tasa base de overflows por segundo (h₀). Aprendida del historial.
     base_rate: f64,
     /// Pesos de riesgo (β). Multiplicadores exponenciales por feature.
@@ -83,6 +87,7 @@ impl HazardModel {
     /// Crea un modelo nuevo con priors conservadores.
     pub fn new() -> Self {
         Self {
+            feature_schema_version: 1,
             // Prior: 1 overflow cada 24 horas como baseline.
             base_rate: 1.0 / (24.0 * 3600.0),
             // Pesos iniciales: presión y swap tienen más importancia a priori.
@@ -156,12 +161,20 @@ impl HazardModel {
                 (self.total_events as f64 + 1.0) / ((self.total_hours + 24.0) * 3600.0);
         }
 
-        // Gradient update para β: en un overflow, las features con valor alto
-        // deberían tener β más alto (contribuyeron al riesgo).
-        // ∂log L / ∂βⱼ = xⱼ - E[xⱼ] ≈ xⱼ - 0.5 (asumiendo media ~0.5 para features normalizadas)
+        self.apply_event_gradient(features_at_event);
+    }
+
+    /// Replay a previously counted event for weight refinement only. This must
+    /// never change the event count, observed time, or baseline event rate.
+    pub fn replay_event_features(&mut self, features_at_event: &[f64; N_RISK]) {
+        self.apply_event_gradient(features_at_event);
+    }
+
+    fn apply_event_gradient(&mut self, features_at_event: &[f64; N_RISK]) {
+        // In an overflow, high-valued features should receive more weight.
         for (b, x) in self.beta.iter_mut().zip(features_at_event.iter()) {
             *b += self.lr * (x - 0.5);
-            *b = b.clamp(0.0, 5.0); // mantener β positivo y acotado
+            *b = b.clamp(0.0, 5.0);
         }
     }
 
@@ -259,6 +272,18 @@ impl HazardModel {
     pub fn base_rate(&self) -> f64 {
         self.base_rate
     }
+
+    pub fn total_events(&self) -> u64 {
+        self.total_events
+    }
+
+    pub fn total_hours(&self) -> f64 {
+        self.total_hours
+    }
+
+    pub fn feature_schema_version(&self) -> u8 {
+        self.feature_schema_version
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -314,6 +339,22 @@ mod tests {
             model.beta[0] > beta_before[0],
             "beta[0] should increase for high-risk feature"
         );
+    }
+
+    #[test]
+    fn replay_updates_weights_without_fabricating_events_or_observation_time() {
+        let mut model = HazardModel::new();
+        let features = HazardModel::risk_features(0.95, 0.08, 0.8, 0.9, 0.0);
+        model.record_event(&features, 2.0);
+        let events_before = model.total_events();
+        let hours_before = model.total_hours();
+        let beta_before = model.beta_weights();
+
+        model.replay_event_features(&features);
+
+        assert_eq!(model.total_events(), events_before);
+        assert_eq!(model.total_hours(), hours_before);
+        assert_ne!(model.beta_weights(), beta_before);
     }
 
     #[test]
@@ -421,6 +462,20 @@ mod tests {
                 restored.beta[i]
             );
         }
+    }
+
+    #[test]
+    fn legacy_state_without_feature_schema_remains_readable() {
+        let model = HazardModel::new();
+        let mut json = serde_json::to_value(&model).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .remove("feature_schema_version");
+
+        let restored: HazardModel = serde_json::from_value(json).unwrap();
+
+        assert_eq!(restored.feature_schema_version(), 0);
+        assert_eq!(restored.beta_weights(), model.beta_weights());
     }
 
     /// validate_after_restore() resets a saturated model to a safe prior.

@@ -18,6 +18,7 @@ use apollo_engine::engine::evolved_anomaly::EvolvedAnomalyDetector;
 use apollo_engine::engine::ioreport::IOReportReader;
 use apollo_engine::engine::learning_pipeline::LearningPipeline;
 use apollo_engine::engine::memory_analyzer::MemoryAnalyzer;
+use apollo_engine::engine::memory_regime::MemoryCapabilities;
 use apollo_engine::engine::network_monitor::NetworkMonitor;
 use apollo_engine::engine::neuromodulator::ApolloNeuromodulator;
 use apollo_engine::engine::optimization_skills::SkillRegistry;
@@ -123,6 +124,17 @@ pub(super) fn detect_hw_caps() -> (u32, f64) {
         s.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0)
     };
     (hw_cores, hw_ram_gb)
+}
+
+pub(super) fn detect_memory_capabilities() -> MemoryCapabilities {
+    let physical_memory_bytes =
+        apollo_engine::engine::sysctl_direct::read_u64("hw.memsize").unwrap_or(0);
+    let page_size_bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    MemoryCapabilities::new(
+        physical_memory_bytes,
+        u64::try_from(page_size_bytes).unwrap_or(0),
+    )
+    .unwrap_or_else(MemoryCapabilities::apple_silicon_fallback)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,6 +416,13 @@ mod tests {
         let (cores, ram_gb) = detect_hw_caps();
         assert!(cores >= 1, "cores must be >= 1, got {cores}");
         assert!(ram_gb >= 1.0, "ram_gb must be >= 1.0, got {ram_gb}");
+    }
+
+    #[test]
+    fn detected_memory_capabilities_are_valid() {
+        let capabilities = detect_memory_capabilities();
+        assert!(capabilities.physical_memory_bytes >= 1024 * 1024 * 1024);
+        assert!(capabilities.page_size_bytes.is_power_of_two());
     }
 
     #[test]

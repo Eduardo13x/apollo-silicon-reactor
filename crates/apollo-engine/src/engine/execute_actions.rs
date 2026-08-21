@@ -130,14 +130,6 @@ fn killall_by_name(daemon: &str, signal: i32) -> anyhow::Result<()> {
 /// `let _ = spawn()` left the Child to drop without `wait()`, accumulating
 /// zombies across the daemon's lifetime (xnu does NOT auto-reap dropped
 /// Child handles — Drop on `std::process::Child` is a no-op by design).
-fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
-    if sysctl_write_with_timeout(key, value) {
-        Ok(())
-    } else {
-        anyhow::bail!("sysctl write failed: {}={}", key, value)
-    }
-}
-
 // ── Timeout wrappers for kernel syscalls that can block as root ──────────
 //
 // A1 fix (round-3): the previous implementation spawned one `thread::spawn`
@@ -149,13 +141,14 @@ fn run_sysctl_write(key: &str, value: &str) -> anyhow::Result<()> {
 // one worker total, no matter how many requests.
 
 enum SysctlRequest {
-    Read {
+    ReadNumeric {
         key: String,
-        reply: std::sync::mpsc::Sender<Option<String>>,
+        reply: std::sync::mpsc::Sender<Option<sysctl_direct::NumericSysctlValue>>,
     },
-    WriteStr {
+    WriteNumeric {
         key: String,
-        value: String,
+        value: i64,
+        width: sysctl_direct::NumericSysctlWidth,
         reply: std::sync::mpsc::Sender<bool>,
     },
     WriteI32 {
@@ -178,11 +171,16 @@ fn sysctl_request_tx() -> &'static std::sync::mpsc::Sender<SysctlRequest> {
                 // loop is never blocked because callers recv_timeout().
                 while let Ok(req) = rx.recv() {
                     match req {
-                        SysctlRequest::Read { key, reply } => {
-                            let _ = reply.send(sysctl_direct::read_str(&key));
+                        SysctlRequest::ReadNumeric { key, reply } => {
+                            let _ = reply.send(sysctl_direct::read_numeric(&key));
                         }
-                        SysctlRequest::WriteStr { key, value, reply } => {
-                            let _ = reply.send(sysctl_direct::write_str_value(&key, &value));
+                        SysctlRequest::WriteNumeric {
+                            key,
+                            value,
+                            width,
+                            reply,
+                        } => {
+                            let _ = reply.send(sysctl_direct::write_numeric(&key, value, width));
                         }
                         SysctlRequest::WriteI32 { key, value, reply } => {
                             let _ = reply.send(sysctl_direct::write_i32(&key, value));
@@ -197,10 +195,10 @@ fn sysctl_request_tx() -> &'static std::sync::mpsc::Sender<SysctlRequest> {
 
 /// Read a sysctl with 500ms timeout. Prevents `sysctlbyname` from blocking
 /// the daemon loop indefinitely under kernel lock contention.
-fn sysctl_read_with_timeout(key: &str) -> Option<String> {
+fn sysctl_read_numeric_with_timeout(key: &str) -> Option<sysctl_direct::NumericSysctlValue> {
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if sysctl_request_tx()
-        .send(SysctlRequest::Read {
+        .send(SysctlRequest::ReadNumeric {
             key: key.to_string(),
             reply: reply_tx,
         })
@@ -214,13 +212,17 @@ fn sysctl_read_with_timeout(key: &str) -> Option<String> {
         .flatten()
 }
 
-/// Write a sysctl with 500ms timeout.
-fn sysctl_write_with_timeout(key: &str, value: &str) -> bool {
+fn sysctl_write_numeric_with_timeout(
+    key: &str,
+    value: i64,
+    width: sysctl_direct::NumericSysctlWidth,
+) -> bool {
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if sysctl_request_tx()
-        .send(SysctlRequest::WriteStr {
+        .send(SysctlRequest::WriteNumeric {
             key: key.to_string(),
-            value: value.to_string(),
+            value,
+            width,
             reply: reply_tx,
         })
         .is_err()
@@ -250,6 +252,14 @@ fn sysctl_write_i32_with_timeout(key: &str, value: i32) -> bool {
         .recv_timeout(std::time::Duration::from_millis(500))
         .ok()
         .unwrap_or(false)
+}
+
+#[inline]
+fn sysctl_postcondition_matches(
+    requested: i64,
+    observed: Option<sysctl_direct::NumericSysctlValue>,
+) -> bool {
+    observed.is_some_and(|observed| observed.value == requested)
 }
 
 /// Aggregate counters returned by execute_actions so callers do not need to
@@ -1242,6 +1252,15 @@ pub fn execute_actions(
                 RootAction::SetSysctl(s) => {
                     let key = s.key();
                     let value = s.value();
+                    let requested = match value.parse::<i64>() {
+                        Ok(value) => value,
+                        Err(_) => {
+                            out.invalid_sysctl_denied += 1;
+                            out.push_skip(format!("sysctl-nonnumeric:{}={}", key, value));
+                            block_reason = Some(BlockReason::InvalidSysctl);
+                            return Ok(());
+                        }
+                    };
                     if !allowlist.contains(key) {
                         out.invalid_sysctl_denied += 1;
                         out.push_skip(format!("sysctl-not-allowlisted:{key}"));
@@ -1274,10 +1293,12 @@ pub fn execute_actions(
                     }
                     // Read current value — doubles as existence check.
                     // Uses timeout wrapper: sysctlbyname can block as root.
-                    let read_result = sysctl_read_with_timeout(key);
+                    let read_result = sysctl_read_numeric_with_timeout(key);
+                    let observed_width;
                     match read_result {
                         Some(val) => {
-                            before = Some(val);
+                            observed_width = val.width;
+                            before = Some(val.value.to_string());
                         }
                         None => {
                             // Read timed out (worker thread saturated) or key
@@ -1302,9 +1323,26 @@ pub fn execute_actions(
                         return Ok(());
                     }
                     if !dry_run {
-                        run_sysctl_write(key, value)?;
+                        if !sysctl_write_numeric_with_timeout(key, requested, observed_width) {
+                            anyhow::bail!("sysctl write failed: {}={}", key, value);
+                        }
+                        let observed = sysctl_read_numeric_with_timeout(key);
+                        after = observed.map(|value| value.value.to_string());
+                        if !sysctl_postcondition_matches(requested, observed) {
+                            crate::engine::lse_counters::LSE_COUNTERS
+                                .inc_mediator_postcondition_violation();
+                            out.push_skip(format!(
+                                "sysctl-postcondition-mismatch:{} requested={} observed={}",
+                                key,
+                                requested,
+                                observed
+                                    .map(|value| value.value.to_string())
+                                    .unwrap_or_else(|| "unreadable".to_string())
+                            ));
+                            block_reason = Some(BlockReason::SysctlFailed);
+                            return Ok(());
+                        }
                         action_applied = true;
-                        after = sysctl_read_with_timeout(key);
                         // S10 producer: enroll post-Receipt observation when
                         // the after-read parsed as i64. Consumer re-reads
                         // sysctl_direct::read_i32(key) after the 5 s settle
@@ -1970,6 +2008,37 @@ mod tests {
             outcomes.decision_events.as_slice()[0].outcome,
             crate::engine::decision_ledger::ActuatorDecisionOutcome::Blocked
         );
+    }
+
+    #[test]
+    fn numeric_sysctl_postcondition_requires_exact_value() {
+        let i32_value = sysctl_direct::NumericSysctlValue {
+            value: 100,
+            width: sysctl_direct::NumericSysctlWidth::I32,
+        };
+        let i64_value = sysctl_direct::NumericSysctlValue {
+            value: 100,
+            width: sysctl_direct::NumericSysctlWidth::I64,
+        };
+        assert!(sysctl_postcondition_matches(100, Some(i32_value)));
+        assert!(sysctl_postcondition_matches(100, Some(i64_value)));
+        assert!(!sysctl_postcondition_matches(
+            100,
+            Some(sysctl_direct::NumericSysctlValue {
+                value: 101,
+                width: sysctl_direct::NumericSysctlWidth::I32,
+            })
+        ));
+        assert!(!sysctl_postcondition_matches(100, None));
+    }
+
+    #[test]
+    fn binary_i32_value_is_reported_as_decimal_not_ascii() {
+        let raw = 100_i32.to_ne_bytes();
+        let decoded = i32::from_ne_bytes(raw);
+
+        assert_eq!(decoded.to_string(), "100");
+        assert_ne!(decoded.to_string(), "d");
     }
 
     #[test]

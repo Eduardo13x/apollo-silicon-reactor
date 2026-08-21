@@ -53,11 +53,12 @@
 //!   Hierarchical Memory" — compression-first architecture matches Apple's
 //!   WKdm design; rates model the compressor pipeline.
 
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
-/// macOS page size in bytes (Apple Silicon default 16 KiB, but compressor
-/// tracks in 4 KiB logical pages for compatibility; we use 16 KiB to match
-/// `vm_stat` page size on M-series).
+/// Compatibility fallback for callers without observed capability data.
+/// Production supplies the native page size through `update_at`.
 pub const PAGE_SIZE_BYTES: u64 = 16_384;
 
 /// EMA smoothing factor for rate estimates.  α = 0.2 → τ_ema ≈ 4 cycles
@@ -221,6 +222,12 @@ pub struct SwapReclaimModel {
     /// only the first cycle in an overflow run emits WARN; subsequent cycles
     /// are suppressed until the system exits and re-enters Overflow.
     overflow_cycles: u32,
+    last_generation: Option<u64>,
+    last_observed_at: Option<Instant>,
+    last_forecast: Option<SaturationForecast>,
+    compatibility_generation: u64,
+    compatibility_elapsed: Duration,
+    compatibility_origin: Option<Instant>,
 }
 
 impl SwapReclaimModel {
@@ -228,15 +235,62 @@ impl SwapReclaimModel {
         Self::default()
     }
 
-    /// Ingest one cycle's VM flow rates and return a `SaturationForecast`.
+    /// Compatibility adapter for tests and legacy callers. Production uses
+    /// [`Self::update_at`] with a real collector generation and timestamp.
     pub fn update(&mut self, sample: &VmFlowSample) -> SaturationForecast {
+        self.compatibility_generation = self.compatibility_generation.saturating_add(1);
+        self.compatibility_elapsed += Duration::from_secs(2);
+        let origin = *self.compatibility_origin.get_or_insert_with(Instant::now);
+        self.update_at(
+            sample,
+            self.compatibility_generation,
+            origin + self.compatibility_elapsed,
+            PAGE_SIZE_BYTES,
+            sample.swap_total_bytes.saturating_mul(2),
+        )
+    }
+
+    pub fn update_at(
+        &mut self,
+        sample: &VmFlowSample,
+        generation: u64,
+        observed_at: Instant,
+        page_size_bytes: u64,
+        physical_memory_bytes: u64,
+    ) -> SaturationForecast {
+        if self.last_generation == Some(generation) {
+            if let Some(forecast) = &self.last_forecast {
+                return forecast.clone();
+            }
+        }
+        let dt_seconds = self
+            .last_observed_at
+            .map(|previous| {
+                observed_at
+                    .saturating_duration_since(previous)
+                    .as_secs_f64()
+            })
+            .unwrap_or(2.0);
+        if dt_seconds > 10.0 {
+            self.reset_dynamic_state();
+        }
+        self.last_generation = Some(generation);
+        self.last_observed_at = Some(observed_at);
+        let page_size_bytes = valid_page_size(page_size_bytes).unwrap_or(PAGE_SIZE_BYTES);
+        let risk_capacity_bytes = if physical_memory_bytes > 0 {
+            physical_memory_bytes / 2
+        } else {
+            sample.swap_total_bytes
+        };
+        let alpha = elapsed_ema_alpha(dt_seconds);
+
         // Convert page/sec → bytes/sec.
-        let dirty_bps = sample.compressions_per_sec * PAGE_SIZE_BYTES as f64;
+        let dirty_bps = sample.compressions_per_sec.max(0.0) * page_size_bytes as f64;
         // reclaim = voluntary decompressions + forced purges.
         // swapouts are NOT counted as reclaim — they represent compressor
         // overflow spilling to disk, which is the emergency state we predict.
-        let reclaim_bps =
-            (sample.decompressions_per_sec + sample.purges_per_sec) * PAGE_SIZE_BYTES as f64;
+        let reclaim_bps = (sample.decompressions_per_sec.max(0.0) + sample.purges_per_sec.max(0.0))
+            * page_size_bytes as f64;
 
         // EMA update — on first sample seed the EMAs directly (no false lag).
         if self.samples == 0 {
@@ -244,11 +298,10 @@ impl SwapReclaimModel {
             self.reclaim_ema_bps = reclaim_bps;
             self.swapout_ema_pps = sample.swapouts_per_sec;
         } else {
-            self.dirty_ema_bps = EMA_ALPHA * dirty_bps + (1.0 - EMA_ALPHA) * self.dirty_ema_bps;
-            self.reclaim_ema_bps =
-                EMA_ALPHA * reclaim_bps + (1.0 - EMA_ALPHA) * self.reclaim_ema_bps;
+            self.dirty_ema_bps = alpha * dirty_bps + (1.0 - alpha) * self.dirty_ema_bps;
+            self.reclaim_ema_bps = alpha * reclaim_bps + (1.0 - alpha) * self.reclaim_ema_bps;
             self.swapout_ema_pps =
-                EMA_ALPHA * sample.swapouts_per_sec + (1.0 - EMA_ALPHA) * self.swapout_ema_pps;
+                alpha * sample.swapouts_per_sec.max(0.0) + (1.0 - alpha) * self.swapout_ema_pps;
         }
         self.samples = self.samples.saturating_add(1);
 
@@ -259,15 +312,14 @@ impl SwapReclaimModel {
         // δ = net_rate - prev_net_rate captures cycle-to-cycle change rate.
         // After warm-up (≥2 samples), σ² = EMA(δ²) is valid.
         let delta = net_rate - self.net_rate_prev;
-        self.net_rate_var_ema =
-            EMA_ALPHA * (delta * delta) + (1.0 - EMA_ALPHA) * self.net_rate_var_ema;
+        self.net_rate_var_ema = alpha * (delta * delta) + (1.0 - alpha) * self.net_rate_var_ema;
         let net_rate_volatility = if self.samples >= 2 {
             self.net_rate_var_ema.sqrt()
         } else {
             0.0
         };
 
-        let swap_total = sample.swap_total_bytes;
+        let swap_total = risk_capacity_bytes;
         let swap_used = sample.swap_used_bytes;
         let swap_ratio = if swap_total > 0 {
             swap_used as f64 / swap_total as f64
@@ -319,7 +371,7 @@ impl SwapReclaimModel {
             false
         };
 
-        SaturationForecast {
+        let forecast = SaturationForecast {
             dirty_rate_bps: self.dirty_ema_bps,
             reclaim_rate_bps: self.reclaim_ema_bps,
             net_rate_bps: net_rate,
@@ -329,7 +381,9 @@ impl SwapReclaimModel {
             overflow_entered,
             swap_ratio,
             net_rate_volatility,
-        }
+        };
+        self.last_forecast = Some(forecast.clone());
+        forecast
     }
 
     /// Reset EMA state (e.g., after a sleep/wake cycle).
@@ -337,9 +391,35 @@ impl SwapReclaimModel {
         *self = Self::default();
     }
 
+    fn reset_dynamic_state(&mut self) {
+        self.dirty_ema_bps = 0.0;
+        self.reclaim_ema_bps = 0.0;
+        self.swapout_ema_pps = 0.0;
+        self.net_rate_var_ema = 0.0;
+        self.net_rate_prev = 0.0;
+        self.samples = 0;
+        self.overflow_cycles = 0;
+        self.last_forecast = None;
+    }
+
     pub fn samples(&self) -> u32 {
         self.samples
     }
+}
+
+fn valid_page_size(page_size_bytes: u64) -> Option<u64> {
+    ((4 * 1024..=64 * 1024).contains(&page_size_bytes) && page_size_bytes.is_power_of_two())
+        .then_some(page_size_bytes)
+}
+
+fn elapsed_ema_alpha(dt_seconds: f64) -> f64 {
+    if !dt_seconds.is_finite() || dt_seconds <= 0.0 {
+        return 0.0;
+    }
+    // Preserve alpha=0.2 at the former nominal two-second cadence while
+    // keeping the same wall-clock response at 500 ms or slower cadences.
+    const TAU_SECONDS: f64 = 8.962_840_235_449_1;
+    (1.0 - (-dt_seconds.min(10.0) / TAU_SECONDS).exp()).clamp(0.0, 1.0)
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -667,5 +747,73 @@ mod tests {
             f.net_rate_volatility > 0.0,
             "oscillating signal must have σ > 0"
         );
+    }
+
+    #[test]
+    fn observed_page_size_scales_byte_flow() {
+        let at = Instant::now();
+        let input = sample(1_000.0, 0.0, 0.0, gb(1), gb(8));
+        let mut four_k = SwapReclaimModel::new();
+        let mut sixteen_k = SwapReclaimModel::new();
+        let a = four_k.update_at(&input, 1, at, 4 * 1024, gb(8));
+        let b = sixteen_k.update_at(&input, 1, at, 16 * 1024, gb(8));
+
+        assert!((b.dirty_rate_bps / a.dirty_rate_bps - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn duplicate_generation_returns_cached_forecast() {
+        let at = Instant::now();
+        let mut model = SwapReclaimModel::new();
+        let first = model.update_at(
+            &sample(100.0, 0.0, 0.0, gb(1), gb(8)),
+            7,
+            at,
+            16 * 1024,
+            gb(8),
+        );
+        let duplicate = model.update_at(
+            &sample(10_000.0, 0.0, 0.0, gb(4), gb(8)),
+            7,
+            at + Duration::from_millis(500),
+            16 * 1024,
+            gb(8),
+        );
+
+        assert_eq!(first.dirty_rate_bps, duplicate.dirty_rate_bps);
+        assert_eq!(model.samples(), 1);
+    }
+
+    #[test]
+    fn elapsed_time_ema_is_cadence_independent() {
+        let start = Instant::now();
+        let quiet = sample(0.0, 0.0, 0.0, gb(1), gb(8));
+        let load = sample(1_000.0, 0.0, 0.0, gb(1), gb(8));
+        let mut fast = SwapReclaimModel::new();
+        let mut slow = SwapReclaimModel::new();
+        fast.update_at(&quiet, 1, start, 16 * 1024, gb(8));
+        slow.update_at(&quiet, 1, start, 16 * 1024, gb(8));
+        let mut fast_forecast = fast.update_at(
+            &load,
+            2,
+            start + Duration::from_millis(500),
+            16 * 1024,
+            gb(8),
+        );
+        for generation in 3..=5_u64 {
+            fast_forecast = fast.update_at(
+                &load,
+                generation,
+                start + Duration::from_millis((generation - 1) * 500),
+                16 * 1024,
+                gb(8),
+            );
+        }
+        let slow_forecast =
+            slow.update_at(&load, 2, start + Duration::from_secs(2), 16 * 1024, gb(8));
+
+        let relative_error = (fast_forecast.dirty_rate_bps - slow_forecast.dirty_rate_bps).abs()
+            / slow_forecast.dirty_rate_bps.max(1.0);
+        assert!(relative_error < 1e-9, "relative_error={relative_error}");
     }
 }

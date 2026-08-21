@@ -97,6 +97,7 @@ pub mod match_engine;
 pub mod mediator;
 pub mod memory_analyzer;
 pub mod memory_budget;
+pub mod memory_regime;
 pub mod meta_cognition;
 pub mod micro_canary;
 pub mod microexperiment_actions;

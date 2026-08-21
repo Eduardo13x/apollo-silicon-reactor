@@ -315,10 +315,11 @@ pub fn apply_learned_policy_actions(
         }
     }
 
-    let survival = apollo_engine::engine::safety::survival_mode_active_total(
+    let survival = apollo_engine::engine::safety::survival_mode_active_capacity(
         snapshot.pressure.memory_pressure,
         snapshot.pressure.swap_used_bytes,
         snapshot.pressure.swap_total_bytes,
+        snapshot.memory.total_ram,
     );
 
     // ROOT FIX (2026-06-18 node boost-loop): a BOOST raises QoS to make the app

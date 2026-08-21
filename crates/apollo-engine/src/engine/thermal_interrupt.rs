@@ -1463,6 +1463,7 @@ mod tests {
     fn compute_phase_idle_when_cool_and_low_pressure() {
         let cfg = SentinelConfig::default();
         let pressure = PressureData {
+            generation: 1,
             memory_pressure: 0.3,
             swap_delta_bps: 0.0,
             ..PressureData::default()
@@ -1499,6 +1500,7 @@ mod tests {
     fn compute_phase_moderate_on_memory_pressure() {
         let cfg = SentinelConfig::default();
         let pressure = PressureData {
+            generation: 1,
             memory_pressure: 0.85,
             ..PressureData::default()
         };
@@ -1534,6 +1536,7 @@ mod tests {
     fn compute_phase_emergency_on_memory_critical_with_swap_thrash() {
         let cfg = SentinelConfig::default();
         let pressure = PressureData {
+            generation: 1,
             memory_pressure: 0.95,
             swap_delta_bps: 1_000_000.0,
             ..PressureData::default()
@@ -1605,6 +1608,7 @@ mod tests {
     fn compute_phase_memory_signal_needs_pressure_above_threshold() {
         let cfg = SentinelConfig::default();
         let low_pressure = PressureData {
+            generation: 1,
             memory_pressure: 0.5,
             ..PressureData::default()
         };
@@ -1621,6 +1625,7 @@ mod tests {
         assert_eq!(phase, InterruptPhase::Idle);
 
         let high_pressure = PressureData {
+            generation: 2,
             memory_pressure: 0.75,
             ..PressureData::default()
         };

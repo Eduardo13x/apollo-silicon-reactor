@@ -491,6 +491,16 @@ pub struct ManualOverride {
     pub profile: OptimizationProfile,
     pub expires_at: DateTime<Utc>,
     pub reason: String,
+    #[serde(default)]
+    pub origin: OverrideOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OverrideOrigin {
+    #[default]
+    Operator,
+    Predictive,
 }
 
 /// Cross-crate visibility: used by apollo-optimizerd socket_handler.rs, metrics_reporter.rs,
@@ -3540,6 +3550,8 @@ pub struct DaemonStatus {
     pub base_profile: OptimizationProfile,
     pub override_active: bool,
     pub override_expires_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub override_origin: Option<OverrideOrigin>,
     pub transition_reason: String,
     pub post_wake_grace_active: bool,
     pub post_wake_grace_remaining_secs: u64,

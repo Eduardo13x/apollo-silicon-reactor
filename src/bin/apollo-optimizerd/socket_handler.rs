@@ -368,6 +368,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 base_profile,
                 override_active,
                 override_expires_at,
+                override_origin,
                 transition_reason,
             ) = {
                 let pg = state.policy.lock_recover();
@@ -376,6 +377,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                     pg.governor.base_profile,
                     pg.governor.manual_override.is_some(),
                     pg.governor.manual_override.as_ref().map(|o| o.expires_at),
+                    pg.governor.manual_override.as_ref().map(|o| o.origin),
                     pg.governor.transition_reason.clone(),
                 )
             };
@@ -428,6 +430,7 @@ pub fn process_request(req: DaemonRequest, state: &SharedState) -> DaemonRespons
                 base_profile,
                 override_active,
                 override_expires_at,
+                override_origin,
                 transition_reason,
                 post_wake_grace_active: grace_active,
                 post_wake_grace_remaining_secs: grace_remaining,

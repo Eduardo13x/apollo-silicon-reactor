@@ -21,6 +21,9 @@ pub const RESPONSIVE_PRESSURE_MAX_AGE: Duration = Duration::from_secs(2);
 /// Cached memory/swap pressure data.
 #[derive(Debug, Clone)]
 pub struct PressureData {
+    /// Monotonic publication generation. Consumers use this to avoid
+    /// recomputing derived state on faster daemon cycles.
+    pub generation: u64,
     /// Memory pressure ratio 0.0–1.0 (1.0 = fully pressured).
     pub memory_pressure: f64,
     /// Swap bytes currently in use.
@@ -60,6 +63,7 @@ pub struct PressureData {
 impl Default for PressureData {
     fn default() -> Self {
         Self {
+            generation: 0,
             memory_pressure: 0.0,
             swap_used_bytes: 0,
             swap_total_bytes: 0,
@@ -110,6 +114,7 @@ impl PressureCollector {
                 // The compute() helper handles empty / mismatched-length
                 // samples on the first cycle, so no special-casing here.
                 let mut prev_cpu_ticks: Vec<PerCoreTicks> = Vec::new();
+                let mut generation = 0_u64;
 
                 loop {
                     let (mem_pressure, vm_sample, swap_sample) = collect_pressure_facts();
@@ -140,7 +145,9 @@ impl PressureCollector {
                     let cpu_saturation = CpuSaturation::compute(&prev_cpu_ticks, &curr_cpu_ticks);
                     prev_cpu_ticks = curr_cpu_ticks;
 
+                    generation = generation.saturating_add(1);
                     *c.lock_recover() = PressureData {
+                        generation,
                         memory_pressure: mem_pressure,
                         swap_used_bytes: swap_used,
                         swap_total_bytes: swap_total,
@@ -294,6 +301,7 @@ mod tests {
     fn pressure_data_defaults() {
         let data = PressureData::default();
         assert!((data.memory_pressure - 0.0).abs() < f64::EPSILON);
+        assert_eq!(data.generation, 0);
         assert_eq!(data.swap_used_bytes, 0);
         assert_eq!(data.swap_total_bytes, 0);
         assert!((data.swap_delta_bps - 0.0).abs() < f64::EPSILON);

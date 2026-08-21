@@ -27,6 +27,8 @@ static P_JANK_60S_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 static THERMAL_EMERGENCY: AtomicBool = AtomicBool::new(false);
 static INTERRUPT_PHASE: AtomicU8 = AtomicU8::new(0);
+static MEMORY_REGIME_CORROBORATED: AtomicBool = AtomicBool::new(false);
+static MEMORY_REGIME_CORROBORATED_WRITTEN: AtomicBool = AtomicBool::new(false);
 
 // Foreground PID: -1 sentinel for None (no foreground app detected).
 static FOREGROUND_PID: AtomicI32 = AtomicI32::new(-1);
@@ -98,6 +100,20 @@ pub fn set_interrupt_phase(phase: u8) {
 
 pub fn get_interrupt_phase() -> u8 {
     INTERRUPT_PHASE.load(Ordering::Relaxed)
+}
+
+/// Publishes whether the current fresh collector generation has sustained,
+/// adverse Contended/Crisis evidence. This is a safety veto for legacy
+/// freeze gates, not an independent action trigger.
+pub fn set_memory_regime_corroborated(corroborated: bool) {
+    MEMORY_REGIME_CORROBORATED.store(corroborated, Ordering::Relaxed);
+    MEMORY_REGIME_CORROBORATED_WRITTEN.store(true, Ordering::Relaxed);
+}
+
+pub fn get_memory_regime_corroborated() -> Option<bool> {
+    MEMORY_REGIME_CORROBORATED_WRITTEN
+        .load(Ordering::Relaxed)
+        .then(|| MEMORY_REGIME_CORROBORATED.load(Ordering::Relaxed))
 }
 
 pub fn set_foreground_pid(pid: Option<u32>) {

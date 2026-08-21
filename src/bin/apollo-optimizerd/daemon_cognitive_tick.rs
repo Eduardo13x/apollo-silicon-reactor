@@ -62,6 +62,7 @@ use apollo_engine::engine::iokit_sensors::HardwareSnapshot;
 use apollo_engine::engine::lock_ext::LockRecover;
 use apollo_engine::engine::lotka_volterra::StabilityRegime;
 use apollo_engine::engine::maintenance_state::MaintenanceState;
+use apollo_engine::engine::memory_regime::{MemoryRegime, MemoryRegimeEvidence};
 use apollo_engine::engine::nars_belief::TruthValue;
 use apollo_engine::engine::overflow_guard::OverflowThresholds;
 use apollo_engine::engine::pipeline::learning_context::LearningContext;
@@ -320,13 +321,14 @@ fn apply_contextual_world_model_bias(
 /// read back the actual firing signals.
 ///
 /// Side effects: on disagreement, emits a `specialist_disagreement` audit
-/// line; on `SuggestAggressive`, may set a 5-minute governor override only
+/// line; on `SuggestAggressive`, may set a short predictive governor lease only
 /// when current pressure and an independent risk signal corroborate it.
 #[allow(clippy::too_many_arguments)]
 pub fn apply_specialist_voting(
     state: &SharedState,
     lctx: &mut LearningContext<'_>,
     signal_digest: &SignalDigest,
+    memory_evidence: &MemoryRegimeEvidence,
     feedback: &mut SpecialistFeedbackState,
     overflow_thresholds: &mut OverflowThresholds,
     linucb_choice: Intervention,
@@ -664,7 +666,14 @@ pub fn apply_specialist_voting(
     // A learned recommendation is advisory while the machine is calm. Only
     // let it take over the profile controller when physical telemetry confirms
     // an imminent memory-risk condition.
+    let physical_corroboration = memory_evidence.sustained
+        && memory_evidence.adverse_flow
+        && matches!(
+            memory_evidence.regime,
+            MemoryRegime::Contended | MemoryRegime::Crisis
+        );
     if intervention == Intervention::SuggestAggressive
+        && physical_corroboration
         && should_apply_aggressive_override(
             signal_digest.pressure_smooth,
             signal_digest.pressure_velocity,
@@ -675,14 +684,19 @@ pub fn apply_specialist_voting(
         )
     {
         let mut pg = state.policy.lock_recover();
-        if pg.governor.manual_override.is_none() {
-            pg.governor.set_manual_override(
-                OptimizationProfile::AggressiveRoot,
-                5,
-                "predictive-agent: proactive pressure mitigation".to_string(),
-            );
+        if pg.governor.set_predictive_override(
+            OptimizationProfile::AggressiveRoot,
+            30,
+            "predictive-agent: proactive pressure mitigation".to_string(),
+        ) {
             applied_intervention = Some(Intervention::SuggestAggressive);
         }
+    } else {
+        state
+            .policy
+            .lock_recover()
+            .governor
+            .clear_predictive_override();
     }
 
     SpecialistVotingOutput {

@@ -1088,6 +1088,21 @@ pub fn swap_exhaustion_threshold_bytes(swap_total_bytes: u64) -> u64 {
     abs_floor.max(pct_floor)
 }
 
+/// Capacity-relative exhaustion threshold for hosts with known physical RAM.
+/// Dynamic macOS swap allocation is retained as telemetry, never as the policy
+/// denominator. Unknown RAM preserves the legacy behavior.
+#[inline]
+pub fn swap_exhaustion_threshold_bytes_for_ram(
+    swap_total_bytes: u64,
+    physical_memory_bytes: u64,
+) -> u64 {
+    if physical_memory_bytes == 0 {
+        swap_exhaustion_threshold_bytes(swap_total_bytes)
+    } else {
+        physical_memory_bytes / 2
+    }
+}
+
 /// Returns true when conditions justify shedding softly_protected processes.
 /// Two independent triggers (OR):
 ///   1. Both pressure AND swap above normal thresholds (sustained crisis)
@@ -1109,6 +1124,26 @@ pub fn survival_mode_active_total(
         && swap_gb >= SOFT_PROTECTION_SWAP_GB_THRESHOLD)
         || exhausted
         || pct_exhausted
+}
+
+/// Capacity-normalized survival gate. This is intentionally no more
+/// aggressive than the 8 GiB baseline: soft protection is released only at
+/// high pressure plus 25% of physical RAM in swap, or at 50% independently.
+/// A missing RAM capacity falls back to the legacy dynamic-swap policy.
+#[inline]
+pub fn survival_mode_active_capacity(
+    memory_pressure: f64,
+    swap_used_bytes: u64,
+    swap_total_bytes: u64,
+    physical_memory_bytes: u64,
+) -> bool {
+    if physical_memory_bytes == 0 {
+        return survival_mode_active_total(memory_pressure, swap_used_bytes, swap_total_bytes);
+    }
+
+    let pressure_correlated = memory_pressure >= SOFT_PROTECTION_PRESSURE_THRESHOLD
+        && swap_used_bytes >= physical_memory_bytes / 4;
+    pressure_correlated || swap_used_bytes >= physical_memory_bytes / 2
 }
 
 /// Backward-compatible shim: assumes swap_total is unknown → absolute 4GB floor only.
@@ -2041,6 +2076,65 @@ mod tests {
         // 35 % × 16 = 5.6 GB absolute → AND-branch needs pressure ≥ 0.85.
         // 13 GB > 5.6 GB → exhausted branch fires; survival should be true.
         assert!(survival_mode_active_total(0.50, 13 * gib, 16 * gib));
+    }
+
+    #[test]
+    fn capacity_thresholds_scale_with_physical_ram() {
+        let gib = 1024u64 * 1024 * 1024;
+
+        assert_eq!(
+            swap_exhaustion_threshold_bytes_for_ram(4 * gib, 8 * gib),
+            4 * gib
+        );
+        assert_eq!(
+            swap_exhaustion_threshold_bytes_for_ram(4 * gib, 16 * gib),
+            8 * gib
+        );
+    }
+
+    #[test]
+    fn capacity_survival_ignores_dynamic_swap_total_growth() {
+        let gib = 1024u64 * 1024 * 1024;
+        let used = 3 * gib;
+
+        assert!(!survival_mode_active_capacity(
+            0.86,
+            used,
+            4 * gib,
+            16 * gib
+        ));
+        assert!(!survival_mode_active_capacity(
+            0.86,
+            used,
+            32 * gib,
+            16 * gib
+        ));
+    }
+
+    #[test]
+    fn capacity_survival_is_equivalent_at_equal_ram_fraction() {
+        let gib = 1024u64 * 1024 * 1024;
+
+        assert_eq!(
+            survival_mode_active_capacity(0.86, 2 * gib, 4 * gib, 8 * gib),
+            survival_mode_active_capacity(0.86, 4 * gib, 8 * gib, 16 * gib)
+        );
+        assert!(survival_mode_active_capacity(
+            0.86,
+            2 * gib,
+            4 * gib,
+            8 * gib
+        ));
+    }
+
+    #[test]
+    fn capacity_survival_falls_back_when_physical_ram_is_unknown() {
+        let gib = 1024u64 * 1024 * 1024;
+
+        assert_eq!(
+            survival_mode_active_capacity(0.50, 4 * gib, 8 * gib, 0),
+            survival_mode_active_total(0.50, 4 * gib, 8 * gib)
+        );
     }
 
     /// The hard-protected fast path (OnceLock) must agree with the full set.

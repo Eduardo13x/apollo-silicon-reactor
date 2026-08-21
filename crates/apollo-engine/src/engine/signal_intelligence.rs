@@ -223,6 +223,8 @@ pub struct SignalIntelligence {
     /// Capped at 50 entries. When ≥10 events, `retrain_hazard_batch()` runs
     /// 10-step gradient descent to refine β weights beyond single-event updates.
     oom_event_buffer: std::collections::VecDeque<([f64; 4], f64)>,
+    accepted_overflow_events: u64,
+    last_retrained_overflow_events: u64,
 
     /// Timestamp of the last recorded OOM/overflow event.
     /// Used to compute real inter-event intervals instead of hardcoded 1.0.
@@ -309,6 +311,8 @@ impl SignalIntelligence {
             zone_stall_cycles: 0,
             workload_zone_offsets: HashMap::new(),
             oom_event_buffer: std::collections::VecDeque::new(),
+            accepted_overflow_events: 0,
+            last_retrained_overflow_events: 0,
             last_oom_instant: None,
             kf_mv: KalmanMV8::new(),
             signal_health: SignalHealthMonitor::new(),
@@ -477,7 +481,10 @@ impl SignalIntelligence {
             // is always ~1.0 whenever any swap is in use. The meaningful signal is
             // swap VELOCITY — if swap is not growing fast, the system is stable even
             // at high pressure. Use 512KB/s as the growth threshold.
-            let swap_growing_fast = swap_velocity_smooth > 524_288.0; // 512KB/s
+            let capacity_growth_floor =
+                (total_available_bytes as f64 * 0.001 / 60.0).max(524_288.0);
+            let swap_growing_fast = swap_delta_bps > capacity_growth_floor
+                && swap_velocity_smooth > capacity_growth_floor;
 
             // Survival feedback: high pressure + slow/no swap growth = model over-estimated.
             if !swap_growing_fast && memory_pressure >= 0.60 {
@@ -646,8 +653,29 @@ impl SignalIntelligence {
         memory_pressure: f64,
         swap_ratio: f64,
         compressor_ratio: f64,
-    ) {
-        let now = std::time::Instant::now();
+    ) -> bool {
+        self.record_overflow_at(
+            memory_pressure,
+            swap_ratio,
+            compressor_ratio,
+            std::time::Instant::now(),
+        )
+    }
+
+    fn record_overflow_at(
+        &mut self,
+        memory_pressure: f64,
+        swap_ratio: f64,
+        compressor_ratio: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        const EPISODE_REFRACTORY: std::time::Duration = std::time::Duration::from_secs(30);
+        if self
+            .last_oom_instant
+            .is_some_and(|previous| now.saturating_duration_since(previous) < EPISODE_REFRACTORY)
+        {
+            return false;
+        }
         let hours_since_last = match self.last_oom_instant {
             Some(prev) => {
                 let secs = now.duration_since(prev).as_secs_f64();
@@ -674,29 +702,33 @@ impl SignalIntelligence {
         }
         self.oom_event_buffer
             .push_back((features, hours_since_last));
+        self.accepted_overflow_events = self.accepted_overflow_events.saturating_add(1);
+        true
     }
 
     /// Mini-batch gradient retrain of the hazard model using buffered OOM events.
     ///
-    /// When ≥10 events have been buffered, replays them 10 times through
-    /// `record_event()` with a reduced learning rate (lr × 0.3) to refine β
-    /// weights beyond single-event online updates. This closes the feedback
-    /// loop where the hazard model only learned from the latest event.
+    /// When ≥10 events have been buffered, replays their features 10 times to
+    /// refine β weights without incrementing event/time exposure counters.
     ///
     /// Returns the number of gradient steps applied (0 if not enough data).
     pub fn retrain_hazard_batch(&mut self) -> usize {
-        if self.oom_event_buffer.len() < 10 {
+        let pending_events = self
+            .accepted_overflow_events
+            .saturating_sub(self.last_retrained_overflow_events)
+            .min(self.oom_event_buffer.len() as u64) as usize;
+        if pending_events < 10 {
             return 0;
         }
-        // Save original lr, use reduced lr for batch replay.
-        let events: Vec<([f64; 4], f64)> = self.oom_event_buffer.iter().copied().collect();
         let mut steps = 0;
+        let (hazard, events) = (&mut self.hazard, &self.oom_event_buffer);
         for _ in 0..10 {
-            for &(ref features, hours) in &events {
-                self.hazard.record_event(features, hours);
+            for (features, _) in events.iter().rev().take(pending_events) {
+                hazard.replay_event_features(features);
                 steps += 1;
             }
         }
+        self.last_retrained_overflow_events = self.accepted_overflow_events;
         steps
     }
 
@@ -2225,9 +2257,15 @@ mod tests {
     #[test]
     fn test_retrain_hazard_batch_needs_10_events() {
         let mut si = SignalIntelligence::new();
+        let start = std::time::Instant::now();
         // Less than 10 events → no retrain
         for i in 0..9 {
-            si.record_overflow(0.8 + (i as f64) * 0.01, 0.3, 0.5);
+            si.record_overflow_at(
+                0.8 + (i as f64) * 0.01,
+                0.3,
+                0.5,
+                start + std::time::Duration::from_secs(i * 31),
+            );
         }
         assert_eq!(si.retrain_hazard_batch(), 0);
         assert_eq!(si.oom_event_count(), 9);
@@ -2236,20 +2274,37 @@ mod tests {
     #[test]
     fn test_retrain_hazard_batch_runs_after_10_events() {
         let mut si = SignalIntelligence::new();
+        let start = std::time::Instant::now();
         for i in 0..12 {
-            si.record_overflow(0.7 + (i as f64) * 0.02, 0.2, 0.4);
+            si.record_overflow_at(
+                0.7 + (i as f64) * 0.02,
+                0.2,
+                0.4,
+                start + std::time::Duration::from_secs(i * 31),
+            );
         }
         assert_eq!(si.oom_event_count(), 12);
         let steps = si.retrain_hazard_batch();
         // 12 events × 10 epochs = 120 gradient steps
         assert_eq!(steps, 120);
+        assert_eq!(
+            si.retrain_hazard_batch(),
+            0,
+            "unchanged events must not replay again"
+        );
     }
 
     #[test]
     fn test_oom_event_buffer_caps_at_50() {
         let mut si = SignalIntelligence::new();
+        let start = std::time::Instant::now();
         for i in 0..60 {
-            si.record_overflow(0.7 + (i as f64) * 0.005, 0.1, 0.3);
+            si.record_overflow_at(
+                0.7 + (i as f64) * 0.005,
+                0.1,
+                0.3,
+                start + std::time::Duration::from_secs(i * 31),
+            );
         }
         assert_eq!(si.oom_event_count(), 50, "buffer should cap at 50");
     }
@@ -2258,9 +2313,15 @@ mod tests {
     fn test_retrain_hazard_batch_improves_beta() {
         let mut si = SignalIntelligence::new();
         let beta_before = si.hazard_beta();
+        let start = std::time::Instant::now();
         // Record 15 events with high pressure + high swap → beta[0] and beta[2] should increase
-        for _ in 0..15 {
-            si.record_overflow(0.95, 0.08, 0.85);
+        for i in 0..15 {
+            si.record_overflow_at(
+                0.95,
+                0.08,
+                0.85,
+                start + std::time::Duration::from_secs(i * 31),
+            );
         }
         let beta_after_online = si.hazard_beta();
         let _steps = si.retrain_hazard_batch();
@@ -2270,6 +2331,61 @@ mod tests {
             beta_after_batch[0] >= beta_after_online[0] || beta_after_batch[0] >= beta_before[0],
             "batch retrain should maintain or increase beta[0] for high-pressure events"
         );
+    }
+
+    #[test]
+    fn repeated_notifications_inside_one_episode_are_deduplicated() {
+        let mut si = SignalIntelligence::new();
+        let now = std::time::Instant::now();
+
+        assert!(si.record_overflow_at(0.9, 0.4, 0.8, now));
+        assert!(!si.record_overflow_at(0.9, 0.4, 0.8, now + std::time::Duration::from_secs(5),));
+        assert_eq!(si.oom_event_count(), 1);
+    }
+
+    #[test]
+    fn swap_burst_then_flat_loses_predictive_authority_immediately() {
+        let mut si = SignalIntelligence::new();
+        let start = std::time::Instant::now();
+        for i in 0..10 {
+            si.record_overflow_at(
+                0.9,
+                0.6,
+                0.8,
+                start + std::time::Duration::from_secs(i * 31),
+            );
+        }
+        for _ in 0..20 {
+            tick_stressed(&mut si, 0.85);
+        }
+        let _burst = si.tick(
+            0.85,
+            5_000_000.0,
+            0.7,
+            0.8,
+            &[40.0],
+            &[2e9],
+            "hog",
+            2_000_000_000,
+            6_000_000_000,
+            8_000_000_000,
+            0.5,
+        );
+        let flat = si.tick(
+            0.85,
+            0.0,
+            0.7,
+            0.8,
+            &[40.0],
+            &[2e9],
+            "hog",
+            2_000_000_000,
+            6_000_000_000,
+            8_000_000_000,
+            0.5,
+        );
+
+        assert!(flat.p_oom_30s <= flat.pressure_smooth * 0.6 + f64::EPSILON);
     }
 
     // ── Workload zone offsets (Phase 4) ─────────────────────────────────

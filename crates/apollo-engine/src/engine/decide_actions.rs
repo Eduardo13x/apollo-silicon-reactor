@@ -237,8 +237,9 @@ pub fn context_from_pressure(
     // [Nygard 2018 §4, macOS memorystatus internals].
     // Relative threshold scales with machine: 8GB swap → 4GB floor; 16GB → 5.6GB.
     let swap_exhausted = snapshot.pressure.swap_used_bytes
-        >= crate::engine::safety::swap_exhaustion_threshold_bytes(
+        >= crate::engine::safety::swap_exhaustion_threshold_bytes_for_ram(
             snapshot.pressure.swap_total_bytes,
+            snapshot.memory.total_ram,
         );
     // Evolve iter-2 (2026-06-10): high CPU alone is NOT a thermal
     // constraint — an M1 runs builds/exports/calls at 90-100% global CPU
@@ -371,6 +372,11 @@ pub(crate) fn evaluate_gate_e(
         0.0
     };
     swap_pct >= 0.85 && memory_pressure >= 0.70
+}
+
+#[inline]
+fn corroborate_memory_action_gate(gates_fired: bool, corroborated: Option<bool>) -> bool {
+    gates_fired && corroborated.unwrap_or(true)
 }
 
 const MIN_PROCESS_EFFECTIVENESS_OBSERVATIONS: u32 = 10;
@@ -1449,7 +1455,10 @@ pub fn decide_actions(
                     shadow_disagreements_path(),
                 );
             }
-            let gates_fired = gate_a || gate_b || gate_c || gate_d || gate_e;
+            let gates_fired = corroborate_memory_action_gate(
+                gate_a || gate_b || gate_c || gate_d || gate_e,
+                crate::engine::shadow_signals::get_memory_regime_corroborated(),
+            );
             let mut extreme_freeze_ok = gates_fired && !freeze_skip_by_user;
 
             // B.6 macOS cooperation: when the kernel is already handling memory
@@ -1582,10 +1591,11 @@ pub fn decide_actions(
                 // Replaced hardcoded ["Slack","Discord","Spotify","Teams"]: any
                 // memory-heavy background app (zoom.us, Figma, Electron apps)
                 // now qualifies. Protection stack in execute_actions still applies.
-                let survival_mode = crate::engine::safety::survival_mode_active_total(
+                let survival_mode = crate::engine::safety::survival_mode_active_capacity(
                     snapshot.pressure.memory_pressure,
                     snapshot.pressure.swap_used_bytes,
                     snapshot.pressure.swap_total_bytes,
+                    snapshot.memory.total_ram,
                 );
                 let mut freeze_candidates: Vec<(u32, String, u64, f32, u64)> = sys
                     .processes()
@@ -2228,6 +2238,17 @@ mod tests {
         assert!(
             !evaluate_gate_e(0, 0, 0.95),
             "gate_e must stay silent when swap_total == 0 regardless of pressure"
+        );
+    }
+
+    #[test]
+    fn memory_action_gate_requires_published_physical_corroboration() {
+        assert!(!corroborate_memory_action_gate(true, Some(false)));
+        assert!(corroborate_memory_action_gate(true, Some(true)));
+        assert!(!corroborate_memory_action_gate(false, Some(true)));
+        assert!(
+            corroborate_memory_action_gate(true, None),
+            "non-daemon compatibility callers retain legacy behavior"
         );
     }
 

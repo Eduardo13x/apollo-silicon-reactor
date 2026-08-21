@@ -1,7 +1,10 @@
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::engine::types::{GovernorState, ManualOverride, OptimizationProfile, ProfileTransition};
+use crate::engine::memory_regime::{MemoryRegime, MemoryRegimeEvidence};
+use crate::engine::types::{
+    GovernorState, ManualOverride, OptimizationProfile, OverrideOrigin, ProfileTransition,
+};
 use crate::engine::workload_classifier::WorkloadMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,10 +38,9 @@ pub struct GovernorInput {
     /// Triggers proactive AggressiveRoot before RAM pressure builds —
     /// faster than any reactive pressure-based trigger.
     pub workload_onset: bool,
-    /// Swap committed in bytes.  Used to boost pressure_score when the system
-    /// is RAM-constrained but CPU is idle — the classic formula underweights
-    /// memory-only pressure on low-RAM machines (≤8 GB).
-    pub swap_used_bytes: u64,
+    /// Capacity-normalized physical memory evidence from the previous fresh
+    /// collector generation. `None` and `Unknown` cannot escalate policy.
+    pub memory_evidence: Option<MemoryRegimeEvidence>,
 }
 
 #[derive(Debug, Clone)]
@@ -157,8 +159,46 @@ impl ProfileGovernor {
             profile,
             expires_at: Utc::now() + Duration::minutes(ttl_minutes as i64),
             reason,
+            origin: OverrideOrigin::Operator,
         });
         self.transition_reason = "manual-override".to_string();
+    }
+
+    pub fn set_predictive_override(
+        &mut self,
+        profile: OptimizationProfile,
+        ttl_seconds: i64,
+        reason: String,
+    ) -> bool {
+        if self
+            .manual_override
+            .as_ref()
+            .is_some_and(|active| active.origin == OverrideOrigin::Operator)
+        {
+            return false;
+        }
+        self.manual_override = Some(ManualOverride {
+            profile,
+            expires_at: Utc::now() + Duration::seconds(ttl_seconds.clamp(1, 30)),
+            reason,
+            origin: OverrideOrigin::Predictive,
+        });
+        self.transition_reason = "predictive-override".to_string();
+        true
+    }
+
+    pub fn clear_predictive_override(&mut self) -> bool {
+        if self
+            .manual_override
+            .as_ref()
+            .is_some_and(|active| active.origin == OverrideOrigin::Predictive)
+        {
+            self.manual_override = None;
+            self.transition_reason = "predictive-override-released".to_string();
+            true
+        } else {
+            false
+        }
     }
 
     pub fn clear_manual_override(&mut self) {
@@ -227,8 +267,10 @@ impl ProfileGovernor {
         self.transition_times
             .retain(|t| *t >= now - Duration::minutes(10));
 
-        let swap_gb_input = input.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-        let mem_thrash_crisis = input.ram_pressure >= 0.60 && swap_gb_input >= 2.0;
+        let mem_thrash_crisis = input
+            .memory_evidence
+            .as_ref()
+            .is_some_and(MemoryRegimeEvidence::physically_correlated_crisis);
 
         let balanced_lock_active = self
             .balanced_lock_until
@@ -454,24 +496,21 @@ fn pressure_score(input: &GovernorInput) -> f64 {
     let ram = input.ram_pressure.clamp(0.0, 1.0);
     let wait = input.interactive_wait_ratio.clamp(0.0, 1.0);
     let reactor = input.reactor_event_weight.clamp(0.0, 1.0);
-    // Swap boost: on memory-constrained systems CPU can be idle while the machine
-    // is actively swapping.  The base formula underweights this case.
-    // Cap at 0.12 (2 GB → full boost on 8 GB machines; higher RAM → less boost).
-    let swap_gb = input.swap_used_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
-    let swap_boost = (swap_gb / 2.0).clamp(0.0, 1.0) * 0.12;
+    let memory = input
+        .memory_evidence
+        .as_ref()
+        .filter(|evidence| evidence.confidence > 0.0 && evidence.regime != MemoryRegime::Unknown);
+    let memory_boost = memory
+        .map(|evidence| evidence.normalized_score.clamp(0.0, 1.0) * 0.12)
+        .unwrap_or(0.0);
     let base =
-        (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor + swap_boost).clamp(0.0, 1.0);
+        (0.35 * cpu + 0.35 * ram + 0.20 * wait + 0.10 * reactor + memory_boost).clamp(0.0, 1.0);
 
-    // Memory-thrash crisis override: when both RAM and swap are simultaneously stressed,
-    // the CPU-idle formula chronically underscores the real system state.
-    // On 8 GB machines: ram >= 0.60 + swap >= 1.5 GB is an active thrash condition.
-    // Guarantee a minimum score that clears the 0.72 aggressive-root threshold.
-    // Scale 0.60→0.85 as swap rises from 1.5→3.0 GB to allow proportional response.
-    if ram >= 0.60 && swap_gb >= 1.5 {
-        let crisis_score = (0.60 + (swap_gb - 1.5).clamp(0.0, 1.5) / 1.5 * 0.25).clamp(0.0, 1.0);
-        return base.max(crisis_score);
+    match memory.map(|evidence| evidence.regime) {
+        Some(MemoryRegime::Crisis) => base.max(0.75),
+        Some(MemoryRegime::Contended) => base.max(0.60),
+        _ => base,
     }
-    base
 }
 
 fn throttle_level(pressure_score: f64) -> String {
@@ -503,7 +542,7 @@ mod tests {
             arousal_level: 0.0,
             workload_mode: None,
             workload_onset,
-            swap_used_bytes: 0,
+            memory_evidence: None,
         }
     }
 
@@ -659,7 +698,7 @@ mod tests {
 
     #[test]
     fn memory_thrash_crisis_score_clears_aggressive_threshold() {
-        // ram=0.67, swap=2.5 GB (8 GB machine thrashing) — score must reach >= 0.72
+        // Sustained, capacity-normalized crisis must clear the aggressive threshold.
         let input = GovernorInput {
             cpu_pressure: 0.05,
             ram_pressure: 0.67,
@@ -672,7 +711,16 @@ mod tests {
             arousal_level: 0.0,
             workload_mode: None,
             workload_onset: false,
-            swap_used_bytes: (2.5 * 1024.0 * 1024.0 * 1024.0) as u64,
+            memory_evidence: Some(MemoryRegimeEvidence {
+                regime: MemoryRegime::Crisis,
+                generation: 1,
+                confidence: 1.0,
+                normalized_score: 0.85,
+                swap_fraction_of_ram: 0.31,
+                swap_growth_fraction_per_minute: 0.01,
+                adverse_flow: true,
+                sustained: true,
+            }),
         };
         let score = pressure_score(&input);
         assert!(
@@ -702,7 +750,16 @@ mod tests {
             arousal_level: 0.0,
             workload_mode: None,
             workload_onset: false,
-            swap_used_bytes: (2.5 * 1024.0 * 1024.0 * 1024.0) as u64,
+            memory_evidence: Some(MemoryRegimeEvidence {
+                regime: MemoryRegime::Crisis,
+                generation: 1,
+                confidence: 1.0,
+                normalized_score: 0.85,
+                swap_fraction_of_ram: 0.31,
+                swap_growth_fraction_per_minute: 0.01,
+                adverse_flow: true,
+                sustained: true,
+            }),
         };
         let decision = gov.evaluate(crisis_input);
         assert_eq!(
@@ -712,6 +769,91 @@ mod tests {
             decision.effective_profile,
             decision.transition_reason
         );
+    }
+
+    #[test]
+    fn unknown_memory_evidence_cannot_escalate_policy() {
+        let mut input = low_pressure_input(false);
+        input.memory_evidence = Some(MemoryRegimeEvidence::default());
+
+        assert!(pressure_score(&input) < 0.40);
+    }
+
+    #[test]
+    fn predictive_override_cannot_replace_operator_override() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        gov.set_manual_override(OptimizationProfile::SafeRoot, 5, "operator".to_string());
+
+        assert!(!gov.set_predictive_override(
+            OptimizationProfile::AggressiveRoot,
+            30,
+            "predictive".to_string(),
+        ));
+        assert_eq!(
+            gov.manual_override.as_ref().map(|active| active.origin),
+            Some(OverrideOrigin::Operator)
+        );
+        assert_eq!(
+            gov.manual_override.as_ref().map(|active| active.profile),
+            Some(OptimizationProfile::SafeRoot)
+        );
+    }
+
+    #[test]
+    fn predictive_override_releases_without_touching_operator_override() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        assert!(gov.set_predictive_override(
+            OptimizationProfile::AggressiveRoot,
+            30,
+            "predictive".to_string(),
+        ));
+        assert!(gov.clear_predictive_override());
+        assert!(gov.manual_override.is_none());
+
+        gov.set_manual_override(OptimizationProfile::SafeRoot, 5, "operator".to_string());
+        assert!(!gov.clear_predictive_override());
+        assert!(gov.manual_override.is_some());
+    }
+
+    #[test]
+    fn legacy_override_without_origin_defaults_to_operator() {
+        let override_state = ManualOverride {
+            profile: OptimizationProfile::BalancedRoot,
+            expires_at: Utc::now() + Duration::minutes(5),
+            reason: "legacy".to_string(),
+            origin: OverrideOrigin::Operator,
+        };
+        let mut json = serde_json::to_value(override_state).unwrap();
+        json.as_object_mut().unwrap().remove("origin");
+
+        let restored: ManualOverride = serde_json::from_value(json).unwrap();
+
+        assert_eq!(restored.origin, OverrideOrigin::Operator);
+    }
+
+    #[test]
+    fn unsustained_memory_burst_cannot_bypass_anti_thrash_lock() {
+        let mut gov = make_governor(OptimizationProfile::BalancedRoot);
+        gov.balanced_lock_until = Some(Utc::now() + Duration::minutes(5));
+        let mut input = low_pressure_input(false);
+        input.memory_evidence = Some(MemoryRegimeEvidence {
+            regime: MemoryRegime::Crisis,
+            generation: 1,
+            confidence: 1.0,
+            normalized_score: 1.0,
+            swap_fraction_of_ram: 0.60,
+            swap_growth_fraction_per_minute: 0.20,
+            adverse_flow: true,
+            sustained: false,
+        });
+
+        let decision = gov.evaluate(input);
+
+        assert_eq!(
+            decision.effective_profile,
+            OptimizationProfile::BalancedRoot
+        );
+        assert_eq!(decision.transition_reason, "anti-thrash-balanced-lock");
     }
 
     #[test]

@@ -10,7 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use apollo_engine::engine::protocol::{DaemonRequest, DaemonResponse};
-use apollo_engine::engine::types::{DaemonStatus, OptimizationProfile, SafetyPolicy};
+use apollo_engine::engine::types::{
+    DaemonStatus, OptimizationProfile, OverrideOrigin, SafetyPolicy,
+};
 
 // ── IPC ──
 
@@ -265,7 +267,11 @@ fn build_menu(status: &Option<DaemonStatus>, updated_secs_ago: u64) -> tray_icon
 
     // ── PERFIL ──
     let profile_mode = if s.override_active {
-        "override"
+        if s.override_origin == Some(OverrideOrigin::Predictive) {
+            "predictivo"
+        } else {
+            "override"
+        }
     } else if s.auto_profile_enabled {
         "auto"
     } else {

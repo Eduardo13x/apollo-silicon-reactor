@@ -5,6 +5,18 @@
 
 use std::ffi::CString;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumericSysctlWidth {
+    I32,
+    I64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NumericSysctlValue {
+    pub value: i64,
+    pub width: NumericSysctlWidth,
+}
+
 /// Read a sysctl value as a trimmed String.
 pub fn read_str(key: &str) -> Option<String> {
     let ckey = CString::new(key).ok()?;
@@ -116,6 +128,50 @@ pub fn read_i32(key: &str) -> Option<i32> {
     Some(val)
 }
 
+pub fn read_i64(key: &str) -> Option<i64> {
+    let ckey = CString::new(key).ok()?;
+    let mut val: i64 = 0;
+    let mut size = std::mem::size_of::<i64>();
+    unsafe {
+        (libc::sysctlbyname(
+            ckey.as_ptr(),
+            &mut val as *mut _ as *mut _,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) == 0)
+            .then_some(val)
+    }
+}
+
+pub fn read_numeric(key: &str) -> Option<NumericSysctlValue> {
+    let ckey = CString::new(key).ok()?;
+    let mut size = 0_usize;
+    unsafe {
+        if libc::sysctlbyname(
+            ckey.as_ptr(),
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        ) != 0
+        {
+            return None;
+        }
+    }
+    match size {
+        4 => read_i32(key).map(|value| NumericSysctlValue {
+            value: value as i64,
+            width: NumericSysctlWidth::I32,
+        }),
+        8 => read_i64(key).map(|value| NumericSysctlValue {
+            value,
+            width: NumericSysctlWidth::I64,
+        }),
+        _ => None,
+    }
+}
+
 /// Read a sysctl value as u32.
 pub fn read_u32_val(key: &str) -> Option<u32> {
     read_i32(key).map(|v| v as u32)
@@ -136,6 +192,31 @@ pub fn write_i32(key: &str, value: i32) -> bool {
             &value as *const i32 as *mut _,
             std::mem::size_of::<i32>(),
         ) == 0
+    }
+}
+
+pub fn write_i64(key: &str, value: i64) -> bool {
+    let ckey = match CString::new(key) {
+        Ok(key) => key,
+        Err(_) => return false,
+    };
+    unsafe {
+        libc::sysctlbyname(
+            ckey.as_ptr(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &value as *const i64 as *mut _,
+            std::mem::size_of::<i64>(),
+        ) == 0
+    }
+}
+
+pub fn write_numeric(key: &str, value: i64, width: NumericSysctlWidth) -> bool {
+    match width {
+        NumericSysctlWidth::I32 => i32::try_from(value)
+            .ok()
+            .is_some_and(|value| write_i32(key, value)),
+        NumericSysctlWidth::I64 => write_i64(key, value),
     }
 }
 
