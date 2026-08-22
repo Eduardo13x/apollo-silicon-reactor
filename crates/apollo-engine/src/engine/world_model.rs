@@ -893,28 +893,29 @@ impl WorldModel {
         let Some(context) = self.latest_context.as_ref() else {
             return evidence;
         };
-        let mut candidates: Vec<_> = self
-            .gpu_advice
-            .iter()
-            .filter_map(|(key, entry)| {
-                (entry.workload == workload
-                    && entry.context_revision == self.gpu_context_revision
-                    && context.cycle >= entry.generation
-                    && context.cycle.saturating_sub(entry.generation) <= GPU_ADVICE_MAX_AGE_CYCLES)
-                    .then_some((key, entry))
-            })
-            .collect();
-        candidates.sort_by(|left, right| {
-            right
-                .1
-                .advice
-                .context_score
-                .abs()
-                .total_cmp(&left.1.advice.context_score.abs())
-                .then_with(|| left.0.cmp(right.0))
-        });
-        evidence.gpu_fresh_predictions = candidates.len().min(u32::MAX as usize) as u32;
-        if let Some((_, entry)) = candidates.first() {
+        let mut fresh_predictions = 0_u32;
+        let mut top_key: Option<String> = None;
+        let mut top_score = f64::NEG_INFINITY;
+        for (key, entry) in &self.gpu_advice {
+            if entry.workload != workload
+                || entry.context_revision != self.gpu_context_revision
+                || context.cycle < entry.generation
+                || context.cycle.saturating_sub(entry.generation) > GPU_ADVICE_MAX_AGE_CYCLES
+            {
+                continue;
+            }
+            fresh_predictions = fresh_predictions.saturating_add(1);
+            let score = entry.advice.context_score.abs();
+            let replaces_top = score.total_cmp(&top_score).is_gt()
+                || (score.total_cmp(&top_score).is_eq()
+                    && top_key.as_ref().is_none_or(|top| key < top));
+            if replaces_top {
+                top_score = score;
+                top_key = Some(key.clone());
+            }
+        }
+        evidence.gpu_fresh_predictions = fresh_predictions;
+        if let Some(entry) = top_key.as_ref().and_then(|key| self.gpu_advice.get(key)) {
             evidence.gpu_top_action = entry.advice.action_key.clone();
             if let Some((support, trust)) =
                 self.gpu_context_support(&entry.advice.action_key, workload)

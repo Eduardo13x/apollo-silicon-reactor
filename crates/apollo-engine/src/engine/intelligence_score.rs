@@ -38,6 +38,14 @@ pub struct PairEvidenceProjection {
     pub mean_effect: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct UnifiedLearningProjection {
+    maturity: f64,
+    evidence: f64,
+    learning_quality: f64,
+    wisdom_quality: f64,
+}
+
 pub fn project_pair_evidence(metrics: &serde_json::Value) -> PairEvidenceProjection {
     let gold = metrics["microexperiment_pair_gold_total"]
         .as_u64()
@@ -62,6 +70,36 @@ pub fn project_pair_evidence(metrics: &serde_json::Value) -> PairEvidenceProject
         verified_adaptations_correct: effective.min(u64::from(u32::MAX)) as u32,
         verified_adaptations_total: gold.min(u64::from(u32::MAX)) as u32,
         mean_effect,
+    }
+}
+
+fn project_unified_learning(metrics: &serde_json::Value) -> UnifiedLearningProjection {
+    let unit = |value: &serde_json::Value| {
+        value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(|value| value.clamp(0.0, 1.0))
+    };
+    let unified = &metrics["unified_learning_ais"];
+    let maturity = unit(&unified["local_learning_maturity"])
+        .or_else(|| unit(&metrics["ais_local_learning_maturity"]))
+        .unwrap_or(0.0);
+    let evidence = unit(&unified["unified_learning_evidence"])
+        .or_else(|| unit(&metrics["ais_unified_learning_evidence"]))
+        .unwrap_or(0.0)
+        .min(maturity);
+    let normalize_matured = |key: &str| {
+        if maturity > f64::EPSILON {
+            (unit(&unified[key]).unwrap_or(0.0) / maturity).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    };
+    UnifiedLearningProjection {
+        maturity,
+        evidence,
+        learning_quality: normalize_matured("learning"),
+        wisdom_quality: normalize_matured("wisdom"),
     }
 }
 
@@ -153,6 +191,16 @@ pub struct AisInput {
     /// until attributed observations exist.
     #[serde(default)]
     pub learning_mean_utility: f64,
+    /// Evidence-gated projection from the unified local learning pipeline.
+    /// Quality alone has no authority: maturity and evidence must both exist.
+    #[serde(default)]
+    pub unified_learning_maturity: f64,
+    #[serde(default)]
+    pub unified_learning_evidence: f64,
+    #[serde(default)]
+    pub unified_learning_quality: f64,
+    #[serde(default)]
+    pub unified_wisdom_quality: f64,
 
     // ── Resource efficiency ──────────────────────────────────────────────
     /// p95 cycle time in milliseconds.
@@ -537,6 +585,7 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
     let learning_attributed_observations = pair_evidence.attributed_observations;
     let learning_effective_observations = pair_evidence.effective_observations;
     let learning_mean_utility = pair_evidence.mean_effect;
+    let unified_learning = project_unified_learning(&rm);
     let (learning_raw_observations, learning_gold_observations, learning_data_quality) =
         merge_learning_evidence(
             pressure_learning_raw,
@@ -667,6 +716,10 @@ pub fn compute_runtime_ais() -> Option<AisScore> {
         learning_attributed_observations,
         learning_effective_observations,
         learning_mean_utility,
+        unified_learning_maturity: unified_learning.maturity,
+        unified_learning_evidence: unified_learning.evidence,
+        unified_learning_quality: unified_learning.learning_quality,
+        unified_wisdom_quality: unified_learning.wisdom_quality,
 
         p95_cycle_ms,
         target_cycle_ms: 100.0,
@@ -959,7 +1012,7 @@ fn learning_velocity(input: &AisInput) -> f64 {
     // Curated evidence is an observed quality stream, not a free activity
     // bonus. It is absent for legacy/simulation inputs, matures over 20 raw
     // outcomes, and rewards both structural quality and Gold admission rate.
-    if input.learning_raw_observations > 0 {
+    let learned = if input.learning_raw_observations > 0 {
         let maturity = sample_strength(input.learning_raw_observations, 20);
         let gold_rate = safe_ratio(
             input.learning_gold_observations,
@@ -989,7 +1042,15 @@ fn learning_velocity(input: &AisInput) -> f64 {
         (0.85 * core_learning + 0.15 * curation_score).clamp(0.0, 1.0)
     } else {
         core_learning
-    }
+    };
+
+    evidence_gated_blend(
+        learned,
+        input.unified_learning_quality,
+        input.unified_learning_maturity,
+        input.unified_learning_evidence,
+        0.20,
+    )
 }
 
 // ── Dimension 4: Resource Efficiency ─────────────────────────────────────────
@@ -1239,7 +1300,13 @@ fn wisdom(input: &AisInput) -> f64 {
         0.0
     };
 
-    learned_wisdom.max(provisional_stability_wisdom)
+    evidence_gated_blend(
+        learned_wisdom.max(provisional_stability_wisdom),
+        input.unified_wisdom_quality,
+        input.unified_learning_maturity,
+        input.unified_learning_evidence,
+        0.25,
+    )
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1307,6 +1374,24 @@ fn sample_strength(observations: u64, mature_at: u64) -> f64 {
     }
 }
 
+fn evidence_gated_blend(
+    baseline: f64,
+    quality: f64,
+    maturity: f64,
+    evidence: f64,
+    max_weight: f64,
+) -> f64 {
+    if ![baseline, quality, maturity, evidence, max_weight]
+        .into_iter()
+        .all(f64::is_finite)
+    {
+        return baseline.clamp(0.0, 1.0);
+    }
+    let authority = maturity.clamp(0.0, 1.0).min(evidence.clamp(0.0, 1.0));
+    let weight = max_weight.clamp(0.0, 1.0) * authority;
+    ((1.0 - weight) * baseline.clamp(0.0, 1.0) + weight * quality.clamp(0.0, 1.0)).clamp(0.0, 1.0)
+}
+
 fn ais_evidence_coverage(input: &AisInput) -> f64 {
     let decision = 0.40 * (input.protected_total > 0) as u8 as f64
         + 0.30 * (input.noise_total > 0) as u8 as f64
@@ -1322,6 +1407,16 @@ fn ais_evidence_coverage(input: &AisInput) -> f64 {
     } else {
         learning
     };
+    let unified_evidence = if input.unified_learning_evidence.is_finite() {
+        input.unified_learning_evidence.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let learning = if unified_evidence > 0.0 {
+        0.85 * learning + 0.15 * unified_evidence
+    } else {
+        learning
+    };
     let resource = 0.45 * (input.p95_cycle_ms > 0.0) as u8 as f64
         + 0.30
             * if input.current_pressure >= 0.55 {
@@ -1334,13 +1429,14 @@ fn ais_evidence_coverage(input: &AisInput) -> f64 {
         + 0.30 * sample_strength(input.total_workload_class as u64, 20)
         + 0.25 * sample_strength(input.regime_shifts_total as u64, 20)
         + 0.25 * sample_strength(input.verified_adaptations_total as u64, 20);
-    let wisdom = (input.causal_mechanism_count > 0
+    let wisdom = ((input.causal_mechanism_count > 0
         || input.experience_memory_count > 0
         || input.novel_patterns_count > 0
         || input.reliable_skills > 0
         || input.causal_solid_edges > 0
         || input.phase_duration_observations > 0
-        || input.verified_adaptations_total > 0) as u8 as f64;
+        || input.verified_adaptations_total > 0) as u8 as f64)
+        .max(unified_evidence);
 
     (W_DECISION * decision
         + W_SIGNAL * signal
@@ -1735,6 +1831,7 @@ mod tests {
         let learning_attributed_observations = pair_evidence.attributed_observations;
         let learning_effective_observations = pair_evidence.effective_observations;
         let learning_mean_utility = pair_evidence.mean_effect;
+        let unified_learning = project_unified_learning(&rm);
 
         // ── Build AisInput ───────────────────────────────────────────────────
         let input = AisInput {
@@ -1786,6 +1883,10 @@ mod tests {
             learning_attributed_observations,
             learning_effective_observations,
             learning_mean_utility,
+            unified_learning_maturity: unified_learning.maturity,
+            unified_learning_evidence: unified_learning.evidence,
+            unified_learning_quality: unified_learning.learning_quality,
+            unified_wisdom_quality: unified_learning.wisdom_quality,
 
             // D4
             p95_cycle_ms,
@@ -1916,6 +2017,10 @@ mod tests {
             learning_attributed_observations: 200,
             learning_effective_observations: 180,
             learning_mean_utility: 0.04,
+            unified_learning_maturity: 0.0,
+            unified_learning_evidence: 0.0,
+            unified_learning_quality: 0.0,
+            unified_wisdom_quality: 0.0,
             // overflow_count from RL sim available as learning.10
 
             // Resource: LIVE from measured computation time
@@ -2636,6 +2741,91 @@ mod tests {
     }
 
     #[test]
+    fn unified_learning_maturity_rewards_closed_useful_learning() {
+        let baseline = AisInput {
+            rl_total_ticks: 1_000,
+            rl_max_ticks: 500,
+            causal_solid_edges: 18,
+            causal_weak_edges: 4,
+            causal_total_edges: 30,
+            reliable_skills: 5,
+            total_skills: 8,
+            experience_records: 120,
+            dyna_transitions: 200,
+            learning_raw_observations: 200,
+            learning_gold_observations: 170,
+            learning_data_quality: 0.90,
+            learning_attributed_observations: 120,
+            learning_effective_observations: 96,
+            learning_mean_utility: 0.03,
+            causal_mechanism_count: 24,
+            experience_memory_count: 120,
+            novel_patterns_count: 12,
+            phase_duration_observations: 30,
+            verified_adaptations_total: 80,
+            ..AisInput::default()
+        };
+        let mature = AisInput {
+            unified_learning_maturity: 1.0,
+            unified_learning_evidence: 1.0,
+            unified_learning_quality: 0.96,
+            unified_wisdom_quality: 0.92,
+            ..baseline.clone()
+        };
+
+        let baseline_score = compute_ais(&baseline);
+        let mature_score = compute_ais(&mature);
+        assert!(mature_score.learning_velocity > baseline_score.learning_velocity);
+        assert!(mature_score.wisdom > baseline_score.wisdom);
+        assert!(mature_score.total > baseline_score.total);
+    }
+
+    #[test]
+    fn unified_learning_without_maturity_or_evidence_cannot_inflate_ais() {
+        let baseline = AisInput {
+            rl_total_ticks: 1_000,
+            rl_max_ticks: 500,
+            ..AisInput::default()
+        };
+        let unsupported = AisInput {
+            unified_learning_quality: 1.0,
+            unified_wisdom_quality: 1.0,
+            ..baseline.clone()
+        };
+
+        let baseline_score = compute_ais(&baseline);
+        let unsupported_score = compute_ais(&unsupported);
+        assert!((baseline_score.total - unsupported_score.total).abs() < f64::EPSILON);
+        assert!(
+            (baseline_score.learning_velocity - unsupported_score.learning_velocity).abs()
+                < f64::EPSILON
+        );
+        assert!((baseline_score.wisdom - unsupported_score.wisdom).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn unified_learning_projection_removes_duplicate_maturity_scaling() {
+        let metrics = serde_json::json!({
+            "ais_local_learning_maturity": 0.50,
+            "ais_unified_learning_evidence": 0.40,
+            "ais_learning": 0.99,
+            "ais_wisdom": 0.99,
+            "unified_learning_ais": {
+                "local_learning_maturity": 0.50,
+                "unified_learning_evidence": 0.40,
+                "learning": 0.40,
+                "wisdom": 0.30
+            }
+        });
+
+        let projection = project_unified_learning(&metrics);
+        assert_eq!(projection.maturity, 0.50);
+        assert_eq!(projection.evidence, 0.40);
+        assert!((projection.learning_quality - 0.80).abs() < 1e-12);
+        assert!((projection.wisdom_quality - 0.60).abs() < 1e-12);
+    }
+
+    #[test]
     fn test_safety_violation_zeroes_dimension() {
         let input = AisInput {
             total_decisions: 100,
@@ -2668,6 +2858,10 @@ mod tests {
             learning_attributed_observations: 0,
             learning_effective_observations: 0,
             learning_mean_utility: 0.0,
+            unified_learning_maturity: 0.0,
+            unified_learning_evidence: 0.0,
+            unified_learning_quality: 0.0,
+            unified_wisdom_quality: 0.0,
             p95_cycle_ms: 30.0,
             target_cycle_ms: 50.0,
             subsystem_skips: 50,
@@ -2925,6 +3119,10 @@ mod tests {
             learning_attributed_observations: 100,
             learning_effective_observations: 90,
             learning_mean_utility: 0.04,
+            unified_learning_maturity: 0.0,
+            unified_learning_evidence: 0.0,
+            unified_learning_quality: 0.0,
+            unified_wisdom_quality: 0.0,
 
             // D4: efficient resource use — fast cycles, good budget
             p95_cycle_ms: 60.0,
@@ -3206,6 +3404,10 @@ mod tests {
             learning_attributed_observations: 100,
             learning_effective_observations: 20,
             learning_mean_utility: -0.04,
+            unified_learning_maturity: 0.0,
+            unified_learning_evidence: 0.0,
+            unified_learning_quality: 0.0,
+            unified_wisdom_quality: 0.0,
 
             // D4: poor efficiency — slow cycles, poor budget
             p95_cycle_ms: 200.0,
