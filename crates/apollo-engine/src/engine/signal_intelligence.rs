@@ -225,6 +225,8 @@ pub struct SignalIntelligence {
     oom_event_buffer: std::collections::VecDeque<([f64; 4], f64)>,
     accepted_overflow_events: u64,
     last_retrained_overflow_events: u64,
+    overflow_episode_active: bool,
+    overflow_episode_recorded: bool,
 
     /// Timestamp of the last recorded OOM/overflow event.
     /// Used to compute real inter-event intervals instead of hardcoded 1.0.
@@ -313,6 +315,8 @@ impl SignalIntelligence {
             oom_event_buffer: std::collections::VecDeque::new(),
             accepted_overflow_events: 0,
             last_retrained_overflow_events: 0,
+            overflow_episode_active: false,
+            overflow_episode_recorded: false,
             last_oom_instant: None,
             kf_mv: KalmanMV8::new(),
             signal_health: SignalHealthMonitor::new(),
@@ -662,6 +666,44 @@ impl SignalIntelligence {
         )
     }
 
+    pub fn observe_overflow_episode(
+        &mut self,
+        active: bool,
+        memory_pressure: f64,
+        swap_ratio: f64,
+        compressor_ratio: f64,
+    ) -> bool {
+        self.observe_overflow_episode_at(
+            active,
+            memory_pressure,
+            swap_ratio,
+            compressor_ratio,
+            std::time::Instant::now(),
+        )
+    }
+
+    fn observe_overflow_episode_at(
+        &mut self,
+        active: bool,
+        memory_pressure: f64,
+        swap_ratio: f64,
+        compressor_ratio: f64,
+        now: std::time::Instant,
+    ) -> bool {
+        if !active {
+            self.overflow_episode_active = false;
+            self.overflow_episode_recorded = false;
+            return false;
+        }
+        if self.overflow_episode_recorded {
+            return false;
+        }
+        self.overflow_episode_active = true;
+        let recorded = self.record_overflow_at(memory_pressure, swap_ratio, compressor_ratio, now);
+        self.overflow_episode_recorded = recorded;
+        recorded
+    }
+
     fn record_overflow_at(
         &mut self,
         memory_pressure: f64,
@@ -965,6 +1007,8 @@ impl SignalIntelligence {
             utility_hazard: self.utility_hazard,
             utility_lotka: self.utility_lotka,
             utility_mpc: self.utility_mpc,
+            overflow_episode_active: self.overflow_episode_active,
+            overflow_episode_recorded: self.overflow_episode_recorded,
             kf_pressure: Some(self.kf_pressure.clone()),
             kf_swap: Some(self.kf_swap.clone()),
             kf_mv: Some(self.kf_mv.clone()),
@@ -1022,6 +1066,8 @@ impl SignalIntelligence {
         } else {
             0.5
         };
+        self.overflow_episode_active = p.overflow_episode_active;
+        self.overflow_episode_recorded = p.overflow_episode_recorded;
         if let Some(kf) = p.kf_pressure {
             self.kf_pressure = kf;
         }
@@ -1194,6 +1240,10 @@ pub struct SignalIntelligencePersisted {
     /// Utility EMA for MPC subsystem.
     #[serde(default = "default_utility")]
     pub utility_mpc: f64,
+    #[serde(default)]
+    pub overflow_episode_active: bool,
+    #[serde(default)]
+    pub overflow_episode_recorded: bool,
     /// Kalman filter state for pressure (position + velocity + covariance).
     #[serde(default)]
     pub kf_pressure: Option<Kalman1D>,
@@ -1501,6 +1551,83 @@ mod tests {
             d_after.p_oom_30s,
             p_before
         );
+    }
+
+    #[test]
+    fn overflow_learning_is_edge_triggered_across_time_and_restore() {
+        let start = std::time::Instant::now();
+        let mut si = SignalIntelligence::new();
+
+        assert!(si.observe_overflow_episode_at(true, 0.95, 0.8, 0.9, start));
+        assert!(!si.observe_overflow_episode_at(
+            true,
+            0.95,
+            0.8,
+            0.9,
+            start + std::time::Duration::from_secs(120),
+        ));
+
+        let persisted = si.to_persisted();
+        let mut restored = SignalIntelligence::new();
+        restored.restore(persisted);
+        assert!(!restored.observe_overflow_episode_at(
+            true,
+            0.95,
+            0.8,
+            0.9,
+            start + std::time::Duration::from_secs(121),
+        ));
+
+        assert!(!restored.observe_overflow_episode_at(
+            false,
+            0.0,
+            0.0,
+            0.0,
+            start + std::time::Duration::from_secs(122),
+        ));
+        assert!(restored.observe_overflow_episode_at(
+            true,
+            0.95,
+            0.8,
+            0.9,
+            start + std::time::Duration::from_secs(123),
+        ));
+    }
+
+    #[test]
+    fn overflow_episode_retries_after_refractory_without_replaying_after_acceptance() {
+        let start = std::time::Instant::now();
+        let mut si = SignalIntelligence::new();
+
+        assert!(si.observe_overflow_episode_at(true, 0.95, 0.8, 0.9, start));
+        assert!(!si.observe_overflow_episode_at(
+            false,
+            0.0,
+            0.0,
+            0.0,
+            start + std::time::Duration::from_secs(10),
+        ));
+        assert!(!si.observe_overflow_episode_at(
+            true,
+            0.95,
+            0.8,
+            0.9,
+            start + std::time::Duration::from_secs(20),
+        ));
+        assert!(si.observe_overflow_episode_at(
+            true,
+            0.95,
+            0.8,
+            0.9,
+            start + std::time::Duration::from_secs(31),
+        ));
+        assert!(!si.observe_overflow_episode_at(
+            true,
+            0.95,
+            0.8,
+            0.9,
+            start + std::time::Duration::from_secs(90),
+        ));
     }
 
     #[test]

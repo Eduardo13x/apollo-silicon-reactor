@@ -257,6 +257,16 @@ impl SwapPredictor {
         self.sum_ty = 0.0;
     }
 
+    pub fn invalidate(&mut self, swap_used_bytes: u64, swap_total_bytes: u64) -> SwapForecast {
+        self.clear_samples();
+        self.last_forecast = stable_forecast(swap_used_bytes, swap_total_bytes);
+        self.last_forecast.clone()
+    }
+
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
     fn regression_slope(&self) -> Option<f64> {
         let n = self.samples.len() as f64;
         if n < 2.0 {
@@ -467,5 +477,21 @@ mod tests {
 
         assert_eq!(forecast.swap_trend, SwapTrend::Stable);
         assert_eq!(predictor.samples.len(), 1);
+    }
+
+    #[test]
+    fn invalidation_discards_cached_critical_forecast() {
+        let start = Instant::now();
+        let mut predictor = SwapPredictor::new();
+        let ram = 8 * GB;
+        predictor.update_at(1, start, 0, 2 * GB, ram);
+        predictor.update_at(2, start + Duration::from_secs(1), GB, 2 * GB, ram);
+        let critical = predictor.update_at(3, start + Duration::from_secs(2), 2 * GB, 2 * GB, ram);
+        assert_ne!(critical.swap_trend, SwapTrend::Stable);
+
+        let passive = predictor.invalidate(2 * GB, 2 * GB);
+
+        assert_eq!(passive.swap_trend, SwapTrend::Stable);
+        assert_eq!(passive.time_to_swap_critical, None);
     }
 }

@@ -800,13 +800,12 @@ pub fn run_learning_tick<'a>(
                     let swap_ratio = snapshot.pressure.swap_used_bytes as f64
                         / (snapshot.pressure.swap_total_bytes.max(1) as f64);
                     let swap_growing = snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
-                    if swap_ratio > 0.10 && swap_growing {
-                        lctx.signal_intel.record_overflow(
-                            mem_pressure,
-                            swap_ratio,
-                            signal_digest.pressure_smooth, // compressor proxy
-                        );
-                    }
+                    lctx.signal_intel.observe_overflow_episode(
+                        swap_ratio > 0.10 && swap_growing,
+                        mem_pressure,
+                        swap_ratio,
+                        signal_digest.pressure_smooth, // compressor proxy
+                    );
                     // NARS: crisis-level salience for OOM kill
                     let salience = Salience {
                         arousal: 1.0,

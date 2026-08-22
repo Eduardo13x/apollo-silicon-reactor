@@ -104,7 +104,7 @@ pub struct PendingObservation {
     pub pid: u32,
     pub kind: ObsKind,
     /// Sysctl key, populated only when `kind == ObsKind::Sysctl`. Required
-    /// for the consumer's `sysctl_direct::read_i32(key)` re-read call.
+    /// for the consumer's width-aware `sysctl_direct::read_numeric(key)` re-read.
     /// `None` for other kinds.
     pub key: Option<String>,
     /// Encoded post-syscall value (interpretation depends on `kind`):

@@ -3542,6 +3542,24 @@ pub fn run_periodic_stage<'a>(
 /// auto-reverts `zone_alpha` / `rl_pressure_bands[2]` to their
 /// pre-shift values. Without this caller, the wire was dormant —
 /// `poke_rollback_guard_via_decay` had zero invocations in the daemon.
+fn read_effect_observation(
+    kind: apollo_engine::engine::effect_decay::ObsKind,
+    pid: u32,
+    key: Option<&str>,
+) -> Option<i64> {
+    use apollo_engine::engine::effect_decay::ObsKind;
+
+    match kind {
+        ObsKind::JetsamTier => {
+            apollo_engine::engine::jetsam_control::get_priority(pid).map(|value| value as i64)
+        }
+        ObsKind::Sysctl => key
+            .and_then(apollo_engine::engine::sysctl_direct::read_numeric)
+            .map(|value| value.value),
+        ObsKind::MachPolicy => None,
+    }
+}
+
 pub fn drain_effect_decay(
     state: &SharedState,
     lp: &mut apollo_engine::engine::learned_state::LearnableParams,
@@ -3589,17 +3607,7 @@ pub fn drain_effect_decay(
                 // deferred — see banner. Skip.
                 continue;
             }
-            let live = match obs.kind {
-                ObsKind::JetsamTier => {
-                    apollo_engine::engine::jetsam_control::get_priority(obs.pid).map(|p| p as i64)
-                }
-                ObsKind::Sysctl => obs
-                    .key
-                    .as_deref()
-                    .and_then(apollo_engine::engine::sysctl_direct::read_i32)
-                    .map(|v| v as i64),
-                ObsKind::MachPolicy => unreachable!("handled above"),
-            };
+            let live = read_effect_observation(obs.kind, obs.pid, obs.key.as_deref());
             if let Some(actual) = live {
                 if actual != obs.value_post {
                     watchdog.report_disagreement_with(&obs);
@@ -3626,16 +3634,31 @@ pub fn drain_effect_decay(
 mod tests {
     use super::{
         decide_acceleration_lanes, evaluate_reflex_reasoning, ns_to_ceil_us,
-        reflex_advice_from_bias, reflex_decision_allows_actuation, select_acceleration_reason,
-        sum_frozen_ram_mb, AccelerationHint, AccelerationHintKind, AccelerationLeaseBroker,
-        InteractionReason, LeaseTtlBand, ReflexModelSignals, ReflexReasoningAdvice,
-        ReflexReasoningPayload,
+        read_effect_observation, reflex_advice_from_bias, reflex_decision_allows_actuation,
+        select_acceleration_reason, sum_frozen_ram_mb, AccelerationHint, AccelerationHintKind,
+        AccelerationLeaseBroker, InteractionReason, LeaseTtlBand, ReflexModelSignals,
+        ReflexReasoningAdvice, ReflexReasoningPayload,
     };
     use apollo_engine::engine::process_identity::ProcessIdentity;
     use apollo_engine::engine::reflex::{ReflexRolloutPhase, ReflexSafetyContext, ReflexSource};
     use apollo_engine::engine::world_model::{ContextualActionBias, WorldModel};
     use std::collections::HashMap;
     use sysinfo::System;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sysctl_decay_reread_supports_native_64_bit_values() {
+        let expected = apollo_engine::engine::sysctl_direct::read_numeric("hw.memsize")
+            .expect("hw.memsize must be readable")
+            .value;
+        let observed = read_effect_observation(
+            apollo_engine::engine::effect_decay::ObsKind::Sysctl,
+            0,
+            Some("hw.memsize"),
+        );
+
+        assert_eq!(observed, Some(expected));
+    }
 
     #[test]
     fn lock_max_rounds_sub_microsecond_samples_up() {

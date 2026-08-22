@@ -2142,6 +2142,8 @@ mod tests {
             utility_hazard: -1.0,
             utility_lotka: 0.7,
             utility_mpc: 0.3,
+            overflow_episode_active: false,
+            overflow_episode_recorded: false,
             kf_pressure: None,
             kf_swap: None,
             kf_mv: None,

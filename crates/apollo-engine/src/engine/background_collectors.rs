@@ -30,10 +30,14 @@ pub struct PressureData {
     pub swap_used_bytes: u64,
     /// Total swap capacity.
     pub swap_total_bytes: u64,
+    /// Whether swap usage was sampled for this exact publication.
+    pub swap_sample_valid: bool,
     /// Swap change rate in bytes/sec (positive = growing, negative = shrinking).
     pub swap_delta_bps: f64,
     /// Native VM page size for converting page rates into comparable byte rates.
     pub page_size_bytes: u64,
+    /// Whether VM pressure and page-flow counters were sampled successfully.
+    pub vm_sample_valid: bool,
     /// When this data was last refreshed.
     pub updated_at: Instant,
     /// Per-second VM flow rates derived from host_statistics64 cumulative
@@ -67,8 +71,10 @@ impl Default for PressureData {
             memory_pressure: 0.0,
             swap_used_bytes: 0,
             swap_total_bytes: 0,
+            swap_sample_valid: false,
             swap_delta_bps: 0.0,
             page_size_bytes: 0,
+            vm_sample_valid: false,
             updated_at: Instant::now(),
             vm_rate: VmRate::default(),
             thrashing_score: 0.0,
@@ -118,6 +124,15 @@ impl PressureCollector {
 
                 loop {
                     let (mem_pressure, vm_sample, swap_sample) = collect_pressure_facts();
+                    let vm_sample_valid = vm_sample.is_some();
+                    let swap_sample_valid = swap_sample.is_some();
+                    if !should_publish_pressure_generation(
+                        vm_sample.is_some(),
+                        swap_sample.is_some(),
+                    ) {
+                        thread::sleep(interval);
+                        continue;
+                    }
                     let curr_cpu_ticks = cpu_sat::read_per_core_ticks();
                     let now = Instant::now();
                     let (swap_used, swap_total, swap_delta) =
@@ -151,8 +166,10 @@ impl PressureCollector {
                         memory_pressure: mem_pressure,
                         swap_used_bytes: swap_used,
                         swap_total_bytes: swap_total,
+                        swap_sample_valid,
                         swap_delta_bps: swap_delta,
                         page_size_bytes,
+                        vm_sample_valid,
                         updated_at: now,
                         vm_rate,
                         thrashing_score,
@@ -215,6 +232,11 @@ fn signed_byte_rate(previous: u64, current: u64, dt_secs: f64) -> f64 {
         return 0.0;
     }
     (current as i128 - previous as i128) as f64 / dt_secs
+}
+
+#[inline]
+fn should_publish_pressure_generation(vm_sample_ok: bool, swap_sample_ok: bool) -> bool {
+    vm_sample_ok || swap_sample_ok
 }
 
 #[derive(Debug, Default)]
@@ -335,6 +357,30 @@ mod tests {
             tracker.observe(Some((8_000, 5_000)), started + Duration::from_secs(1)),
             (5_000, 8_000, 1_000.0)
         );
+    }
+
+    #[test]
+    fn totally_failed_collection_does_not_publish_a_fresh_generation() {
+        assert!(!should_publish_pressure_generation(false, false));
+        assert!(should_publish_pressure_generation(true, false));
+        assert!(should_publish_pressure_generation(false, true));
+    }
+
+    #[test]
+    fn partial_collection_is_not_coherent_memory_evidence() {
+        let vm_only = PressureData {
+            vm_sample_valid: true,
+            swap_sample_valid: false,
+            ..PressureData::default()
+        };
+        let swap_only = PressureData {
+            vm_sample_valid: false,
+            swap_sample_valid: true,
+            ..PressureData::default()
+        };
+
+        assert!(!(vm_only.vm_sample_valid && vm_only.swap_sample_valid));
+        assert!(!(swap_only.vm_sample_valid && swap_only.swap_sample_valid));
     }
 
     #[test]

@@ -127,14 +127,16 @@ pub(super) fn detect_hw_caps() -> (u32, f64) {
 }
 
 pub(super) fn detect_memory_capabilities() -> MemoryCapabilities {
-    let physical_memory_bytes =
-        apollo_engine::engine::sysctl_direct::read_u64("hw.memsize").unwrap_or(0);
+    let physical_memory_bytes = apollo_engine::engine::sysctl_direct::read_u64("hw.memsize");
     let page_size_bytes = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    MemoryCapabilities::new(
-        physical_memory_bytes,
-        u64::try_from(page_size_bytes).unwrap_or(0),
-    )
-    .unwrap_or_else(MemoryCapabilities::apple_silicon_fallback)
+    memory_capabilities_from_partial(physical_memory_bytes, u64::try_from(page_size_bytes).ok())
+}
+
+fn memory_capabilities_from_partial(
+    physical_memory_bytes: Option<u64>,
+    page_size_bytes: Option<u64>,
+) -> MemoryCapabilities {
+    MemoryCapabilities::from_partial(physical_memory_bytes, page_size_bytes)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,6 +425,26 @@ mod tests {
         let capabilities = detect_memory_capabilities();
         assert!(capabilities.physical_memory_bytes >= 1024 * 1024 * 1024);
         assert!(capabilities.page_size_bytes.is_power_of_two());
+    }
+
+    #[test]
+    fn partial_memory_capabilities_preserve_the_observed_dimension() {
+        let gib = 1024_u64 * 1024 * 1024;
+        let memory_only = memory_capabilities_from_partial(Some(32 * gib), None);
+        assert_eq!(memory_only.physical_memory_bytes, 32 * gib);
+        assert_eq!(memory_only.page_size_bytes, 16 * 1024);
+        assert_eq!(
+            memory_only.memory_confidence,
+            apollo_engine::engine::memory_regime::CapabilityConfidence::Observed
+        );
+        assert_eq!(
+            memory_only.page_size_confidence,
+            apollo_engine::engine::memory_regime::CapabilityConfidence::Fallback
+        );
+
+        let page_only = memory_capabilities_from_partial(None, Some(64 * 1024));
+        assert_eq!(page_only.physical_memory_bytes, 8 * gib);
+        assert_eq!(page_only.page_size_bytes, 64 * 1024);
     }
 
     #[test]

@@ -51,6 +51,31 @@ impl MemoryCapabilities {
         }
     }
 
+    pub fn from_partial(physical_memory_bytes: Option<u64>, page_size_bytes: Option<u64>) -> Self {
+        let fallback = Self::apple_silicon_fallback();
+        let (physical_memory_bytes, memory_confidence) = physical_memory_bytes
+            .filter(|value| (MIN_PHYSICAL_MEMORY_BYTES..=MAX_PHYSICAL_MEMORY_BYTES).contains(value))
+            .map(|value| (value, CapabilityConfidence::Observed))
+            .unwrap_or((
+                fallback.physical_memory_bytes,
+                CapabilityConfidence::Fallback,
+            ));
+        let (page_size_bytes, page_size_confidence) = page_size_bytes
+            .filter(|value| {
+                (MIN_PAGE_SIZE_BYTES..=MAX_PAGE_SIZE_BYTES).contains(value)
+                    && value.is_power_of_two()
+            })
+            .map(|value| (value, CapabilityConfidence::Observed))
+            .unwrap_or((fallback.page_size_bytes, CapabilityConfidence::Fallback));
+
+        Self {
+            physical_memory_bytes,
+            page_size_bytes,
+            memory_confidence,
+            page_size_confidence,
+        }
+    }
+
     pub fn with_observed_page_size(self, page_size_bytes: u64) -> Self {
         Self::new(self.physical_memory_bytes, page_size_bytes)
             .map(|mut capabilities| {
@@ -69,12 +94,14 @@ pub struct MemoryObservation {
     pub pressure_velocity_per_second: f64,
     pub swap_used_bytes: u64,
     pub swap_total_bytes: u64,
+    pub swap_source_valid: bool,
     pub swap_delta_bytes_per_second: f64,
     pub compressions_per_second: f64,
     pub decompressions_per_second: f64,
     pub purges_per_second: f64,
     pub swapouts_per_second: f64,
     pub page_size_bytes: u64,
+    pub vm_source_valid: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -104,7 +131,12 @@ impl MemoryNormalizer {
         observation: &MemoryObservation,
         now: Instant,
     ) -> NormalizedMemoryState {
+        let timestamp_ordered = now
+            .checked_duration_since(observation.observed_at)
+            .is_some();
         let sample_age = now.saturating_duration_since(observation.observed_at);
+        let memory_capacity_valid = (MIN_PHYSICAL_MEMORY_BYTES..=MAX_PHYSICAL_MEMORY_BYTES)
+            .contains(&capabilities.physical_memory_bytes);
         let page_size_valid = (MIN_PAGE_SIZE_BYTES..=MAX_PAGE_SIZE_BYTES)
             .contains(&observation.page_size_bytes)
             && observation.page_size_bytes.is_power_of_two();
@@ -123,15 +155,46 @@ impl MemoryNormalizer {
             && observation.decompressions_per_second >= 0.0
             && observation.purges_per_second >= 0.0
             && observation.swapouts_per_second >= 0.0;
+        let ram = if memory_capacity_valid {
+            capabilities.physical_memory_bytes as f64
+        } else {
+            1.0
+        };
+        let page = if page_size_valid {
+            observation.page_size_bytes as f64
+        } else {
+            1.0
+        };
+        let swap_fraction_of_ram = observation.swap_used_bytes as f64 / ram;
+        let dynamic_swap_fraction = (observation.swap_total_bytes > 0)
+            .then(|| observation.swap_used_bytes as f64 / observation.swap_total_bytes as f64);
+        let swap_growth_fraction_per_minute = observation.swap_delta_bytes_per_second / ram * 60.0;
+        let compression_fraction_per_second = observation.compressions_per_second * page / ram;
+        let reclaim_fraction_per_second =
+            (observation.decompressions_per_second + observation.purges_per_second) * page / ram;
+        let swapout_fraction_per_second = observation.swapouts_per_second * page / ram;
+        let derived_finite = [
+            swap_fraction_of_ram,
+            swap_growth_fraction_per_minute,
+            compression_fraction_per_second,
+            reclaim_fraction_per_second,
+            swapout_fraction_per_second,
+        ]
+        .into_iter()
+        .all(f64::is_finite)
+            && dynamic_swap_fraction.is_none_or(f64::is_finite);
         let valid = finite
+            && derived_finite
             && non_negative_rates
+            && observation.vm_source_valid
+            && observation.swap_source_valid
+            && memory_capacity_valid
             && page_size_valid
+            && timestamp_ordered
             && observation.pressure >= 0.0
             && observation.pressure <= 1.0
             && sample_age <= Self::MAX_SAMPLE_AGE;
 
-        let ram = capabilities.physical_memory_bytes as f64;
-        let page = observation.page_size_bytes as f64;
         let confidence = if capabilities.memory_confidence == CapabilityConfidence::Observed
             && capabilities.page_size_confidence == CapabilityConfidence::Observed
             && observation.page_size_bytes == capabilities.page_size_bytes
@@ -153,23 +216,13 @@ impl MemoryNormalizer {
                 0.0
             },
             pressure_velocity_per_second: finite_or_zero(observation.pressure_velocity_per_second),
-            swap_fraction_of_ram: (observation.swap_used_bytes as f64 / ram).max(0.0),
-            dynamic_swap_fraction: (observation.swap_total_bytes > 0).then(|| {
-                (observation.swap_used_bytes as f64 / observation.swap_total_bytes as f64).max(0.0)
-            }),
-            swap_growth_fraction_per_minute: finite_or_zero(
-                observation.swap_delta_bytes_per_second / ram * 60.0,
-            ),
-            compression_fraction_per_second: finite_or_zero(
-                observation.compressions_per_second * page / ram,
-            ),
-            reclaim_fraction_per_second: finite_or_zero(
-                (observation.decompressions_per_second + observation.purges_per_second) * page
-                    / ram,
-            ),
-            swapout_fraction_per_second: finite_or_zero(
-                observation.swapouts_per_second * page / ram,
-            ),
+            swap_fraction_of_ram: finite_or_zero(swap_fraction_of_ram).max(0.0),
+            dynamic_swap_fraction: dynamic_swap_fraction
+                .map(|value| finite_or_zero(value).max(0.0)),
+            swap_growth_fraction_per_minute: finite_or_zero(swap_growth_fraction_per_minute),
+            compression_fraction_per_second: finite_or_zero(compression_fraction_per_second),
+            reclaim_fraction_per_second: finite_or_zero(reclaim_fraction_per_second),
+            swapout_fraction_per_second: finite_or_zero(swapout_fraction_per_second),
         }
     }
 }
@@ -298,14 +351,13 @@ impl MemoryRegimeDetector {
         self.accepted_samples
     }
 
-    pub fn update(&mut self, state: &NormalizedMemoryState, now: Instant) -> MemoryRegimeEvidence {
-        if self.last_generation == Some(state.generation) {
-            return self.last_evidence.clone();
-        }
-        self.last_generation = Some(state.generation);
-        self.accepted_samples = self.accepted_samples.saturating_add(1);
+    pub fn reset(&mut self) {
+        *self = Self::new(self.policy.clone());
+    }
 
+    pub fn update(&mut self, state: &NormalizedMemoryState, now: Instant) -> MemoryRegimeEvidence {
         if !state.valid {
+            self.last_generation = Some(state.generation);
             self.regime = MemoryRegime::Unknown;
             self.candidate = MemoryRegime::Unknown;
             self.candidate_since = None;
@@ -315,6 +367,11 @@ impl MemoryRegimeDetector {
             };
             return self.last_evidence.clone();
         }
+        if self.last_generation == Some(state.generation) {
+            return self.last_evidence.clone();
+        }
+        self.last_generation = Some(state.generation);
+        self.accepted_samples = self.accepted_samples.saturating_add(1);
 
         let compression_net =
             state.compression_fraction_per_second - state.reclaim_fraction_per_second;
@@ -414,12 +471,14 @@ mod tests {
             pressure_velocity_per_second: 0.0,
             swap_used_bytes: (swap_gib * GIB as f64) as u64,
             swap_total_bytes: 2 * GIB,
+            swap_source_valid: true,
             swap_delta_bytes_per_second: swap_growth_fraction_per_minute * ram / 60.0,
             compressions_per_second: 0.0,
             decompressions_per_second: 0.0,
             purges_per_second: 0.0,
             swapouts_per_second: 0.0,
             page_size_bytes: 16 * 1024,
+            vm_source_valid: true,
         }
     }
 
@@ -541,6 +600,67 @@ mod tests {
 
         assert_eq!(first, duplicate);
         assert_eq!(detector.accepted_samples(), 1);
+    }
+
+    #[test]
+    fn stale_duplicate_generation_invalidates_cached_crisis() {
+        let start = Instant::now();
+        let caps = capabilities(8, 16 * 1024);
+        let mut detector = MemoryRegimeDetector::default();
+        let mut latest = MemoryRegimeEvidence::default();
+
+        for (generation, seconds) in [(1, 0), (2, 1), (3, 2), (4, 4)] {
+            let at = start + Duration::from_secs(seconds);
+            let state = MemoryNormalizer::normalize(
+                &caps,
+                &observation(generation, at, 8, 4.5, 0.02, 0.90),
+                at,
+            );
+            latest = detector.update(&state, at);
+        }
+        assert_eq!(latest.regime, MemoryRegime::Crisis);
+
+        let stale = MemoryNormalizer::normalize(
+            &caps,
+            &observation(4, start + Duration::from_secs(4), 8, 4.5, 0.02, 0.90),
+            start + Duration::from_secs(7),
+        );
+        let evidence = detector.update(&stale, start + Duration::from_secs(7));
+
+        assert_eq!(evidence.regime, MemoryRegime::Unknown);
+        assert!(!evidence.sustained);
+    }
+
+    #[test]
+    fn derived_overflow_fails_closed_and_stays_finite() {
+        let now = Instant::now();
+        let mut extreme = observation(1, now, 8, 1.0, 0.0, 0.70);
+        extreme.compressions_per_second = f64::MAX;
+
+        let state = MemoryNormalizer::normalize(&capabilities(8, 64 * 1024), &extreme, now);
+
+        assert!(!state.valid);
+        assert!(state.compression_fraction_per_second.is_finite());
+        assert_eq!(
+            MemoryRegimeDetector::default().update(&state, now).regime,
+            MemoryRegime::Unknown
+        );
+    }
+
+    #[test]
+    fn partial_kernel_sources_never_become_fresh_regime_evidence() {
+        let now = Instant::now();
+        let caps = capabilities(8, 16 * 1024);
+        let mut partial = observation(1, now, 8, 4.5, 0.02, 0.90);
+        partial.swap_source_valid = false;
+
+        let state = MemoryNormalizer::normalize(&caps, &partial, now);
+
+        assert!(!state.valid);
+        assert_eq!(
+            MemoryRegimeDetector::default().update(&state, now).regime,
+            MemoryRegime::Unknown
+        );
     }
 
     #[test]

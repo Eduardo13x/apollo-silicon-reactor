@@ -313,6 +313,17 @@ fn apply_contextual_world_model_bias(
     (modulated, gpu_modulated, strongest, strongest_gpu)
 }
 
+#[inline]
+fn has_physical_memory_authority(memory_evidence: &MemoryRegimeEvidence) -> bool {
+    memory_evidence.sustained
+        && memory_evidence.adverse_flow
+        && memory_evidence.confidence > 0.0
+        && matches!(
+            memory_evidence.regime,
+            MemoryRegime::Contended | MemoryRegime::Crisis
+        )
+}
+
 /// Super Learner specialist voting + accuracy feedback.
 ///
 /// Runs once per cycle, **after** `PredictiveAgent::select_action_with_confidence`
@@ -649,10 +660,13 @@ pub fn apply_specialist_voting(
     // Apply the ensemble winner, not the earlier LinUCB proposal.  The
     // distinction matters: telemetry may only claim a threshold treatment
     // when the final voted intervention actually changed policy.
+    let physical_corroboration = has_physical_memory_authority(memory_evidence);
     let thresholds_before = *overflow_thresholds;
-    *overflow_thresholds = lctx
-        .predictive_agent
-        .adjust_thresholds_for(intervention, *overflow_thresholds);
+    if intervention != Intervention::TightenThresholds || physical_corroboration {
+        *overflow_thresholds = lctx
+            .predictive_agent
+            .adjust_thresholds_for(intervention, *overflow_thresholds);
+    }
     let mut applied_intervention = if intervention == Intervention::TightenThresholds
         && (thresholds_before.bg_pressure != overflow_thresholds.bg_pressure
             || thresholds_before.critical_pressure != overflow_thresholds.critical_pressure
@@ -666,12 +680,6 @@ pub fn apply_specialist_voting(
     // A learned recommendation is advisory while the machine is calm. Only
     // let it take over the profile controller when physical telemetry confirms
     // an imminent memory-risk condition.
-    let physical_corroboration = memory_evidence.sustained
-        && memory_evidence.adverse_flow
-        && matches!(
-            memory_evidence.regime,
-            MemoryRegime::Contended | MemoryRegime::Crisis
-        );
     if intervention == Intervention::SuggestAggressive
         && physical_corroboration
         && should_apply_aggressive_override(
@@ -1121,6 +1129,27 @@ mod tests {
         assert!(!fb.prev_monopoly_fired);
         assert!(!fb.prev_kalman_fired);
         assert!(!fb.prev_linucb_intervened);
+    }
+
+    #[test]
+    fn learned_memory_actions_require_sustained_physical_authority() {
+        let mut evidence = MemoryRegimeEvidence {
+            regime: MemoryRegime::Contended,
+            generation: 1,
+            confidence: 1.0,
+            normalized_score: 0.8,
+            swap_fraction_of_ram: 0.3,
+            swap_growth_fraction_per_minute: 0.01,
+            adverse_flow: true,
+            sustained: false,
+        };
+        assert!(!has_physical_memory_authority(&evidence));
+
+        evidence.sustained = true;
+        assert!(has_physical_memory_authority(&evidence));
+
+        evidence.adverse_flow = false;
+        assert!(!has_physical_memory_authority(&evidence));
     }
 
     // ── Phase 4.3.1 — Specialist accuracy purge inhibition ───────────────────

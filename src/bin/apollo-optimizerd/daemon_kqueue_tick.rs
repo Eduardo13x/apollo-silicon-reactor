@@ -101,13 +101,12 @@ pub fn run_kqueue_tick(
                             0.0
                         };
                         let swap_growing = snapshot.pressure.swap_delta_bytes_per_sec > 524_288.0;
-                        if sr > 0.10 && swap_growing {
-                            signal_intel.record_overflow(
-                                snapshot.pressure.memory_pressure,
-                                sr,
-                                snapshot.pressure.memory_pressure,
-                            );
-                        }
+                        signal_intel.observe_overflow_episode(
+                            sr > 0.10 && swap_growing,
+                            snapshot.pressure.memory_pressure,
+                            sr,
+                            snapshot.pressure.memory_pressure,
+                        );
                     }
                     VmPressureLevel::Warning => {
                         *reactor_weight = (*reactor_weight + 0.5).min(1.0);

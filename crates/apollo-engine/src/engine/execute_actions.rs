@@ -136,20 +136,20 @@ fn killall_by_name(daemon: &str, signal: i32) -> anyhow::Result<()> {
 // per timeout call and leaked it on timeout.  Over hours that produced
 // thousands of detached zombies.  Replace with a single dedicated worker
 // thread, spawned lazily on first use and fed via a mpsc request queue.
-// On timeout, the caller abandons the response channel; the worker continues
-// to completion on its own thread and silently discards the result — only
-// one worker total, no matter how many requests.
+// On timeout, the caller abandons the response channel. The worker completes
+// the request and compensates a late numeric mutation before accepting more
+// work — only one worker total, no matter how many requests.
 
 enum SysctlRequest {
     ReadNumeric {
         key: String,
         reply: std::sync::mpsc::Sender<Option<sysctl_direct::NumericSysctlValue>>,
     },
-    WriteNumeric {
+    TransactNumeric {
         key: String,
-        value: i64,
-        width: sysctl_direct::NumericSysctlWidth,
-        reply: std::sync::mpsc::Sender<bool>,
+        before: sysctl_direct::NumericSysctlValue,
+        requested: i64,
+        reply: std::sync::mpsc::Sender<NumericSysctlTransaction>,
     },
     WriteI32 {
         key: String,
@@ -174,13 +174,25 @@ fn sysctl_request_tx() -> &'static std::sync::mpsc::Sender<SysctlRequest> {
                         SysctlRequest::ReadNumeric { key, reply } => {
                             let _ = reply.send(sysctl_direct::read_numeric(&key));
                         }
-                        SysctlRequest::WriteNumeric {
+                        SysctlRequest::TransactNumeric {
                             key,
-                            value,
-                            width,
+                            before,
+                            requested,
                             reply,
                         } => {
-                            let _ = reply.send(sysctl_direct::write_numeric(&key, value, width));
+                            let outcome = run_numeric_sysctl_transaction_with(
+                                before,
+                                requested,
+                                || sysctl_direct::read_numeric(&key),
+                                |value, width| sysctl_direct::write_numeric(&key, value, width),
+                            );
+                            deliver_numeric_sysctl_transaction_with(
+                                reply,
+                                outcome,
+                                before,
+                                || sysctl_direct::read_numeric(&key),
+                                |value, width| sysctl_direct::write_numeric(&key, value, width),
+                            );
                         }
                         SysctlRequest::WriteI32 { key, value, reply } => {
                             let _ = reply.send(sysctl_direct::write_i32(&key, value));
@@ -212,27 +224,26 @@ fn sysctl_read_numeric_with_timeout(key: &str) -> Option<sysctl_direct::NumericS
         .flatten()
 }
 
-fn sysctl_write_numeric_with_timeout(
+fn sysctl_numeric_transaction_with_timeout(
     key: &str,
-    value: i64,
-    width: sysctl_direct::NumericSysctlWidth,
-) -> bool {
+    before: sysctl_direct::NumericSysctlValue,
+    requested: i64,
+) -> Option<NumericSysctlTransaction> {
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if sysctl_request_tx()
-        .send(SysctlRequest::WriteNumeric {
+        .send(SysctlRequest::TransactNumeric {
             key: key.to_string(),
-            value,
-            width,
+            before,
+            requested,
             reply: reply_tx,
         })
         .is_err()
     {
-        return false;
+        return None;
     }
     reply_rx
         .recv_timeout(std::time::Duration::from_millis(500))
         .ok()
-        .unwrap_or(false)
 }
 
 /// Write an i32 sysctl with 500ms timeout.
@@ -255,11 +266,109 @@ fn sysctl_write_i32_with_timeout(key: &str, value: i32) -> bool {
 }
 
 #[inline]
+#[cfg(test)]
 fn sysctl_postcondition_matches(
     requested: i64,
     observed: Option<sysctl_direct::NumericSysctlValue>,
 ) -> bool {
     observed.is_some_and(|observed| observed.value == requested)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NumericSysctlTransaction {
+    Applied(sysctl_direct::NumericSysctlValue),
+    NoOp,
+    ReadFailed,
+    PreconditionChanged,
+    WriteFailed,
+    Uncertain(Option<sysctl_direct::NumericSysctlValue>),
+}
+
+#[inline]
+fn numeric_sysctl_matches(
+    expected: sysctl_direct::NumericSysctlValue,
+    observed: Option<sysctl_direct::NumericSysctlValue>,
+) -> bool {
+    observed == Some(expected)
+}
+
+fn restore_numeric_sysctl_if_owned_with<Read, Write>(
+    before: sysctl_direct::NumericSysctlValue,
+    owned: sysctl_direct::NumericSysctlValue,
+    mut read: Read,
+    mut write: Write,
+) -> bool
+where
+    Read: FnMut() -> Option<sysctl_direct::NumericSysctlValue>,
+    Write: FnMut(i64, sysctl_direct::NumericSysctlWidth) -> bool,
+{
+    // There is no kernel CAS primitive for sysctl. Re-read immediately before
+    // compensation and abstain if another writer has taken ownership.
+    if !numeric_sysctl_matches(owned, read()) {
+        return true;
+    }
+    write(before.value, before.width) && numeric_sysctl_matches(before, read())
+}
+
+fn deliver_numeric_sysctl_transaction_with<Read, Write>(
+    reply: std::sync::mpsc::Sender<NumericSysctlTransaction>,
+    outcome: NumericSysctlTransaction,
+    before: sysctl_direct::NumericSysctlValue,
+    read: Read,
+    write: Write,
+) where
+    Read: FnMut() -> Option<sysctl_direct::NumericSysctlValue>,
+    Write: FnMut(i64, sysctl_direct::NumericSysctlWidth) -> bool,
+{
+    let Err(undelivered) = reply.send(outcome) else {
+        return;
+    };
+    if let NumericSysctlTransaction::Applied(owned) = undelivered.0 {
+        if !restore_numeric_sysctl_if_owned_with(before, owned, read, write) {
+            crate::engine::lse_counters::LSE_COUNTERS.inc_mediator_postcondition_violation();
+        }
+    }
+}
+
+/// Execute a numeric sysctl as one compare/write/verify transaction. The
+/// dedicated worker owns compensation, so timeout cannot leave a late write
+/// silently applied after the caller has abandoned its receipt.
+fn run_numeric_sysctl_transaction_with<Read, Write>(
+    before: sysctl_direct::NumericSysctlValue,
+    requested: i64,
+    mut read: Read,
+    mut write: Write,
+) -> NumericSysctlTransaction
+where
+    Read: FnMut() -> Option<sysctl_direct::NumericSysctlValue>,
+    Write: FnMut(i64, sysctl_direct::NumericSysctlWidth) -> bool,
+{
+    let Some(live_before) = read() else {
+        return NumericSysctlTransaction::ReadFailed;
+    };
+    if live_before != before {
+        return NumericSysctlTransaction::PreconditionChanged;
+    }
+    if requested == before.value {
+        return NumericSysctlTransaction::NoOp;
+    }
+    if !write(requested, before.width) {
+        return NumericSysctlTransaction::WriteFailed;
+    }
+
+    let observed = read();
+    let expected = sysctl_direct::NumericSysctlValue {
+        value: requested,
+        width: before.width,
+    };
+    if numeric_sysctl_matches(expected, observed) {
+        return NumericSysctlTransaction::Applied(expected);
+    }
+
+    // A mismatching value may belong to another system component. Without a
+    // kernel CAS primitive Apollo cannot prove ownership, so it must not write
+    // `before` over that value.
+    NumericSysctlTransaction::Uncertain(observed)
 }
 
 /// Aggregate counters returned by execute_actions so callers do not need to
@@ -1293,12 +1402,10 @@ pub fn execute_actions(
                     }
                     // Read current value — doubles as existence check.
                     // Uses timeout wrapper: sysctlbyname can block as root.
-                    let read_result = sysctl_read_numeric_with_timeout(key);
-                    let observed_width;
-                    match read_result {
+                    let observed_before = match sysctl_read_numeric_with_timeout(key) {
                         Some(val) => {
-                            observed_width = val.width;
                             before = Some(val.value.to_string());
+                            val
                         }
                         None => {
                             // Read timed out (worker thread saturated) or key
@@ -1311,42 +1418,71 @@ pub fn execute_actions(
                             block_reason = Some(BlockReason::InvalidSysctl);
                             return Ok(());
                         }
-                    }
+                    };
                     // Skip no-op writes: if current value already equals the
                     // proposed value, don't issue the write nor emit a journal
                     // entry. After the Phase C clamp landed, governor began
                     // emitting clamped-to-current writes (e.g. delayed_ack=3
                     // when sysctl already reads 3), inflating the journal
                     // with success-but-unchanged entries (fix 2026-05-07).
-                    if before.as_deref() == Some(value) {
+                    if observed_before.value == requested {
                         out.push_skip(format!("sysctl-noop:{}={}", key, value));
                         return Ok(());
                     }
                     if !dry_run {
-                        if !sysctl_write_numeric_with_timeout(key, requested, observed_width) {
-                            anyhow::bail!("sysctl write failed: {}={}", key, value);
-                        }
-                        let observed = sysctl_read_numeric_with_timeout(key);
-                        after = observed.map(|value| value.value.to_string());
-                        if !sysctl_postcondition_matches(requested, observed) {
-                            crate::engine::lse_counters::LSE_COUNTERS
-                                .inc_mediator_postcondition_violation();
-                            out.push_skip(format!(
-                                "sysctl-postcondition-mismatch:{} requested={} observed={}",
-                                key,
-                                requested,
-                                observed
-                                    .map(|value| value.value.to_string())
-                                    .unwrap_or_else(|| "unreadable".to_string())
-                            ));
-                            block_reason = Some(BlockReason::SysctlFailed);
-                            return Ok(());
-                        }
+                        let transaction = sysctl_numeric_transaction_with_timeout(
+                            key,
+                            observed_before,
+                            requested,
+                        );
+                        let observed = match transaction {
+                            Some(NumericSysctlTransaction::Applied(observed)) => observed,
+                            Some(NumericSysctlTransaction::NoOp) => {
+                                out.push_skip(format!("sysctl-noop:{}={}", key, value));
+                                return Ok(());
+                            }
+                            Some(NumericSysctlTransaction::ReadFailed) => {
+                                out.push_skip(format!("sysctl-transaction-read-failed:{key}"));
+                                block_reason = Some(BlockReason::SysctlFailed);
+                                return Ok(());
+                            }
+                            Some(NumericSysctlTransaction::PreconditionChanged) => {
+                                out.push_skip(format!(
+                                    "sysctl-precondition-changed:{} expected={}",
+                                    key, observed_before.value
+                                ));
+                                block_reason = Some(BlockReason::SysctlFailed);
+                                return Ok(());
+                            }
+                            Some(NumericSysctlTransaction::WriteFailed) => {
+                                anyhow::bail!("sysctl write failed: {}={}", key, value);
+                            }
+                            Some(NumericSysctlTransaction::Uncertain(observed)) => {
+                                crate::engine::lse_counters::LSE_COUNTERS
+                                    .inc_mediator_postcondition_violation();
+                                after = observed.map(|value| value.value.to_string());
+                                action_applied = true;
+                                anyhow::bail!(
+                                    "sysctl state uncertain after failed compensation: {}={} observed={}",
+                                    key,
+                                    requested,
+                                    after.as_deref().unwrap_or("unreadable")
+                                );
+                            }
+                            None => {
+                                anyhow::bail!(
+                                    "sysctl transaction timed out; worker owns compensation: {}={}",
+                                    key,
+                                    value
+                                );
+                            }
+                        };
+                        after = Some(observed.value.to_string());
                         action_applied = true;
-                        // S10 producer: enroll post-Receipt observation when
-                        // the after-read parsed as i64. Consumer re-reads
-                        // sysctl_direct::read_i32(key) after the 5 s settle
-                        // window and bumps effect_decay_detected_total on
+                        out.sysctl_applied += 1;
+                        // S10 producer: enroll post-Receipt observation. The
+                        // consumer re-reads the native i32/i64 width after the
+                        // 5 s settle window and bumps effect_decay_detected_total on
                         // mismatch (kernel reverted, sysctl saturated to a
                         // different value, etc).
                         if let Some(post_str) = after.as_ref() {
@@ -1370,7 +1506,6 @@ pub fn execute_actions(
                             }
                         }
                     }
-                    out.sysctl_applied += 1;
                 }
                 RootAction::SetMemorystatus { pid, .. } => {
                     // Coalition guard: never pressure a PID whose coalition
@@ -2030,6 +2165,120 @@ mod tests {
             })
         ));
         assert!(!sysctl_postcondition_matches(100, None));
+    }
+
+    #[test]
+    fn numeric_sysctl_transaction_does_not_overwrite_a_mismatching_live_value() {
+        use std::cell::Cell;
+
+        let live = Cell::new(100_i64);
+        let width = sysctl_direct::NumericSysctlWidth::I64;
+        let before = sysctl_direct::NumericSysctlValue { value: 100, width };
+        let outcome = run_numeric_sysctl_transaction_with(
+            before,
+            200,
+            || {
+                Some(sysctl_direct::NumericSysctlValue {
+                    value: live.get(),
+                    width,
+                })
+            },
+            |value, _| {
+                live.set(if value == 200 { 201 } else { value });
+                true
+            },
+        );
+
+        assert_eq!(
+            outcome,
+            NumericSysctlTransaction::Uncertain(Some(sysctl_direct::NumericSysctlValue {
+                value: 201,
+                width,
+            }))
+        );
+        assert_eq!(live.get(), 201);
+    }
+
+    #[test]
+    fn numeric_sysctl_transaction_rejects_a_changed_precondition() {
+        let width = sysctl_direct::NumericSysctlWidth::I32;
+        let before = sysctl_direct::NumericSysctlValue { value: 100, width };
+        let writes = std::cell::Cell::new(0_u32);
+        let outcome = run_numeric_sysctl_transaction_with(
+            before,
+            200,
+            || Some(sysctl_direct::NumericSysctlValue { value: 101, width }),
+            |_, _| {
+                writes.set(writes.get() + 1);
+                true
+            },
+        );
+
+        assert_eq!(outcome, NumericSysctlTransaction::PreconditionChanged);
+        assert_eq!(writes.get(), 0);
+    }
+
+    #[test]
+    fn abandoned_numeric_sysctl_receipt_restores_a_late_applied_write() {
+        let width = sysctl_direct::NumericSysctlWidth::I64;
+        let before = sysctl_direct::NumericSysctlValue { value: 100, width };
+        let live = std::cell::Cell::new(200_i64);
+        let (reply, abandoned) = std::sync::mpsc::channel();
+        drop(abandoned);
+
+        deliver_numeric_sysctl_transaction_with(
+            reply,
+            NumericSysctlTransaction::Applied(sysctl_direct::NumericSysctlValue {
+                value: 200,
+                width,
+            }),
+            before,
+            || {
+                Some(sysctl_direct::NumericSysctlValue {
+                    value: live.get(),
+                    width,
+                })
+            },
+            |value, _| {
+                live.set(value);
+                true
+            },
+        );
+
+        assert_eq!(live.get(), before.value);
+    }
+
+    #[test]
+    fn abandoned_numeric_sysctl_receipt_never_overwrites_a_new_owner() {
+        let width = sysctl_direct::NumericSysctlWidth::I64;
+        let before = sysctl_direct::NumericSysctlValue { value: 100, width };
+        let live = std::cell::Cell::new(300_i64);
+        let writes = std::cell::Cell::new(0_u32);
+        let (reply, abandoned) = std::sync::mpsc::channel();
+        drop(abandoned);
+
+        deliver_numeric_sysctl_transaction_with(
+            reply,
+            NumericSysctlTransaction::Applied(sysctl_direct::NumericSysctlValue {
+                value: 200,
+                width,
+            }),
+            before,
+            || {
+                Some(sysctl_direct::NumericSysctlValue {
+                    value: live.get(),
+                    width,
+                })
+            },
+            |value, _| {
+                writes.set(writes.get() + 1);
+                live.set(value);
+                true
+            },
+        );
+
+        assert_eq!(live.get(), 300);
+        assert_eq!(writes.get(), 0);
     }
 
     #[test]

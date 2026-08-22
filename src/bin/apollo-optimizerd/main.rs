@@ -186,7 +186,7 @@ use apollo_engine::engine::adaptive_governor::AdaptiveGovernor;
 use apollo_engine::engine::amx_detector;
 use apollo_engine::engine::audit_types::{DecisionReason, PolicyDecisionTrace};
 use apollo_engine::engine::background_collectors::{
-    PressureCollector, RESPONSIVE_PRESSURE_INTERVAL, RESPONSIVE_PRESSURE_MAX_AGE,
+    PressureCollector, PressureData, RESPONSIVE_PRESSURE_INTERVAL, RESPONSIVE_PRESSURE_MAX_AGE,
 };
 use apollo_engine::engine::capabilities::detect_capabilities;
 use apollo_engine::engine::causal_graph::CausalGraph;
@@ -518,6 +518,20 @@ fn is_dev_tool_name(name: &str) -> bool {
     ];
     let lc = name.to_ascii_lowercase();
     DEV_TOOLS.iter().any(|tool| lc.contains(tool))
+}
+
+fn governor_memory_evidence(
+    pressure: &PressureData,
+    latest: &apollo_engine::engine::memory_regime::MemoryRegimeEvidence,
+) -> apollo_engine::engine::memory_regime::MemoryRegimeEvidence {
+    if pressure.is_fresh(apollo_engine::engine::memory_regime::MemoryNormalizer::MAX_SAMPLE_AGE)
+        && pressure.vm_sample_valid
+        && pressure.swap_sample_valid
+    {
+        latest.clone()
+    } else {
+        apollo_engine::engine::memory_regime::MemoryRegimeEvidence::default()
+    }
 }
 
 /// Toggle Spotlight indexing via `mdutil -a -i on/off`.
@@ -2195,6 +2209,17 @@ fn main() -> anyhow::Result<()> {
                     exploration_scheduler.cancel_active(
                         apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::KillSwitch,
                     );
+                    memory_regime_detector.reset();
+                    swap_predictor.reset();
+                    swap_reclaim.reset();
+                    last_memory_regime =
+                        apollo_engine::engine::memory_regime::MemoryRegimeEvidence::default();
+                    state
+                        .policy
+                        .lock_recover()
+                        .governor
+                        .clear_predictive_override();
+                    apollo_engine::engine::shadow_signals::set_memory_regime_corroborated(false);
                     // Even when paused, populate basic observability metrics
                     // so the dashboard shows real system state.
                     {
@@ -2447,6 +2472,17 @@ fn main() -> anyhow::Result<()> {
                     exploration_scheduler.cancel_active(
                         apollo_engine::engine::exploration_scheduler::TerminalDiagnostic::Wake,
                     );
+                    memory_regime_detector.reset();
+                    swap_predictor.reset();
+                    swap_reclaim.reset();
+                    last_memory_regime =
+                        apollo_engine::engine::memory_regime::MemoryRegimeEvidence::default();
+                    state
+                        .policy
+                        .lock_recover()
+                        .governor
+                        .clear_predictive_override();
+                    apollo_engine::engine::shadow_signals::set_memory_regime_corroborated(false);
                     maintenance_state.observe_wake();
                 }
                 if sleep_notifier.is_sleeping() {
@@ -4634,6 +4670,9 @@ fn main() -> anyhow::Result<()> {
                     work_session.is_active(power_mgr.is_on_battery(), battery_low, now_instant);
                 let workload_onset = raw_workload_onset;
 
+                let current_pressure_data = pressure_collector.latest();
+                let current_memory_evidence =
+                    governor_memory_evidence(&current_pressure_data, &last_memory_regime);
                 let governor_decision = {
                     let mut pg = state.policy.lock_recover();
                     pg.governor.evaluate(GovernorInput {
@@ -4651,7 +4690,7 @@ fn main() -> anyhow::Result<()> {
                         arousal_level: arousal_state.level as f64,
                         workload_mode: Some(workload_mode),
                         workload_onset,
-                        memory_evidence: Some(last_memory_regime.clone()),
+                        memory_evidence: Some(current_memory_evidence),
                     })
                 };
                 if governor_decision.transition_reason.contains("floor") {
@@ -4746,22 +4785,28 @@ fn main() -> anyhow::Result<()> {
                         pressure_velocity_per_second: signal_digest.pressure_velocity,
                         swap_used_bytes: pd.swap_used_bytes,
                         swap_total_bytes: pd.swap_total_bytes,
+                        swap_source_valid: pd.swap_sample_valid,
                         swap_delta_bytes_per_second: pd.swap_delta_bps,
                         compressions_per_second: pd.vm_rate.compressions_per_sec,
                         decompressions_per_second: pd.vm_rate.decompressions_per_sec,
                         purges_per_second: pd.vm_rate.purges_per_sec,
                         swapouts_per_second: pd.vm_rate.swapouts_per_sec,
                         page_size_bytes: pd.page_size_bytes,
+                        vm_source_valid: pd.vm_sample_valid,
                     };
                     let normalized = MemoryNormalizer::normalize(&capabilities, &observation, now);
                     let regime = memory_regime_detector.update(&normalized, now);
-                    let swap_forecast = swap_predictor.update_at(
-                        pd.generation,
-                        pd.updated_at,
-                        pd.swap_used_bytes,
-                        pd.swap_total_bytes,
-                        capabilities.physical_memory_bytes,
-                    );
+                    let swap_forecast = if normalized.valid {
+                        swap_predictor.update_at(
+                            pd.generation,
+                            pd.updated_at,
+                            pd.swap_used_bytes,
+                            pd.swap_total_bytes,
+                            capabilities.physical_memory_bytes,
+                        )
+                    } else {
+                        swap_predictor.invalidate(pd.swap_used_bytes, pd.swap_total_bytes)
+                    };
                     let flow = VmFlowSample {
                         compressions_per_sec: pd.vm_rate.compressions_per_sec,
                         decompressions_per_sec: pd.vm_rate.decompressions_per_sec,
@@ -4770,13 +4815,17 @@ fn main() -> anyhow::Result<()> {
                         swap_used_bytes: pd.swap_used_bytes,
                         swap_total_bytes: pd.swap_total_bytes,
                     };
-                    let reclaim = swap_reclaim.update_at(
-                        &flow,
-                        pd.generation,
-                        pd.updated_at,
-                        capabilities.page_size_bytes,
-                        capabilities.physical_memory_bytes,
-                    );
+                    let reclaim = if normalized.valid {
+                        swap_reclaim.update_at(
+                            &flow,
+                            pd.generation,
+                            pd.updated_at,
+                            capabilities.page_size_bytes,
+                            capabilities.physical_memory_bytes,
+                        )
+                    } else {
+                        swap_reclaim.invalidate()
+                    };
                     (reclaim, normalized, regime, swap_forecast)
                 };
                 last_memory_regime = memory_regime.clone();
@@ -8871,8 +8920,8 @@ mod tests {
     //! call count `< 30` (one per fg-burst or graph mutation).
 
     use super::{
-        contention_mach_tier_event, fingerprint_top_processes, is_dev_tool_name,
-        swap_reclaim_bypass_active, wait_for_cycle_signal, CompanionFgCache,
+        contention_mach_tier_event, fingerprint_top_processes, governor_memory_evidence,
+        is_dev_tool_name, swap_reclaim_bypass_active, wait_for_cycle_signal, CompanionFgCache,
     };
     use apollo_engine::collector::ProcessStats;
     use apollo_engine::engine::decision_ledger::ActuatorDecisionOutcome;
@@ -8881,6 +8930,44 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Condvar, Mutex};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn governor_never_consumes_stale_or_partial_memory_evidence() {
+        let evidence = apollo_engine::engine::memory_regime::MemoryRegimeEvidence {
+            regime: apollo_engine::engine::memory_regime::MemoryRegime::Crisis,
+            generation: 7,
+            confidence: 1.0,
+            normalized_score: 1.0,
+            swap_fraction_of_ram: 0.6,
+            swap_growth_fraction_per_minute: 0.02,
+            adverse_flow: true,
+            sustained: true,
+        };
+        let coherent = super::PressureData {
+            vm_sample_valid: true,
+            swap_sample_valid: true,
+            ..super::PressureData::default()
+        };
+        assert_eq!(governor_memory_evidence(&coherent, &evidence), evidence);
+
+        let stale = super::PressureData {
+            updated_at: Instant::now() - Duration::from_secs(3),
+            ..coherent.clone()
+        };
+        assert_eq!(
+            governor_memory_evidence(&stale, &evidence).regime,
+            apollo_engine::engine::memory_regime::MemoryRegime::Unknown
+        );
+
+        let partial = super::PressureData {
+            swap_sample_valid: false,
+            ..coherent
+        };
+        assert_eq!(
+            governor_memory_evidence(&partial, &evidence).regime,
+            apollo_engine::engine::memory_regime::MemoryRegime::Unknown
+        );
+    }
 
     #[test]
     fn exploration_rechecks_use_fresh_real_gate_sources() {

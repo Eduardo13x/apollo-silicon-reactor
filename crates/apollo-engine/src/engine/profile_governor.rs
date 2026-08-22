@@ -118,6 +118,13 @@ impl ProfileGovernor {
                 p.auto_profile_enabled = true;
             }
         }
+        if p.manual_override
+            .as_ref()
+            .is_some_and(|active| active.origin == OverrideOrigin::Predictive)
+        {
+            p.manual_override = None;
+            p.transition_reason = "predictive-override-reset-on-startup".to_string();
+        }
         if let Some(t) = p.governor_state.cooldown_until {
             if t <= now {
                 p.governor_state.cooldown_until = None;
@@ -496,10 +503,12 @@ fn pressure_score(input: &GovernorInput) -> f64 {
     let ram = input.ram_pressure.clamp(0.0, 1.0);
     let wait = input.interactive_wait_ratio.clamp(0.0, 1.0);
     let reactor = input.reactor_event_weight.clamp(0.0, 1.0);
-    let memory = input
-        .memory_evidence
-        .as_ref()
-        .filter(|evidence| evidence.confidence > 0.0 && evidence.regime != MemoryRegime::Unknown);
+    let memory = input.memory_evidence.as_ref().filter(|evidence| {
+        evidence.confidence > 0.0
+            && evidence.sustained
+            && evidence.adverse_flow
+            && evidence.regime != MemoryRegime::Unknown
+    });
     let memory_boost = memory
         .map(|evidence| evidence.normalized_score.clamp(0.0, 1.0) * 0.12)
         .unwrap_or(0.0);
@@ -854,6 +863,43 @@ mod tests {
             OptimizationProfile::BalancedRoot
         );
         assert_eq!(decision.transition_reason, "anti-thrash-balanced-lock");
+    }
+
+    #[test]
+    fn unsustained_crisis_cannot_raise_pressure_score_without_a_lock() {
+        let mut input = low_pressure_input(false);
+        input.memory_evidence = Some(MemoryRegimeEvidence {
+            regime: MemoryRegime::Crisis,
+            generation: 1,
+            confidence: 1.0,
+            normalized_score: 1.0,
+            swap_fraction_of_ram: 0.60,
+            swap_growth_fraction_per_minute: 0.20,
+            adverse_flow: true,
+            sustained: false,
+        });
+
+        assert!(pressure_score(&input) < 0.40);
+    }
+
+    #[test]
+    fn restore_discards_predictive_override_but_preserves_operator_override() {
+        let mut predictive = make_governor(OptimizationProfile::BalancedRoot);
+        predictive.set_predictive_override(
+            OptimizationProfile::AggressiveRoot,
+            30,
+            "predictive".to_string(),
+        );
+        let restored = ProfileGovernor::from_persisted(predictive.to_persisted());
+        assert!(restored.manual_override.is_none());
+
+        let mut operator = make_governor(OptimizationProfile::BalancedRoot);
+        operator.set_manual_override(OptimizationProfile::SafeRoot, 5, "operator".to_string());
+        let restored = ProfileGovernor::from_persisted(operator.to_persisted());
+        assert_eq!(
+            restored.manual_override.as_ref().map(|value| value.origin),
+            Some(OverrideOrigin::Operator)
+        );
     }
 
     #[test]

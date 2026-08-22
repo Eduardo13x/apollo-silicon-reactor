@@ -260,7 +260,9 @@ impl SwapReclaimModel {
     ) -> SaturationForecast {
         if self.last_generation == Some(generation) {
             if let Some(forecast) = &self.last_forecast {
-                return forecast.clone();
+                let mut cached = forecast.clone();
+                cached.overflow_entered = false;
+                return cached;
             }
         }
         let dt_seconds = self
@@ -389,6 +391,21 @@ impl SwapReclaimModel {
     /// Reset EMA state (e.g., after a sleep/wake cycle).
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    pub fn invalidate(&mut self) -> SaturationForecast {
+        self.reset();
+        SaturationForecast {
+            dirty_rate_bps: 0.0,
+            reclaim_rate_bps: 0.0,
+            net_rate_bps: 0.0,
+            swapouts_ema_pps: 0.0,
+            t_sat_sec: None,
+            risk: SwapRisk::Safe,
+            overflow_entered: false,
+            swap_ratio: 0.0,
+            net_rate_volatility: 0.0,
+        }
     }
 
     fn reset_dynamic_state(&mut self) {
@@ -766,7 +783,7 @@ mod tests {
         let at = Instant::now();
         let mut model = SwapReclaimModel::new();
         let first = model.update_at(
-            &sample(100.0, 0.0, 0.0, gb(1), gb(8)),
+            &sample(100.0, 0.0, 0.0, gb(4), gb(8)),
             7,
             at,
             16 * 1024,
@@ -781,7 +798,23 @@ mod tests {
         );
 
         assert_eq!(first.dirty_rate_bps, duplicate.dirty_rate_bps);
+        assert!(first.overflow_entered);
         assert_eq!(model.samples(), 1);
+        assert!(
+            !duplicate.overflow_entered,
+            "cached reads must not replay edge events"
+        );
+    }
+
+    #[test]
+    fn invalidation_returns_a_passive_finite_forecast() {
+        let mut model = SwapReclaimModel::new();
+        let passive = model.invalidate();
+
+        assert_eq!(passive.risk, SwapRisk::Safe);
+        assert_eq!(passive.t_sat_sec, None);
+        assert!(passive.net_rate_bps.is_finite());
+        assert_eq!(model.samples(), 0);
     }
 
     #[test]
